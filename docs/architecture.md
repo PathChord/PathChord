@@ -68,7 +68,9 @@ Egress status is reported over existing Paths. Ingress maintains per-Ingress-to-
 
 ## 7. Sessions and Paths
 
-One Ingress and one selected Egress share a Session. Multiple Streams and UDP sessions may use it. Ingress creates, expands, drains, and closes bidirectional long-lived Paths. Egress reuses those Paths for return traffic.
+One Session is created when a new logical connection to an Egress is established and has a strict one-to-one relationship with that Egress. The Session is the logical channel between one Ingress and one Egress. Multiple Streams and UDP sessions use it. A Session is not tied to one physical transport.
+
+Each Session contains zero or more bidirectional, long-lived Paths. A Path is one physical transit link for the Session. Ingress creates, expands, drains, and closes Paths; Egress reuses the same Paths for return traffic. Streams are independent of Path identity and may migrate between Paths at any time.
 
 Control messages have an independent sending budget. Business traffic is fairly scheduled, with optional priority and shares. Stream data can only use Paths admitted for that stream; Session control can use any non-revoked Path.
 
