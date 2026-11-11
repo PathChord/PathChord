@@ -49,7 +49,7 @@ The protocol needs at least:
 ```text
 VERSION_NEGOTIATE
 SESSION_ATTACH
-SESSION_ATTACH_ACK
+SESSION_ATTACH_OK
 EGRESS_STATUS
 PATH_PROBE
 PATH_PROBE_ACK
@@ -58,10 +58,10 @@ PATH_CLOSE
 STREAM_OPEN
 STREAM_OPEN_ACK
 STREAM_FIN
-STREAM_RESET
-DATA
-ACK
-WINDOW_UPDATE
+STREAM_RST
+STREAM_DATA
+STREAM_ACK
+STREAM_WINDOW
 SESSION_CLOSE
 ERROR
 ```
@@ -258,7 +258,7 @@ The following invariants are normative:
 
 The PathChord wire format is byte-oriented, but a Path is not required to be reliable. The complete encoded frame is the minimum delivery unit: a Path may lose, duplicate, or reorder whole frames, but it must never expose a partial frame or a frame with modified payload to the protocol core. The Path layer uses `frame_seq` and frame boundaries to detect these conditions; Session-level reliability handles recovery for control messages and reliable Stream data.
 
-Each Path adapter presents a byte-oriented frame carrier to the protocol core. A reliable byte-stream upstream such as TCP may preserve ordering internally. An unreliable or datagram-oriented upstream may deliver complete frames, lose frames, duplicate frames, or reorder frames, but must not silently modify a frame payload. The adapter performs any segmentation and reassembly needed to preserve complete PathChord frames; incomplete or damaged frames are discarded before delivery.
+Each Path adapter reads and writes a byte stream but presents only complete PathChord frames to the protocol core. A reliable byte-stream upstream such as TCP may preserve ordering internally. An unreliable or datagram-oriented upstream may deliver complete frames, lose frames, duplicate frames, or reorder frames, but must not silently modify a frame payload. The adapter or record decoder performs segmentation and reassembly needed to preserve complete frames; incomplete or damaged frames are discarded before delivery.
 
 This keeps TCP, TLS, WebSocket, VLESS, VMess, XTLS, and future adapters within one framing model while allowing direct use of unreliable transports. Datagram semantics exist only above the framing layer in `UDP_DATAGRAM` messages.
 
