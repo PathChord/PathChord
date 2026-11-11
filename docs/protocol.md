@@ -291,3 +291,29 @@ Authorization changes are generation-based:
 - an Egress authorization-list update does not require Ingress restart when only the Egress-side list changes.
 
 The enrollment control API is outside the data Path protocol. It may modify the Egress authorization database or configuration file, but must use atomic generation updates and preserve the previous valid record if validation or persistence fails.
+
+## 18. Local management API
+
+The management API is local-only:
+
+```text
+Linux   Unix domain socket
+Windows named pipe
+```
+
+The `anasto`/PathChord CLI is the supported management client. The API authorizes callers through the operating-system ownership and permission model of the socket or pipe. It is not exposed through the Transit Proxy or Egress data Paths.
+
+The running Egress process owns both the management API and the authorization store. The CLI never edits the database or configuration file directly; it submits an operation to Egress, and Egress performs the complete update.
+
+Enrollment operations are transactional:
+
+1. CLI submits an enrollment, disable, revoke, or delete request.
+2. Egress validates identifiers, key encoding, duplicate identities, and policy constraints.
+3. Egress writes the new authorization generation atomically to its database or configuration store.
+4. Egress replaces its in-memory authorization snapshot without restarting.
+5. Egress applies revocation or disable effects to live Paths and Sessions.
+6. The API returns the applied generation and effective state.
+
+If persistence succeeds but the in-memory update fails, Egress must roll back the persistent generation where possible; otherwise it reports the generation as `pending_apply`, rejects further mutations, and exposes the mismatch through status. If validation or persistence fails, no generation change is published.
+
+Authorization changes that revoke or disable an Ingress are applied to new handshakes immediately and then terminate all matching live Paths and Sessions according to the revocation rules.
