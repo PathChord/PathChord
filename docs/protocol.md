@@ -260,3 +260,34 @@ The PathChord wire format is byte-oriented, but a Path is not required to be rel
 Each Path adapter presents a byte-oriented frame carrier to the protocol core. A reliable byte-stream upstream such as TCP may preserve ordering internally. An unreliable or datagram-oriented upstream may deliver complete frames, lose frames, duplicate frames, or reorder frames, but must not silently modify a frame payload. The adapter performs any segmentation and reassembly needed to preserve complete PathChord frames; incomplete or damaged frames are discarded before delivery.
 
 This keeps TCP, TLS, WebSocket, VLESS, VMess, XTLS, and future adapters within one framing model while allowing direct use of unreliable transports. Datagram semantics exist only above the framing layer in `UDP_DATAGRAM` messages.
+
+## 17. Enrollment and authorization
+
+Enrollment is an administrative operation performed separately on Ingress and Egress through a trusted local or out-of-band channel. PathChord does not use TOFU, automatic trust discovery, or an online third-party CA.
+
+The enrollment record contains:
+
+```text
+IngressID
+Ingress static public key
+EgressID
+Egress static public key
+authorization state: enabled | disabled | revoked
+optional administrator labels and limits
+record generation
+```
+
+The Ingress stores the expected Egress public key in its static Egress topology. The Egress stores the authorized Ingress public-key list in its local authorization database or configuration. Both sides must be configured independently before a Path can become `PATH_READY`.
+
+The Noise pattern is `Noise_IK_25519_ChaChaPoly_SHA256`. Each Path performs a fresh handshake and obtains independent transport keys. The handshake authenticates the static keys and binds the resulting Path to the configured IngressID and EgressID. A successful Noise handshake alone is insufficient: the Egress must also find the Ingress static public key in its enabled authorization list.
+
+Authorization changes are generation-based:
+
+- enabling an Ingress key permits new Paths and Sessions;
+- disabling or revoking a key prevents new Paths immediately;
+- revocation closes all related Paths, Sessions, Streams, and Egress-to-target connections;
+- existing authorization state is not silently upgraded after a failed configuration write;
+- a changed static key requires the affected endpoint to restart;
+- an Egress authorization-list update does not require Ingress restart when only the Egress-side list changes.
+
+The enrollment control API is outside the data Path protocol. It may modify the Egress authorization database or configuration file, but must use atomic generation updates and preserve the previous valid record if validation or persistence fails.
