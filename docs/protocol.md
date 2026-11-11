@@ -68,7 +68,7 @@ ERROR
 
 Control traffic has reserved capacity. A Session requires at least one active Path; loss of the last Path terminates the Session. Status reports, heartbeats, and Session control messages use the currently available Paths, with a Session control sequence number for duplicate suppression. Control messages may optionally carry a dependency sequence number when execution order matters. Any available Path may carry any control or data exchange.
 
-Control messages are replicated across multiple currently available Paths by default. The receiver applies each `control_seqno` at most once, so replication is safe. An implementation may suppress replication temporarily under a Session-wide control-plane budget, but must retain at least one delivery attempt while a compliant Path exists.
+Control messages are replicated across multiple currently available Paths by default. The receiver applies each `control_seqno` at most once, so replication is safe. `CONTROL_ACK` reports the highest contiguous applied sequence and optional selective ranges. The sender retains unacknowledged control messages and retransmits them until acknowledged or until the Session closes.
 
 ## 5. TCP Streams
 
@@ -85,7 +85,7 @@ Required semantics:
 - bounded reordering buffers;
 - backpressure instead of silently dropping TCP bytes.
 
-A connect request carries a unique RequestID. Retrying the request on another Path must be idempotent at Egress so an uncertain response cannot create a second target connection. If the Session is gone and the result is uncertain, fail the local connection and let the application retry.
+A connect request carries a unique RequestID. Retrying the request on another Path must be idempotent at Egress so an uncertain response cannot create a second target connection. `STREAM_OPEN` carries the original hostname when available and may also carry resolved address candidates; Egress applies its configured DNS policy. If the Session is gone and the result is uncertain, fail the local connection and let the application retry.
 
 ## 6. UDP sessions
 
@@ -119,7 +119,7 @@ frame_seq      monotonically increasing sequence on this Path
 payload_len    payload length
 ```
 
-`session_id` identifies the Ingress-to-Egress logical channel. `path_id` identifies only the physical Path and has no meaning to Streams. `frame_seq` is used for Path-level duplicate detection, diagnostics, and loss accounting; it is not a Stream byte offset.
+`session_id` identifies the Ingress-to-Egress logical channel. `path_id` identifies only the physical Path and has no meaning to Streams. `frame_seq` is used for Path-level duplicate detection, diagnostics, and loss accounting; it is not a Stream byte offset. SessionID and PathID are 128-bit random values; RequestID is a 128-bit random value; StreamID is a 62-bit locally allocated value and is never reused within a Session.
 
 TCP and other reliable byte streams use a separate data header:
 
@@ -165,6 +165,7 @@ PATH_CLOSE       close this Path
 SESSION_CLOSE    close the Session and all related Streams
 STATUS_REPORT    Egress capacity and health report
 HEARTBEAT        liveness and control sequence exchange
+CONTROL_ACK      applied control sequence and selective ranges
 ```
 
 `PATH_DRAIN` is advisory and may be interrupted by an urgent failure. `PATH_CLOSE` is final for that Path. `SESSION_CLOSE` is final for the Session; a new Session is required after the last Path disappears or either endpoint restarts.
@@ -301,7 +302,7 @@ Linux   Unix domain socket
 Windows named pipe
 ```
 
-The `anasto`/PathChord CLI is the supported management client. The API authorizes callers through the operating-system ownership and permission model of the socket or pipe. It is not exposed through the Transit Proxy or Egress data Paths.
+The `pathchord` CLI is the supported management client. The API authorizes callers through the operating-system ownership and permission model of the socket or pipe. It is not exposed through the Transit Proxy or Egress data Paths.
 
 The running Egress process owns both the management API and the authorization store. The CLI never edits the database or configuration file directly; it submits an operation to Egress, and Egress performs the complete update.
 
