@@ -70,9 +70,9 @@ Egress status is reported over existing Paths. Ingress maintains per-Ingress-to-
 
 One Session exists for each active Ingress-to-Egress relationship and has a strict one-to-one relationship with that Egress. Ingress attempts to establish Sessions for configured Egresses when it comes online and maintains them while the Egress is online. The Session is the logical channel between one Ingress and one Egress; business Streams and UDP sessions reuse it. A Session is not tied to one physical transport.
 
-Each Session contains zero or more bidirectional, long-lived Paths. A Path is one physical transit link for the Session. Ingress creates, expands, drains, and closes Paths; Egress reuses the same Paths for return traffic. Streams are independent of Path identity and may migrate between Paths at any time.
+Each live Session contains at least one `PATH_READY` bidirectional, long-lived Path. The Session manager may retain a reconnecting record with zero Paths, but that record cannot carry business traffic. A Path is one physical transit link for the Session. Ingress creates, expands, drains, and closes Paths; Egress reuses the same Paths for return traffic. Streams are independent of Path identity and may migrate between Paths at any time.
 
-Control messages have an independent sending budget. Business traffic is fairly scheduled, with optional priority and shares. Stream data can only use Paths admitted for that stream; Session control can use any non-revoked Path.
+Control messages have an independent sending budget. Business traffic is fairly scheduled, with optional priority and shares. The scheduler decides which currently usable Paths may carry each traffic class; Streams do not retain Path identity. Session control can use any non-revoked Path.
 
 ## 8. Dynamic scheduling
 
