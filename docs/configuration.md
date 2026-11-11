@@ -127,3 +127,55 @@ listeners:
 ```
 
 `listener_id`, source address, authentication identity, process metadata, protocol, and target address are available to rules.
+
+## Runtime snapshots
+
+Configuration is evaluated through immutable snapshots:
+
+```text
+Static Egress topology
+        +
+Dynamic Transit Proxy snapshot
+        +
+Compiled rule snapshot
+        +
+Observed node and Egress state
+        = effective runtime snapshot
+```
+
+Each snapshot has a monotonically increasing generation. A new connection captures one generation at the beginning of rule evaluation and uses that snapshot for the complete Egress and Proxy selection. Existing Sessions, Streams, and Paths continue using the generation under which they were admitted unless a hard revocation or Egress failure closes them.
+
+Rule evaluation produces only policy data:
+
+```yaml
+decision:
+  egress_selector: { labels: { region: jp } }
+  proxy_selector: { tags: [gaming] }
+  traffic_policy: gaming-default
+```
+
+Rules do not embed a concrete dynamic Proxy identity. The scheduler resolves selectors against the current runtime state and applies health, capacity, weight, quota metadata, and Path policy.
+
+## Label and tag namespaces
+
+The internal node model uses namespaced attributes:
+
+```text
+node.*      static identity and protocol attributes
+admin.*     local administrator annotations
+source.*    subscription source and imported metadata
+observed.*  runtime measurements and derived state
+quota.*     optional provider quota metadata
+```
+
+Local administrator attributes override imported source attributes. Observed attributes are owned by the runtime and cannot be overridden by subscription data. Hard runtime states such as revoked, disabled, or disconnected always exclude a node regardless of labels.
+
+## Dynamic update rules
+
+- Static Egress topology changes require an Ingress restart.
+- Transit Proxy subscription updates replace the dynamic snapshot atomically.
+- A failed subscription refresh retains the last successful snapshot.
+- Removed Transit Proxies enter draining and are excluded from new selections.
+- Existing Paths using a removed Transit Proxy remain until drain completion or failure.
+- Compiled rules are replaced atomically; a failed compilation retains the previous rule snapshot.
+- Runtime observations update independently from configuration generations.
