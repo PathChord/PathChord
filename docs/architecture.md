@@ -68,7 +68,7 @@ Egress status is reported over existing Paths. Ingress maintains per-Ingress-to-
 
 ## 7. Sessions and Paths
 
-One Session is created when a new logical connection to an Egress is established and has a strict one-to-one relationship with that Egress. The Session is the logical channel between one Ingress and one Egress. Multiple Streams and UDP sessions use it. A Session is not tied to one physical transport.
+One Session exists for each active Ingress-to-Egress relationship and has a strict one-to-one relationship with that Egress. Ingress attempts to establish Sessions for configured Egresses when it comes online and maintains them while the Egress is online. The Session is the logical channel between one Ingress and one Egress; business Streams and UDP sessions reuse it. A Session is not tied to one physical transport.
 
 Each Session contains zero or more bidirectional, long-lived Paths. A Path is one physical transit link for the Session. Ingress creates, expands, drains, and closes Paths; Egress reuses the same Paths for return traffic. Streams are independent of Path identity and may migrate between Paths at any time.
 
