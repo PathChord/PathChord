@@ -179,3 +179,7 @@ Local administrator attributes override imported source attributes. Observed att
 - Existing Paths using a removed Transit Proxy remain until drain completion or failure.
 - Compiled rules are replaced atomically; a failed compilation retains the previous rule snapshot.
 - Runtime observations update independently from configuration generations.
+
+## Session maintenance
+
+Ingress maintains one Session slot per configured Egress. When Ingress starts, it attempts to establish Sessions for Egresses whose current effective state is online. A Session remains alive while idle and is reused by subsequent Streams and UDP Associations. When an Egress becomes offline or enters hard failure, its Session and all related business connections are destroyed. When the Egress becomes online again, Ingress creates a new Session and Path set.
