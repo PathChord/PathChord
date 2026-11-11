@@ -45,4 +45,4 @@ ACTIVE → CLOSED
 DRAINING → CLOSED
 ```
 
-A Session is shared by one Ingress and one Egress. Either endpoint restart, authorization revocation, or Egress hard failure closes the Session and related target connections. It is not resumed after endpoint restart.
+A Session is shared by one Ingress and one Egress and requires at least one active Path. Losing the last Path immediately terminates the Session and related target connections. Either endpoint restart, authorization revocation, or Egress hard failure also closes the Session. It is not resumed after endpoint restart. Control messages and heartbeats use currently available Paths and are deduplicated by Session control sequence number.
