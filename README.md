@@ -24,6 +24,7 @@ Design phase. The current repository contains the architecture and protocol desi
 - [Configuration model](docs/configuration.md)
 - [State machines](docs/state-machines.md)
 - [Implementation plan](docs/implementation-plan.md)
+- [Technology selection](docs/technology-selection.md)
 
 ## Planned commands
 
