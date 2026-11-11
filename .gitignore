@@ -1,0 +1,23 @@
+# Build output
+/target/
+/dist/
+/build/
+
+# Local runtime state
+*.db
+*.sqlite
+*.sock
+*.pid
+
+# Secrets and local configuration
+*.key
+*.pem
+*.secret
+config.local.*
+.env
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
