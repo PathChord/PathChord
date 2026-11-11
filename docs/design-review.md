@@ -2,6 +2,10 @@
 
 This review compares the architecture, protocol, configuration, state-machine, implementation, and technology-selection documents.
 
+## Review status
+
+The Session lifecycle, control ACK, identifier, DNS, and naming issues from this review have been applied to the main design documents. The remaining items are implementation specifications to be completed before the corresponding subsystem is built.
+
 ## Must fix before implementation
 
 ### 1. Session cardinality and Path cardinality conflict
