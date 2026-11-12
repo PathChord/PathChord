@@ -21,6 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 mod control;
 mod control_views;
+mod flow;
 mod http_connect;
 mod local_dispatch;
 mod local_protocol;
@@ -39,6 +40,9 @@ pub use control::{
 pub use control_views::{
     ListenerInventory, ListenerSelectionError, ListenerView, ListenerViewState,
     SystemProxyPlatformEffect, SystemProxyRestorationState, SystemProxyStatusView,
+};
+pub use flow::{
+    FixedTargetDialer, FlowBridgeError, FlowBridgeStats, IngressTargetDialer, bridge_connection,
 };
 pub use http_connect::{HttpConnectListener, MAX_HEADER_BYTES as HTTP_MAX_HEADER_BYTES};
 pub use local_dispatch::LocalControlDispatcher;
