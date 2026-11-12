@@ -40,6 +40,12 @@ separate from `docs/design/`, which describes the intended architecture, and
 - Egress now includes a concrete Tokio TCP `TargetConnector` that tries explicit
   address candidates, falls back to hostname resolution, supports an optional
   connect timeout, and preserves typed target validation failures.
+- Ingress now exposes a transport-neutral direct TCP bridge with an injected
+  target dialer and bidirectional copy/EOF propagation tests. Session/Path
+  multiplexing and production flow orchestration remain separate work.
+- Ingress now provides a transport-neutral direct TCP flow bridge with an
+  injected target-dialer trait, bidirectional copy/half-close propagation, byte
+  counters, and deterministic dial/copy failure tests.
 
 ## Missing operational integration
 
