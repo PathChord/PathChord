@@ -304,6 +304,8 @@ Windows named pipe
 
 The `pathchord` CLI is the supported management client. The API authorizes callers through the operating-system ownership and permission model of the socket or pipe. It is not exposed through the Transit Proxy or Egress data Paths.
 
+Management messages use a length-prefixed UTF-8 JSON envelope. The envelope includes an API version, operation name, request ID, and typed request or response body. JSON is limited to the local management API; the data Path continues to use the dedicated binary frame codec.
+
 The running Egress process owns both the management API and the authorization store. The CLI never edits the database or configuration file directly; it submits an operation to Egress, and Egress performs the complete update.
 
 Enrollment operations are transactional:
