@@ -1,0 +1,36 @@
+# Repository Guidelines
+
+## Project Structure & Module Organization
+
+PathChord is currently in the design phase. `README.md` defines the project vocabulary and links the design baseline. The `docs/` directory contains architecture, protocol, configuration, state-machine, implementation-plan, technology-selection, and design-review documents. There is not yet a `src/`, `tests/`, or assets directory, nor a Cargo workspace.
+
+The recommended Rust layout separates `pathchord-core`, `pathchord-noise`, `pathchord-path`, `pathchord-policy`, `pathchord-transit`, `pathchord-egress`, `pathchord-ingress`, and `pathchord-cli`. Keep `pathchord-core` independent of platforms, subscription formats, and listener implementations.
+
+## Build, Test, and Development Commands
+
+No application build or runtime command is available yet; the CLI commands in `README.md` are planned interfaces. For current documentation changes, run:
+
+```sh
+git diff --check
+rg -n '^#{1,6} ' README.md docs/*.md AGENTS.md
+```
+
+The first command detects whitespace errors; the second makes heading structure easy to review. Once the Rust workspace exists, the expected checks are `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`.
+
+## Coding Style & Naming Conventions
+
+Use one H1 per Markdown document, sentence-case headings, kebab-case filenames, and language-tagged fences such as `yaml` or `text`. Preserve the defined capitalization and meaning of Ingress, Transit Proxy, Egress, Session, Path, and Stream. Keep related claims synchronized across `architecture.md`, `protocol.md`, `configuration.md`, and `state-machines.md`.
+
+For future Rust code, accept `rustfmt` defaults. Use `snake_case` for modules, functions, and tests; `PascalCase` for types and traits; and kebab-case crate names.
+
+## Testing Guidelines
+
+There is no numeric coverage target. Tests should protect protocol invariants and failure semantics using deterministic Noise/framing vectors, fake transports, property tests, packet traces, and fault injection for loss, duplication, reordering, restart, and partition behavior. Keep unit tests near their modules and integration tests under `tests/`; prefer behavioral names such as `reorders_frames_across_paths`.
+
+## Commit & Pull Request Guidelines
+
+Follow the existing `type: lowercase imperative summary` pattern, for example `docs: clarify session restart semantics`. Use focused commits; introduce `feat:`, `fix:`, or `test:` when code arrives. Pull requests should explain the intent, identify affected contracts and documents, link relevant issues or decisions, and report validation performed. Include screenshots only when a user-visible interface is introduced or changed.
+
+## Security & Configuration
+
+Never commit `.env`, `config.local.*`, private keys, certificates, or secret files. Use placeholders in examples. Preserve explicit enrollment, independent per-Path Noise state, and the documented prohibition on trust-on-first-use.
