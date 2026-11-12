@@ -106,7 +106,7 @@ SQLite transactions are used for Egress authorization changes. The running Egres
 
 ## Platform architecture
 
-Linux integrates TPROXY, REDIRECT, process metadata, and transparent routing through platform adapters. Windows uses Wintun and system-proxy integration. Both platforms reuse the core and policy crates.
+Linux integrates TPROXY, REDIRECT, process metadata, and transparent routing through platform adapters. Windows uses Wintun and system-proxy integration selected through the control plane. Both platforms reuse the core and policy crates.
 
 Platform adapters own operating-system-specific packaging, service integration, socket behavior, and routing behavior. Linux transparent routing supports IPv4 and IPv6. Tokio task supervision and cancellation must handle Path churn without leaking tasks or resources. SQLite transactions preserve authorization consistency during concurrent status queries and enrollment operations. The frame codec bounds allocation by protocol limits, and the rule compiler enforces bounded evaluation cost.
 

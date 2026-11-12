@@ -1,10 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-/// High-level error classes exposed by the PathChord protocol.
-///
-/// The Phase-0 numeric values are deterministic test fixtures, not a stable
-/// interoperability registry.
+/// Stable error classes exposed by wire-profile-v1.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum ErrorClass {
@@ -15,7 +12,7 @@ pub enum ErrorClass {
 }
 
 impl ErrorClass {
-    pub const fn experimental_code(self) -> u8 {
+    pub const fn code(self) -> u8 {
         self as u8
     }
 }
@@ -64,14 +61,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn experimental_error_codes_round_trip() {
+    fn v1_error_codes_round_trip() {
         for class in [
             ErrorClass::LocalPolicy,
             ErrorClass::PathFailure,
             ErrorClass::EgressFailure,
             ErrorClass::TargetFailure,
         ] {
-            assert_eq!(ErrorClass::try_from(class.experimental_code()), Ok(class));
+            assert_eq!(ErrorClass::try_from(class.code()), Ok(class));
         }
     }
 

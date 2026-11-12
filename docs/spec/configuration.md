@@ -2,77 +2,129 @@
 
 **English** | [简体中文](configuration.zh-CN.md)
 
-This document defines the configuration model represented by the YAML examples
-below. Configuration adapters validate human-authored YAML and convert it into
-typed configuration snapshots before publication. The fragments define model
-semantics, but do not constitute an exhaustive serialization schema; a
-versioned schema defines accepted fields, defaults, unknown-field handling, and
-validation rules. Runtime observations are separate from administrator
-configuration. Management operations use the JSON envelopes defined in the
-[protocol specification](protocol.md); configuration YAML is not a
-management-message or data-Path wire encoding.
+This document explains the Kubernetes-style configuration objects and evaluation order. The
+normative field, type, default, and validation contract is the
+[versioned configuration schema](configuration-schema.md); platform listeners
+and independent DNS are defined in the [platform and DNS specification](platform-and-dns.md).
+Configuration uses `apiVersion: pathchord.io/v1`, `kind`, `metadata`, and
+`spec` objects. A `kind: List` object is the normal multi-resource form; the
+snippets below show either complete objects or `spec` fragments as labeled.
+Configuration adapters validate the complete object graph and convert it into
+typed immutable snapshots before publication. Runtime observations are exposed
+as read-only `status` views and are never mixed into desired `spec`. Management
+operations use the JSON envelopes defined in the [protocol specification](protocol.md);
+configuration YAML is not a management-message or data-Path wire encoding.
+
+## Canonical object set
+
+```yaml
+apiVersion: pathchord.io/v1
+kind: List
+metadata:
+  name: default
+items:
+  - apiVersion: pathchord.io/v1
+    kind: Egress
+    metadata:
+      name: jp-1
+      labels:
+        region: jp
+    spec:
+      address: egress.example.net
+      port: 443
+      publicKey: <curve25519-public-key>
+      capabilities:
+        tcp: true
+        udp: true
+  - apiVersion: pathchord.io/v1
+    kind: DNSPolicy
+    metadata:
+      name: default-dns
+    spec:
+      defaultRoute: local
+  - apiVersion: pathchord.io/v1
+    kind: FallbackPolicy
+    metadata:
+      name: default-fallback
+    spec:
+      action: reject
+```
+
+Resource references use `metadata.name` (for example, `egressRef: jp-1`),
+never collection-local `id` fields. `metadata.generation` and a read-only
+`status` are produced by the control plane after publication.
 
 ## Static Egress topology
 
 ```yaml
-egresses:
-  - id: jp-1
-    address: egress.example.net
-    port: 443
-    public_key: <curve25519-public-key>
-    labels:
-      region: jp
-      role: egress
-    capabilities:
-      tcp: true
-      udp: true
+apiVersion: pathchord.io/v1
+kind: Egress
+metadata:
+  name: jp-1
+  labels:
+    region: jp
+    role: egress
+spec:
+  address: egress.example.net
+  port: 443
+  publicKey: <curve25519-public-key>
+  capabilities:
+    tcp: true
+    udp: true
 ```
 
 ## Dynamic Transit Proxy data
 
 ```yaml
-transit_proxies:
-  - id: provider-a-node-01
-    source:
-      type: clash
-      subscription: provider-a
-    protocol: vless
-    address: proxy.example.net
-    port: 443
-    labels:
-      region: jp
-      provider: provider-a
-    tags: [gaming]
-    weight: 100
+apiVersion: pathchord.io/v1
+kind: TransitProxy
+metadata:
+  name: provider-a-node-01
+  labels:
+    region: jp
+    provider: provider-a
+spec:
+  source:
+    type: clash
+    subscriptionRef: provider-a
+  protocol: vless
+  address: proxy.example.net
+  port: 443
+  tags: [gaming]
+  weight: 100
 ```
 
-Runtime fields are maintained separately:
+The following is a read-only runtime `status` view, not administrator-authored desired YAML:
 
 ```yaml
-observed:
-  connected: true
-  rtt_ms: 42
-  jitter_ms: 5
-  loss_rate: 0.002
-  effective_capacity_bps: 180000000
-quota:
-  remaining_ratio: 0.42
-  reset_at: 2026-12-01T00:00:00Z
-billing:
-  traffic_multiplier: 2.0
+status:
+  observed:
+    connected: true
+    rttMs: 42
+    jitterMs: 5
+    lossRate: 0.002
+    effectiveCapacityBps: 180000000
+  quota:
+    remainingRatio: 0.42
+    resetAt: 2026-12-01T00:00:00Z
+  billing:
+    trafficMultiplier: 2.0
 ```
 
 ## Ordered Egress rules
 
 ```yaml
-egress_rules:
-  - id: jp-gaming
-    match:
-      flow_tags: [gaming]
-      protocol: [tcp, udp]
-    egress: jp-1
-    requirements:
-      min_usable_paths: 1
+apiVersion: pathchord.io/v1
+kind: EgressRule
+metadata:
+  name: jp-gaming
+spec:
+  match:
+    flowTags: [gaming]
+    protocols: [tcp, udp]
+  egressRef: jp-1
+  requirements:
+    minUsablePaths: 1
 ```
 
 The first rule whose conditions match and whose Egress is currently usable wins. Egress usability is precomputed by the runtime state manager.
@@ -80,19 +132,22 @@ The first rule whose conditions match and whose Egress is currently usable wins.
 ## Egress-specific Proxy rules
 
 ```yaml
-transit_rules:
-  - id: jp-1-gaming
-    egress: jp-1
-    match:
-      flow_tags: [gaming]
-    require:
-      labels:
-        region: jp
-      capabilities: [udp]
-    reject:
-      tags: [quota-exhausted]
-    weight: 100
-    traffic_policy: gaming-default
+apiVersion: pathchord.io/v1
+kind: TransitRule
+metadata:
+  name: jp-1-gaming
+spec:
+  egressRef: jp-1
+  match:
+    flowTags: [gaming]
+  require:
+    labels:
+      region: jp
+    capabilities: [udp]
+  reject:
+    tags: [quota-exhausted]
+  weight: 100
+  trafficPolicyRef: gaming-default
 ```
 
 Rules are ordered. The first matching rule determines admission and base relationship weight.
@@ -100,12 +155,15 @@ Rules are ordered. The first matching rule determines admission and base relatio
 Traffic policies may define multipath scheduling and replication budgets:
 
 ```yaml
-traffic_policies:
-  gaming-default:
-    scheduler: effective_capacity_weighted
-    session_replication_budget_bps: 2000000
-    class_replication_budget_bps: 1000000
-    retransmission_replication: allowed
+apiVersion: pathchord.io/v1
+kind: TrafficPolicy
+metadata:
+  name: gaming-default
+spec:
+  scheduler: effectiveCapacityWeighted
+  sessionReplicationBudgetBps: 2000000
+  classReplicationBudgetBps: 1000000
+  retransmissionReplication: allowed
 ```
 
 The Session budget is the hard upper bound. A traffic-class budget can reduce the allocation for that class but cannot exceed the remaining Session budget.
@@ -113,16 +171,24 @@ The Session budget is the hard upper bound. A traffic-class budget can reduce th
 ## Ordinary Proxy rules and fallback
 
 ```yaml
-proxy_rules:
-  - id: direct-jp
-    match:
-      flow_tags: [web]
-    require:
-      labels:
-        region: jp
-    select: any
+apiVersion: pathchord.io/v1
+kind: ProxyRule
+metadata:
+  name: direct-jp
+spec:
+  match:
+    flowTags: [web]
+  require:
+    labels:
+      region: jp
+  select: any
 
-fallback:
+---
+apiVersion: pathchord.io/v1
+kind: FallbackPolicy
+metadata:
+  name: default-fallback
+spec:
   action: reject # or direct
 ```
 
@@ -136,21 +202,31 @@ ordered effective Egress rules
 
 ## Listeners
 
-```yaml
-listeners:
-  - id: lan-socks
-    type: socks5
-    bind: 0.0.0.0:1080
-    allowed_sources: [192.168.1.0/24]
-    authentication: required
+The complete listener schema, including mandatory HTTP/SOCKS support on both
+platforms, Linux transparent modes and optional TUN, Windows TUN and the
+control-plane system-proxy switch, authentication references, source restrictions,
+and loop prevention is defined in
+[the platform and DNS specification](platform-and-dns.md).
 
-  - id: local-http
-    type: http
-    bind: 127.0.0.1:8080
-    authentication: disabled
+```yaml
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata:
+  name: lan-socks
+spec:
+  type: socks5
+  bind: 0.0.0.0:1080
+  allowedSources: [192.168.1.0/24]
+  authentication:
+    mode: required
 ```
 
 `listener_id`, source address, authentication identity, process metadata, protocol, and target address are available to rules.
+
+DNS is an independent policy. Its `local`, `transit`, `egress`, and `blocked`
+routes, resolver limits, cache behavior, hostname/candidate handling, and
+Fake-IP prohibition are normative in
+[the platform and DNS specification](platform-and-dns.md).
 
 ## Runtime snapshots
 
@@ -173,9 +249,9 @@ Rule evaluation produces only policy data:
 
 ```yaml
 decision:
-  egress_selector: { labels: { region: jp } }
-  proxy_selector: { tags: [gaming] }
-  traffic_policy: gaming-default
+  egressSelector: { labels: { region: jp } }
+  proxySelector: { tags: [gaming] }
+  trafficPolicyRef: gaming-default
 ```
 
 Rules do not embed a concrete dynamic Proxy identity. The scheduler resolves selectors against the current runtime state and applies health, capacity, weight, quota metadata, and Path policy.
@@ -190,6 +266,7 @@ admin.*     local administrator annotations
 source.*    subscription source and imported metadata
 observed.*  runtime measurements and derived state
 quota.*     optional provider quota metadata
+billing.*   optional provider billing metadata
 ```
 
 Local administrator attributes override imported source attributes. Observed attributes are owned by the runtime and cannot be overridden by subscription data. Hard runtime states such as revoked, disabled, or disconnected always exclude a node regardless of labels.

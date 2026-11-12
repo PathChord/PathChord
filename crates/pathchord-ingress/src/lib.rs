@@ -115,6 +115,7 @@ pub enum SessionSlotPhase {
 pub enum SessionCloseReason {
     LastPathLost,
     EgressUnavailable,
+    AuthorizationDisabled,
     AuthorizationRevoked,
     EndpointRestart,
     DrainComplete,
@@ -306,7 +307,8 @@ where
         let next_phase = match reason {
             SessionCloseReason::LastPathLost => SessionSlotPhase::Connecting,
             SessionCloseReason::EgressUnavailable => SessionSlotPhase::WaitingForEgress,
-            SessionCloseReason::AuthorizationRevoked => SessionSlotPhase::AuthorizationBlocked,
+            SessionCloseReason::AuthorizationDisabled
+            | SessionCloseReason::AuthorizationRevoked => SessionSlotPhase::AuthorizationBlocked,
             SessionCloseReason::EndpointRestart => SessionSlotPhase::Stopped,
             SessionCloseReason::DrainComplete => SessionSlotPhase::Configured,
         };
@@ -552,6 +554,10 @@ mod tests {
                 SessionSlotPhase::WaitingForEgress,
             ),
             (
+                SessionCloseReason::AuthorizationDisabled,
+                SessionSlotPhase::AuthorizationBlocked,
+            ),
+            (
                 SessionCloseReason::AuthorizationRevoked,
                 SessionSlotPhase::AuthorizationBlocked,
             ),
@@ -589,6 +595,16 @@ mod tests {
             .authorization_enabled()
             .expect("authorization restored");
         assert_eq!(revoked.phase(), SessionSlotPhase::Connecting);
+
+        let mut disabled = connecting_slot(1);
+        disabled.attach(1).expect("live Session");
+        disabled
+            .close_for(SessionCloseReason::AuthorizationDisabled)
+            .expect("disable close");
+        disabled
+            .authorization_enabled()
+            .expect("authorization restored");
+        assert_eq!(disabled.phase(), SessionSlotPhase::Connecting);
     }
 
     #[tokio::test]

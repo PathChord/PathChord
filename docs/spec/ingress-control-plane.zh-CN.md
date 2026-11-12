@@ -2,16 +2,11 @@
 
 [English](ingress-control-plane.md) | **简体中文**
 
-本文档定义用于操作 Ingress 的本地控制平面，以及供前端使用的可选 Web 网关。
-它独立于 PathChord 数据 Path，涵盖节点标签/标记编辑、订阅生命周期操作、
-手动刷新，以及结构化的节点/连接查询。
+本文档定义用于操作 Ingress 的本地控制平面，以及供前端使用的可选 Web 网关。它独立于
+PathChord 数据 Path。所有适配器都调用同一个类型化 command/query service；不得直接编辑
+配置文件、订阅缓存或数据库。
 
-控制平面是类型化内部命令/查询服务之上的适配器。CLI、本地 Web 网关和自动化客户端
-使用同一服务；它们不得（MUST NOT）直接编辑配置文件、缓存或数据库。
-
-该服务通过共享的类型化接口提供有界命令执行、原子快照、持久化、订阅工作器和授权。
-
-## 架构
+## 架构和封装
 
 ```text
 pathchord CLI --------------------+
@@ -24,56 +19,72 @@ Unix socket / named pipe ----------+             +--> atomic snapshots
                                                  +--> metrics registry
 ```
 
-特权本地适配器为：
+必需的特权本地适配器在 Linux 上是 Unix domain socket，在 Windows 上是 Named Pipe。操作系统
+所有者/ACL 是第一道授权边界。可选 Web Gateway 默认关闭，必须与数据 Path 分离，不能通过
+Transit Proxy 或 Egress 数据 Path 访问。非 loopback 绑定还必须显式配置受保护通道、强身份
+认证、来源允许列表、限流、脱敏和管理员可见的审计记录。
 
-```text
-Linux    Unix domain socket
-Windows  named pipe
+本地协议使用带长度前缀的 UTF-8 JSON 封装。长度是一个规范的 QUIC 风格无符号变长整数，
+表示恰好一个 JSON 对象的 UTF-8 字节数。封装上限为 1 MiB；零长度、截断前缀、非规范变长
+整数、尾随字节或超限对象必须在 JSON 分配前拒绝。
+
+请求格式如下：
+
+```json
+{
+  "api_version": "1",
+  "operation": "nodes.patch_labels",
+  "request_id": "01JEXAMPLE",
+  "actor": {"id": "local-admin", "capabilities": ["nodes:write"]},
+  "expected_generation": {"scope": "configuration", "value": 12},
+  "body": {"node_id": "provider-a-node-01", "set": {"admin.region": "jp"}, "remove": []}
+}
 ```
 
-套接字或管道在操作系统中的所有者/ACL 是第一道授权边界。本地协议使用带长度前缀的
-UTF-8 JSON 信封，其中包含 API 版本、操作名称、请求 ID 和类型化正文。
+每个响应都包含 `api_version`、原样返回的 `request_id`、布尔 `ok` 和 `observed_generation`。
+成功响应包含 `result`；失败响应包含具有 `code`、安全 `message` 和类型化 `details` 的
+`error` 对象：
 
-Web 网关是可选的，并且必须（MUST）与数据 Path 之间具有独立的进程/任务边界。
-它可以（MAY）默认绑定到回环地址。如果绑定到回环地址以外的地址，则必须（MUST）
-要求显式配置、TLS 或等效的受保护通道、强身份验证、来源允许列表，以及管理员可见的
-对外开放审计记录。
+```json
+{
+  "api_version": "1",
+  "request_id": "01JEXAMPLE",
+  "ok": false,
+  "observed_generation": {"scope": "configuration", "value": 12},
+  "error": {"code": "GENERATION_CONFLICT", "message": "generation mismatch", "details": {"expected": 11, "current": 12}}
+}
+```
 
-Web 网关调用与 CLI 相同的类型化服务。它不得（MUST NOT）将 Unix 套接字或命名管道
-直接暴露给浏览器，也不得（MUST NOT）通过 Transit Proxy 或 Egress 数据 Path 访问。
+`observed_generation` 是响应采集时的观测提供器代次；资源还会暴露其拥有者的 `generation`
+或 `revision`。变更前置条件使用明确的 scope/value 对象，不得从整数猜测作用域。
 
-本地 Unix 套接字/命名管道适配器是必需的。可选 Web 网关必须（MUST）保留与本地
-命令/查询服务相同的脱敏、审计和代次语义。
+## 资源模型和查询
 
-## API 适配器选择
-
-选定的内置 Web 适配器为 REST 加服务器发送事件（Server-Sent Events，SSE）。
-
-GraphQL 适配器可以（MAY）将同一类型化命令/查询服务映射为查询、变更和订阅。
-它必须（MUST）保留此处定义的资源所有权、授权、脱敏、审计、幂等性、代次和资源限制
-契约。GraphQL 错误必须（MUST）暴露对应的类型化失败；订阅必须（MUST）保留事件顺序，
-并在无法重放时支持快照恢复。内部服务和代次语义必须（MUST）独立于外部适配器。
-
-## 资源模型
-
-所有响应都包含 `api_version`、`request_id` 和 `observed_generation`。
-资源使用稳定的不透明 ID，并在更新可能发生竞争时暴露 `generation` 或 `revision`。
+资源使用稳定的不透明 ID。列表端点支持有界的 `page_size`（默认 100，最大 1000）、不透明
+`page_token`、类型化 `filter`，以及带明确升降序的有界 `sort` 字段。未知过滤器、排序字段
+和查询参数必须拒绝。列表结果包含 `items`、末尾为 null 的 `next_page_token` 和响应元数据。
 
 REST 查询资源如下：
 
 ```text
-GET  /api/v1/status
-GET  /api/v1/nodes
-GET  /api/v1/nodes/{node_id}
-GET  /api/v1/sessions
-GET  /api/v1/sessions/{session_id}
-GET  /api/v1/connections
-GET  /api/v1/subscriptions
-GET  /api/v1/metrics/snapshot
-GET  /api/v1/events              (SSE)
+GET /api/v1/status
+GET /api/v1/nodes
+GET /api/v1/nodes/{node_id}
+GET /api/v1/sessions
+GET /api/v1/sessions/{session_id}
+GET /api/v1/connections
+GET /api/v1/listeners
+GET /api/v1/subscriptions
+GET /api/v1/authorizations
+GET /api/v1/authorizations/{ingress_id}
+GET /api/v1/system-proxy
+GET /api/v1/metrics/snapshot
+GET /api/v1/metrics/paths
+GET /api/v1/metrics/streams
+GET /api/v1/events (SSE)
 ```
 
-节点响应区分命名空间及所有权：
+节点响应保留所有权命名空间：
 
 ```text
 node.*       static identity and protocol attributes
@@ -83,112 +94,130 @@ observed.*   runtime-owned health and quality values
 quota.*      provider quota metadata
 ```
 
-API 必须（MUST）保留导入数据、管理员所有的数据与运行时所有的数据之间的区别。
-客户端不能通过标签变更端点写入 `observed.*` 或 `quota.*`。已撤销、已禁用或已断开连接
-等硬性状态以类型化状态返回，而非可覆盖的偏好标记。
+客户端不得通过 label/tag 操作写入 `source.*`、`observed.*`、`quota.*` 或硬状态字段。硬
+状态必须作为类型化值返回，而不是可覆盖的偏好标记。
 
-## 命令与变更
+## 操作注册表
 
-变更是提交给类型化服务的命令。每个命令携带客户端 `request_id`、操作者身份和可选的
-预期代次。
-
-节点元数据：
+以下操作名称具有规范性；REST 适配器把资源映射到同样的操作：
 
 ```text
-PATCH /api/v1/nodes/{node_id}/labels
-PATCH /api/v1/nodes/{node_id}/tags
+status.get
+nodes.list             nodes.get
+nodes.patch_labels     nodes.patch_tags
+sessions.list          sessions.get
+connections.list
+listeners.list
+subscriptions.list     subscriptions.create
+subscriptions.delete   subscriptions.enable
+subscriptions.disable  subscriptions.refresh
+authorizations.list    authorizations.get
+authorizations.enroll  authorizations.enable
+authorizations.disable authorizations.revoke
+authorizations.delete
+metrics.snapshot       metrics.paths
+metrics.streams         events.subscribe
+system_proxy.get        system_proxy.enable
+system_proxy.disable
 ```
 
-正文包含完整操作，而非任意 JSON 合并：
+节点 patch 正文是完整操作，不是任意 JSON merge patch：
 
 ```json
 {
-  "expected_generation": 12,
+  "node_id": "provider-a-node-01",
   "set": {"admin.region": "jp"},
   "remove": ["admin.temporary"]
 }
 ```
 
-设置导入命名空间或运行时命名空间的操作会被拒绝。成功的变更以原子方式发布新的快照
-代次，并返回已更改的字段。
+订阅创建/刷新正文包含来源引用、验证策略、启用状态和当前 revision。成功刷新原子发布一个
+动态配置代次；失败保留最近成功快照并返回类型化失败。删除会排空仅由该来源导入的节点。
 
-订阅生命周期：
-
-```text
-POST   /api/v1/subscriptions
-DELETE /api/v1/subscriptions/{subscription_id}
-POST   /api/v1/subscriptions/{subscription_id}/refresh
-```
-
-`POST /subscriptions` 根据请求创建禁用或启用的订阅，验证其来源和策略，并发布一个代次。
-删除操作会将订阅从后续刷新中移除，并使其导入的节点进入文档规定的排空行为。
-刷新是显式操作，也可以（MAY）由工作器调度；刷新失败时保留上一次成功的快照。
-
-所有变更都按 `(actor_id, request_id)` 保证幂等。重放相同请求会返回原始结果。
-使用相同请求 ID 但携带不同正文会被拒绝。更改授权或硬性运行时状态的变更必须（MUST）
-返回结果状态，以及受影响 Session/Path 的清理摘要。
-
-## 代次与并发
-
-每个可变快照都有单调递增的代次。更改快照的命令必须（MUST）包含以下任一项：
-
-- `expected_generation`，其值必须等于当前已发布的代次；或
-- 仅授予已授权管理员的显式 `force` 能力。
-
-预期代次不匹配时，REST 返回 HTTP `409 Conflict`，本地 JSON 协议返回类型化
-`GENERATION_CONFLICT` 错误。响应包含当前代次、请求代次和新的资源摘要。
-发生冲突、验证失败或持久化失败时，不发布任何部分变更。
-
-静态 Egress 拓扑和本地密钥材料仍要求重启才能生效。动态 Transit 数据、管理员标签/标记
-和编译后的策略快照以原子方式发布。除硬性撤销或 Egress 故障外，现有 Session 保留其
-准入代次。
-
-## 身份验证与审计
-
-本地套接字/管道使用操作系统所有权和 ACL 作为主要授权边界。服务仍会为每个请求分配
-操作者身份和能力集。建议的能力如下：
+系统代理开关是控制面运行时 mutation，不是 YAML 资源。`system_proxy.enable` 必须包含 `listener_id`，
+且该 ID 必须引用 HTTP 或 SOCKS Listener。Windows 将其应用到环境变量和操作系统代理配置；
+`system_proxy.disable` 恢复之前的值。Linux 对启用和关闭都返回 `UNSUPPORTED_OPERATION`，并继续通过
+`nodes` 和 status 展示普通 Listener。
 
 ```text
-status:read
-metrics:read
-nodes:read
-nodes:write
-subscriptions:write
-authorization:write
+GET  /api/v1/system-proxy
+POST /api/v1/system-proxy/enable
+     {"listener_id":"local-http"}
+POST /api/v1/system-proxy/disable
 ```
 
-Web 网关必须（MUST）要求经过身份验证的管理员会话。浏览器会话必须（MUST）对变更使用
-CSRF 防护、来源允许列表、有界请求正文和严格的内容类型。令牌、私钥、订阅 URL、原始
-授权记录和未脱敏的目标数据不得（MUST NOT）出现在响应、SSE 事件或审计记录中。
+响应和 `system_proxy.changed` 事件包含 `enabled`、当前 `listener_id`（如有）、平台效果以及恢复/错误状态。
+在 Linux 上，GET 返回 `enabled: false` 和 `platform_effect: unsupported`。
 
-每次变更和身份验证失败都会生成结构化审计事件：
+授权操作使用 Egress 所有的存储：
+
+```text
+POST   /api/v1/authorizations
+POST   /api/v1/authorizations/{ingress_id}/enable
+POST   /api/v1/authorizations/{ingress_id}/disable
+POST   /api/v1/authorizations/{ingress_id}/revoke
+DELETE /api/v1/authorizations/{ingress_id}
+```
+
+注册正文包含 `ingress_id`、使用无填充小写 base64url 编码的 32 字节公钥、规范
+`egress_id`、可选管理员 label/limit 和 `expected_generation`。Enable 允许新 Path。
+Disable 和 revoke 都会立即拒绝新握手，并终止匹配的存活 Path、Session、Stream、UDP
+Association 及 Egress 目标连接。Revoke 对该记录身份是终态；delete 只有在存量资源清理完成
+后才移除记录。每次授权变更都返回已应用代次、有效状态和清理摘要。
+
+## 代次、幂等性和错误
+
+可变代次有三个作用域：`configuration` 表示静态/动态策略快照，`observation` 表示运行时
+快照，`authorization` 表示 Egress 授权存储。变更必须携带所属作用域的
+`expected_generation`，或显式授权的 `force` capability。冲突不得发布部分变更。
+
+所有变更按 `(actor.id, request_id)` 幂等。重放相同请求返回原响应；相同 request ID 携带不同
+规范正文时返回 `IDEMPOTENCY_CONFLICT`。幂等记录保留到所属代次被替换且至少 24 小时，以较长
+者为准。
+
+稳定错误码如下：
+
+```text
+MALFORMED_REQUEST       invalid envelope or JSON
+AUTHENTICATION_REQUIRED missing or invalid actor authentication
+CAPABILITY_DENIED       actor lacks the required capability
+VALIDATION_FAILED       typed field or policy validation failed
+NOT_FOUND               resource does not exist
+GENERATION_CONFLICT     expected generation is stale
+IDEMPOTENCY_CONFLICT    request ID was reused with a different body
+RESOURCE_LIMIT          a bounded service resource was exhausted
+PERSISTENCE_UNAVAILABLE durable store or audit sink is unavailable
+UNSUPPORTED_OPERATION   operation or API version is not supported
+```
+
+REST 按情况映射为 `400`、`401/403`、`404`、`409`、`429` 和 `500/503`；本地调用方收到相同
+类型码。错误消息仅用于诊断，绝不能包含机密、文件系统路径、对端任意文本或完整请求正文。
+
+## 身份验证和审计
+
+本地 socket/pipe 使用操作系统所有权和 ACL 作为主要边界。服务为每个请求分配 actor 和
+capability。标准 capability 为 `status:read`、`metrics:read`、`nodes:read`、`nodes:write`、
+`listeners:read`、`subscriptions:write`、`authorization:write` 和 `system_proxy:write`。
+
+每次变更和身份验证失败都发出包含以下字段的审计事件：
 
 ```text
 event_id, timestamp, actor_id, source, operation, request_id,
 target_resource, expected_generation, applied_generation, result, reason
 ```
 
-审计记录包含标识符和结果元数据，不包含机密或完整请求正文。审计写入应当（SHOULD）
-在成功的变更响应之前持久化；如果审计接收端不可用，服务对授权变更遵循显式的失败关闭
-策略，并对非敏感元数据操作报告降级状态。
+审计记录包含标识符和结果元数据，不包含机密或完整请求正文。授权变更无法完成持久化审计
+写入时必须失败关闭；非敏感元数据操作报告降级状态。
 
-## 速率与资源限制
+## 资源限制
 
-网关和本地服务必须（MUST）限制：
+本地服务和 Web Gateway 必须限制每个 actor 及全局并发请求数、封装/请求/响应大小、刷新频率
+和工作器数量、SSE 连接数和重放积压、分页大小、label/tag 基数以及键和值长度。超限返回
+`RESOURCE_LIMIT`/HTTP `429` 并附带重试提示，且不得发布任何变更。
 
-- 每个操作者及全局的并发请求数；
-- 请求正文和响应大小；
-- 订阅刷新频率和并发刷新工作器数；
-- SSE 连接数、事件积压量和每个客户端的重放窗口；
-- 节点标签/标记的基数和键/值长度。
+## REST 和 SSE 合同
 
-速率限制响应使用 HTTP `429` 并附带重试提示。本地调用方收到类型化 `RESOURCE_LIMIT`
-错误。超出限制不得（MUST NOT）修改快照或静默丢弃成功的命令。
-
-## REST 与 SSE 约定
-
-REST 仅对控制平面载荷使用 JSON。数据 Path 继续使用专用二进制帧协议。
-REST 状态映射如下：
+REST 仅对控制面载荷使用 JSON。状态映射如下：
 
 ```text
 200/201  successful query or mutation
@@ -197,17 +226,30 @@ REST 状态映射如下：
 404      unknown resource
 409      generation or idempotency conflict
 429      rate/resource limit
-500/503  unavailable persistence or service dependency
+500/503  unavailable persistence, audit, or service dependency
 ```
 
-SSE 先发送快照事件，然后发送带有事件 ID 和代次的有序事件。客户端使用
-`Last-Event-ID` 重新连接；如果重放窗口不包含该事件，服务器会在增量之前发送新的快照。
-事件采用类型化形式（`node.changed`、`subscription.refresh`、`session.changed`、
-`connection.changed`、`metrics.snapshot`、`audit.notice`），并针对发出请求的操作者脱敏。
+以下事件注册表与可观测性规范共享：
 
-## 显式边界
+```text
+metrics.snapshot
+node.changed
+path.changed
+session.changed
+stream.changed
+connection.changed
+subscription.changed
+authorization.changed
+system_proxy.changed
+audit.notice
+```
 
-控制平面不替代数据 Path 的 `STATUS_REPORT`。`STATUS_REPORT` 是用于 Path/Session
-准入和远端健康状态的紧凑 Egress 到 Ingress 协议消息。控制平面状态和指标是本地结构化
-视图，可以结合运行时观测、策略代次、订阅状态和连接详情。它们不得通过数据 Path 消息
-隧道传输，也不得仅从数据 Path 消息推断。
+每个事件包含 `id`、`type`、`generation`、`emitted_at`、`resource_type`、`resource_id` 和
+类型化 `payload`。`generation` 使用与响应元数据相同的 `{scope,value}` 形式；资源载荷可以
+另外携带自身的 `revision`。事件在每个 Ingress 进程内有序。`Last-Event-ID` 要么从有界缓冲区重放，
+要么先发送完整快照事件再发送新的增量。查询和事件载荷使用相同的 actor 授权和脱敏策略。
+
+## 明确边界
+
+控制平面不替代数据 Path 的 `STATUS_REPORT`。该消息用于 Path/Session 准入和远端健康；本地
+状态和指标是控制服务拥有的结构化视图。客户端绝不直接编辑数据库、配置文件或订阅缓存。

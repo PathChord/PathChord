@@ -1,9 +1,9 @@
-//! Phase-1 experimental payload schemas.
+//! wire-profile-v1 payload schemas.
 //!
 //! The outer [`PathFrame`](crate::PathFrame) codec owns the common header. This
-//! module owns the canonical payload encoding for the single-path control and
-//! stream messages. Numeric frame discriminants remain experimental; payload
-//! fields are nevertheless length-delimited and checked before allocation.
+//! module owns the canonical payload encoding for control and stream messages.
+//! Every field is length-delimited where applicable and checked before
+//! allocation.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -13,12 +13,13 @@ use crate::frame::{FrameType, ProtocolVersion};
 use crate::id::{PathId, RequestId, SessionId, StreamId};
 use crate::limits::ProtocolLimits;
 use crate::reliability::AckRange;
+use crate::state::EgressServiceState;
 use crate::varint::{MAX_VARINT, VarIntError, decode_varint, encode_varint};
 
-const MAX_ENDPOINT_ADDRESSES: usize = 16;
-const MAX_ACK_RANGES: usize = 256;
+const MAX_ENDPOINT_ADDRESSES: usize = ProtocolLimits::HARD_MAX_ENDPOINT_ADDRESSES;
+const MAX_ACK_RANGES: usize = ProtocolLimits::HARD_MAX_ACK_RANGES;
 
-/// A Phase-1 target endpoint. Hostname bytes are UTF-8 by contract but remain
+/// A v1 target endpoint. Hostname bytes are UTF-8 by contract but remain
 /// opaque here so DNS policy stays above the wire codec.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetEndpoint {
@@ -62,11 +63,32 @@ pub struct PathReady {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathDrain {
+    pub drain_reason: u64,
+    pub deadline_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathClose {
+    pub error: ErrorClass,
+    pub reason: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusReport {
     pub connected: bool,
+    pub service_state: EgressServiceState,
+    pub load_basis_points: u16,
+    pub connection_utilization_basis_points: u16,
+    pub bandwidth_utilization_basis_points: u16,
+    pub active_sessions: u64,
     pub active_streams: u64,
     pub active_target_connections: u64,
     pub capacity_bps: u64,
+    pub recommended_path_count: u64,
+    pub report_seqno: u64,
+    pub sample_age_ms: u64,
+    pub expires_after_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,7 +162,41 @@ pub struct StreamRst {
     pub reason: Vec<u8>,
 }
 
-/// All Phase-1 payloads carried by the canonical frame registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdpOpen {
+    pub association_id: u64,
+    pub target_flags: u64,
+    pub target: TargetEndpoint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdpOpenOk {
+    pub association_id: u64,
+    pub target_visible_port: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdpOpenErr {
+    pub association_id: u64,
+    pub error: ErrorClass,
+    pub reason: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdpDatagram {
+    pub association_id: u64,
+    pub datagram_seq: u64,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdpClose {
+    pub association_id: u64,
+    pub error: ErrorClass,
+    pub reason: Vec<u8>,
+}
+
+/// All v1 payloads carried by the canonical frame registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
     PathHello(PathHello),
@@ -148,6 +204,8 @@ pub enum Message {
     SessionAttachOk(SessionAttachOk),
     SessionAttachReject(SessionAttachReject),
     PathReady(PathReady),
+    PathDrain(PathDrain),
+    PathClose(PathClose),
     StatusReport(StatusReport),
     Heartbeat(Heartbeat),
     ControlAck(ControlAck),
@@ -160,6 +218,11 @@ pub enum Message {
     StreamWindow(StreamWindow),
     StreamFin(StreamFin),
     StreamRst(StreamRst),
+    UdpOpen(UdpOpen),
+    UdpOpenOk(UdpOpenOk),
+    UdpOpenErr(UdpOpenErr),
+    UdpDatagram(UdpDatagram),
+    UdpClose(UdpClose),
 }
 
 impl Message {
@@ -171,6 +234,8 @@ impl Message {
             Self::SessionAttachOk(_) => FrameType::SessionAttachOk,
             Self::SessionAttachReject(_) => FrameType::SessionAttachReject,
             Self::PathReady(_) => FrameType::PathReady,
+            Self::PathDrain(_) => FrameType::PathDrain,
+            Self::PathClose(_) => FrameType::PathClose,
             Self::StatusReport(_) => FrameType::StatusReport,
             Self::Heartbeat(_) => FrameType::Heartbeat,
             Self::ControlAck(_) => FrameType::ControlAck,
@@ -183,6 +248,11 @@ impl Message {
             Self::StreamWindow(_) => FrameType::StreamWindow,
             Self::StreamFin(_) => FrameType::StreamFin,
             Self::StreamRst(_) => FrameType::StreamRst,
+            Self::UdpOpen(_) => FrameType::UdpOpen,
+            Self::UdpOpenOk(_) => FrameType::UdpOpenOk,
+            Self::UdpOpenErr(_) => FrameType::UdpOpenErr,
+            Self::UdpDatagram(_) => FrameType::UdpDatagram,
+            Self::UdpClose(_) => FrameType::UdpClose,
         }
     }
 
@@ -234,6 +304,8 @@ impl Message {
                 Self::SessionAttachReject(SessionAttachReject::decode(&mut reader, limits)?)
             }
             FrameType::PathReady => Self::PathReady(PathReady::decode(&mut reader)?),
+            FrameType::PathDrain => Self::PathDrain(PathDrain::decode(&mut reader)?),
+            FrameType::PathClose => Self::PathClose(PathClose::decode(&mut reader, limits)?),
             FrameType::StatusReport => Self::StatusReport(StatusReport::decode(&mut reader)?),
             FrameType::Heartbeat => Self::Heartbeat(Heartbeat::decode(&mut reader)?),
             FrameType::ControlAck => Self::ControlAck(ControlAck::decode(&mut reader)?),
@@ -252,7 +324,11 @@ impl Message {
             FrameType::StreamWindow => Self::StreamWindow(StreamWindow::decode(&mut reader)?),
             FrameType::StreamFin => Self::StreamFin(StreamFin::decode(&mut reader)?),
             FrameType::StreamRst => Self::StreamRst(StreamRst::decode(&mut reader, limits)?),
-            _ => return Err(MessageCodecError::UnsupportedFrameType { frame_type }),
+            FrameType::UdpOpen => Self::UdpOpen(UdpOpen::decode(&mut reader, limits)?),
+            FrameType::UdpOpenOk => Self::UdpOpenOk(UdpOpenOk::decode(&mut reader)?),
+            FrameType::UdpOpenErr => Self::UdpOpenErr(UdpOpenErr::decode(&mut reader, limits)?),
+            FrameType::UdpDatagram => Self::UdpDatagram(UdpDatagram::decode(&mut reader, limits)?),
+            FrameType::UdpClose => Self::UdpClose(UdpClose::decode(&mut reader, limits)?),
         };
         reader.finish()?;
         Ok(message)
@@ -269,6 +345,8 @@ impl Message {
             Self::SessionAttachOk(value) => value.encode(output),
             Self::SessionAttachReject(value) => value.encode(output, limits),
             Self::PathReady(value) => value.encode(output),
+            Self::PathDrain(value) => value.encode(output),
+            Self::PathClose(value) => value.encode(output, limits),
             Self::StatusReport(value) => value.encode(output),
             Self::Heartbeat(value) => value.encode(output),
             Self::ControlAck(value) => value.encode(output),
@@ -281,6 +359,11 @@ impl Message {
             Self::StreamWindow(value) => value.encode(output),
             Self::StreamFin(value) => value.encode(output),
             Self::StreamRst(value) => value.encode(output, limits),
+            Self::UdpOpen(value) => value.encode(output, limits),
+            Self::UdpOpenOk(value) => value.encode(output),
+            Self::UdpOpenErr(value) => value.encode(output, limits),
+            Self::UdpDatagram(value) => value.encode(output, limits),
+            Self::UdpClose(value) => value.encode(output, limits),
         }
     }
 }
@@ -348,7 +431,7 @@ impl fmt::Display for MessageCodecError {
             Self::UnsupportedFrameType { frame_type } => {
                 write!(
                     formatter,
-                    "frame type {frame_type:?} has no Phase-1 payload schema"
+                    "frame type {frame_type:?} has no wire-profile-v1 payload schema"
                 )
             }
         }
@@ -468,7 +551,46 @@ fn put_id128(id: [u8; 16], output: &mut Vec<u8>) {
 }
 
 fn put_error(error: ErrorClass, output: &mut Vec<u8>) {
-    output.push(error.experimental_code());
+    output.push(error.code());
+}
+
+fn validate_status_report(value: &StatusReport) -> Result<(), MessageCodecError> {
+    for (field, ratio) in [
+        ("load_basis_points", value.load_basis_points),
+        (
+            "connection_utilization_basis_points",
+            value.connection_utilization_basis_points,
+        ),
+        (
+            "bandwidth_utilization_basis_points",
+            value.bandwidth_utilization_basis_points,
+        ),
+    ] {
+        if ratio > 10_000 {
+            return Err(MessageCodecError::InvalidField { field });
+        }
+    }
+    if value.expires_after_ms == 0 {
+        return Err(MessageCodecError::InvalidField {
+            field: "expires_after_ms",
+        });
+    }
+    let expected_connected = !matches!(value.service_state, EgressServiceState::Down);
+    if value.connected != expected_connected {
+        return Err(MessageCodecError::InvalidField {
+            field: "connected/service_state",
+        });
+    }
+    Ok(())
+}
+
+fn validate_stream_flags(flags: u64) -> Result<(), MessageCodecError> {
+    if flags & !0x3 != 0 {
+        return Err(MessageCodecError::InvalidField {
+            field: "stream_flags",
+        });
+    }
+    Ok(())
 }
 
 fn validate_negotiated_limits(
@@ -671,6 +793,9 @@ impl PathHello {
         output: &mut Vec<u8>,
         limits: ProtocolLimits,
     ) -> Result<(), MessageCodecError> {
+        if self.version != crate::frame::WIRE_PROFILE_V1_VERSION {
+            return Err(MessageCodecError::InvalidField { field: "version" });
+        }
         put_varint(self.version.get(), output)?;
         put_varint(self.capabilities, output)?;
         put_id128(self.path_id.to_be_bytes(), output);
@@ -685,6 +810,9 @@ impl PathHello {
     fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
         let version = ProtocolVersion::try_new(reader.varint("version")?)
             .map_err(MessageCodecError::VarInt)?;
+        if version != crate::frame::WIRE_PROFILE_V1_VERSION {
+            return Err(MessageCodecError::InvalidField { field: "version" });
+        }
         let capabilities = reader.varint("capabilities")?;
         let path_id = PathId::from_be_bytes(reader.id128("path_id")?);
         let transport_metadata =
@@ -811,25 +939,94 @@ impl_simple_codec!(
 );
 
 impl_simple_codec!(
-    StatusReport,
+    PathDrain,
     this,
     output,
     reader,
     {
-        output.push(u8::from(this.connected));
-        put_varint(this.active_streams, output)?;
-        put_varint(this.active_target_connections, output)?;
-        put_varint(this.capacity_bps, output)
+        if this.drain_reason > 2 {
+            return Err(MessageCodecError::InvalidField {
+                field: "drain_reason",
+            });
+        }
+        put_varint(this.drain_reason, output)?;
+        put_varint(this.deadline_ms, output)
     },
     {
+        let value = Self {
+            drain_reason: reader.varint("drain_reason")?,
+            deadline_ms: reader.varint("deadline_ms")?,
+        };
+        if value.drain_reason > 2 {
+            return Err(MessageCodecError::InvalidField {
+                field: "drain_reason",
+            });
+        }
+        Ok(value)
+    }
+);
+
+impl PathClose {
+    fn encode(
+        &self,
+        output: &mut Vec<u8>,
+        limits: ProtocolLimits,
+    ) -> Result<(), MessageCodecError> {
+        put_error(self.error, output);
+        put_bytes(&self.reason, limits.max_control_payload(), "reason", output)
+    }
+
+    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
         Ok(Self {
-            connected: reader.bool("connected")?,
+            error: get_error(reader)?,
+            reason: reader.bytes(limits.max_control_payload(), "reason")?,
+        })
+    }
+}
+
+impl StatusReport {
+    fn encode(&self, output: &mut Vec<u8>) -> Result<(), MessageCodecError> {
+        validate_status_report(self)?;
+        output.push(u8::from(self.connected));
+        output.push(self.service_state.wire_code());
+        output.extend_from_slice(&self.load_basis_points.to_be_bytes());
+        output.extend_from_slice(&self.connection_utilization_basis_points.to_be_bytes());
+        output.extend_from_slice(&self.bandwidth_utilization_basis_points.to_be_bytes());
+        put_varint(self.active_sessions, output)?;
+        put_varint(self.active_streams, output)?;
+        put_varint(self.active_target_connections, output)?;
+        put_varint(self.capacity_bps, output)?;
+        put_varint(self.recommended_path_count, output)?;
+        put_varint(self.report_seqno, output)?;
+        put_varint(self.sample_age_ms, output)?;
+        put_varint(self.expires_after_ms, output)
+    }
+
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, MessageCodecError> {
+        let connected = reader.bool("connected")?;
+        let service_state = EgressServiceState::from_wire_code(reader.byte("service_state")?)
+            .ok_or(MessageCodecError::InvalidField {
+                field: "service_state",
+            })?;
+        let value = Self {
+            connected,
+            service_state,
+            load_basis_points: reader.u16("load_basis_points")?,
+            connection_utilization_basis_points: reader.u16("connection_utilization_bp")?,
+            bandwidth_utilization_basis_points: reader.u16("bandwidth_utilization_bp")?,
+            active_sessions: reader.varint("active_sessions")?,
             active_streams: reader.varint("active_streams")?,
             active_target_connections: reader.varint("active_target_connections")?,
             capacity_bps: reader.varint("capacity_bps")?,
-        })
+            recommended_path_count: reader.varint("recommended_path_count")?,
+            report_seqno: reader.varint("report_seqno")?,
+            sample_age_ms: reader.varint("sample_age_ms")?,
+            expires_after_ms: reader.varint("expires_after_ms")?,
+        };
+        validate_status_report(&value)?;
+        Ok(value)
     }
-);
+}
 
 impl_simple_codec!(
     Heartbeat,
@@ -952,9 +1149,10 @@ impl StreamData {
             .offset
             .checked_add(self.data.len() as u64)
             .ok_or(MessageCodecError::InvalidField { field: "offset" })?;
-        if end > MAX_VARINT + 1 {
+        if end > MAX_VARINT {
             return Err(MessageCodecError::InvalidField { field: "offset" });
         }
+        validate_stream_flags(self.flags)?;
         put_stream_id(self.stream_id, output)?;
         put_varint(self.offset, output)?;
         put_varint(self.flags, output)?;
@@ -969,9 +1167,10 @@ impl StreamData {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or(MessageCodecError::InvalidField { field: "offset" })?;
-        if end > MAX_VARINT + 1 {
+        if end > MAX_VARINT {
             return Err(MessageCodecError::InvalidField { field: "offset" });
         }
+        validate_stream_flags(flags)?;
         Ok(Self {
             stream_id,
             offset,
@@ -1023,14 +1222,17 @@ impl_simple_codec!(
     output,
     reader,
     {
+        validate_stream_flags(this.flags)?;
         put_stream_id(this.stream_id, output)?;
         put_varint(this.flags, output)
     },
     {
-        Ok(Self {
+        let value = Self {
             stream_id: get_stream_id(reader)?,
             flags: reader.varint("flags")?,
-        })
+        };
+        validate_stream_flags(value.flags)?;
+        Ok(value)
     }
 );
 
@@ -1048,6 +1250,211 @@ impl StreamRst {
     fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
         Ok(Self {
             stream_id: get_stream_id(reader)?,
+            error: get_error(reader)?,
+            reason: reader.bytes(limits.max_control_payload(), "reason")?,
+        })
+    }
+}
+
+impl UdpOpen {
+    fn encode(
+        &self,
+        output: &mut Vec<u8>,
+        limits: ProtocolLimits,
+    ) -> Result<(), MessageCodecError> {
+        const HOSTNAME: u64 = 1;
+        const CANDIDATES: u64 = 2;
+        if self.target_flags & !(HOSTNAME | CANDIDATES) != 0
+            || self.target_flags == 0
+            || self.target.port == 0
+            || (self.target_flags & HOSTNAME == 0 && !self.target.hostname.is_empty())
+            || (self.target_flags & CANDIDATES == 0 && !self.target.resolved_addresses.is_empty())
+            || (self.target_flags & HOSTNAME != 0 && self.target.hostname.is_empty())
+            || (self.target_flags & CANDIDATES != 0 && self.target.resolved_addresses.is_empty())
+        {
+            return Err(MessageCodecError::InvalidField {
+                field: "target_flags",
+            });
+        }
+        if self.target.resolved_addresses.len() > MAX_ENDPOINT_ADDRESSES {
+            return Err(MessageCodecError::TooManyItems {
+                field: "resolved_addresses",
+                count: self.target.resolved_addresses.len(),
+                maximum: MAX_ENDPOINT_ADDRESSES,
+            });
+        }
+        put_varint(self.association_id, output)?;
+        put_varint(self.target_flags, output)?;
+        if self.target_flags & HOSTNAME != 0 {
+            put_bytes(
+                &self.target.hostname,
+                limits.max_target_name(),
+                "hostname",
+                output,
+            )?;
+        }
+        output.extend_from_slice(&self.target.port.to_be_bytes());
+        put_varint(self.target.resolved_addresses.len() as u64, output)?;
+        if self.target_flags & CANDIDATES != 0 {
+            for address in &self.target.resolved_addresses {
+                match address {
+                    IpAddr::V4(value) => {
+                        output.push(4);
+                        output.extend_from_slice(&value.octets());
+                    }
+                    IpAddr::V6(value) => {
+                        output.push(6);
+                        output.extend_from_slice(&value.octets());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
+        const HOSTNAME: u64 = 1;
+        const CANDIDATES: u64 = 2;
+        let association_id = reader.varint("association_id")?;
+        let target_flags = reader.varint("target_flags")?;
+        if target_flags & !(HOSTNAME | CANDIDATES) != 0 || target_flags == 0 {
+            return Err(MessageCodecError::InvalidField {
+                field: "target_flags",
+            });
+        }
+        let hostname = if target_flags & HOSTNAME != 0 {
+            reader.bytes(limits.max_target_name(), "hostname")?
+        } else {
+            Vec::new()
+        };
+        if target_flags & HOSTNAME != 0 && hostname.is_empty() {
+            return Err(MessageCodecError::InvalidField { field: "hostname" });
+        }
+        if !hostname.is_empty() && std::str::from_utf8(&hostname).is_err() {
+            return Err(MessageCodecError::InvalidField { field: "hostname" });
+        }
+        let port = reader.u16("port")?;
+        if port == 0 {
+            return Err(MessageCodecError::InvalidField { field: "port" });
+        }
+        let count = reader.varint("candidate_count")? as usize;
+        if count > MAX_ENDPOINT_ADDRESSES
+            || (target_flags & CANDIDATES == 0 && count != 0)
+            || (target_flags & CANDIDATES != 0 && count == 0)
+        {
+            return Err(MessageCodecError::InvalidField {
+                field: "candidate_count",
+            });
+        }
+        let mut resolved_addresses = Vec::with_capacity(count);
+        for _ in 0..count {
+            let family = reader.byte("address_family")?;
+            let address = match family {
+                4 => IpAddr::V4(Ipv4Addr::from(
+                    <[u8; 4]>::try_from(reader.take(4, "ipv4")?).expect("four bytes checked"),
+                )),
+                6 => IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(reader.take(16, "ipv6")?).expect("sixteen bytes checked"),
+                )),
+                code => return Err(MessageCodecError::InvalidAddressFamily { code }),
+            };
+            resolved_addresses.push(address);
+        }
+        Ok(Self {
+            association_id,
+            target_flags,
+            target: TargetEndpoint {
+                hostname,
+                port,
+                resolved_addresses,
+            },
+        })
+    }
+}
+
+impl_simple_codec!(
+    UdpOpenOk,
+    this,
+    output,
+    reader,
+    {
+        if this.target_visible_port == 0 {
+            return Err(MessageCodecError::InvalidField {
+                field: "target_visible_port",
+            });
+        }
+        put_varint(this.association_id, output)?;
+        output.extend_from_slice(&this.target_visible_port.to_be_bytes());
+        Ok(())
+    },
+    {
+        let value = Self {
+            association_id: reader.varint("association_id")?,
+            target_visible_port: reader.u16("target_visible_port")?,
+        };
+        if value.target_visible_port == 0 {
+            return Err(MessageCodecError::InvalidField {
+                field: "target_visible_port",
+            });
+        }
+        Ok(value)
+    }
+);
+
+impl UdpOpenErr {
+    fn encode(
+        &self,
+        output: &mut Vec<u8>,
+        limits: ProtocolLimits,
+    ) -> Result<(), MessageCodecError> {
+        put_varint(self.association_id, output)?;
+        put_error(self.error, output);
+        put_bytes(&self.reason, limits.max_control_payload(), "reason", output)
+    }
+
+    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
+        Ok(Self {
+            association_id: reader.varint("association_id")?,
+            error: get_error(reader)?,
+            reason: reader.bytes(limits.max_control_payload(), "reason")?,
+        })
+    }
+}
+
+impl UdpDatagram {
+    fn encode(
+        &self,
+        output: &mut Vec<u8>,
+        limits: ProtocolLimits,
+    ) -> Result<(), MessageCodecError> {
+        put_varint(self.association_id, output)?;
+        put_varint(self.datagram_seq, output)?;
+        put_bytes(&self.payload, limits.max_frame_payload(), "payload", output)
+    }
+
+    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
+        Ok(Self {
+            association_id: reader.varint("association_id")?,
+            datagram_seq: reader.varint("datagram_seq")?,
+            payload: reader.bytes(limits.max_frame_payload(), "payload")?,
+        })
+    }
+}
+
+impl UdpClose {
+    fn encode(
+        &self,
+        output: &mut Vec<u8>,
+        limits: ProtocolLimits,
+    ) -> Result<(), MessageCodecError> {
+        put_varint(self.association_id, output)?;
+        put_error(self.error, output);
+        put_bytes(&self.reason, limits.max_control_payload(), "reason", output)
+    }
+
+    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
+        Ok(Self {
+            association_id: reader.varint("association_id")?,
             error: get_error(reader)?,
             reason: reader.bytes(limits.max_control_payload(), "reason")?,
         })
@@ -1101,11 +1508,11 @@ mod tests {
     }
 
     #[test]
-    fn all_phase1_message_kinds_round_trip() {
+    fn all_v1_message_kinds_round_trip() {
         let limits = ProtocolLimits::default();
         let messages = vec![
             Message::PathHello(PathHello {
-                version: ProtocolVersion::try_new(0).unwrap(),
+                version: ProtocolVersion::try_new(1).unwrap(),
                 capabilities: 3,
                 path_id: PathId::new(4),
                 transport_metadata: b"direct".to_vec(),
@@ -1128,11 +1535,28 @@ mod tests {
                 max_control_payload: 512,
                 max_session_buffering: 4096,
             }),
+            Message::PathDrain(PathDrain {
+                drain_reason: 1,
+                deadline_ms: 500,
+            }),
+            Message::PathClose(PathClose {
+                error: ErrorClass::PathFailure,
+                reason: b"drained".to_vec(),
+            }),
             Message::StatusReport(StatusReport {
                 connected: true,
+                service_state: EgressServiceState::Up,
+                load_basis_points: 100,
+                connection_utilization_basis_points: 200,
+                bandwidth_utilization_basis_points: 300,
+                active_sessions: 1,
                 active_streams: 2,
                 active_target_connections: 3,
                 capacity_bps: 4,
+                recommended_path_count: 5,
+                report_seqno: 6,
+                sample_age_ms: 7,
+                expires_after_ms: 1000,
             }),
             Message::Heartbeat(Heartbeat { control_seq: 8 }),
             Message::ControlAck(ControlAck {
@@ -1181,6 +1605,30 @@ mod tests {
                 error: ErrorClass::PathFailure,
                 reason: b"reset".to_vec(),
             }),
+            Message::UdpOpen(UdpOpen {
+                association_id: 18,
+                target_flags: 3,
+                target: endpoint(),
+            }),
+            Message::UdpOpenOk(UdpOpenOk {
+                association_id: 18,
+                target_visible_port: 5353,
+            }),
+            Message::UdpOpenErr(UdpOpenErr {
+                association_id: 18,
+                error: ErrorClass::TargetFailure,
+                reason: b"unreachable".to_vec(),
+            }),
+            Message::UdpDatagram(UdpDatagram {
+                association_id: 18,
+                datagram_seq: 19,
+                payload: b"datagram".to_vec(),
+            }),
+            Message::UdpClose(UdpClose {
+                association_id: 18,
+                error: ErrorClass::EgressFailure,
+                reason: b"closed".to_vec(),
+            }),
         ];
         for message in messages {
             let frame_type = message.frame_type();
@@ -1193,12 +1641,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_payload_frame_types_are_rejected() {
+    fn lifecycle_payloads_are_decoded_by_the_v1_registry() {
         assert!(matches!(
             Message::decode(FrameType::PathDrain, &[], ProtocolLimits::default()),
-            Err(MessageCodecError::UnsupportedFrameType {
-                frame_type: FrameType::PathDrain
-            })
+            Err(MessageCodecError::VarInt(VarIntError::Truncated { .. }))
         ));
     }
 }

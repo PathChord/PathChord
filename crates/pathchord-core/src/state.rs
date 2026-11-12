@@ -176,11 +176,35 @@ impl EgressRelationshipState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
 pub enum EgressServiceState {
     Up,
     Degraded,
     Draining,
     Down,
+}
+
+impl EgressServiceState {
+    /// Returns the wire-profile-v1 status code.
+    pub const fn wire_code(self) -> u8 {
+        match self {
+            Self::Down => 0,
+            Self::Up => 1,
+            Self::Degraded => 2,
+            Self::Draining => 3,
+        }
+    }
+
+    /// Decodes the wire-profile-v1 status code.
+    pub const fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Down),
+            1 => Some(Self::Up),
+            2 => Some(Self::Degraded),
+            3 => Some(Self::Draining),
+            _ => None,
+        }
+    }
 }
 
 /// Runtime facts used to derive the externally visible Egress service state.

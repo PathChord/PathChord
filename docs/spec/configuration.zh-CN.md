@@ -2,69 +2,116 @@
 
 [English](configuration.md) | **简体中文**
 
-本文档定义下列 YAML 示例所表示的配置模型。配置适配器验证人工编写的 YAML，并在发布前将其转换为类型化配置快照。这些片段定义模型语义，但不构成完整的序列化 schema；版本化 schema 定义可接受字段、默认值、未知字段处理和验证规则。运行时观测与管理员配置分开维护。管理操作使用[协议规范](protocol.zh-CN.md)定义的 JSON 封装；配置 YAML 不作为管理消息或 data Path 的线编码。
+本文档说明 Kubernetes 风格配置对象和求值顺序。规范性的字段、类型、默认值和验证契约见[版本化配置 schema](configuration-schema.zh-CN.md)；平台监听器和独立 DNS 见[平台与 DNS 规范](platform-and-dns.zh-CN.md)。配置使用 `apiVersion: pathchord.io/v1`、`kind`、`metadata` 和 `spec` 对象；多资源通常使用 `kind: List`。下文片段会明确标注是完整对象还是 `spec` 片段。配置适配器必须验证完整对象图，并在发布前将其转换为不可变类型化快照。运行时观测以只读 `status` 视图暴露，不能混入期望的 `spec`。管理操作使用[协议规范](protocol.zh-CN.md)定义的 JSON 封装；配置 YAML 不作为管理消息或 data Path 的线编码。
+
+## 规范对象集合
+
+```yaml
+apiVersion: pathchord.io/v1
+kind: List
+metadata:
+  name: default
+items:
+  - apiVersion: pathchord.io/v1
+    kind: Egress
+    metadata:
+      name: jp-1
+      labels:
+        region: jp
+    spec:
+      address: egress.example.net
+      port: 443
+      publicKey: <curve25519-public-key>
+      capabilities:
+        tcp: true
+        udp: true
+  - apiVersion: pathchord.io/v1
+    kind: DNSPolicy
+    metadata:
+      name: default-dns
+    spec:
+      defaultRoute: local
+  - apiVersion: pathchord.io/v1
+    kind: FallbackPolicy
+    metadata:
+      name: default-fallback
+    spec:
+      action: reject
+```
+
+资源引用使用 `metadata.name`（例如 `egressRef: jp-1`），不再使用集合内部的 `id` 字段。控制面发布后生成 `metadata.generation` 和只读 `status`。
 
 ## 静态 Egress 拓扑
 
 ```yaml
-egresses:
-  - id: jp-1
-    address: egress.example.net
-    port: 443
-    public_key: <curve25519-public-key>
-    labels:
-      region: jp
-      role: egress
-    capabilities:
-      tcp: true
-      udp: true
+apiVersion: pathchord.io/v1
+kind: Egress
+metadata:
+  name: jp-1
+  labels:
+    region: jp
+    role: egress
+spec:
+  address: egress.example.net
+  port: 443
+  publicKey: <curve25519-public-key>
+  capabilities:
+    tcp: true
+    udp: true
 ```
 
 ## 动态 Transit Proxy 数据
 
 ```yaml
-transit_proxies:
-  - id: provider-a-node-01
-    source:
-      type: clash
-      subscription: provider-a
-    protocol: vless
-    address: proxy.example.net
-    port: 443
-    labels:
-      region: jp
-      provider: provider-a
-    tags: [gaming]
-    weight: 100
+apiVersion: pathchord.io/v1
+kind: TransitProxy
+metadata:
+  name: provider-a-node-01
+  labels:
+    region: jp
+    provider: provider-a
+spec:
+  source:
+    type: clash
+    subscriptionRef: provider-a
+  protocol: vless
+  address: proxy.example.net
+  port: 443
+  tags: [gaming]
+  weight: 100
 ```
 
-运行时字段单独维护：
+以下是只读运行时 `status` 视图，不是管理员编写的期望 YAML：
 
 ```yaml
-observed:
-  connected: true
-  rtt_ms: 42
-  jitter_ms: 5
-  loss_rate: 0.002
-  effective_capacity_bps: 180000000
-quota:
-  remaining_ratio: 0.42
-  reset_at: 2026-12-01T00:00:00Z
-billing:
-  traffic_multiplier: 2.0
+status:
+  observed:
+    connected: true
+    rttMs: 42
+    jitterMs: 5
+    lossRate: 0.002
+    effectiveCapacityBps: 180000000
+  quota:
+    remainingRatio: 0.42
+    resetAt: 2026-12-01T00:00:00Z
+  billing:
+    trafficMultiplier: 2.0
 ```
 
 ## 有序 Egress 规则
 
 ```yaml
-egress_rules:
-  - id: jp-gaming
-    match:
-      flow_tags: [gaming]
-      protocol: [tcp, udp]
-    egress: jp-1
-    requirements:
-      min_usable_paths: 1
+apiVersion: pathchord.io/v1
+kind: EgressRule
+metadata:
+  name: jp-gaming
+spec:
+  match:
+    flowTags: [gaming]
+    protocols: [tcp, udp]
+  egressRef: jp-1
+  requirements:
+    minUsablePaths: 1
 ```
 
 首个条件匹配且 Egress 当前可用的规则胜出。Egress 可用性由运行时状态管理器预先计算。
@@ -72,19 +119,22 @@ egress_rules:
 ## Egress 专用 Proxy 规则
 
 ```yaml
-transit_rules:
-  - id: jp-1-gaming
-    egress: jp-1
-    match:
-      flow_tags: [gaming]
-    require:
-      labels:
-        region: jp
-      capabilities: [udp]
-    reject:
-      tags: [quota-exhausted]
-    weight: 100
-    traffic_policy: gaming-default
+apiVersion: pathchord.io/v1
+kind: TransitRule
+metadata:
+  name: jp-1-gaming
+spec:
+  egressRef: jp-1
+  match:
+    flowTags: [gaming]
+  require:
+    labels:
+      region: jp
+    capabilities: [udp]
+  reject:
+    tags: [quota-exhausted]
+  weight: 100
+  trafficPolicyRef: gaming-default
 ```
 
 规则按顺序执行。首个匹配规则决定准入和关系的基础权重。
@@ -92,12 +142,15 @@ transit_rules:
 流量策略可以定义多路径调度和复制预算：
 
 ```yaml
-traffic_policies:
-  gaming-default:
-    scheduler: effective_capacity_weighted
-    session_replication_budget_bps: 2000000
-    class_replication_budget_bps: 1000000
-    retransmission_replication: allowed
+apiVersion: pathchord.io/v1
+kind: TrafficPolicy
+metadata:
+  name: gaming-default
+spec:
+  scheduler: effectiveCapacityWeighted
+  sessionReplicationBudgetBps: 2000000
+  classReplicationBudgetBps: 1000000
+  retransmissionReplication: allowed
 ```
 
 Session 预算是硬性上限。流量类别预算可以减少该类别的分配量，但不能超过 Session 的剩余预算。
@@ -105,16 +158,24 @@ Session 预算是硬性上限。流量类别预算可以减少该类别的分配
 ## 普通 Proxy 规则与回退
 
 ```yaml
-proxy_rules:
-  - id: direct-jp
-    match:
-      flow_tags: [web]
-    require:
-      labels:
-        region: jp
-    select: any
+apiVersion: pathchord.io/v1
+kind: ProxyRule
+metadata:
+  name: direct-jp
+spec:
+  match:
+    flowTags: [web]
+  require:
+    labels:
+      region: jp
+  select: any
 
-fallback:
+---
+apiVersion: pathchord.io/v1
+kind: FallbackPolicy
+metadata:
+  name: default-fallback
+spec:
   action: reject # or direct
 ```
 
@@ -128,21 +189,27 @@ ordered effective Egress rules
 
 ## 监听器
 
-```yaml
-listeners:
-  - id: lan-socks
-    type: socks5
-    bind: 0.0.0.0:1080
-    allowed_sources: [192.168.1.0/24]
-    authentication: required
+完整监听器 schema（包括两个平台都必须支持的 HTTP/SOCKS、Linux 透明模式和可选 TUN、Windows TUN
+及 Windows 控制面的 system-proxy 开关、认证引用、来源限制
+以及环路防护）见[平台与 DNS 规范](platform-and-dns.zh-CN.md)。
 
-  - id: local-http
-    type: http
-    bind: 127.0.0.1:8080
-    authentication: disabled
+```yaml
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata:
+  name: lan-socks
+spec:
+  type: socks5
+  bind: 0.0.0.0:1080
+  allowedSources: [192.168.1.0/24]
+  authentication:
+    mode: required
 ```
 
 规则可以使用 `listener_id`、来源地址、认证身份、进程元数据、协议和目标地址。
+
+DNS 是独立策略。其 `local`、`transit`、`egress` 和 `blocked` 路由、解析器限制、缓存行为、主机名/候选地址
+处理以及 Fake-IP 禁止规则在[平台与 DNS 规范](platform-and-dns.zh-CN.md)中规范定义。
 
 ## 运行时快照
 
@@ -165,9 +232,9 @@ Observed node and Egress state
 
 ```yaml
 decision:
-  egress_selector: { labels: { region: jp } }
-  proxy_selector: { tags: [gaming] }
-  traffic_policy: gaming-default
+  egressSelector: { labels: { region: jp } }
+  proxySelector: { tags: [gaming] }
+  trafficPolicyRef: gaming-default
 ```
 
 规则不会嵌入具体的动态 Proxy 标识。调度器根据当前运行时状态解析选择器，并应用健康状态、容量、权重、配额元数据和 Path 策略。
@@ -182,6 +249,7 @@ admin.*     local administrator annotations
 source.*    subscription source and imported metadata
 observed.*  runtime measurements and derived state
 quota.*     optional provider quota metadata
+billing.*   optional provider billing metadata
 ```
 
 本地管理员属性覆盖导入的来源属性。观测属性由运行时管理，不能被订阅数据覆盖。无论标签如何，已撤销、已禁用或已断开连接等运行时硬状态始终排除相应节点。

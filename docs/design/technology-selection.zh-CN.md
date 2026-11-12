@@ -85,7 +85,7 @@ Egress 授权变更使用 SQLite 事务。运行中的 Egress 进程拥有数据
 
 ## 平台架构
 
-Linux 通过平台适配器集成 TPROXY、REDIRECT、进程元数据和透明路由。Windows 使用 Wintun 和系统代理集成。两个平台复用核心和策略 crate。
+Linux 通过平台适配器集成 TPROXY、REDIRECT、进程元数据和透明路由。Windows 使用 Wintun，并通过控制面选择监听器来集成系统代理。两个平台复用核心和策略 crate。
 
 平台适配器负责操作系统专用的打包、服务集成、套接字行为和路由行为。Linux 透明路由支持 IPv4 和 IPv6。Tokio 任务监管和取消必须在 Path 频繁变动时避免任务或资源泄漏。SQLite 事务在并发状态查询和注册操作期间保持授权一致性。帧编解码器依据协议上限约束内存分配，规则编译器保证有界求值成本。
 

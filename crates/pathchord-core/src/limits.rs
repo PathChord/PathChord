@@ -1,9 +1,10 @@
 use std::error::Error;
 use std::fmt;
 
-/// Phase-0 hard caps. Negotiated limits may reduce, but never exceed, these.
+/// wire-profile-v1 hard caps. Negotiated limits may reduce, but never exceed,
+/// these values.
 ///
-/// The frame payload cap is 63 KiB so a complete bootstrap frame, including
+/// The frame payload cap is 63 KiB so a complete v1 frame, including
 /// its worst-case header and the Noise authentication tag, fits within Snow's
 /// 65,535-byte message limit without record fragmentation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +22,8 @@ impl ProtocolLimits {
     pub const HARD_MAX_TARGET_NAME: usize = 255;
     pub const HARD_MAX_STREAM_REORDERING: usize = 4 * 1024 * 1024;
     pub const HARD_MAX_SESSION_BUFFERING: usize = 32 * 1024 * 1024;
+    pub const HARD_MAX_ENDPOINT_ADDRESSES: usize = 16;
+    pub const HARD_MAX_ACK_RANGES: usize = 256;
 
     pub fn try_new(
         max_frame_payload: usize,

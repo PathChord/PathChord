@@ -30,8 +30,9 @@ separate from `docs/design/`, which describes the intended architecture, and
 - The local length-prefixed JSON adapter, persistent authorization and metadata
   stores, subscription worker, REST/SSE Web Gateway, and frontend are not
   integrated.
-- UDP payload codecs, Path drain/close payloads, multipath scheduling, and
-  production cross-Path retransmission remain outside the implemented slice.
+- Multipath scheduling and production cross-Path retransmission remain outside
+  the implemented slice; v1 UDP and Path lifecycle payload codecs are present
+  as protocol primitives but are not integrated into the data plane.
 
 The staged implementation sequence is tracked in
 [the implementation plan](implementation-plan.md). Phase-specific scope,
@@ -46,13 +47,12 @@ documents in this directory.
   required before production deployment.
 - Session ACK retention and retransmission behavior still need validation
   against the 64-record replay-window bound.
-- The YAML fragments define the normalized configuration model, but the
-  exhaustive versioned schema, including defaults and unknown-field handling,
-  is not finalized.
-- The Phase 1 fixture defines the provisional Egress identity domain separator
-  `PathChord/phase1/egress/`. A stable protocol-version registry entry and an
-  explicit compatibility path are still required before that fixture can
-  become a cross-version contract.
+- The final-state `schema_version: 1` configuration contract is defined by
+  `docs/spec/configuration-schema.md` and the platform/DNS contract. The
+  implementation still needs to replace its bootstrap parser with that schema.
+- The final-state `wire-profile-v1` registry and canonical EgressID prologue
+  are defined by `docs/spec/wire-profile.md`. The Phase 1 fixture remains a
+  historical implementation record and is not the final wire contract.
 
 ## Open validation work
 
