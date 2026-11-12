@@ -10,10 +10,10 @@ publish.workspace = true
 async-trait.workspace = true
 pathchord-core = { path = "../pathchord-core" }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "time"] }
 
 [lints]
 workspace = true

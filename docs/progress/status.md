@@ -37,6 +37,9 @@ separate from `docs/design/`, which describes the intended architecture, and
   handshakes into typed `ConnectionContext` values, including domain/IPv4/IPv6
   targets, optional SOCKS username/password identity, and deterministic failure
   replies. Target dialing and Stream creation remain separate integration work.
+- Egress now includes a concrete Tokio TCP `TargetConnector` that tries explicit
+  address candidates, falls back to hostname resolution, supports an optional
+  connect timeout, and preserves typed target validation failures.
 
 ## Missing operational integration
 
