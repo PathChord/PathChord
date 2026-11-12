@@ -97,7 +97,9 @@ UDP preserves datagram boundaries. Ordinary application datagrams are not retran
 
 Ingress owns Path creation and admission. Path state is transparent to Streams and UDP sessions, so adding or removing a Path does not require overlay stream or socket-state synchronization. Each Path owns its congestion control and flow-control window and reports available capacity, quality, and scheduling state to the Session scheduler. Ingress schedules upstream data; Egress schedules downstream data over any existing compliant Paths.
 
-Per-Path scheduling uses configured relationship weight plus observed effective capacity. Multiple Paths through one Transit Proxy share the Proxy-to-Egress relationship weight.
+Per-Path scheduling uses effective-capacity weighting: the configured Proxy-to-Egress relationship weight establishes the baseline, then each Path's reported effective capacity, congestion window, RTT, jitter, and loss adjust its current share. Multiple Paths through one Transit Proxy share the relationship weight, while their observed capacities determine how that relationship's share is distributed.
+
+Retransmission replication is limited by two budgets: a Session-wide replication budget and an optional per-traffic-class budget. A traffic-class budget may further restrict replication but may never exceed the remaining Session-wide budget. Control messages use the default control replication policy and are accounted against the Session budget.
 
 ## 8. Versioning
 
