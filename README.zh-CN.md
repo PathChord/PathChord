@@ -58,9 +58,9 @@ pathchord status
 pathchord enroll
 ```
 
-`ingress` 命令会启动配置的本地监听器和控制 socket；`status` 与
-`system-proxy` 通过本地控制 socket 工作；`egress` 与 `enroll` 仍会返回
-初始化阶段错误。
+在 Unix 上，`ingress` 命令会启动配置的本地监听器和控制 socket；`status`
+与 `system-proxy` 通过本地控制 socket 工作；`egress` 与 `enroll` 仍会
+返回初始化阶段错误。
 
 ## 开发
 
