@@ -92,6 +92,53 @@ pub struct TransitProxySpec {
     credentials_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SubscriptionSourceSpec {
+    #[serde(rename = "type")]
+    source_type: String,
+    url: String,
+    credentials_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RefreshSpec {
+    #[serde(default = "default_refresh_interval")]
+    interval_seconds: u64,
+    #[serde(default = "default_refresh_timeout")]
+    timeout_seconds: u64,
+    #[serde(default = "default_refresh_attempts")]
+    max_attempts: u32,
+    #[serde(default = "default_refresh_backoff")]
+    backoff_seconds: u64,
+}
+
+fn default_refresh_interval() -> u64 {
+    3600
+}
+fn default_refresh_timeout() -> u64 {
+    30
+}
+fn default_refresh_attempts() -> u32 {
+    3
+}
+fn default_refresh_backoff() -> u64 {
+    5
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CacheSpec {
+    path: String,
+    #[serde(default = "default_cache_age")]
+    max_age_seconds: u64,
+}
+
+fn default_cache_age() -> u64 {
+    86_400
+}
+
 fn default_weight() -> u32 {
     100
 }
@@ -246,6 +293,15 @@ pub struct TrafficPolicySpec {
     class_replication_budget_bps: Option<u64>,
     #[serde(default = "default_replication")]
     retransmission_replication: ReplicationSpec,
+    #[serde(default)]
+    classes: BTreeMap<String, ClassSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClassSpec {
+    priority: u8,
+    share: u32,
 }
 
 fn default_scheduler() -> String {
@@ -276,6 +332,32 @@ pub struct ListenerSpec {
     allowed_sources: Vec<String>,
     #[serde(default = "default_authentication_value")]
     authentication: AuthenticationValue,
+    #[serde(default)]
+    mark: Option<u32>,
+    #[serde(default)]
+    route_table: Option<u32>,
+    #[serde(default)]
+    protocols: BTreeSet<FlowProtocol>,
+    #[serde(default)]
+    interface: Option<String>,
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    mtu: Option<u32>,
+    #[serde(default)]
+    bypass: Vec<String>,
+    #[serde(default)]
+    proxy_ref: Option<String>,
+    #[serde(default)]
+    process_metadata: Option<ProcessMetadataSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessMetadataSpec {
+    executable: Option<String>,
+    user: Option<String>,
+    group: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -311,6 +393,28 @@ struct DnsLocalSpec {
 pub struct DnsPolicySpec {
     default_route: String,
     local: Option<DnsLocalSpec>,
+    transit: Option<DnsSelectorSpec>,
+    egress: Option<DnsSelectorSpec>,
+    blocked_response: Option<String>,
+    timeout_seconds: Option<u64>,
+    max_inflight: Option<u64>,
+    cache: Option<DnsCacheSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DnsSelectorSpec {
+    proxy_selector: Option<SelectorSpec>,
+    egress_selector: Option<SelectorSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DnsCacheSpec {
+    #[serde(default)]
+    enabled: bool,
+    max_entries: Option<u64>,
+    max_ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -324,6 +428,9 @@ pub struct FallbackPolicySpec {
 pub struct SubscriptionSpec {
     #[serde(default = "default_enabled")]
     enabled: bool,
+    source: Option<SubscriptionSourceSpec>,
+    refresh: Option<RefreshSpec>,
+    cache: Option<CacheSpec>,
 }
 
 fn default_enabled() -> bool {
@@ -495,7 +602,16 @@ impl KubeConfig {
                         value.spec.mode,
                     ) {
                         (Some(id), None, None) => EgressSelection::Id(EgressId::new(id)),
-                        (None, Some(selector), None) => EgressSelection::Selector(selector.into()),
+                        (None, Some(selector), None) => {
+                            if selector_empty(&selector) {
+                                return Err(ConfigError::InvalidSpec {
+                                    kind: value.kind,
+                                    name: value.metadata.name,
+                                    reason: "egressSelector must contain a criterion".into(),
+                                });
+                            }
+                            EgressSelection::Selector(selector.into())
+                        }
                         (None, None, Some(mode)) if mode == "none" => EgressSelection::None,
                         _ => return Err(ConfigError::InvalidSpec {
                             kind: value.kind,
@@ -906,6 +1022,10 @@ fn validate_rule_spec(
         });
     }
     Ok(())
+}
+
+fn selector_empty(value: &SelectorSpec) -> bool {
+    value.labels.is_empty() && value.tags.is_empty() && value.capabilities.is_empty()
 }
 
 #[cfg(test)]
