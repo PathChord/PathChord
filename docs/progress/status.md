@@ -18,6 +18,13 @@ separate from `docs/design/`, which describes the intended architecture, and
   The transport-neutral Ingress command/query service currently provides
   bounded in-memory snapshots, mutations, idempotency, generation checks,
   subscription refresh state, observations, and events.
+- Kubernetes-style `pathchord.io/v1` YAML parsing now validates strict resource
+  envelopes, multi-document/List input, DNS prerequisites, rule ordering, and
+  converts desired objects into the existing immutable policy snapshot model.
+- Ingress control state now exposes typed Listener inventory and the Windows-only
+  system-proxy switch contract with idempotent enable/disable transitions and
+  structured events. Platform-side Windows environment/OS proxy mutation is
+  still an adapter integration task.
 - The CLI command tree exposes `ingress`, `egress`, `status`, and `enroll` for
   interface discovery.
 
@@ -47,12 +54,16 @@ documents in this directory.
   required before production deployment.
 - Session ACK retention and retransmission behavior still need validation
   against the 64-record replay-window bound.
-- The final-state `schema_version: 1` configuration contract is defined by
-  `docs/spec/configuration-schema.md` and the platform/DNS contract. The
-  implementation still needs to replace its bootstrap parser with that schema.
+- The final-state Kubernetes-style `pathchord.io/v1` configuration contract is
+  now parsed by `pathchord-policy`, including strict envelopes, List and
+  multi-document input, DNS prerequisites, rule ordering, listener shorthand,
+  and conversion into immutable policy snapshots.
 - The final-state `wire-profile-v1` registry and canonical EgressID prologue
   are defined by `docs/spec/wire-profile.md`. The Phase 1 fixture remains a
   historical implementation record and is not the final wire contract.
+- Ingress now has typed Listener inventory and a Windows-only system-proxy
+  control-state boundary with idempotent transitions and events. Real Windows
+  environment-variable/OS proxy mutation remains a platform adapter task.
 
 ## Open validation work
 

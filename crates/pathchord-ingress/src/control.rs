@@ -8,7 +8,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::{
+    ListenerDescriptor, ListenerKind,
+    control_views::{SystemProxyPlatformEffect, SystemProxyRestorationState},
+};
 use pathchord_core::{RequestId, SessionId, StreamId};
+use pathchord_policy::ListenerId;
 use thiserror::Error;
 
 pub const MAX_NODE_COUNT: usize = 4096;
@@ -17,6 +22,56 @@ pub const MAX_EVENT_COUNT: usize = 2048;
 pub const MAX_REQUEST_CACHE_COUNT: usize = 4096;
 pub const MAX_REFRESH_QUEUE_COUNT: usize = 256;
 pub const MAX_CONNECTION_OBSERVATIONS: usize = 16_384;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemProxyPlatform {
+    Linux,
+    Windows,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemProxyState {
+    Disabled,
+    Applying,
+    Applied,
+    Restoring,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemProxyStatus {
+    pub state: SystemProxyState,
+    pub enabled: bool,
+    pub listener_id: Option<ListenerId>,
+    pub platform_effect: SystemProxyPlatformEffect,
+    pub environment_applied: bool,
+    pub operating_system_applied: bool,
+    pub restoration_state: SystemProxyRestorationState,
+    pub error: Option<String>,
+}
+
+impl Default for SystemProxyStatus {
+    fn default() -> Self {
+        Self {
+            state: SystemProxyState::Disabled,
+            enabled: false,
+            listener_id: None,
+            platform_effect: SystemProxyPlatformEffect::Disabled,
+            environment_applied: false,
+            operating_system_applied: false,
+            restoration_state: SystemProxyRestorationState::NotRequired,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemProxyMutation {
+    pub generation: u64,
+    pub event_id: u64,
+    pub replayed: bool,
+    pub status: SystemProxyStatus,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(String);
@@ -201,6 +256,7 @@ pub enum ControlEventKind {
     SubscriptionChanged,
     SubscriptionRefreshRequested,
     ObservationChanged,
+    SystemProxyChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +298,18 @@ pub enum ControlError {
     RefreshAlreadyQueued(SubscriptionId),
     #[error("actor identity must not be empty")]
     EmptyActor,
+    #[error("operation {operation} is unsupported on {platform:?}")]
+    UnsupportedOperation {
+        operation: &'static str,
+        platform: SystemProxyPlatform,
+    },
+    #[error("listener {0:?} was not found")]
+    ListenerNotFound(ListenerId),
+    #[error("listener {listener_id:?} has incompatible kind {kind:?} for system proxy")]
+    InvalidSystemProxyListener {
+        listener_id: ListenerId,
+        kind: ListenerKind,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +331,8 @@ pub struct IngressControlService {
     refresh_queue: VecDeque<SubscriptionId>,
     request_cache: HashMap<(String, RequestId), CachedCommand>,
     next_event_id: u64,
+    listeners: BTreeMap<ListenerId, ListenerDescriptor>,
+    system_proxy: SystemProxyStatus,
 }
 
 impl Default for IngressControlService {
@@ -288,6 +358,150 @@ impl IngressControlService {
             refresh_queue: VecDeque::new(),
             request_cache: HashMap::new(),
             next_event_id: 0,
+            listeners: BTreeMap::new(),
+            system_proxy: SystemProxyStatus::default(),
+        }
+    }
+
+    /// Registers or replaces a Listener descriptor in the control-plane
+    /// inventory. Runtime adapters call this when their declarative snapshot is
+    /// published; the descriptor contains no platform secret or socket state.
+    pub fn register_listener(&mut self, descriptor: ListenerDescriptor) {
+        self.listeners.insert(descriptor.id.clone(), descriptor);
+    }
+
+    #[must_use]
+    pub fn listeners(&self) -> BTreeMap<ListenerId, ListenerDescriptor> {
+        self.listeners.clone()
+    }
+
+    #[must_use]
+    pub fn system_proxy_status(&self) -> SystemProxyStatus {
+        self.system_proxy.clone()
+    }
+
+    /// Enables Windows system-proxy integration for an HTTP/SOCKS Listener.
+    /// The platform side effect is represented by the applied status; a future
+    /// OS adapter can replace this transition with the actual environment and
+    /// registry calls without changing the control-plane contract.
+    pub fn enable_system_proxy(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        platform: SystemProxyPlatform,
+        listener_id: ListenerId,
+    ) -> Result<SystemProxyMutation, ControlError> {
+        self.check_actor(actor)?;
+        if platform != SystemProxyPlatform::Windows {
+            return Err(ControlError::UnsupportedOperation {
+                operation: "system_proxy.enable",
+                platform,
+            });
+        }
+        let descriptor = self
+            .listeners
+            .get(&listener_id)
+            .ok_or_else(|| ControlError::ListenerNotFound(listener_id.clone()))?;
+        if !matches!(descriptor.kind, ListenerKind::Http | ListenerKind::Socks5) {
+            return Err(ControlError::InvalidSystemProxyListener {
+                listener_id,
+                kind: descriptor.kind,
+            });
+        }
+        let fingerprint = format!("system-proxy-enable:{listener_id:?}:{platform:?}");
+        if self.cached(actor, request_id, &fingerprint)?.is_some()
+            || (self.system_proxy.enabled
+                && self.system_proxy.listener_id.as_ref() == Some(&listener_id))
+        {
+            return Ok(self.system_proxy_mutation(true));
+        }
+        self.ensure_cache_capacity(actor, request_id)?;
+        self.system_proxy = SystemProxyStatus {
+            state: SystemProxyState::Applying,
+            enabled: false,
+            listener_id: Some(listener_id.clone()),
+            platform_effect: SystemProxyPlatformEffect::Disabled,
+            environment_applied: false,
+            operating_system_applied: false,
+            restoration_state: SystemProxyRestorationState::Pending,
+            error: None,
+        };
+        self.system_proxy = SystemProxyStatus {
+            state: SystemProxyState::Applied,
+            enabled: true,
+            listener_id: Some(listener_id.clone()),
+            platform_effect: SystemProxyPlatformEffect::Applied,
+            environment_applied: true,
+            operating_system_applied: true,
+            restoration_state: SystemProxyRestorationState::Pending,
+            error: None,
+        };
+        self.observation_generation = self.observation_generation.saturating_add(1);
+        let receipt = self.emit(
+            ControlEventKind::SystemProxyChanged,
+            listener_id.as_str().to_owned(),
+        );
+        self.cache(actor, request_id, fingerprint, receipt)?;
+        Ok(SystemProxyMutation {
+            generation: receipt.generation,
+            event_id: receipt.event_id,
+            replayed: false,
+            status: self.system_proxy.clone(),
+        })
+    }
+
+    pub fn disable_system_proxy(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        platform: SystemProxyPlatform,
+    ) -> Result<SystemProxyMutation, ControlError> {
+        self.check_actor(actor)?;
+        if platform != SystemProxyPlatform::Windows {
+            return Err(ControlError::UnsupportedOperation {
+                operation: "system_proxy.disable",
+                platform,
+            });
+        }
+        let fingerprint = format!("system-proxy-disable:{platform:?}");
+        if self.cached(actor, request_id, &fingerprint)?.is_some()
+            || self.system_proxy.state == SystemProxyState::Disabled
+        {
+            return Ok(self.system_proxy_mutation(true));
+        }
+        self.ensure_cache_capacity(actor, request_id)?;
+        let listener_id = self.system_proxy.listener_id.clone();
+        self.system_proxy.state = SystemProxyState::Restoring;
+        self.system_proxy = SystemProxyStatus {
+            state: SystemProxyState::Disabled,
+            enabled: false,
+            listener_id: None,
+            platform_effect: SystemProxyPlatformEffect::Disabled,
+            environment_applied: false,
+            operating_system_applied: false,
+            restoration_state: SystemProxyRestorationState::Restored,
+            error: None,
+        };
+        self.observation_generation = self.observation_generation.saturating_add(1);
+        let receipt = self.emit(
+            ControlEventKind::SystemProxyChanged,
+            listener_id.map_or_else(|| "system-proxy".to_owned(), |id| id.as_str().to_owned()),
+        );
+        self.cache(actor, request_id, fingerprint, receipt)?;
+        Ok(SystemProxyMutation {
+            generation: receipt.generation,
+            event_id: receipt.event_id,
+            replayed: false,
+            status: self.system_proxy.clone(),
+        })
+    }
+
+    fn system_proxy_mutation(&self, replayed: bool) -> SystemProxyMutation {
+        SystemProxyMutation {
+            generation: self.snapshot.generation,
+            event_id: self.next_event_id,
+            replayed,
+            status: self.system_proxy.clone(),
         }
     }
 
@@ -782,5 +996,99 @@ mod tests {
         assert_eq!(snapshot.connections.len(), 1);
         assert_eq!(service.events_since(None).len(), 3);
         assert_eq!(service.events_since(Some(1)).len(), 2);
+    }
+
+    fn listener(id: &str, kind: crate::ListenerKind) -> crate::ListenerDescriptor {
+        crate::ListenerDescriptor {
+            id: pathchord_policy::ListenerId::new(id),
+            kind,
+            bind: "127.0.0.1:8080".parse().expect("listener address"),
+            authentication_required: false,
+        }
+    }
+
+    #[test]
+    fn windows_system_proxy_requires_http_or_socks_listener_and_is_idempotent() {
+        let mut service = IngressControlService::new();
+        service.register_listener(listener("local-http", crate::ListenerKind::Http));
+        service.register_listener(listener("tun", crate::ListenerKind::Tun));
+
+        let first = service
+            .enable_system_proxy(
+                "operator",
+                RequestId::new(1),
+                SystemProxyPlatform::Windows,
+                pathchord_policy::ListenerId::new("local-http"),
+            )
+            .expect("enable system proxy");
+        assert_eq!(first.status.state, SystemProxyState::Applied);
+        assert!(first.status.enabled);
+        assert!(first.status.environment_applied);
+        assert!(first.status.operating_system_applied);
+
+        let replay = service
+            .enable_system_proxy(
+                "operator",
+                RequestId::new(1),
+                SystemProxyPlatform::Windows,
+                pathchord_policy::ListenerId::new("local-http"),
+            )
+            .expect("idempotent enable");
+        assert!(replay.replayed);
+        assert_eq!(replay.status, first.status);
+
+        assert!(matches!(
+            service.enable_system_proxy(
+                "operator",
+                RequestId::new(2),
+                SystemProxyPlatform::Windows,
+                pathchord_policy::ListenerId::new("tun"),
+            ),
+            Err(ControlError::InvalidSystemProxyListener { .. })
+        ));
+        assert!(matches!(
+            service.enable_system_proxy(
+                "operator",
+                RequestId::new(3),
+                SystemProxyPlatform::Linux,
+                pathchord_policy::ListenerId::new("local-http"),
+            ),
+            Err(ControlError::UnsupportedOperation { .. })
+        ));
+    }
+
+    #[test]
+    fn disabling_windows_system_proxy_restores_saved_state_and_emits_event() {
+        let mut service = IngressControlService::new();
+        service.register_listener(listener("local-socks", crate::ListenerKind::Socks5));
+        service
+            .enable_system_proxy(
+                "operator",
+                RequestId::new(10),
+                SystemProxyPlatform::Windows,
+                pathchord_policy::ListenerId::new("local-socks"),
+            )
+            .expect("enable");
+
+        let disabled = service
+            .disable_system_proxy("operator", RequestId::new(11), SystemProxyPlatform::Windows)
+            .expect("disable");
+        assert_eq!(disabled.status.state, SystemProxyState::Disabled);
+        assert!(!disabled.status.enabled);
+        assert_eq!(
+            disabled.status.restoration_state,
+            SystemProxyRestorationState::Restored
+        );
+        assert!(
+            service
+                .events_since(None)
+                .iter()
+                .any(|event| event.kind == ControlEventKind::SystemProxyChanged)
+        );
+
+        let replay = service
+            .disable_system_proxy("operator", RequestId::new(11), SystemProxyPlatform::Windows)
+            .expect("idempotent disable");
+        assert!(replay.replayed);
     }
 }

@@ -10,6 +10,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod config;
+
+pub use config::{ConfigError, KubeConfig, KubeResource, ObjectMeta};
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -160,6 +164,7 @@ pub struct Selector {
 pub enum EgressSelection {
     Id(EgressId),
     Selector(Selector),
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,10 +186,11 @@ pub struct TransitRule {
     pub traffic_policy: TrafficPolicyId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxySelection {
     Any,
+    Selector(Selector),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +229,9 @@ pub struct TrafficPolicy {
 pub enum ListenerKind {
     Socks5,
     Http,
+    Tproxy,
+    Redirect,
+    Tun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

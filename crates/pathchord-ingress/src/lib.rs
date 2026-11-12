@@ -20,6 +20,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 mod control;
+mod control_views;
 
 pub use control::{
     ConnectionObservation, ConnectionState, ControlError, ControlEvent, ControlEventKind,
@@ -27,7 +28,12 @@ pub use control::{
     MAX_NODE_COUNT, MAX_REFRESH_QUEUE_COUNT, MAX_REQUEST_CACHE_COUNT, MAX_SUBSCRIPTION_COUNT,
     MutationReceipt, NodeAdminPatch, NodeAdminState, NodeHealthState, NodeId, NodeObservation,
     ObservationSnapshot, RuntimeCounts, SubscriptionId, SubscriptionRefreshState, SubscriptionSpec,
-    SubscriptionState,
+    SubscriptionState, SystemProxyMutation, SystemProxyPlatform, SystemProxyState,
+    SystemProxyStatus,
+};
+pub use control_views::{
+    ListenerInventory, ListenerSelectionError, ListenerView, ListenerViewState,
+    SystemProxyPlatformEffect, SystemProxyRestorationState, SystemProxyStatusView,
 };
 
 pub trait LocalConnection: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -40,7 +46,8 @@ pub type BoxedLocalConnection = Box<dyn LocalConnection>;
 pub enum ListenerKind {
     Socks5,
     Http,
-    Transparent,
+    Tproxy,
+    Redirect,
     Tun,
 }
 
