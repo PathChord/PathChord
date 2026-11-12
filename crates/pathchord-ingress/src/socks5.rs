@@ -39,7 +39,7 @@ impl Socks5Listener {
         Self::validate_descriptor(&descriptor)?;
         let listener = TcpListener::bind(descriptor.bind)
             .await
-            .map_err(|e| ListenerError::Accept(e.to_string()))?;
+            .map_err(|e| ListenerError::Bind(e.to_string()))?;
         Ok(Self {
             listener,
             descriptor,
@@ -55,6 +55,12 @@ impl Socks5Listener {
             listener,
             descriptor,
         })
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, ListenerError> {
+        self.listener
+            .local_addr()
+            .map_err(|error| ListenerError::Accept(error.to_string()))
     }
 
     pub async fn accept_stream<S>(
@@ -87,7 +93,7 @@ impl Socks5Listener {
         if descriptor.kind == ListenerKind::Socks5 {
             Ok(())
         } else {
-            Err(ListenerError::Accept(
+            Err(ListenerError::InvalidDescriptor(
                 "SOCKS5 adapter requires a socks5 Listener".to_owned(),
             ))
         }
@@ -98,6 +104,10 @@ impl Socks5Listener {
 impl IngressListener for Socks5Listener {
     fn descriptor(&self) -> &ListenerDescriptor {
         &self.descriptor
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr, ListenerError> {
+        Self::local_addr(self)
     }
 
     async fn accept(&self) -> Result<AcceptedConnection, ListenerError> {
@@ -129,7 +139,7 @@ where
     stream
         .read_exact(&mut methods)
         .await
-        .map_err(|e| ListenerError::Accept(e.to_string()))?;
+        .map_err(|e| ListenerError::Protocol(e.to_string()))?;
     let selected = if authentication_required {
         USERPASS
     } else {
@@ -180,7 +190,7 @@ where
             stream
                 .read_exact(&mut bytes)
                 .await
-                .map_err(|e| ListenerError::Accept(e.to_string()))?;
+                .map_err(|e| ListenerError::Protocol(e.to_string()))?;
             TargetHost::Ip(IpAddr::V4(Ipv4Addr::from(bytes)))
         }
         IPV6 => {
@@ -188,7 +198,7 @@ where
             stream
                 .read_exact(&mut bytes)
                 .await
-                .map_err(|e| ListenerError::Accept(e.to_string()))?;
+                .map_err(|e| ListenerError::Protocol(e.to_string()))?;
             TargetHost::Ip(IpAddr::V6(Ipv6Addr::from(bytes)))
         }
         DOMAIN => {
@@ -220,7 +230,7 @@ where
     stream
         .write_all(&[VERSION, method])
         .await
-        .map_err(|e| ListenerError::Accept(e.to_string()))
+        .map_err(|e| ListenerError::Protocol(e.to_string()))
 }
 
 async fn send_auth<S>(stream: &mut S, success: bool) -> Result<(), ListenerError>
@@ -230,7 +240,7 @@ where
     stream
         .write_all(&[1, if success { 0 } else { 1 }])
         .await
-        .map_err(|e| ListenerError::Accept(e.to_string()))
+        .map_err(|e| ListenerError::Protocol(e.to_string()))
 }
 
 async fn send_reply<S>(stream: &mut S, code: u8) -> Result<(), ListenerError>
@@ -240,7 +250,7 @@ where
     stream
         .write_all(&[VERSION, code, 0, IPV4, 0, 0, 0, 0, 0, 0])
         .await
-        .map_err(|e| ListenerError::Accept(e.to_string()))
+        .map_err(|e| ListenerError::Protocol(e.to_string()))
 }
 
 async fn read_u8<S>(stream: &mut S, field: &'static str) -> Result<u8, ListenerError>
@@ -251,7 +261,7 @@ where
     stream
         .read_exact(&mut value)
         .await
-        .map_err(|e| ListenerError::Accept(format!("{field}: {e}")))?;
+        .map_err(|e| ListenerError::Protocol(format!("{field}: {e}")))?;
     Ok(value[0])
 }
 
@@ -263,7 +273,7 @@ where
     stream
         .read_exact(&mut value)
         .await
-        .map_err(|e| ListenerError::Accept(format!("{field}: {e}")))?;
+        .map_err(|e| ListenerError::Protocol(format!("{field}: {e}")))?;
     Ok(u16::from_be_bytes(value))
 }
 
@@ -283,12 +293,12 @@ where
     stream
         .read_exact(&mut bytes)
         .await
-        .map_err(|e| ListenerError::Accept(format!("{field}: {e}")))?;
+        .map_err(|e| ListenerError::Protocol(format!("{field}: {e}")))?;
     Ok(bytes)
 }
 
 fn error(message: impl Into<String>) -> ListenerError {
-    ListenerError::Accept(message.into())
+    ListenerError::Protocol(message.into())
 }
 
 #[cfg(test)]

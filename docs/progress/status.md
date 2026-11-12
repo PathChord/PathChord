@@ -1,6 +1,6 @@
 # PathChord implementation status
 
-Status snapshot: 2026-11-12.
+Status snapshot: 2026-11-13.
 
 This document records the repository's implementation state. It is intentionally
 separate from `docs/design/`, which describes the intended architecture, and
@@ -40,22 +40,25 @@ separate from `docs/design/`, which describes the intended architecture, and
 - Egress now includes a concrete Tokio TCP `TargetConnector` that tries explicit
   address candidates, falls back to hostname resolution, supports an optional
   connect timeout, and preserves typed target validation failures.
-- Ingress now exposes a transport-neutral direct TCP bridge with an injected
-  target dialer and bidirectional copy/EOF propagation tests. Session/Path
-  multiplexing and production flow orchestration remain separate work.
 - Ingress now provides a transport-neutral direct TCP flow bridge with an
   injected target-dialer trait, bidirectional copy/half-close propagation, byte
   counters, and deterministic dial/copy failure tests.
+- Ingress now provides a bounded listener runtime that supervises HTTP CONNECT
+  and SOCKS5 listeners, classifies malformed handshakes as per-connection
+  rejections, exposes bound addresses/events, and shuts down listener and flow
+  tasks together. The CLI wires this runtime to the concrete TCP target
+  connector for a direct local-listener-to-target bootstrap path.
 
 ## Missing operational integration
 
-- CLI `egress` and `enroll` commands still return the bootstrap error; `ingress`
-  currently starts the local control server and does not yet start traffic
-  listeners.
+- CLI `egress` and `enroll` commands still return the bootstrap error; on Unix,
+  `ingress` starts the local control server together with configured HTTP/SOCKS
+  traffic listeners and the bounded direct TCP bridge.
 - TPROXY, TUN, Windows system-proxy OS side effects, and production Transit
-  adapters are not implemented; HTTP/SOCKS handshake adapters are now present
-  but are not connected to target dialing or the data plane.
-- The end-to-end proxy data plane is not operational.
+  adapters are not implemented; the direct bootstrap bridge does not create
+  PathChord Sessions or Paths and therefore is not the full multipath data
+  plane.
+- The Session/Path end-to-end proxy data plane is not operational.
 - Named Pipe transport, persistent authorization and metadata stores,
   subscription worker, REST/SSE Web Gateway, and frontend are not integrated.
 - Multipath scheduling and production cross-Path retransmission remain outside

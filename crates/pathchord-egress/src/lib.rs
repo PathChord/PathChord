@@ -110,14 +110,18 @@ impl TcpTargetConnector {
         };
         result.map_err(|_| TargetConnectError::Connection("target connection failed".into()))
     }
-}
 
-#[async_trait]
-impl TargetConnector for TcpTargetConnector {
-    async fn connect(
+    /// Dials a target and returns the concrete Tokio TCP stream.
+    ///
+    /// The concrete method is useful to platform adapters that need to bridge
+    /// the stream into another transport-neutral socket trait. The
+    /// [`TargetConnector`] implementation below delegates to this method, so
+    /// candidate ordering, hostname resolution, and timeout behavior remain
+    /// identical for both call paths.
+    pub async fn connect_tcp(
         &self,
         request: TargetRequest,
-    ) -> Result<BoxedTargetConnection, TargetConnectError> {
+    ) -> Result<TcpStream, TargetConnectError> {
         request.validate()?;
 
         let mut last_error = None;
@@ -128,7 +132,7 @@ impl TargetConnector for TcpTargetConnector {
             .map(|ip| SocketAddr::new(ip, request.port))
         {
             match self.connect_addr(address).await {
-                Ok(stream) => return Ok(Box::new(stream)),
+                Ok(stream) => return Ok(stream),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -139,7 +143,7 @@ impl TargetConnector for TcpTargetConnector {
             })?;
             for address in addresses {
                 match self.connect_addr(address).await {
-                    Ok(stream) => return Ok(Box::new(stream)),
+                    Ok(stream) => return Ok(stream),
                     Err(error) => last_error = Some(error),
                 }
             }
@@ -148,6 +152,16 @@ impl TargetConnector for TcpTargetConnector {
         Err(last_error.unwrap_or_else(|| {
             TargetConnectError::Connection("no target addresses were available".into())
         }))
+    }
+}
+
+#[async_trait]
+impl TargetConnector for TcpTargetConnector {
+    async fn connect(
+        &self,
+        request: TargetRequest,
+    ) -> Result<BoxedTargetConnection, TargetConnectError> {
+        Ok(Box::new(self.connect_tcp(request).await?))
     }
 }
 

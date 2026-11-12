@@ -124,6 +124,12 @@ impl LocalControlServer {
             platform: std::env::consts::OS,
         })
     }
+
+    pub async fn run(self) -> Result<(), LocalServerError> {
+        Err(LocalServerError::Unsupported {
+            platform: std::env::consts::OS,
+        })
+    }
 }
 
 #[cfg(unix)]

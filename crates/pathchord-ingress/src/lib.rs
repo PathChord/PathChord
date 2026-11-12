@@ -1,7 +1,6 @@
 //! Ingress listener and Session-manager boundaries.
 //!
-//! Phase 0 provides no SOCKS, HTTP, TPROXY, or TUN implementation. The
-//! reconnecting `SessionSlot` is deliberately separate from a protocol
+//! The reconnecting `SessionSlot` is deliberately separate from a protocol
 //! `SessionId`. The Session manager must allocate a fresh random ID for each
 //! attachment; the slot rejects immediate accidental reuse without retaining
 //! unbounded process-lifetime history.
@@ -26,6 +25,7 @@ mod http_connect;
 mod local_dispatch;
 mod local_protocol;
 mod local_server;
+mod runtime;
 mod socks5;
 
 pub use control::{
@@ -52,6 +52,10 @@ pub use local_protocol::{
     read_object, write_object,
 };
 pub use local_server::{LocalControlServer, LocalServerError};
+pub use runtime::{
+    DEFAULT_MAX_CONNECTIONS, ListenerRuntime, ListenerRuntimeConfig, ListenerRuntimeEvent,
+    ListenerRuntimeEventSender, RuntimeError, RuntimeReport,
+};
 pub use socks5::Socks5Listener;
 
 pub trait LocalConnection: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -110,17 +114,29 @@ pub struct AcceptedConnection {
     pub context: ConnectionContext,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ListenerError {
-    #[error("listener is not implemented in the Phase 0 bootstrap: {0}")]
+    #[error("listener is not implemented: {0}")]
     NotImplemented(String),
-    #[error("listener failed: {0}")]
+    #[error("listener descriptor is invalid: {0}")]
+    InvalidDescriptor(String),
+    #[error("listener bind failed: {0}")]
+    Bind(String),
+    #[error("listener accept failed: {0}")]
     Accept(String),
+    #[error("listener protocol rejected the connection: {0}")]
+    Protocol(String),
 }
 
 #[async_trait]
 pub trait IngressListener: Send + Sync {
     fn descriptor(&self) -> &ListenerDescriptor;
+
+    /// Returns the platform resource address. Implementations that bind an
+    /// ephemeral port should override this to report the assigned address.
+    fn local_addr(&self) -> Result<SocketAddr, ListenerError> {
+        Ok(self.descriptor().bind)
+    }
 
     async fn accept(&self) -> Result<AcceptedConnection, ListenerError>;
 }
