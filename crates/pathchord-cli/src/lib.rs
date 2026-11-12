@@ -5,8 +5,12 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use getrandom::fill;
 use pathchord_ingress::{
-    Actor, ErrorCode, LOCAL_API_VERSION, LocalProtocolError, RequestEnvelope, ResponseEnvelope,
+    Actor, ErrorCode, LOCAL_API_VERSION, ListenerDescriptor, ListenerKind, LocalControlDispatcher,
+    LocalControlServer, LocalProtocolError, RequestEnvelope, ResponseEnvelope, SystemProxyPlatform,
     read_object, write_object,
+};
+use pathchord_policy::{
+    AuthenticationMode, KubeConfig, ListenerConfig, ListenerKind as PolicyListenerKind,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -30,7 +34,7 @@ pub struct Cli {
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Run the Ingress service.
-    Ingress,
+    Ingress(IngressArgs),
     /// Run the Egress service.
     Egress,
     /// Query local runtime status.
@@ -40,6 +44,13 @@ pub enum Command {
     SystemProxy(SystemProxyCommand),
     /// Manage explicit endpoint enrollment.
     Enroll,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct IngressArgs {
+    /// Kubernetes-style PathChord configuration YAML.
+    #[arg(long, default_value = "pathchord.yaml")]
+    pub config: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -60,7 +71,7 @@ pub struct SystemProxyEnableArgs {
 impl Command {
     pub const fn name(&self) -> &'static str {
         match self {
-            Self::Ingress => "ingress",
+            Self::Ingress(_) => "ingress",
             Self::Egress => "egress",
             Self::Status => "status",
             Self::SystemProxy(SystemProxyCommand::Enable(_)) => "system-proxy enable",
@@ -84,6 +95,17 @@ pub enum CliError {
     RequestId(String),
     #[error("JSON output failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("cannot read configuration {path}: {source}")]
+    ConfigRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("configuration validation failed: {0}")]
+    Config(#[from] pathchord_policy::ConfigError),
+    #[error("local control server failed: {0}")]
+    LocalServer(#[from] pathchord_ingress::LocalServerError),
+    #[error("listener {listener_id} has invalid bind address {bind}")]
+    InvalidListenerBind { listener_id: String, bind: String },
 }
 
 pub fn status_request(actor: impl Into<String>) -> RequestEnvelope {
@@ -142,27 +164,90 @@ fn request_id() -> Result<String, CliError> {
 }
 
 pub async fn run(cli: Cli) -> Result<(), CliError> {
-    match cli.command {
-        Command::Ingress | Command::Egress | Command::Enroll => Err(CliError::NotImplemented {
-            command: cli.command.name(),
+    let Cli {
+        socket,
+        actor,
+        command,
+    } = cli;
+    match command {
+        Command::Ingress(args) => run_ingress(&socket, &args.config).await,
+        Command::Egress | Command::Enroll => Err(CliError::NotImplemented {
+            command: command.name(),
         }),
         Command::Status => {
-            let response = call_unix(&cli.socket, status_request(cli.actor)).await?;
+            let response = call_unix(&socket, status_request(actor)).await?;
             print_response(response)
         }
         Command::SystemProxy(SystemProxyCommand::Enable(args)) => {
             let response = call_unix(
-                &cli.socket,
-                system_proxy_enable_request(cli.actor, args.listener_id),
+                &socket,
+                system_proxy_enable_request(actor, args.listener_id),
             )
             .await?;
             print_response(response)
         }
         Command::SystemProxy(SystemProxyCommand::Disable) => {
-            let response = call_unix(&cli.socket, system_proxy_disable_request(cli.actor)).await?;
+            let response = call_unix(&socket, system_proxy_disable_request(actor)).await?;
             print_response(response)
         }
     }
+}
+
+async fn run_ingress(
+    socket: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Result<(), CliError> {
+    let yaml = std::fs::read_to_string(config_path).map_err(|source| CliError::ConfigRead {
+        path: config_path.to_owned(),
+        source,
+    })?;
+    let kube_config = KubeConfig::from_yaml(&yaml)?;
+    let policy = kube_config.into_policy_config()?;
+    let platform = if cfg!(target_os = "windows") {
+        SystemProxyPlatform::Windows
+    } else {
+        SystemProxyPlatform::Linux
+    };
+    let mut dispatcher = LocalControlDispatcher::new(platform);
+    for listener in policy.listeners {
+        dispatcher
+            .service_mut()
+            .register_listener(listener_descriptor(listener)?);
+    }
+    let server = LocalControlServer::bind(socket.to_owned(), dispatcher)?;
+    server.run().await?;
+    Ok(())
+}
+
+fn listener_descriptor(listener: ListenerConfig) -> Result<ListenerDescriptor, CliError> {
+    let bind = parse_bind(&listener.bind.host, listener.bind.port).ok_or_else(|| {
+        CliError::InvalidListenerBind {
+            listener_id: listener.id.as_str().to_owned(),
+            bind: format!("{}:{}", listener.bind.host, listener.bind.port),
+        }
+    })?;
+    let kind = match listener.kind {
+        PolicyListenerKind::Http => ListenerKind::Http,
+        PolicyListenerKind::Socks5 => ListenerKind::Socks5,
+        PolicyListenerKind::Tproxy => ListenerKind::Tproxy,
+        PolicyListenerKind::Redirect => ListenerKind::Redirect,
+        PolicyListenerKind::Tun => ListenerKind::Tun,
+    };
+    Ok(ListenerDescriptor {
+        id: listener.id,
+        kind,
+        bind,
+        authentication_required: matches!(listener.authentication, AuthenticationMode::Required),
+    })
+}
+
+fn parse_bind(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    let value = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    value.parse().ok()
 }
 
 fn print_response(response: ResponseEnvelope) -> Result<(), CliError> {
@@ -219,6 +304,34 @@ mod tests {
         assert_eq!(cli.socket, PathBuf::from("/tmp/ingress.sock"));
         assert_eq!(cli.actor, "operator");
         assert_eq!(cli.command, Command::Status);
+    }
+
+    #[test]
+    fn parses_ingress_config_argument() {
+        let cli = Cli::try_parse_from(["pathchord", "ingress", "--config", "config.yaml"])
+            .expect("ingress args");
+        assert!(matches!(
+            cli.command,
+            Command::Ingress(IngressArgs { config }) if config.as_os_str() == "config.yaml"
+        ));
+    }
+
+    #[test]
+    fn maps_policy_listener_bind_and_kind() {
+        let listener = ListenerConfig {
+            id: pathchord_policy::ListenerId::new("local-http"),
+            kind: PolicyListenerKind::Http,
+            bind: pathchord_policy::Endpoint {
+                host: "127.0.0.1".into(),
+                port: 8080,
+            },
+            allowed_sources: Vec::new(),
+            authentication: AuthenticationMode::Required,
+        };
+        let descriptor = listener_descriptor(listener).expect("descriptor");
+        assert_eq!(descriptor.kind, ListenerKind::Http);
+        assert_eq!(descriptor.bind.port(), 8080);
+        assert!(descriptor.authentication_required);
     }
 
     #[test]

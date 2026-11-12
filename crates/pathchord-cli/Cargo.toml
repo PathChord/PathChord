@@ -14,6 +14,7 @@ path = "src/main.rs"
 clap.workspace = true
 getrandom.workspace = true
 pathchord-ingress = { path = "../pathchord-ingress" }
+pathchord-policy = { path = "../pathchord-policy" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "macros"] }
 thiserror.workspace = true
