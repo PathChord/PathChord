@@ -1,9 +1,12 @@
-# Phase 1 wire specification
+# Phase 1 provisional wire contract
 
-This document freezes the payload contract used by the Phase 1 single-path
-fixture. It supplements the common `PathFrame` header and the Phase 0 Noise
-record envelope. The numeric frame codes are deterministic within Phase 1 but
-remain provisional until a compatibility registry is published.
+This progress document freezes the payload contract used by the Phase 1
+single-path fixture. It supplements the final-state
+[protocol specification](../spec/protocol.md) with the temporary boundaries of
+the implemented slice. The numeric frame codes are deterministic within Phase 1
+but remain provisional until a compatibility registry is published. In
+particular, the fixture-specific EgressID prologue is not a final registry
+entry; see [implementation status](status.md#known-implementation-constraints).
 
 ## Common encoding
 

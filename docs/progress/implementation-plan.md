@@ -1,6 +1,7 @@
-# PathChord Implementation Plan
+# PathChord implementation plan
 
-**English** | [简体中文](implementation-plan.zh-CN.md)
+This document tracks implementation sequencing. Final-state requirements and
+contracts remain under `docs/design/` and `docs/spec/`.
 
 ## Phase 0: protocol and test fixtures
 
@@ -18,6 +19,9 @@
 
 ## Phase 2: adapters
 
+- Treat Linux as the first platform target; do not combine both transparent
+  interception platforms in one milestone. Validate the local SOCKS5,
+  single-Transit, single-Egress TCP slice before adding TPROXY or TUN.
 - Linux HTTP/SOCKS.
 - Linux TPROXY/REDIRECT.
 - Windows TUN.
@@ -60,4 +64,8 @@
 
 ## Deferred implementation choices
 
-The implementation baseline is selected in the technology-selection document. Still deferred are the exact proxy adapter libraries, Tokio task topology, persistent key encoding, stable wire discriminants and capability IDs, operational buffer tuning, exact probe intervals, and autoscaler constants.
+The implementation baseline is selected in the
+[technology design](../design/technology-selection.md). Still deferred are the
+exact proxy adapter libraries, Tokio task topology, persistent key encoding,
+stable wire discriminants and capability IDs, operational buffer tuning, exact
+probe intervals, and autoscaler constants.

@@ -1,17 +1,18 @@
 # Ingress control plane specification
 
+**English** | [简体中文](ingress-control-plane.zh-CN.md)
+
 This document defines the local control plane used to operate Ingress and the
 optional web gateway used by a frontend. It is separate from the PathChord data
 Path. It covers node label/tag edits, subscription lifecycle operations, manual
 refresh, and structured node/connection queries.
 
 The control plane is an adapter over a typed internal command/query service. A
-CLI, a local web gateway, and future automation clients use the same service;
+CLI, a local web gateway, and automation clients use the same service;
 they MUST NOT edit configuration files, caches, or databases directly.
 
-The Phase-1 foundation provides this service as a bounded in-memory component;
-the local JSON adapter, persistence, subscription worker, and Web Gateway are
-separate follow-up integrations over the same interface.
+The service provides bounded command execution, atomic snapshots, persistence,
+subscription workers, and authorization through a shared typed interface.
 
 ## Architecture
 
@@ -34,7 +35,7 @@ Windows  named pipe
 ```
 
 The operating-system owner/ACL of the socket or pipe is the first authorization
-boundary. The local protocol uses the existing length-prefixed UTF-8 JSON
+boundary. The local protocol uses a length-prefixed UTF-8 JSON
 envelope with API version, operation name, request ID, and typed body.
 
 The web gateway is optional and MUST be a separate process/task boundary from
@@ -47,22 +48,21 @@ The web gateway calls the same typed service as the CLI. It MUST NOT expose the
 Unix socket or named pipe directly to a browser, and it MUST NOT be reachable
 through a Transit Proxy or Egress data Path.
 
-Phase 1 requires only the local Unix socket/named-pipe adapter. The web gateway
-is an optional follow-up adapter once the local command/query service and its
-redaction, audit, and generation semantics are stable.
+The local Unix socket/named-pipe adapter is required. An optional web gateway
+MUST preserve the same redaction, audit, and generation semantics as the local
+command/query service.
 
 ## API adapter choice
 
-The first web adapter is REST plus Server-Sent Events (SSE):
+The selected built-in web adapter is REST plus Server-Sent Events (SSE).
 
-| Option | Strengths | Costs | Decision |
-|---|---|---|---|
-| REST + SSE | Simple resource URLs, native HTTP caching/status codes, easy CLI and browser tooling, one-way live updates fit metrics/events | Separate endpoint types and some client-side composition | **First future web adapter** |
-| GraphQL queries/mutations + subscriptions | Flexible frontend selection sets, one schema for varied views, fewer round trips for dashboards | More complex authorization, subscription lifecycle, caching, persisted-query and DoS controls | Defer until multiple clients prove the need |
-
-GraphQL is not prohibited. A later adapter MAY map the same typed command/query
-service to GraphQL queries, mutations, and subscriptions. The internal service
-and generation semantics MUST remain independent of the external adapter.
+A GraphQL adapter MAY map the same typed command/query service to queries,
+mutations, and subscriptions. It MUST preserve the resource ownership,
+authorization, redaction, audit, idempotency, generation, and resource-limit
+contracts defined here. GraphQL errors MUST expose the corresponding typed
+failure, and subscriptions MUST preserve event ordering and snapshot recovery
+when replay is unavailable. The internal service and generation semantics MUST
+remain independent of the external adapter.
 
 ## Resource model
 
@@ -70,7 +70,7 @@ All responses include `api_version`, `request_id`, and `observed_generation`.
 Resources use stable opaque IDs and expose a `generation` or `revision` where
 updates can race.
 
-Phase 1 resources are:
+The REST query resources are:
 
 ```text
 GET  /api/v1/status

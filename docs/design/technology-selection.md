@@ -1,16 +1,16 @@
-# PathChord Technology Selection
+# PathChord technology selection
 
 **English** | [简体中文](technology-selection.zh-CN.md)
 
-This document selects the initial implementation technologies. It is intentionally limited to implementation choices; protocol and behavioral requirements remain defined in the architecture and protocol documents.
+This document defines the selected technologies and implementation boundaries. Protocol and behavioral requirements are defined in the architecture and protocol documents.
 
-## Recommended baseline
+## Selected technologies
 
 | Area | Selection | Reason |
 |---|---|---|
 | Language | Rust | Strong control over buffers, concurrency, platform integration, and long-lived networking services |
 | Async runtime | Tokio | Mature async I/O, timers, cancellation, task supervision, and Windows/Linux support |
-| Cryptography | `snow` with `Noise_IK_25519_ChaChaPoly_SHA256` | Direct Noise pattern support and independent handshake state per Path |
+| Cryptography | `Noise_IK_25519_ChaChaPoly_SHA256` behind a replaceable crypto interface; `snow` with a reviewed zeroizing resolver where it satisfies the security requirements | Direct Noise pattern support, independent handshake state per Path, and enforceable secret-state cleanup |
 | Symmetric primitives | ChaCha20-Poly1305 through the Noise implementation | Matches the selected Noise pattern |
 | Serialization | `serde` for configuration and management API models | Shared typed models without coupling the wire protocol to a text format |
 | Wire framing | Dedicated Rust codec using QUIC-style unsigned varints | Protocol requires explicit framing and does not depend on a general RPC schema |
@@ -28,7 +28,7 @@ The scheduler uses effective-capacity weighting. Configured relationship weights
 
 ## Architecture boundaries
 
-The implementation should be divided into crates or equivalent modules:
+The implementation is divided into crates or equivalent modules:
 
 ```text
 pathchord-core       protocol types, frame codec, Session, Stream, UDP
@@ -52,11 +52,13 @@ Pipe on Windows, using the versioned length-delimited JSON envelope selected by
 the protocol design.
 
 An optional Web Gateway calls the same service. It is disabled by default and
-is not reachable through Transit or data Paths. The first browser adapter is
-REST resources plus Server-Sent Events (SSE); a later GraphQL adapter may serve
-the same typed service if dashboard query composition justifies its additional
-authorization, query-cost, and subscription complexity. REST or GraphQL is an
-adapter choice, not the internal state model.
+is not reachable through Transit or data Paths. The selected built-in browser
+adapter uses REST resources plus Server-Sent Events (SSE): resource URLs and
+HTTP status semantics fit commands and queries, while one-way SSE updates fit
+metrics and events. A GraphQL adapter is permitted behind the same typed service
+boundary, but carries additional authorization, query-cost, caching, and
+subscription complexity. The typed service owns the internal state model
+independently of the browser API style.
 
 Node label/tag edits, subscription create/delete/refresh, and other mutations
 are generation-checked, idempotent, audited commands. Dynamic snapshots replace
@@ -83,7 +85,7 @@ Each Path owns an independent Noise session and transport cipher state. The reco
 - report authentication failure as a Path failure;
 - never reuse transport cipher state across Paths.
 
-The Phase-0 `snow` wrapper uses explicit nonces and a bounded replay window, but `snow` 0.10 does not guarantee zeroization of every private/DH and traffic-key buffer it owns. This is a known non-production limitation; a zeroizing resolver or reviewed library replacement is required before deployment.
+The Noise implementation must zeroize all private-key, DH, and traffic-key buffers it owns, including resolver-owned state. The record layer uses a bounded replay window whose size and retention semantics accommodate Session-level ACK retention and retransmission behavior.
 
 The implementation must not reuse WireGuard key material or treat the Transit Proxy as an authenticated peer.
 
@@ -91,7 +93,10 @@ The implementation must not reuse WireGuard key material or treat the Transit Pr
 
 The rule engine must be deterministic, bounded, and unable to perform I/O. It may read a connection context, listener metadata, process metadata, target metadata, static labels, and observed state. It may output selectors, tags, labels, and traffic policy parameters, but never a concrete socket or arbitrary node object.
 
-The first implementation should use a small native AST compiler rather than embedding a general scripting language. A future WASM or eBPF-like backend can implement the same restricted rule interface if needed.
+The built-in rule engine uses a small native AST compiler. An alternative WASM
+or eBPF-like backend may implement the same restricted rule interface, but it
+must preserve deterministic, bounded, I/O-free evaluation. The interface
+defines the boundary between policy compilation and runtime evaluation.
 
 ## Configuration and hot reload
 
@@ -99,25 +104,9 @@ Human configuration is parsed into typed data, validated, normalized, and compil
 
 SQLite transactions are used for Egress authorization changes. The running Egress process owns the database and publishes the resulting generation to its in-memory authorization snapshot.
 
-## Platform plan
+## Platform architecture
 
-Linux is the first implementation target because TPROXY, REDIRECT, process metadata, and transparent routing are central requirements. Windows support reuses the core and policy crates and adds Wintun plus system-proxy integration.
+Linux integrates TPROXY, REDIRECT, process metadata, and transparent routing through platform adapters. Windows uses Wintun and system-proxy integration. Both platforms reuse the core and policy crates.
 
-The first milestone should avoid implementing both transparent interception platforms. It should validate the protocol with a local SOCKS5 listener, one Transit adapter, one Egress, and one TCP Stream before adding TPROXY or TUN.
-
-## Deferred validation
-
-These choices are recommended but should be verified by a small prototype before being treated as permanent:
-
-- zeroization of Noise handshake and transport state, including the selected resolver;
-- Tokio task and cancellation structure under Path churn;
-- Wintun packaging and service integration;
-- Linux TPROXY behavior with IPv4 and IPv6;
-- SQLite behavior under concurrent status and enrollment operations;
-- throughput and allocation cost of the custom frame codec;
-- rule compiler latency and worst-case evaluation cost.
-
-The Phase-0 replay window is intentionally bounded to 64 records. Session-level
-ACK retention and retransmission behavior must be validated against that bound
-before the multipath data plane is considered production-ready.
+Platform adapters own operating-system-specific packaging, service integration, socket behavior, and routing behavior. Linux transparent routing supports IPv4 and IPv6. Tokio task supervision and cancellation must handle Path churn without leaking tasks or resources. SQLite transactions preserve authorization consistency during concurrent status queries and enrollment operations. The frame codec bounds allocation by protocol limits, and the rule compiler enforces bounded evaluation cost.
 

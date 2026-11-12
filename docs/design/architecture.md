@@ -1,4 +1,4 @@
-# PathChord Architecture
+# PathChord architecture
 
 **English** | [简体中文](architecture.zh-CN.md)
 
@@ -6,7 +6,7 @@
 
 PathChord supports Linux and Windows. Linux supports TPROXY, REDIRECT, and HTTP/SOCKS listeners. Windows supports TUN and system-proxy integration. Both platforms share the policy, node, Noise, Session, and multipath cores.
 
-The system supports TCP, UDP, and independent DNS in the first scope. Fake-IP, general ICMP forwarding, multicast proxying, and arbitrary IP tunneling are out of scope for the first protocol baseline.
+The system supports TCP, UDP, and independent DNS. Fake-IP, general ICMP forwarding, multicast proxying, and arbitrary IP tunneling are outside the protocol scope.
 
 ## 2. Topology
 

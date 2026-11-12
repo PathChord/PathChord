@@ -1,5 +1,7 @@
 # Ingress observability specification
 
+**English** | [简体中文](observability.zh-CN.md)
+
 Ingress observability is a structured query and event surface for the local
 control plane. It is designed for a web dashboard, CLI diagnostics, automated
 health checks, and incident analysis. Logs are supplementary; a metric or state
@@ -16,9 +18,10 @@ The observability service runs beside the Ingress runtime and reads typed
 snapshots from the policy, Session, Path, target-connection, subscription, and
 authorization components. It MUST NOT parse logs to reconstruct primary state.
 
-The Phase-1 foundation exposes a bounded typed snapshot/event provider inside
-Ingress. Runtime producers and external adapters can be connected incrementally;
-the provider contract does not depend on REST, GraphQL, or a log backend.
+Ingress exposes a bounded typed snapshot/event provider. Runtime producers
+publish structured observations through this provider, and external adapters
+read its snapshots and events. The provider contract is independent of the
+external API adapter and log backend.
 
 ## Snapshot model
 
@@ -120,7 +123,7 @@ hashed according to the configured redaction policy.
 
 ## Counters, gauges, and histograms
 
-The first implementation SHOULD provide these metric families:
+The observability service SHOULD provide these metric families:
 
 ```text
 pathchord_sessions_total
@@ -164,7 +167,8 @@ or counters required for safety decisions.
 
 ## Events and live updates
 
-`GET /api/v1/events` uses SSE as the first web adapter. Every event includes:
+`GET /api/v1/events` uses SSE in the selected REST + SSE web adapter. Every event
+includes:
 
 ```text
 id, type, generation, emitted_at, resource_type, resource_id, payload

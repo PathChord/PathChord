@@ -1,8 +1,16 @@
-# PathChord Configuration Model
+# PathChord configuration specification
 
 **English** | [简体中文](configuration.zh-CN.md)
 
-This is a conceptual model. Exact serialization is not fixed.
+This document defines the configuration model represented by the YAML examples
+below. Configuration adapters validate human-authored YAML and convert it into
+typed configuration snapshots before publication. The fragments define model
+semantics, but do not constitute an exhaustive serialization schema; a
+versioned schema defines accepted fields, defaults, unknown-field handling, and
+validation rules. Runtime observations are separate from administrator
+configuration. Management operations use the JSON envelopes defined in the
+[protocol specification](protocol.md); configuration YAML is not a
+management-message or data-Path wire encoding.
 
 ## Static Egress topology
 
