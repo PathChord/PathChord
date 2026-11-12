@@ -64,6 +64,53 @@ Transit Proxy 或 Egress 数据 Path 访问。非 loopback 绑定还必须显式
 `page_token`、类型化 `filter`，以及带明确升降序的有界 `sort` 字段。未知过滤器、排序字段
 和查询参数必须拒绝。列表结果包含 `items`、末尾为 null 的 `next_page_token` 和响应元数据。
 
+通用列表查询语法如下：
+
+```text
+page_size   无符号整数，1..=1000；默认 100
+page_token  上一响应返回的不透明 token
+filter      已注册的类型化过滤对象
+sort        已注册字段名
+direction   asc | desc；默认 asc
+```
+
+未知查询键、过滤字段、排序字段、无效 token 或越界 page size 必须返回
+`VALIDATION_FAILED`。资源响应必须使用类型化字段，并包含所有者 generation 或 revision。注册字段包括：
+
+```text
+status:         ingress.state、control_plane.state、runtime_snapshot.state、
+                data_path_summary、configuration_generation、observation_generation
+listeners:      id、kind、platform、bind、allowed_sources、authentication、
+                state、generation、status.reason
+sessions:       session_id、egress_id、state、ready_path_count、
+                admission_generation、close_reason、created_at、last_change_at
+connections:    connection_id、session_id、stream_id、listener_id、protocol、
+                target_kind、state、bytes_sent、bytes_received、close_reason
+subscriptions:  id、source_type、enabled、revision、state、last_refresh_at、
+                next_refresh_at、imported_node_count、last_error
+authorizations: ingress_id、egress_id、public_key、state、generation、
+                active_path_count、active_session_count
+system-proxy:   enabled、listener_id、platform_effect、environment_applied、
+                operating_system_applied、restoration_state、error
+```
+
+脱敏值必须使用 `null` 表示，并附带类型化脱敏原因。
+
+已注册过滤字段必须有界且按资源区分：
+
+```text
+nodes:          namespace、state、label.<key>、source.subscription
+listeners:      kind、platform、state
+sessions:       egress_id、state、admission_generation
+connections:    listener_id、protocol、state、session_id
+subscriptions:  enabled、state、source_type
+authorizations: ingress_id、egress_id、state
+paths/streams:  state、session_id、egress_id
+```
+
+过滤值只能使用精确字符串、布尔值、数值相等或已注册的前缀匹配；API 不提供任意表达式或无界正则表达式。
+排序字段必须来自资源列出的稳定字段，并以不透明资源 ID 作为确定性平局打破规则。
+
 REST 查询资源如下：
 
 ```text
@@ -148,6 +195,24 @@ POST /api/v1/system-proxy/disable
 
 响应和 `system_proxy.changed` 事件包含 `enabled`、当前 `listener_id`（如有）、平台效果以及恢复/错误状态。
 在 Linux 上，GET 返回 `enabled: false` 和 `platform_effect: unsupported`。
+
+变更成功响应使用以下结构：
+
+```json
+{
+  "api_version": "1",
+  "request_id": "01JEXAMPLE",
+  "ok": true,
+  "observed_generation": {"scope": "observation", "value": 42},
+  "result": {
+    "applied_generation": {"scope": "configuration", "value": 13},
+    "resource": {"id": "local-http", "state": "active"},
+    "cleanup": {"paths": 0, "sessions": 0, "streams": 0, "target_connections": 0}
+  }
+}
+```
+
+授权和 system-proxy 变更必须包含 `cleanup`，其中为非负计数；没有影响时也必须返回零值。
 
 授权操作使用 Egress 所有的存储：
 
@@ -253,3 +318,5 @@ audit.notice
 
 控制平面不替代数据 Path 的 `STATUS_REPORT`。该消息用于 Path/Session 准入和远端健康；本地
 状态和指标是控制服务拥有的结构化视图。客户端绝不直接编辑数据库、配置文件或订阅缓存。
+
+本文档中的操作注册表是权威管理操作集合。协议规范只定义传输边界和封装，不定义第二套更小的操作集合。

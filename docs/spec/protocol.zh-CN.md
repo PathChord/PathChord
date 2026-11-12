@@ -37,13 +37,13 @@ Association、控制消息和健康报告。本文档定义协议行为、生命
 
 ## 1. 密码学
 
-通过成熟的实现使用 `Noise_IK_25519_ChaChaPoly_SHA256`。
+实现 MUST 通过成熟的实现使用 `Noise_IK_25519_ChaChaPoly_SHA256`。
 
 - Ingress 和 Egress 各自拥有一对静态 Curve25519 密钥。
 - Egress 公钥是 Ingress 的静态配置。
 - Egress 存储已授权的 Ingress 公钥列表；注册操作会动态更改此列表。
 - 每条 Path 都执行自己的 Noise 握手，并获得独立的传输密钥。
-- 不要将 WireGuard 私钥复用于 PathChord。
+- 实现 MUST NOT 将 WireGuard 私钥复用于 PathChord。
 - PathChord MUST NOT 使用 X.509 CA、PGP、TOFU 或自动的首次使用信任。
 - 密码学 provider MUST 清零其拥有的全部私钥、DH 和传输密钥缓冲区，包括
   resolver 拥有的状态。无法作出该保证的 provider 不符合已部署 PathChord
@@ -341,7 +341,12 @@ Windows named pipe
 
 管理消息使用带长度前缀的 UTF-8 JSON 封装结构。该封装包含 API 版本、操作名称、请求 ID，以及具有类型的请求或响应正文。Command 还携带 actor、 OPTIONAL 的期望代次和幂等请求 ID。JSON 仅用于管理适配器；data Path 继续使用专用二进制帧编解码器。
 
-Ingress 变更包括管理员节点 tag/label 修改、订阅创建/删除和手动订阅刷新。它们原子发布动态快照，使用代次检查处理并发更新；刷新失败时保留最近一次成功的订阅快照，并产生结构化审计事件。`observed.*` 和运行时拥有的 quota 字段不能通过管理员元数据 command 写入。
+Ingress 变更包括管理员节点 tag/label 修改、订阅创建/删除、手动订阅刷新、监听器清单查询以及
+Windows 专用的 `system_proxy.get`、`system_proxy.enable` 和 `system_proxy.disable` 操作。完整的操作、
+资源、响应、错误、分页和事件注册表由[Ingress 控制面规范](ingress-control-plane.zh-CN.md)定义；该文档
+具有权威性，本节不得被解释为更小的子集。mutation 原子发布动态快照，使用代次检查处理并发更新；
+刷新失败时保留最近一次成功的订阅快照，并产生结构化审计事件。`observed.*` 和运行时拥有的 quota
+字段不能通过管理员元数据 command 写入。
 
 Ingress 同时发布节点、Path、Session、Stream、目标连接、订阅和策略代次的结构化观测快照及有界事件流。当前状态和 metrics MUST 查询，不能要求解析日志。`STATUS_REPORT` 仍然是认证 data-Path 健康消息，不是管理 API 或 metrics API。
 

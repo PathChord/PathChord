@@ -3,9 +3,8 @@
 **English** | [简体中文](wire-profile.zh-CN.md)
 
 This document is the interoperable wire contract for wire-profile-v1. The
-profile uses protocol version 1. A peer that implements another version or a
-bootstrap version MUST reject the Path before PATH_READY; version 0 values used
-by development fixtures are not part of this profile.
+profile uses protocol version 1. A peer that presents any protocol version
+other than 1 MUST reject the Path before PATH_READY.
 
 The [protocol specification](protocol.md) defines the behavioral model. This
 document defines the bytes, registries, limits, and failure handling needed to
@@ -299,12 +298,13 @@ sample_age_ms                varint
 expires_after_ms             varint, positive
 ~~~
 
-connected MUST be consistent with service_state: it is zero only for down.
+`connected` MUST be equivalent to `service_state != down`: `connected=0` iff
+`service_state=down`, and every other service state MUST use `connected=1`.
 Ratios are basis points, not floating-point values. Ingress treats a report as
 stale when sample_age_ms > expires_after_ms; stale reports cannot admit a new
 flow or trigger scale-in. Reports are applied in report_seqno order and
-duplicate or older reports are ignored. The four-field bootstrap report
-(connected, active Streams, active target connections, capacity) is not a v1
+duplicate or older reports are ignored. A status payload that omits the v1
+service state, utilization, sequencing, and freshness fields is not a v1
 payload and is not interoperable with this profile.
 
 ### TCP Stream

@@ -186,6 +186,58 @@ the record identity; a new enrollment record is REQUIRED. `DISABLED` MAY be
 returned to `ENABLED` through a new generation, which permits new Sessions but
 does not resurrect an old SessionID.
 
+## Windows system-proxy switch
+
+The switch is owned by the control plane and is independent of Listener
+lifecycle:
+
+```text
+DISABLED → APPLYING
+APPLYING → APPLIED
+APPLYING → FAILED
+APPLIED → RESTORING → DISABLED
+APPLIED → FAILED
+FAILED → APPLYING
+```
+
+`APPLYING` MUST verify that the requested `listener_id` resolves to an HTTP or
+SOCKS Listener on Windows. Enabling the already-selected listener is idempotent
+and MUST return the current applied state without rewriting saved values.
+`APPLIED` MUST record the exact previous environment and operating-system proxy
+values. Disable MUST restore those values; a restore failure enters `FAILED`,
+retains the saved values, and MUST NOT report `DISABLED`. Linux MUST reject
+enable/disable as `UNSUPPORTED_OPERATION` and MUST NOT enter this state machine.
+Every transition emits `system_proxy.changed` with the listener ID, platform
+effect, and error or restoration state.
+
+## Scheduler and autoscaling guards
+
+For each eligible Path, the scheduler computes:
+
+```text
+score(path) = relationship_weight
+              × billing_multiplier
+              × advertised_effective_capacity
+              × quality_factor
+```
+
+`quality_factor` is bounded and derived from congestion window, RTT, jitter,
+loss, and reordering. Its coefficients are configuration, but it MUST be
+monotonic so worse quality cannot increase a Path score. A relationship's
+weight is shared by all its Paths before Path scores distribute that share.
+Control traffic is reserved first and charged to the Session replication
+budget; business replication MUST NOT consume more than the remaining budget.
+
+The autoscaler MUST use hysteresis: it MAY add a Path only after aggregate
+capacity is below demand (or the Egress recommendation exceeds active count)
+for a configured consecutive sample window; it MAY remove a Path only after
+surplus persists for a separate non-zero window and another compliant Path
+remains. Scale-in MUST enter `DRAINING` first. A Path MUST be excluded when
+incremental capacity is below scheduling overhead, with the reason exposed in
+observations. Opposite-direction counters MUST reset after a state change or
+failed probe. Thresholds and windows MAY be configured, but these guards,
+hysteresis, drain action, and budget accounting are normative.
+
 ## Transition effects and failure reasons
 
 | Trigger | Required guard and action |

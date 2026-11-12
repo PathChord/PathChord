@@ -51,7 +51,8 @@ Windows-only control-plane switch and does not add a Listener type. `spec.allowe
 empty list meaning “all source addresses” for an explicitly non-loopback
 listener. Administrators SHOULD use an explicit list for non-loopback binds.
 
-`spec.authentication` is either the scalar `disabled` or a mapping:
+The following is a `spec.authentication` fragment; it is not a standalone
+resource object. `spec.authentication` is either the scalar `disabled` or a mapping:
 
 ```yaml
 authentication:

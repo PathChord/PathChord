@@ -74,6 +74,57 @@ and a bounded `sort` field with an explicit ascending/descending direction.
 Unknown filters, sort fields, and query parameters are rejected. A list result
 contains `items`, `next_page_token` (null at end), and the response metadata.
 
+The common list query grammar is:
+
+```text
+page_size   unsigned integer, 1..=1000; default 100
+page_token  opaque token returned by the previous response
+filter      registered typed filter object
+sort        registered field name
+direction   asc | desc; default asc
+```
+
+Unknown query keys, filter keys, sort fields, invalid tokens, and out-of-range
+page sizes MUST return `VALIDATION_FAILED`. Resource responses MUST use typed
+fields and include the owning generation or revision. The registered resource
+fields are:
+
+```text
+status:         ingress.state, control_plane.state, runtime_snapshot.state,
+                data_path_summary, configuration_generation, observation_generation
+listeners:      id, kind, platform, bind, allowed_sources, authentication,
+                state, generation, status.reason
+sessions:       session_id, egress_id, state, ready_path_count,
+                admission_generation, close_reason, created_at, last_change_at
+connections:    connection_id, session_id, stream_id, listener_id, protocol,
+                target_kind, state, bytes_sent, bytes_received, close_reason
+subscriptions:  id, source_type, enabled, revision, state, last_refresh_at,
+                next_refresh_at, imported_node_count, last_error
+authorizations: ingress_id, egress_id, public_key, state, generation,
+                active_path_count, active_session_count
+system-proxy:   enabled, listener_id, platform_effect, environment_applied,
+                operating_system_applied, restoration_state, error
+```
+
+Redacted values MUST be represented as `null` with a typed redaction reason.
+
+Registered filter keys are bounded and resource-specific:
+
+```text
+nodes:          namespace, state, label.<key>, source.subscription
+listeners:      kind, platform, state
+sessions:       egress_id, state, admission_generation
+connections:    listener_id, protocol, state, session_id
+subscriptions:  enabled, state, source_type
+authorizations: ingress_id, egress_id, state
+paths/streams:  state, session_id, egress_id
+```
+
+Filter values use exact string, boolean, numeric equality, or registered
+prefix matching; arbitrary expressions and unbounded regular expressions are
+not part of the API. Sort fields are the stable fields shown for the resource
+and MUST have a deterministic tie-break by opaque resource ID.
+
 The REST query resources are:
 
 ```text
@@ -166,6 +217,25 @@ POST /api/v1/system-proxy/disable
 The response and `system_proxy.changed` event include `enabled`, the selected
 `listener_id` when present, platform effect, and restoration/error state. On
 Linux, `GET` returns `enabled: false` with `platform_effect: unsupported`.
+
+Mutation success responses use this shape:
+
+```json
+{
+  "api_version": "1",
+  "request_id": "01JEXAMPLE",
+  "ok": true,
+  "observed_generation": {"scope": "observation", "value": 42},
+  "result": {
+    "applied_generation": {"scope": "configuration", "value": 13},
+    "resource": {"id": "local-http", "state": "active"},
+    "cleanup": {"paths": 0, "sessions": 0, "streams": 0, "target_connections": 0}
+  }
+}
+```
+
+Authorization and system-proxy mutations MUST include `cleanup` with non-negative
+counts, including zeroes when no resources were affected.
 
 Authorization operations use the Egress-owned store:
 
@@ -291,3 +361,7 @@ The control plane does not replace data-Path `STATUS_REPORT`. That message is
 used for Path/Session admission and remote health; local status and metrics are
 structured views owned by the control service. Clients never edit a database,
 configuration file, or subscription cache directly.
+
+This document's operation registry is the authoritative management operation
+set. The protocol specification defines only the transport boundary and
+envelope; it does not define a second, smaller operation set.

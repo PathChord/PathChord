@@ -31,7 +31,7 @@ Transit A  Transit B  Transit C
 ## 3. 路由模式
 
 - `egress: <id-or-selector>`：Ingress 通过一个或多个 Transit Path 到达选定的 Egress。默认使用多路径聚合。
-- `egress: none`：Ingress 选择一个 Transit Proxy，由该代理连接目标。这是普通代理回退模式。
+- `mode: none`：Ingress 选择一个 Transit Proxy，由该代理连接目标。这是普通代理回退模式。
 - `proxy: direct`：direct 是一种无需第三方中继、直接建立连接的 Transit Proxy 传输方式。
 - 全局回退必须显式配置为 `reject` 或 `direct`。
 

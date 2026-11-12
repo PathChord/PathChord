@@ -210,10 +210,10 @@ An Egress target is exactly one of:
 ```yaml
 egressRef: egress-name
 egressSelector: {labels: {region: jp}, tags: [gaming], capabilities: [tcp]}
-egress: none
+mode: none
 ```
 
-The mapping selector MUST contain at least one criterion. `egress: none` is
+The mapping selector MUST contain at least one criterion. `mode: none` is
 ordinary Proxy mode and MUST NOT create a PathChord Session. `proxy: direct` is
 the built-in direct Transit adapter and is not an Egress selector.
 
@@ -247,7 +247,7 @@ Each `kind: TrafficPolicy` object has the following `spec` fields:
 
 | Field | Required | Default and limits |
 |---|---|---|
-| `scheduler` | no | `effective_capacity_weighted` |
+| `scheduler` | no | `effectiveCapacityWeighted` |
 | `sessionReplicationBudgetBps` | no | `0` (no replication) |
 | `classReplicationBudgetBps` | no | absent; bounded by Session budget |
 | `retransmissionReplication` | no | `disabled` |

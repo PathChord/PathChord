@@ -401,11 +401,17 @@ idempotency request ID. JSON is limited to management adapters; the data Path
 continues to use the dedicated binary frame codec.
 
 Ingress mutations include administrator node tag/label edits, subscription
-creation/deletion, and explicit subscription refresh. They publish dynamic
-snapshots atomically, require generation checks for concurrent updates, retain
-the last successful subscription snapshot after refresh failure, and produce
-structured audit events. `observed.*` and runtime-owned quota fields cannot be
-written through administrator metadata commands.
+creation/deletion, explicit subscription refresh, listener inventory queries,
+and the Windows-only `system_proxy.get`, `system_proxy.enable`, and
+`system_proxy.disable` operations. The complete operation, resource, response,
+error, pagination, and event registry is defined by the
+[Ingress control-plane specification](ingress-control-plane.md); that document
+is authoritative and this section MUST NOT be interpreted as a smaller subset.
+Mutations publish dynamic snapshots atomically, require generation checks for
+concurrent updates, retain the last successful subscription snapshot after
+refresh failure, and produce structured audit events. `observed.*` and
+runtime-owned quota fields cannot be written through administrator metadata
+commands.
 
 Ingress also publishes structured observation snapshots and bounded event
 streams for nodes, Paths, Sessions, Streams, target connections, subscriptions,

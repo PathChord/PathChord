@@ -3,8 +3,7 @@
 [English](wire-profile.md) | **简体中文**
 
 本文档是 wire-profile-v1 的可互操作线路合同。该 profile 使用协议版本 1。
-实现其他版本或 bootstrap 版本的对端 MUST 在 PATH_READY 之前拒绝 Path；开发
-fixture 使用的版本 0 不属于本 profile。
+提供任何非 1 协议版本的对端 MUST 在 PATH_READY 之前拒绝 Path。
 
 [协议规范](protocol.zh-CN.md)定义行为模型；本文档定义实现该模型所需的字节、
 注册表、限制和失败处理。
@@ -272,11 +271,12 @@ sample_age_ms                varint
 expires_after_ms             varint, positive
 ~~~
 
-connected MUST 与 service_state 一致：只有 down 时才为零。比率使用 basis
+`connected` MUST 等价于 `service_state != down`：当且仅当 `service_state=down` 时
+`connected=0`，其他服务状态 MUST 使用 `connected=1`。比率使用 basis
 points，不使用浮点数。当 sample_age_ms > expires_after_ms 时，Ingress MUST
 将报告视为过期；过期报告不能准入新流，也不能触发缩容。报告按 report_seqno
-顺序应用，重复或更旧的报告忽略。四字段 bootstrap 报告（connected、活跃
-Stream、活跃目标连接、capacity）不是 v1 payload，与本 profile 不互操作。
+顺序应用，重复或更旧的报告忽略。省略 v1 服务状态、利用率、序列和新鲜度字段的
+状态 payload 不是 v1 payload，与本 profile 不互操作。
 
 ### TCP Stream
 
