@@ -22,6 +22,8 @@ This document selects the initial implementation technologies. It is intentional
 | HTTP/SOCKS | Internal protocol adapters | Required semantics are small and avoid unnecessary proxy-framework coupling |
 | Testing | `cargo test`, deterministic fake transports, property tests, packet traces, and fault injection | Multipath correctness depends on reproducible loss, duplication, reordering, and restart tests |
 
+The scheduler uses effective-capacity weighting. Configured relationship weights provide the baseline; Path-reported capacity, congestion window, RTT, jitter, and loss adjust the instantaneous allocation. Retransmission replication uses both a Session-wide budget and optional per-traffic-class budgets, with the Session budget as the hard upper bound.
+
 ## Architecture boundaries
 
 The implementation should be divided into crates or equivalent modules:
