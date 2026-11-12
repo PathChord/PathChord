@@ -196,6 +196,12 @@ quota.*     optional provider quota metadata
 - 已编译规则以原子方式替换；编译失败时保留上一个规则快照。
 - 运行时观测独立于配置代次更新。
 
+Ingress 管理员 label/tag 编辑属于控制面动态 mutation，只能更新 `admin.*` 命名空间，必须携带期望代次（或显式授权的 force capability），并原子发布新的快照。它们不能覆盖 `source.*`、`observed.*` 或 `quota.*` 值。
+
+订阅是控制面资源，支持创建、删除、启用/禁用和手动刷新。刷新基于当前订阅 revision 执行；成功时发布一个新的动态代次，失败时保留最近一次成功的节点快照。删除会将订阅从后续刷新中移除，并排空仅由该来源导入的节点。每个 mutation 按 actor 和 request ID 幂等，并产生审计事件。
+
+控制面为节点、Path、Session、Stream、目标连接、订阅和策略代次提供结构化快照及有界变更事件。这些视图是前端和 metrics endpoint 的数据源；日志不是权威状态存储。
+
 ## Session 维护
 
 Ingress 为每个已配置的 Egress 维护一个 Session 槽位。Ingress 启动时，会尝试为当前有效状态为在线的 Egress 建立 Session。Session 在空闲期间保持存活，并由后续 Stream 和 UDP Association 复用。当 Egress 离线或进入硬故障状态时，其 Session 和所有相关业务连接都会被销毁。Egress 再次上线后，Ingress 会创建新的 Session 和 Path 集合。

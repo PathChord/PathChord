@@ -9,6 +9,8 @@ mod error;
 mod frame;
 mod id;
 mod limits;
+mod messages;
+mod reliability;
 mod state;
 mod varint;
 
@@ -19,6 +21,15 @@ pub use frame::{
 };
 pub use id::{IdError, PathId, RequestId, SessionId, StreamId};
 pub use limits::{LimitsError, ProtocolLimits};
+pub use messages::{
+    ControlAck, Heartbeat, Message, MessageCodecError, PathHello, PathReady, SessionAttach,
+    SessionAttachOk, SessionAttachReject, SessionClose, StatusReport, StreamAck, StreamData,
+    StreamFin, StreamOpen, StreamOpenErr, StreamOpenOk, StreamRst, StreamWindow, TargetEndpoint,
+};
+pub use reliability::{
+    AckRange, ControlReceiver, ControlSender, ReliabilityError, StreamInsertResult,
+    StreamReceiveBuffer,
+};
 pub use state::{
     EgressRelationshipState, EgressRuntime, EgressServiceState, PathState, SessionState,
     StateTransitionError, StreamState,

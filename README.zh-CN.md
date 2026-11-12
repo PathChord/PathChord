@@ -8,7 +8,7 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 ## 状态
 
-目前处于初始实现阶段。本仓库包含设计基线，以及用于协议原语、逐 Path Noise 实验和确定性传输测试夹具的阶段 0 Rust 工作区。代理数据面尚未实现。
+目前处于初始实现阶段。本仓库包含设计基线、阶段 0 协议/传输原语，以及阶段 1A TCP 单路径规范和 core reliability/control-service 基础。代理数据面和 Web Gateway 适配器尚未实现。
 
 ## 术语
 
@@ -28,6 +28,11 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 - [实现计划](docs/implementation-plan.zh-CN.md)
 - [技术选型](docs/technology-selection.zh-CN.md)
 - [设计审查](docs/design-review.zh-CN.md)
+- [阶段 1 规范](docs/spec/phase-1-single-path.md)
+- [阶段 1 线协议契约](docs/spec/phase-1-wire.md)
+- [阶段 1 验收标准](docs/spec/phase-1-acceptance.md)
+- [Ingress 控制面](docs/spec/ingress-control-plane.md)
+- [Ingress 可观测性](docs/spec/observability.md)
 
 ## 命令界面
 

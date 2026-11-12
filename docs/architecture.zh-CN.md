@@ -80,6 +80,8 @@ Egress 状态通过现有 Path 上报。Ingress 维护每个 Ingress 到 Egress 
 
 Egress 上报负载、连接利用率、带宽利用率、活跃 Session、活跃 Stream、活跃目标连接、容量以及建议 Path 数量。Ingress 测量每条 Path 的 RTT、抖动、丢包、乱序、吞吐量和连接建立质量。
 
+Ingress 通过原子运行时快照 provider 发布这些观测数据。该 provider 也提供节点 label/tag、订阅代次、Session、Stream、目标连接和策略状态，供结构化管理查询使用。日志只是补充诊断；当前运行状态和 metric 不得依靠解析日志重建。可选的认证 Web Gateway 可以向前端提供快照和有界变更事件，而权威本地控制 API 仍然位于 Unix socket 或 Named Pipe 上。
+
 有效聚合容量不足时，自动扩缩容会增加 Path；只有在持续出现容量富余后才会谨慎移除 Path。质量下降时会快速减少分配；恢复和缩容过程保持稳定。可以通过增加其他 Path 来补偿质量较差的 Path，但当其新增容量低于自身开销时会将其排除。
 
 订阅配额和流量倍率是可选的参考元数据。它们可以生成标签或影响权重；它们不是硬性限制，也不会直接改变 Egress 连通性。
@@ -106,3 +108,5 @@ Egress 上报负载、连接利用率、带宽利用率、活跃 Session、活�
 Egress 拓扑、Egress 公钥和 Ingress 本地私钥属于静态配置，发生变更时需要重启 Ingress。Transit Proxy 列表是运行时数据，从订阅刷新到磁盘缓存并热重载。刷新失败时保留当前列表；订阅中已删除的 Proxy 进入排空状态。
 
 规则在启动时编译。运行时分别维护策略、Egress、Proxy、认证和指标快照。Ingress 内部流量绕过自身的透明拦截，以防止形成环路。
+
+Ingress 管理员元数据和订阅操作属于控制面 mutation。它们原子发布新的代次，使用期望代次检查处理并发编辑；刷新失败时保留最近一次成功的订阅快照。Web/API 适配器调用拥有者的类型化 service，不能直接编辑配置文件或缓存。

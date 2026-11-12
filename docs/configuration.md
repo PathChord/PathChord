@@ -196,6 +196,24 @@ Local administrator attributes override imported source attributes. Observed att
 - Compiled rules are replaced atomically; a failed compilation retains the previous rule snapshot.
 - Runtime observations update independently from configuration generations.
 
+Ingress administrator label/tag edits are dynamic mutations owned by the
+control plane. They update only the `admin.*` namespace, require an expected
+generation (or an explicitly authorized force capability), and publish a new
+snapshot atomically. They do not overwrite `source.*`, `observed.*`, or
+`quota.*` values.
+
+Subscriptions are control-plane resources with create, delete, enable/disable,
+and manual-refresh operations. A refresh runs against the current subscription
+revision; success publishes one new dynamic generation and failure retains the
+last successful node snapshot. Deletion removes the subscription from future
+refreshes and drains nodes imported solely from that source. Every mutation is
+idempotent by actor and request ID and produces an audit event.
+
+The control plane exposes structured snapshots and bounded change events for
+nodes, Paths, Sessions, Streams, target connections, subscriptions, and policy
+generations. These views are the source for the frontend and metrics endpoint;
+logs are not the authoritative state store.
+
 ## Session maintenance
 
 Ingress maintains one Session slot per configured Egress. When Ingress starts, it attempts to establish Sessions for Egresses whose current effective state is online. A Session remains alive while idle and is reused by subsequent Streams and UDP Associations. When an Egress becomes offline or enters hard failure, its Session and all related business connections are destroyed. When the Egress becomes online again, Ingress creates a new Session and Path set.
