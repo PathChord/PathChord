@@ -295,20 +295,28 @@ Noise 模式为 `Noise_IK_25519_ChaChaPoly_SHA256`。每条 Path 执行全新握
 
 注册控制 API 位于数据 Path 协议之外。它可以修改 Egress 授权数据库或配置文件，但必须使用原子代次更新，并在验证或持久化失败时保留先前的有效记录。
 
-## 18. 本地管理 API
+## 18. Ingress 控制面和管理 API
 
-管理 API 仅限本地使用：
+Ingress 拥有一个类型化 command/query service，用于节点元数据、订阅、运行时快照、连接、metrics 和结构化事件。该 service 与二进制 data Path 分离，也是唯一可以发布可变运行时快照的组件。
+
+权威的本地管理 API 仅限本地使用：
 
 ```text
 Linux   Unix domain socket
 Windows named pipe
 ```
 
-`pathchord` CLI 是受支持的管理客户端。API 通过操作系统对套接字或管道的所有权和权限模型来授权调用方。它不通过 Transit Proxy 或 Egress 数据 Path 暴露。
+`pathchord` CLI 是受支持的本地管理客户端。API 通过操作系统对套接字或管道的所有权和权限模型来授权调用方。它不通过 Transit Proxy 或 Egress 数据 Path 暴露。
 
-管理消息使用带长度前缀的 UTF-8 JSON 封装结构。该封装包含 API 版本、操作名称、请求 ID，以及具有类型的请求或响应正文。JSON 仅用于本地管理 API；数据 Path 继续使用专用二进制帧编解码器。
+管理消息使用带长度前缀的 UTF-8 JSON 封装结构。该封装包含 API 版本、操作名称、请求 ID，以及具有类型的请求或响应正文。Command 还携带 actor、可选的期望代次和幂等请求 ID。JSON 仅用于管理适配器；data Path 继续使用专用二进制帧编解码器。
 
-运行中的 Egress 进程同时拥有管理 API 和授权存储。CLI 从不直接编辑数据库或配置文件；它向 Egress 提交操作，由 Egress 完成整个更新。
+Ingress 变更包括管理员节点 tag/label 修改、订阅创建/删除和手动订阅刷新。它们原子发布动态快照，使用代次检查处理并发更新；刷新失败时保留最近一次成功的订阅快照，并产生结构化审计事件。`observed.*` 和运行时拥有的 quota 字段不能通过管理员元数据 command 写入。
+
+Ingress 同时发布节点、Path、Session、Stream、目标连接、订阅和策略代次的结构化观测快照及有界事件流。当前状态和 metrics 必须可以查询，不能要求解析日志。`STATUS_REPORT` 仍然是认证 data-Path 健康消息，不是管理 API 或 metrics API。
+
+可选的认证 Web Gateway 为前端提供接入点。它调用同一个类型化 command/query service，默认关闭。首个 Web 适配器使用 REST 资源接口和 Server-Sent Events（SSE）；如果 dashboard 的查询组合确实需要，未来可以为同一 service 提供 GraphQL 适配器。Gateway 不得把本地 socket/pipe 直接暴露给浏览器，也不得通过 Transit Proxy 或数据 Path 访问。非 loopback 监听必须显式配置，并启用强认证、来源控制、限流、脱敏和审计日志。
+
+运行中的 Egress 进程拥有 Egress 授权存储，Ingress 控制服务拥有 Ingress 节点/订阅快照。客户端从不直接编辑数据库、配置文件或订阅缓存；它们向拥有者 service 提交类型化操作。
 
 注册操作是事务性的：
 

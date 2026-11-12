@@ -5,6 +5,9 @@
 //! `SessionId`. The Session manager must allocate a fresh random ID for each
 //! attachment; the slot rejects immediate accidental reuse without retaining
 //! unbounded process-lifetime history.
+//!
+//! The transport-neutral [`IngressControlService`] is the shared foundation
+//! for the local management protocol and future REST/SSE or GraphQL adapters.
 
 use std::net::SocketAddr;
 
@@ -15,6 +18,17 @@ use pathchord_policy::{EgressId, PolicyContext};
 pub use pathchord_policy::{FlowProtocol, ListenerId, ProcessMetadata, TargetEndpoint, TargetHost};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+mod control;
+
+pub use control::{
+    ConnectionObservation, ConnectionState, ControlError, ControlEvent, ControlEventKind,
+    IngressControlService, IngressControlSnapshot, MAX_CONNECTION_OBSERVATIONS, MAX_EVENT_COUNT,
+    MAX_NODE_COUNT, MAX_REFRESH_QUEUE_COUNT, MAX_REQUEST_CACHE_COUNT, MAX_SUBSCRIPTION_COUNT,
+    MutationReceipt, NodeAdminPatch, NodeAdminState, NodeHealthState, NodeId, NodeObservation,
+    ObservationSnapshot, RuntimeCounts, SubscriptionId, SubscriptionRefreshState, SubscriptionSpec,
+    SubscriptionState,
+};
 
 pub trait LocalConnection: AsyncRead + AsyncWrite + Send + Unpin {}
 

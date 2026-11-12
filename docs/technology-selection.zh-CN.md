@@ -15,7 +15,7 @@
 | 序列化 | 配置和管理 API 模型使用 `serde` | 共享强类型模型，同时不将线协议耦合到文本格式 |
 | 线协议帧封装 | 使用 QUIC 风格无符号变长整数的专用 Rust 编解码器 | 协议要求显式帧封装，并且不依赖通用 RPC 模式定义 |
 | 配置 | 人工编写的文件使用 YAML，并规范化为强类型 Rust 快照 | 在保持运行时求值强类型的同时提供易读的静态配置 |
-| 本地管理 API | 通过 Unix Socket/Named Pipe 传输带版本的长度分隔 JSON 消息 | 仅限本地管理、易于检查，并提供稳定的 CLI/API 边界 |
+| 控制面 | 类型化 command/query service，通过 Unix Socket/Named Pipe 传输带版本的长度分隔 JSON；可选认证 Web Gateway | 保持特权本地管理隔离，同时提供浏览器接入点，且不把运行时状态绑定到单一外部 API 风格 |
 | 嵌入式状态 | Egress 授权和持久本地元数据使用 SQLite | 提供原子事务、代次编号并便于检查 |
 | 规则 | 启动时编译的专用受限规则语言 | 求值具有确定性且输出模型狭窄；不能任意访问主机 |
 | Linux 拦截 | `nix`/`socket2` 加平台专用的 netlink 和 TPROXY 代码 | 能够访问套接字选项和路由原语，同时不隐藏内核行为 |
@@ -42,6 +42,16 @@ pathchord-cli        local management API client and operational commands
 ```
 
 `pathchord-core` 不得依赖 Linux、Windows、订阅格式或监听器实现。平台适配器通过面向字节传输、本地套接字、目标拨号和进程元数据的窄 trait 进行通信。
+
+## Ingress 控制面和可观测性
+
+Ingress 拥有一个类型化 command/query service，用于节点元数据、订阅、运行时快照、连接视图和结构化事件。权威本地适配器仍然是 Linux Unix domain socket 或 Windows Named Pipe，使用协议设计中选定的带版本长度分隔 JSON 封装。
+
+可选 Web Gateway 调用同一个 service，默认关闭，且不能通过 Transit 或数据 Path 访问。首个浏览器适配器选择 REST 资源接口加 Server-Sent Events（SSE）；如果后续 dashboard 的查询组合确实需要，可再为同一 service 增加 GraphQL 适配器，并承担额外的授权、查询成本和订阅复杂度。REST 或 GraphQL 只是适配器选择，不是内部状态模型。
+
+节点 tag/label 修改、订阅创建/删除/刷新及其他变更都是带代次检查、幂等和审计的 command。动态快照原子替换；订阅刷新失败时保留最近一次成功快照。观测 provider 发布类型化的节点、Path、Session、Stream、目标连接、订阅和策略 metric。Web Gateway 暴露这些快照和有界事件流；运维人员不能依靠解析日志重建当前状态。
+
+`STATUS_REPORT` 仍然是用于 Egress 准入和健康状态的紧凑认证 data-Path 消息，不是管理 API，也不是 metrics 传输。
 
 ## Noise 和记录处理
 

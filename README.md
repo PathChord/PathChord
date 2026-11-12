@@ -8,7 +8,10 @@ PathChord provides ordinary proxy semantics to local applications while maintain
 
 ## Status
 
-Initial implementation. The repository contains the design baseline and a Phase 0 Rust workspace for protocol primitives, per-Path Noise experiments, and deterministic transport fixtures. The proxy data plane is not implemented yet.
+Initial implementation. The repository contains the design baseline, Phase 0
+protocol/transport primitives, and the Phase 1A TCP single-path specification
+and core reliability/control-service foundations. The proxy data plane and Web
+Gateway adapters are not implemented yet.
 
 ## Terminology
 
@@ -28,6 +31,11 @@ Initial implementation. The repository contains the design baseline and a Phase 
 - [Implementation plan](docs/implementation-plan.md)
 - [Technology selection](docs/technology-selection.md)
 - [Design review](docs/design-review.md)
+- [Phase 1 specifications](docs/spec/phase-1-single-path.md)
+- [Phase 1 wire contract](docs/spec/phase-1-wire.md)
+- [Phase 1 acceptance criteria](docs/spec/phase-1-acceptance.md)
+- [Ingress control plane](docs/spec/ingress-control-plane.md)
+- [Ingress observability](docs/spec/observability.md)
 
 ## Command surface
 

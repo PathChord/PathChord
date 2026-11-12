@@ -80,6 +80,14 @@ Control messages have an independent sending budget. Business traffic is fairly 
 
 Egress reports load, connection utilization, bandwidth utilization, active sessions, active Streams, active target connections, capacity, and a recommended Path count. Ingress measures per-Path RTT, jitter, loss, reordering, throughput, and connection establishment quality.
 
+Ingress publishes these observations through an atomic local snapshot provider.
+The provider also exposes node labels/tags, subscription generations, Session,
+Stream, target-connection, and policy state for structured management queries.
+Logs are supplementary diagnostics; current operational state and metrics are
+not reconstructed from log text. An optional authenticated Web Gateway may
+serve the snapshot and bounded change events to a frontend, while the
+authoritative local control API remains on a Unix socket or Named Pipe.
+
 Autoscaling adds Paths when effective aggregate capacity is insufficient and removes Paths cautiously after sustained surplus. Quality degradation reduces allocation quickly; recovery and scale-in are stabilized. A poor Path may be compensated by adding other Paths, but is excluded when its additional capacity is lower than its overhead.
 
 Subscription quota and traffic multiplier are optional reference metadata. They may produce tags or affect weight; they are not hard limits and do not directly change Egress connectivity.
@@ -106,3 +114,9 @@ Transparent entry does not perform domain routing. HTTP/SOCKS requests may route
 Egress topology, Egress public keys, and Ingress local private keys are static and require Ingress restart when changed. Transit Proxy lists are runtime data, refreshed from subscriptions into a disk cache and hot-reloaded. Failed refreshes keep the current list; deleted subscription Proxies drain.
 
 Rules are compiled at startup. The runtime maintains separate policy, Egress, Proxy, authentication, and metrics snapshots. Ingress internal traffic bypasses its own transparent interception to prevent loops.
+
+Ingress administrator metadata and subscription operations are control-plane
+mutations. They publish new generations atomically, use expected-generation
+checks for concurrent edits, and retain the last successful subscription
+snapshot after a failed refresh. Web/API adapters call the owning typed service
+and never edit configuration files or caches directly.

@@ -31,6 +31,8 @@
 - Name-based tag/label annotations.
 - Compiled ordered Egress and Proxy rules.
 - Runtime snapshots and listener IDs.
+- Ingress command/query service for administrator labels/tags and subscription lifecycle.
+- Atomic generations, audit events, and structured observation snapshots.
 
 ## Phase 4: multipath
 
@@ -51,7 +53,8 @@
 
 - Manual public-key enrollment on both ends.
 - Dynamic Egress authorization list.
-- Status and diagnostics CLI.
+- Local management API and status/diagnostics CLI.
+- Optional authenticated Web Gateway for frontend management and SSE observations.
 - Crash cleanup and network restoration.
 - Compatibility, restart, partition, proxy deletion, and quota tests.
 

@@ -295,20 +295,57 @@ Authorization changes are generation-based:
 
 The enrollment control API is outside the data Path protocol. It may modify the Egress authorization database or configuration file, but must use atomic generation updates and preserve the previous valid record if validation or persistence fails.
 
-## 18. Local management API
+## 18. Ingress control plane and management API
 
-The management API is local-only:
+Ingress owns a typed command/query service for node metadata, subscriptions,
+runtime snapshots, connections, metrics, and structured events. The service is
+separate from the binary data Path and is the only component allowed to publish
+mutable runtime snapshots.
+
+The authoritative local management API is local-only:
 
 ```text
 Linux   Unix domain socket
 Windows named pipe
 ```
 
-The `pathchord` CLI is the supported management client. The API authorizes callers through the operating-system ownership and permission model of the socket or pipe. It is not exposed through the Transit Proxy or Egress data Paths.
+The `pathchord` CLI is the supported local management client. The API
+authorizes callers through the operating-system ownership and permission model
+of the socket or pipe. It is not exposed through the Transit Proxy or Egress
+data Paths.
 
-Management messages use a length-prefixed UTF-8 JSON envelope. The envelope includes an API version, operation name, request ID, and typed request or response body. JSON is limited to the local management API; the data Path continues to use the dedicated binary frame codec.
+Management messages use a length-prefixed UTF-8 JSON envelope. The envelope
+includes an API version, operation name, request ID, and typed request or
+response body. Commands carry an actor, optional expected generation, and
+idempotency request ID. JSON is limited to management adapters; the data Path
+continues to use the dedicated binary frame codec.
 
-The running Egress process owns both the management API and the authorization store. The CLI never edits the database or configuration file directly; it submits an operation to Egress, and Egress performs the complete update.
+Ingress mutations include administrator node tag/label edits, subscription
+creation/deletion, and explicit subscription refresh. They publish dynamic
+snapshots atomically, require generation checks for concurrent updates, retain
+the last successful subscription snapshot after refresh failure, and produce
+structured audit events. `observed.*` and runtime-owned quota fields cannot be
+written through administrator metadata commands.
+
+Ingress also publishes structured observation snapshots and bounded event
+streams for nodes, Paths, Sessions, Streams, target connections, subscriptions,
+and policy generations. Current state and metrics MUST be queryable without
+parsing logs. `STATUS_REPORT` remains a compact authenticated data-Path health
+message and is not the management or metrics API.
+
+An optional authenticated Web Gateway provides the frontend access point. It
+calls the same typed command/query service and is disabled by default. The
+first web adapter is REST resources plus Server-Sent Events (SSE); a future
+GraphQL adapter may expose the same service if dashboard query composition
+justifies it. The gateway MUST NOT expose the local socket/pipe directly to a
+browser, and it MUST NOT be reachable through a Transit Proxy or data Path. A
+non-loopback bind requires explicit configuration, strong authentication,
+origin controls, rate limits, redaction, and audit logging.
+
+The running Egress process owns the Egress authorization store. The Ingress
+control service owns Ingress node/subscription snapshots. Clients never edit a
+database, configuration file, or subscription cache directly; they submit a
+typed operation to the owning service.
 
 Enrollment operations are transactional:
 

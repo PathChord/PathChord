@@ -15,7 +15,7 @@ This document selects the initial implementation technologies. It is intentional
 | Serialization | `serde` for configuration and management API models | Shared typed models without coupling the wire protocol to a text format |
 | Wire framing | Dedicated Rust codec using QUIC-style unsigned varints | Protocol requires explicit framing and does not depend on a general RPC schema |
 | Configuration | YAML for human-authored files, normalized into typed Rust snapshots | Readable static configuration while keeping runtime evaluation typed |
-| Local management API | Versioned length-delimited JSON messages over Unix Socket/Named Pipe | Local-only administration, easy inspection, and stable CLI/API boundary |
+| Control plane | Typed command/query service with versioned length-delimited JSON over Unix Socket/Named Pipe; optional authenticated web gateway | Keeps privileged local administration isolated while providing a browser integration point without coupling runtime state to one external API style |
 | Embedded state | SQLite for Egress authorization and durable local metadata | Atomic transactions, generation numbers, and easy inspection |
 | Rules | Dedicated restricted rule language compiled at startup | Deterministic evaluation and a narrow output model; no arbitrary host access |
 | Linux interception | `nix`/`socket2` plus platform-specific netlink and TPROXY code | Access to socket options and routing primitives without hiding kernel behavior |
@@ -42,6 +42,32 @@ pathchord-cli        local management API client and operational commands
 ```
 
 `pathchord-core` must not depend on Linux, Windows, subscription formats, or listener implementations. Platform adapters communicate through narrow traits for byte transport, local sockets, target dialing, and process metadata.
+
+## Ingress control plane and observability
+
+Ingress owns a typed command/query service for mutable node metadata,
+subscriptions, runtime snapshots, connection views, and structured events. The
+authoritative local adapter remains a Unix domain socket on Linux or a Named
+Pipe on Windows, using the versioned length-delimited JSON envelope selected by
+the protocol design.
+
+An optional Web Gateway calls the same service. It is disabled by default and
+is not reachable through Transit or data Paths. The first browser adapter is
+REST resources plus Server-Sent Events (SSE); a later GraphQL adapter may serve
+the same typed service if dashboard query composition justifies its additional
+authorization, query-cost, and subscription complexity. REST or GraphQL is an
+adapter choice, not the internal state model.
+
+Node label/tag edits, subscription create/delete/refresh, and other mutations
+are generation-checked, idempotent, audited commands. Dynamic snapshots replace
+atomically; a failed subscription refresh retains the last successful snapshot.
+The observation provider publishes typed node, Path, Session, Stream, target
+connection, subscription, and policy metrics. The Web Gateway exposes those
+snapshots and bounded event streams; operators must not reconstruct current
+state by parsing logs.
+
+`STATUS_REPORT` remains a compact authenticated data-Path message for Egress
+admission and health. It is not the management API or the metrics transport.
 
 ## Noise and record handling
 

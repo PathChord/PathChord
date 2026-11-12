@@ -6,7 +6,17 @@ This review compares the architecture, protocol, configuration, state-machine, i
 
 ## Review status
 
-The Session lifecycle, control ACK, identifier, DNS, and naming issues from this review have been applied to the main design documents. The remaining items are implementation specifications to be completed before the corresponding subsystem is built.
+The Session lifecycle, control ACK, identifier, DNS, naming, and frame-boundary
+issues from this review have been applied to the main design documents and the
+Phase 1 specifications under `docs/spec/`. The Ingress control-plane and
+observability specifications now define typed mutations, subscription refresh,
+structured snapshots, and an optional authenticated Web Gateway. Remaining
+items are implementation specifications for later subsystems, not permission
+to invent a different contract in code.
+
+Phase 1A is intentionally TCP-only. UDP payload codecs, Path drain/close
+payloads, multipath scheduling, management API implementation, and persistent
+SQLite operations remain explicitly deferred.
 
 ## Must fix before implementation
 
