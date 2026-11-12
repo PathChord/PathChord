@@ -1,5 +1,7 @@
 # PathChord
 
+**English** | [简体中文](README.zh-CN.md)
+
 Adaptive multipath proxy with Ingress, Transit Proxy, and Egress.
 
 PathChord provides ordinary proxy semantics to local applications while maintaining multiple replaceable transit paths between an Ingress and a selected Egress.
@@ -25,6 +27,7 @@ Design phase. The current repository contains the architecture and protocol desi
 - [State machines](docs/state-machines.md)
 - [Implementation plan](docs/implementation-plan.md)
 - [Technology selection](docs/technology-selection.md)
+- [Design review](docs/design-review.md)
 
 ## Planned commands
 

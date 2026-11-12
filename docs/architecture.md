@@ -1,5 +1,7 @@
 # PathChord Architecture
 
+**English** | [简体中文](architecture.zh-CN.md)
+
 ## 1. Scope
 
 PathChord supports Linux and Windows. Linux supports TPROXY, REDIRECT, and HTTP/SOCKS listeners. Windows supports TUN and system-proxy integration. Both platforms share the policy, node, Noise, Session, and multipath cores.
