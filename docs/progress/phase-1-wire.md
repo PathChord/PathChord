@@ -1,12 +1,10 @@
 # Phase 1 provisional wire contract
 
-This progress document freezes the payload contract used by the Phase 1
-single-path fixture. It supplements the final-state
-[protocol specification](../spec/protocol.md) with the temporary boundaries of
-the implemented slice. The numeric frame codes are deterministic within Phase 1
-but remain provisional until a compatibility registry is published. In
-particular, the fixture-specific EgressID prologue is not a final registry
-entry; see [implementation status](status.md#known-implementation-constraints).
+This progress document records the payload contract used by the historical
+Phase 1 single-path fixture. It is retained for implementation archaeology and
+does not define interoperability. The final-state bytes, registries, limits,
+and EgressID prologue are defined by the
+[wire profile v1](../spec/wire-profile.md).
 
 ## Common encoding
 

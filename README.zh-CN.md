@@ -8,7 +8,7 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 ## 状态
 
-目前处于初始实现阶段。本仓库包含设计基线、阶段 0 协议/传输原语、阶段 1A TCP 单 Path 实施范围与临时线协议契约，以及 core reliability/control-service 基础。代理数据面和 Web Gateway 适配器尚未实现。
+目前处于初始实现阶段。本仓库包含设计基线、`wire-profile-v1` 协议契约、Kubernetes 风格配置契约，以及阶段 0/阶段 1A reliability/control-service 基础。代理数据面和 Web Gateway 适配器尚未实现。
 
 ## 术语
 
@@ -32,7 +32,10 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 ### 规范
 
 - [协议](docs/spec/protocol.zh-CN.md)
+- [v1 线协议 profile](docs/spec/wire-profile.zh-CN.md)
 - [配置模型](docs/spec/configuration.zh-CN.md)
+- [配置 schema](docs/spec/configuration-schema.zh-CN.md)
+- [平台与 DNS](docs/spec/platform-and-dns.zh-CN.md)
 - [状态机](docs/spec/state-machines.zh-CN.md)
 - [Ingress 控制面](docs/spec/ingress-control-plane.zh-CN.md)
 - [Ingress 可观测性](docs/spec/observability.zh-CN.md)

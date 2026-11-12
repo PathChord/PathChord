@@ -4,7 +4,7 @@
 
 ## 1. 范围
 
-PathChord 支持 Linux 和 Windows。Linux 支持 TPROXY、REDIRECT 以及 HTTP/SOCKS 监听器。Windows 支持 TUN 和系统代理集成。两个平台共享策略、节点、Noise、Session 和多路径核心。
+PathChord 支持 Linux 和 Windows。两个平台都必须支持 HTTP/SOCKS 监听器。Linux 支持 TPROXY、REDIRECT，可以支持 TUN；Windows 通过控制面选择监听器来提供 TUN 和系统代理集成。两个平台共享策略、节点、Noise、Session 和多路径核心。
 
 系统支持 TCP、UDP 和独立 DNS。Fake-IP、通用 ICMP 转发、组播代理和任意 IP 隧道不在协议范围内。
 
@@ -91,8 +91,10 @@ Ingress 通过原子运行时快照 provider 发布这些观测数据。该 prov
 节点使用相互分离的命名空间：
 
 - `node`：静态标签/标记以及订阅派生的标签/标记。
+- `source`：导入的订阅身份和来源元数据。
 - `observed`：运行时 Path 质量和健康状态标签。
 - `quota`：可选的订阅配额参考信息。
+- `billing`：可选的流量倍率参考元数据。
 - `admin`：管理状态。
 
 本地覆盖优先于订阅注解。管理员禁用、授权撤销和断开连接等硬状态不能被偏好标签覆盖。
@@ -101,12 +103,14 @@ Ingress 通过原子运行时快照 provider 发布这些观测数据。该 prov
 
 多个 HTTP/SOCKS 监听器各自具有唯一 ID，并参与策略评估。监听器认证和来源网络限制独立于 Ingress 到 Egress 的 Noise 认证。
 
+Windows 系统代理集成是控制面开关，按 ID 选择一个 HTTP/SOCKS 监听器。Linux 不暴露系统代理激活模式；其监听器仍可通过控制面查看。
+
 透明入口不执行域名路由。HTTP/SOCKS 请求显式携带域名，因此可以按域名路由。DNS 独立运行，并选择查询的解析位置：本地、通过 Transit Proxy、通过选定的 Egress，或阻止查询。不使用 Fake-IP 映射。
 
 ## 11. 配置生命周期
 
 Egress 拓扑、Egress 公钥和 Ingress 本地私钥属于静态配置，发生变更时需要重启 Ingress。Transit Proxy 列表是运行时数据，从订阅刷新到磁盘缓存并热重载。刷新失败时保留当前列表；订阅中已删除的 Proxy 进入排空状态。
 
-规则在启动时编译。运行时分别维护策略、Egress、Proxy、认证和指标快照。Ingress 内部流量绕过自身的透明拦截，以防止形成环路。
+静态规则配置在启动时编译。订阅派生数据和获准的动态规则快照可以在后台编译并原子热重载。运行时分别维护策略、Egress、Proxy、认证和指标快照。Ingress 内部流量绕过自身的透明拦截，以防止形成环路。
 
 Ingress 管理员元数据和订阅操作属于控制面 mutation。它们原子发布新的代次，使用期望代次检查处理并发编辑；刷新失败时保留最近一次成功的订阅快照。Web/API 适配器调用拥有者的类型化 service，不能直接编辑配置文件或缓存。

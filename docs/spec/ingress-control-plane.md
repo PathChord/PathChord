@@ -4,17 +4,10 @@
 
 This document defines the local control plane used to operate Ingress and the
 optional web gateway used by a frontend. It is separate from the PathChord data
-Path. It covers node label/tag edits, subscription lifecycle operations, manual
-refresh, and structured node/connection queries.
+Path. All adapters call the same typed command/query service; they MUST NOT edit
+configuration files, subscription caches, or databases directly.
 
-The control plane is an adapter over a typed internal command/query service. A
-CLI, a local web gateway, and automation clients use the same service;
-they MUST NOT edit configuration files, caches, or databases directly.
-
-The service provides bounded command execution, atomic snapshots, persistence,
-subscription workers, and authorization through a shared typed interface.
-
-## Architecture
+## Architecture and envelope
 
 ```text
 pathchord CLI --------------------+
@@ -27,64 +20,81 @@ Unix socket / named pipe ----------+             +--> atomic snapshots
                                                  +--> metrics registry
 ```
 
-The privileged local adapter is:
+The required privileged local adapter is a Unix domain socket on Linux and a
+Named Pipe on Windows. The operating-system owner/ACL is the first
+authorization boundary. The optional Web Gateway is a separate process/task
+boundary, disabled by default, and MUST NOT be reachable through a Transit
+Proxy or Egress data Path. A non-loopback bind additionally requires explicit
+configuration, a protected channel, strong authentication, an origin allowlist,
+rate limits, redaction, and an administrator-visible audit record.
 
-```text
-Linux    Unix domain socket
-Windows  named pipe
+The local protocol is a length-prefixed UTF-8 JSON envelope. The length is one
+canonical unsigned QUIC-style varint and counts the UTF-8 bytes of exactly one
+JSON object. The maximum envelope is 1 MiB; a zero length, truncated prefix,
+non-canonical varint, trailing bytes, or a larger object is rejected before
+JSON allocation.
+
+Every request has this shape:
+
+```json
+{
+  "api_version": "1",
+  "operation": "nodes.patch_labels",
+  "request_id": "01JEXAMPLE",
+  "actor": {"id": "local-admin", "capabilities": ["nodes:write"]},
+  "expected_generation": {"scope": "configuration", "value": 12},
+  "body": {"node_id": "provider-a-node-01", "set": {"admin.region": "jp"}, "remove": []}
+}
 ```
 
-The operating-system owner/ACL of the socket or pipe is the first authorization
-boundary. The local protocol uses a length-prefixed UTF-8 JSON
-envelope with API version, operation name, request ID, and typed body.
+Every response has `api_version`, the echoed `request_id`, a boolean `ok`, and
+`observed_generation`. Success responses contain `result`; failures contain a
+typed `error` object with `code`, safe `message`, and typed `details`:
 
-The web gateway is optional and MUST be a separate process/task boundary from
-the data Path. It MAY bind to loopback by default. If it binds beyond loopback,
-it MUST require explicit configuration, TLS or an equivalent protected channel,
-strong authentication, an origin allowlist, and an administrator-visible audit
-record for the exposure.
+```json
+{
+  "api_version": "1",
+  "request_id": "01JEXAMPLE",
+  "ok": false,
+  "observed_generation": {"scope": "configuration", "value": 12},
+  "error": {"code": "GENERATION_CONFLICT", "message": "generation mismatch", "details": {"expected": 11, "current": 12}}
+}
+```
 
-The web gateway calls the same typed service as the CLI. It MUST NOT expose the
-Unix socket or named pipe directly to a browser, and it MUST NOT be reachable
-through a Transit Proxy or Egress data Path.
+`observed_generation` is the observation-provider generation captured for the
+response. Resources expose their owning `generation` or `revision` as well.
+Mutation preconditions use the explicit scope/value object and never infer a
+scope from an integer.
 
-The local Unix socket/named-pipe adapter is required. An optional web gateway
-MUST preserve the same redaction, audit, and generation semantics as the local
-command/query service.
+## Resource model and queries
 
-## API adapter choice
-
-The selected built-in web adapter is REST plus Server-Sent Events (SSE).
-
-A GraphQL adapter MAY map the same typed command/query service to queries,
-mutations, and subscriptions. It MUST preserve the resource ownership,
-authorization, redaction, audit, idempotency, generation, and resource-limit
-contracts defined here. GraphQL errors MUST expose the corresponding typed
-failure, and subscriptions MUST preserve event ordering and snapshot recovery
-when replay is unavailable. The internal service and generation semantics MUST
-remain independent of the external adapter.
-
-## Resource model
-
-All responses include `api_version`, `request_id`, and `observed_generation`.
-Resources use stable opaque IDs and expose a `generation` or `revision` where
-updates can race.
+Stable opaque IDs are used for resources. List endpoints support bounded
+`page_size` (default 100, maximum 1000), opaque `page_token`, a typed `filter`,
+and a bounded `sort` field with an explicit ascending/descending direction.
+Unknown filters, sort fields, and query parameters are rejected. A list result
+contains `items`, `next_page_token` (null at end), and the response metadata.
 
 The REST query resources are:
 
 ```text
-GET  /api/v1/status
-GET  /api/v1/nodes
-GET  /api/v1/nodes/{node_id}
-GET  /api/v1/sessions
-GET  /api/v1/sessions/{session_id}
-GET  /api/v1/connections
-GET  /api/v1/subscriptions
-GET  /api/v1/metrics/snapshot
-GET  /api/v1/events              (SSE)
+GET /api/v1/status
+GET /api/v1/nodes
+GET /api/v1/nodes/{node_id}
+GET /api/v1/sessions
+GET /api/v1/sessions/{session_id}
+GET /api/v1/connections
+GET /api/v1/listeners
+GET /api/v1/subscriptions
+GET /api/v1/authorizations
+GET /api/v1/authorizations/{ingress_id}
+GET /api/v1/system-proxy
+GET /api/v1/metrics/snapshot
+GET /api/v1/metrics/paths
+GET /api/v1/metrics/streams
+GET /api/v1/events (SSE)
 ```
 
-Node responses separate namespaces and ownership:
+Node responses preserve ownership namespaces:
 
 ```text
 node.*       static identity and protocol attributes
@@ -94,97 +104,131 @@ observed.*   runtime-owned health and quality values
 quota.*      provider quota metadata
 ```
 
-The API MUST preserve the distinction between imported, administrator-owned,
-and runtime-owned data. A client cannot write `observed.*` or `quota.*` through
-the label mutation endpoint. Hard states such as revoked, disabled, or
-disconnected are returned as typed state, not as an overridable preference tag.
+Clients MUST NOT write `source.*`, `observed.*`, `quota.*`, or hard state
+fields through label/tag operations. Hard states are typed values, not
+overridable preference tags.
 
-## Commands and mutations
+## Operation registry
 
-Mutations are commands submitted to the typed service. Each command carries a
-client `request_id`, actor identity, and optional expected generation.
-
-Node metadata:
+The following operation names are normative; REST adapters map their resources
+to the same operations:
 
 ```text
-PATCH /api/v1/nodes/{node_id}/labels
-PATCH /api/v1/nodes/{node_id}/tags
+status.get
+nodes.list             nodes.get
+nodes.patch_labels     nodes.patch_tags
+sessions.list          sessions.get
+connections.list
+listeners.list
+subscriptions.list     subscriptions.create
+subscriptions.delete   subscriptions.enable
+subscriptions.disable  subscriptions.refresh
+authorizations.list    authorizations.get
+authorizations.enroll  authorizations.enable
+authorizations.disable authorizations.revoke
+authorizations.delete
+metrics.snapshot       metrics.paths
+metrics.streams         events.subscribe
+system_proxy.get        system_proxy.enable
+system_proxy.disable
 ```
 
-The body contains a complete operation, not an arbitrary JSON merge:
+Node patch bodies are complete operations, not arbitrary JSON merge patches:
 
 ```json
 {
-  "expected_generation": 12,
+  "node_id": "provider-a-node-01",
   "set": {"admin.region": "jp"},
   "remove": ["admin.temporary"]
 }
 ```
 
-Setting an imported or runtime namespace is rejected. A successful mutation
-atomically publishes a new snapshot generation and returns the changed fields.
+Subscription create/refresh bodies contain a source reference, validation
+policy, enabled state, and current revision. A successful refresh publishes one
+dynamic configuration generation; a failed refresh retains the last successful
+snapshot and returns a typed failure. Delete drains nodes imported solely from
+the source.
 
-Subscription lifecycle:
+The system-proxy switch is a runtime control-plane mutation, not a YAML
+resource. `system_proxy.enable` MUST include `listener_id`, which MUST resolve
+to an HTTP or SOCKS Listener. Windows applies that listener to environment and
+operating-system proxy settings; `system_proxy.disable` restores the previous
+values. Linux returns `UNSUPPORTED_OPERATION` for both activation and disable
+and continues to expose ordinary listeners through `nodes` and status.
 
 ```text
-POST   /api/v1/subscriptions
-DELETE /api/v1/subscriptions/{subscription_id}
-POST   /api/v1/subscriptions/{subscription_id}/refresh
+GET  /api/v1/system-proxy
+POST /api/v1/system-proxy/enable
+     {"listener_id":"local-http"}
+POST /api/v1/system-proxy/disable
 ```
 
-`POST /subscriptions` creates a disabled-or-enabled subscription according to
-the request, validates its source and policy, and publishes one generation.
-Delete removes the subscription from future refreshes and moves its imported
-nodes into the documented draining behavior. Refresh is explicit and MAY also
-be scheduled by the worker; a failed refresh retains the last successful
-snapshot.
+The response and `system_proxy.changed` event include `enabled`, the selected
+`listener_id` when present, platform effect, and restoration/error state. On
+Linux, `GET` returns `enabled: false` with `platform_effect: unsupported`.
 
-All mutations are idempotent by `(actor_id, request_id)`. Replaying an identical
-request returns the original result. Reusing a request ID with a different body
-is rejected. A mutation that changes an authorization or hard runtime state MUST
-return the resulting state and the affected Session/Path cleanup summary.
+Authorization operations use the Egress-owned store:
 
-## Generation and concurrency
+```text
+POST   /api/v1/authorizations
+POST   /api/v1/authorizations/{ingress_id}/enable
+POST   /api/v1/authorizations/{ingress_id}/disable
+POST   /api/v1/authorizations/{ingress_id}/revoke
+DELETE /api/v1/authorizations/{ingress_id}
+```
 
-Every mutable snapshot has a monotonically increasing generation. A command that
-changes a snapshot MUST include either:
+An enrollment body contains `ingress_id`, a 32-byte public key encoded as
+lowercase base64url without padding, the canonical `egress_id`, optional admin
+labels/limits, and `expected_generation`. Enable permits new Paths. Disable
+and revoke both immediately reject new handshakes and terminate matching live
+Paths, Sessions, Streams, UDP Associations, and Egress target connections.
+Revoke is terminal for that record identity; delete removes the record only
+after its live-resource cleanup has completed. Every authorization mutation
+returns the applied generation, effective state, and a cleanup summary.
 
-- `expected_generation`, which must equal the currently published generation; or
-- an explicit `force` capability granted only to an authorized administrator.
+## Generation, idempotency, and errors
 
-An expected-generation mismatch returns HTTP `409 Conflict` in REST and a
-typed `GENERATION_CONFLICT` error in the local JSON protocol. The response
-contains current generation, requested generation, and a fresh resource summary.
-No partial mutation is published on conflict, validation failure, or persistence
-failure.
+Mutable generations have one of three scopes: `configuration` for static and
+dynamic policy snapshots, `observation` for runtime snapshots, and
+`authorization` for the Egress authorization store. A mutation MUST carry an
+`expected_generation` for its owning scope, or an explicitly authorized
+`force` capability. A conflict publishes no partial change.
 
-Static Egress topology and local key material remain restart-required. Dynamic
-Transit data, administrator labels/tags, and compiled policy snapshots publish
-atomically. Existing Sessions retain their admission generation except for hard
-revocation or Egress failure.
+All mutations are idempotent by `(actor.id, request_id)`. Replaying the same
+request returns the original response. Reusing a request ID with a different
+canonical request body returns `IDEMPOTENCY_CONFLICT`. Idempotency records are
+retained until the owning generation is superseded and for at least 24 hours,
+whichever is longer.
+
+Stable error codes are:
+
+```text
+MALFORMED_REQUEST       invalid envelope or JSON
+AUTHENTICATION_REQUIRED missing or invalid actor authentication
+CAPABILITY_DENIED       actor lacks the required capability
+VALIDATION_FAILED       typed field or policy validation failed
+NOT_FOUND               resource does not exist
+GENERATION_CONFLICT     expected generation is stale
+IDEMPOTENCY_CONFLICT    request ID was reused with a different body
+RESOURCE_LIMIT          a bounded service resource was exhausted
+PERSISTENCE_UNAVAILABLE durable store or audit sink is unavailable
+UNSUPPORTED_OPERATION   operation or API version is not supported
+```
+
+REST maps these to `400`, `401/403`, `404`, `409`, `429`, and `500/503` as
+appropriate. Local callers receive the same typed code. Error messages are
+diagnostic only and never contain secrets, filesystem paths, peer-provided
+arbitrary text, or complete request bodies.
 
 ## Authentication and audit
 
-The local socket/pipe uses OS ownership and ACLs as the primary authorization
-boundary. The service still assigns an actor identity and capability set to each
-request. Suggested capabilities are:
+The local socket/pipe uses OS ownership and ACLs as the primary boundary. The
+service assigns an actor and capabilities for every request. Standard
+capabilities are `status:read`, `metrics:read`, `nodes:read`, `nodes:write`,
+`listeners:read`, `subscriptions:write`, `authorization:write`, and
+`system_proxy:write`.
 
-```text
-status:read
-metrics:read
-nodes:read
-nodes:write
-subscriptions:write
-authorization:write
-```
-
-The web gateway MUST require an authenticated administrator session. A browser
-session MUST use CSRF protection for mutations, an origin allowlist, bounded
-request bodies, and strict content types. Tokens, private keys, subscription
-URLs, raw authorization records, and unredacted target data MUST NOT appear in
-responses, SSE events, or audit records.
-
-Every mutation and authentication failure produces a structured audit event:
+Every mutation and authentication failure emits an audit event containing:
 
 ```text
 event_id, timestamp, actor_id, source, operation, request_id,
@@ -192,29 +236,20 @@ target_resource, expected_generation, applied_generation, result, reason
 ```
 
 Audit records contain identifiers and outcome metadata, not secrets or complete
-request bodies. Audit writes SHOULD be durable before a successful mutation
-response; if the audit sink is unavailable, the service follows an explicit
-fail-closed policy for authorization mutations and reports degraded status for
-non-sensitive metadata operations.
+request bodies. Authorization mutations fail closed if a durable audit write
+cannot be completed; non-sensitive metadata operations report degraded status.
 
-## Rate and resource limits
+## Resource limits
 
-The gateway and local service MUST bound:
+The local service and Web Gateway MUST bound concurrent requests per actor and
+globally, envelope/request/response sizes, refresh frequency and worker count,
+SSE connections and replay backlog, page size, and label/tag cardinality and
+key/value lengths. A limit breach returns `RESOURCE_LIMIT`/HTTP `429`, includes
+a retry hint, and publishes no mutation.
 
-- concurrent requests per actor and globally;
-- request body and response sizes;
-- subscription refresh frequency and concurrent refresh workers;
-- SSE connections, event backlog, and per-client replay window;
-- node label/tag cardinality and key/value lengths.
+## REST and SSE contract
 
-Rate-limit responses use HTTP `429` with a retry hint. Local callers receive a
-typed `RESOURCE_LIMIT` error. A limit breach MUST NOT mutate a snapshot or
-silently drop a successful command.
-
-## REST and SSE conventions
-
-REST uses JSON for control-plane payloads only. The data Path remains the
-dedicated binary frame protocol. REST status mapping is:
+REST uses JSON only for control-plane payloads. Status mapping is:
 
 ```text
 200/201  successful query or mutation
@@ -223,21 +258,36 @@ dedicated binary frame protocol. REST status mapping is:
 404      unknown resource
 409      generation or idempotency conflict
 429      rate/resource limit
-500/503  unavailable persistence or service dependency
+500/503  unavailable persistence, audit, or service dependency
 ```
 
-SSE starts with a snapshot event and then emits ordered events with an event ID
-and generation. A client reconnects with `Last-Event-ID`; if the replay window
-does not contain that event, the server sends a fresh snapshot before deltas.
-Events are typed (`node.changed`, `subscription.refresh`, `session.changed`,
-`connection.changed`, `metrics.snapshot`, `audit.notice`) and are redacted for
-the requesting actor.
+The canonical SSE event registry is shared with the observability
+specification:
+
+```text
+metrics.snapshot
+node.changed
+path.changed
+session.changed
+stream.changed
+connection.changed
+subscription.changed
+authorization.changed
+system_proxy.changed
+audit.notice
+```
+
+Each event contains `id`, `type`, `generation`, `emitted_at`, `resource_type`,
+`resource_id`, and a typed `payload`. `generation` uses the same
+`{scope,value}` form as response metadata; a resource payload MAY additionally
+carry its own `revision`. Events are ordered per Ingress process.
+`Last-Event-ID` either replays from the bounded buffer or causes a complete
+snapshot event before new deltas. Query and event payloads use the same actor
+authorization and redaction policy.
 
 ## Explicit boundaries
 
-The control plane does not replace data-Path `STATUS_REPORT`. `STATUS_REPORT` is
-a compact Egress-to-Ingress protocol message used for Path/session admission and
-remote health. Control-plane status and metrics are local structured views that
-may combine runtime observations, policy generations, subscription state, and
-connection details. They must not be tunneled through or inferred solely from
-data-Path messages.
+The control plane does not replace data-Path `STATUS_REPORT`. That message is
+used for Path/Session admission and remote health; local status and metrics are
+structured views owned by the control service. Clients never edit a database,
+configuration file, or subscription cache directly.

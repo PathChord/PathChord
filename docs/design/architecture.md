@@ -4,7 +4,7 @@
 
 ## 1. Scope
 
-PathChord supports Linux and Windows. Linux supports TPROXY, REDIRECT, and HTTP/SOCKS listeners. Windows supports TUN and system-proxy integration. Both platforms share the policy, node, Noise, Session, and multipath cores.
+PathChord supports Linux and Windows. Both platforms MUST support HTTP/SOCKS listeners. Linux supports TPROXY and REDIRECT and MAY support TUN; Windows supports TUN and system-proxy integration through a control-plane listener selection. Both platforms share the policy, node, Noise, Session, and multipath cores.
 
 The system supports TCP, UDP, and independent DNS. Fake-IP, general ICMP forwarding, multicast proxying, and arbitrary IP tunneling are outside the protocol scope.
 
@@ -97,8 +97,10 @@ Subscription quota and traffic multiplier are optional reference metadata. They 
 Nodes have separated namespaces:
 
 - `node`: static and subscription-derived labels/tags.
+- `source`: imported subscription identity and source metadata.
 - `observed`: runtime path quality and health labels.
 - `quota`: optional subscription quota reference.
+- `billing`: optional traffic-multiplier reference metadata.
 - `admin`: administrative state.
 
 Local overrides take precedence over subscription annotations. Hard states such as administrative disable, authorization revocation, and disconnection cannot be overridden by preference tags.
@@ -107,13 +109,19 @@ Local overrides take precedence over subscription annotations. Hard states such 
 
 Multiple HTTP/SOCKS listeners have unique IDs and participate in policy evaluation. Listener authentication and source-network restrictions are independent of Ingress-to-Egress Noise authentication.
 
+Windows system-proxy integration is a control-plane switch that selects one HTTP/SOCKS listener by ID. Linux does not expose a system-proxy activation mode; its listeners remain inspectable through the control plane.
+
 Transparent entry does not perform domain routing. HTTP/SOCKS requests may route by domain because they carry the domain explicitly. DNS is independent and selects where a query is resolved: local, through a Transit Proxy, through the selected Egress, or blocked. No Fake-IP mapping is used.
 
 ## 11. Configuration lifecycle
 
 Egress topology, Egress public keys, and Ingress local private keys are static and require Ingress restart when changed. Transit Proxy lists are runtime data, refreshed from subscriptions into a disk cache and hot-reloaded. Failed refreshes keep the current list; deleted subscription Proxies drain.
 
-Rules are compiled at startup. The runtime maintains separate policy, Egress, Proxy, authentication, and metrics snapshots. Ingress internal traffic bypasses its own transparent interception to prevent loops.
+Static rule configuration is compiled at startup. Subscription-derived data and
+approved dynamic rule snapshots may be compiled off-thread and hot-reloaded
+atomically. The runtime maintains separate policy, Egress, Proxy,
+authentication, and metrics snapshots. Ingress internal traffic bypasses its own
+transparent interception to prevent loops.
 
 Ingress administrator metadata and subscription operations are control-plane
 mutations. They publish new generations atomically, use expected-generation

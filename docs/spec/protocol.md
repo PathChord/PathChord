@@ -2,16 +2,59 @@
 
 **English** | [简体中文](protocol.zh-CN.md)
 
+The interoperable bytes for protocol version 1 are defined by the
+[wire profile](wire-profile.md). This document owns behavior and invariants;
+it does not define a second encoding.
+
+## Abstract
+
+This specification defines the PathChord protocol: an authenticated,
+multipath logical channel between one Ingress and one Egress, carrying TCP
+Streams, UDP Associations, control messages, and health reports over one or
+more Transit Proxy Paths. It defines protocol behavior, lifecycle invariants,
+failure propagation, scheduling responsibilities, and management boundaries.
+The normative v1 byte layout and registries are defined by the companion
+[wire profile](wire-profile.md).
+
+## Status of This Specification
+
+This document is the final behavioral contract for the PathChord protocol.
+Implementations claiming conformance MUST implement the requirements in this
+document and the referenced `wire-profile-v1` document together.
+
+## Conventions and Requirements
+
+The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
+**SHOULD**, **SHOULD NOT**, **RECOMMENDED**, **NOT RECOMMENDED**, **MAY**, and
+**OPTIONAL** in this document are to be interpreted as described in
+[RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and
+[RFC 8174](https://www.rfc-editor.org/rfc/rfc8174). These terms have normative
+force only when they appear in uppercase.
+
+## Terminology
+
+* **Ingress** is the local policy and traffic entry point.
+* **Transit Proxy** is an uncontrolled transport used to reach an Egress.
+* **Egress** is the authenticated final traffic exit.
+* **Session** is the logical channel between exactly one Ingress and one Egress.
+* **Path** is one authenticated, long-lived physical link in a Session.
+* **Stream** is one ordered target TCP byte stream in a Session.
+* **UDP Association** is one Egress-side UDP socket context in a Session.
+
 ## 1. Cryptography
 
-Use `Noise_IK_25519_ChaChaPoly_SHA256` through a mature implementation.
+Implementations MUST use `Noise_IK_25519_ChaChaPoly_SHA256` through a mature
+implementation.
 
 - Ingress and Egress each have a static Curve25519 key pair.
 - The Egress public key is static Ingress configuration.
 - Egress stores the authorized Ingress public-key list; enrollment changes this list dynamically.
 - Every Path performs its own Noise handshake and receives independent transport keys.
-- Do not reuse WireGuard private keys for PathChord.
-- No X.509 CA, PGP, TOFU, or automatic first-use trust is required.
+- Implementations MUST NOT reuse WireGuard private keys for PathChord.
+- PathChord MUST NOT use X.509 CA, PGP, TOFU, or automatic first-use trust.
+- The crypto provider MUST zeroize every private-key, DH, and traffic-key
+  buffer it owns, including resolver-owned state. A provider that cannot make
+  this guarantee is not conforming for deployed PathChord paths.
 
 ## 2. Protocol layers
 
@@ -62,34 +105,38 @@ CONTROL_ACK
 SESSION_CLOSE
 ```
 
-Version and capability negotiation is part of `PATH_HELLO`. `STATUS_REPORT` is the canonical Egress-status name, and `HEARTBEAT` provides Path liveness. Operations with a result use their specific success and error frames, such as `STREAM_OPEN_OK` and `STREAM_OPEN_ERR`, rather than a generic `ERROR` frame.
+Version and capability negotiation is part of `PATH_HELLO` and follows the
+[wire profile registry](wire-profile.md#frame-envelope). `STATUS_REPORT` is the
+canonical Egress-status name, and `HEARTBEAT` provides Path liveness. Operations
+with a result use their specific success and error frames, such as
+`STREAM_OPEN_OK` and `STREAM_OPEN_ERR`, rather than a generic `ERROR` frame.
 
-Control traffic has reserved capacity. A Session requires at least one active Path; loss of the last Path terminates the Session. Status reports, heartbeats, and Session control messages use the currently available Paths, with a Session control sequence number for duplicate suppression. Control messages may optionally carry a dependency sequence number when execution order matters. Any available Path may carry any control or data exchange.
+Control traffic has reserved capacity. A Session requires at least one active Path; loss of the last Path terminates the Session. Status reports, heartbeats, and Session control messages use the currently available Paths, with a Session control sequence number for duplicate suppression. Control messages MAY optionally carry a dependency sequence number when execution order matters. Any available Path MAY carry any control or data exchange.
 
-Control messages are replicated across multiple currently available Paths by default. The receiver applies each `control_seqno` at most once, so replication is safe. `CONTROL_ACK` reports the highest contiguous applied sequence and optional selective ranges. The sender retains unacknowledged control messages and retransmits them until acknowledged or until the Session closes.
+Control messages are replicated across multiple currently available Paths by default. The receiver applies each `control_seqno` at most once, so replication is safe. `CONTROL_ACK` reports the highest contiguous applied sequence and OPTIONAL selective ranges. The sender retains unacknowledged control messages and retransmits them until acknowledged or until the Session closes.
 
 ## 5. TCP Streams
 
-A Stream represents one target TCP connection inside exactly one Ingress-to-Egress Session. Data is framed with a Stream offset and can be split across multiple bidirectional Paths. Frames may arrive out of order; the receiver reorders them by offset before writing contiguous bytes to the target connection. A Stream may migrate between Paths without changing its identity or target connection.
+A Stream represents one target TCP connection inside exactly one Ingress-to-Egress Session. Data is framed with a Stream offset and can be split across multiple bidirectional Paths. Frames MAY arrive out of order; the receiver reorders them by offset before writing contiguous bytes to the target connection. A Stream MAY migrate between Paths without changing its identity or target connection.
 
-Required semantics:
+REQUIRED semantics:
 
 - ordered byte delivery;
 - half-close in each direction;
 - target FIN/RST propagation;
 - per-Stream and Session flow control;
 - ACK ranges and duplicate suppression;
-- cross-Path retransmission for unacknowledged data; retransmission may use any currently compliant Path. Replication of retransmissions is policy-controlled per traffic class and may be enabled or disabled by the Egress default policy;
+- cross-Path retransmission for unacknowledged data; retransmission MAY use any currently compliant Path. Replication of retransmissions is policy-controlled per traffic class and MAY be enabled or disabled by the Egress default policy;
 - bounded reordering buffers;
 - backpressure instead of silently dropping TCP bytes.
 
-A connect request carries a unique RequestID. Retrying the request on another Path must be idempotent at Egress so an uncertain response cannot create a second target connection. `STREAM_OPEN` carries the original hostname when available and may also carry resolved address candidates; Egress applies its configured DNS policy. If the Session is gone and the result is uncertain, fail the local connection and let the application retry.
+A connect request carries a unique RequestID. Retrying the request on another Path MUST be idempotent at Egress so an uncertain response cannot create a second target connection. `STREAM_OPEN` carries the original hostname when available and MAY also carry resolved address candidates; Egress applies its configured DNS policy. If the Session is gone and the result is uncertain, fail the local connection and let the application retry.
 
 ## 6. UDP sessions
 
 A UDP session is bound to one Egress and one Egress-side socket context. TCP and UDP are both independent of Path identity. Path migration does not recreate or rebind the Egress-side socket, so the target-visible address and port remain unchanged.
 
-UDP preserves datagram boundaries. Ordinary application datagrams are not retransmitted by the aggregation layer and may be dropped when expired or over budget. Control messages remain reliable. If a reliable byte-stream transport carries the Path, its own head-of-line behavior is accepted as an implementation limitation.
+UDP preserves datagram boundaries. Ordinary application datagrams are not retransmitted by the aggregation layer and MAY be dropped when expired or over budget. Control messages remain reliable. If a reliable byte-stream transport carries the Path, its own head-of-line behavior is accepted as an implementation limitation.
 
 ## 7. Path scheduling
 
@@ -97,42 +144,43 @@ Ingress owns Path creation and admission. Path state is transparent to Streams a
 
 Per-Path scheduling uses effective-capacity weighting: the configured Proxy-to-Egress relationship weight establishes the baseline, then each Path's reported effective capacity, congestion window, RTT, jitter, and loss adjust its current share. Multiple Paths through one Transit Proxy share the relationship weight, while their observed capacities determine how that relationship's share is distributed.
 
-Retransmission replication is limited by two budgets: a Session-wide replication budget and an optional per-traffic-class budget. A traffic-class budget may further restrict replication but may never exceed the remaining Session-wide budget. Control messages use the default control replication policy and are accounted against the Session budget.
+Retransmission replication is limited by two budgets: a Session-wide replication budget and an OPTIONAL per-traffic-class budget. A traffic-class budget MAY further restrict replication but MAY never exceed the remaining Session-wide budget. Control messages use the default control replication policy and are accounted against the Session budget.
 
 ## 8. Versioning
 
-Session creation negotiates protocol version and capabilities. Required capability mismatch rejects the Egress from the effective rule set. Optional capabilities are selected by intersection. All Paths in one Session use the same Session semantics.
+Session creation negotiates `wire-profile-v1` and its registered capabilities.
+REQUIRED capability mismatch rejects the Egress from the effective rule set.
+OPTIONAL capabilities are selected by intersection. All Paths in one Session
+use the same Session semantics. Version, capability IDs, and rejection behavior
+are defined in [wire-profile-v1](wire-profile.md).
 
 ## 9. Frame format and numbering
 
 Each encrypted Path record contains one Path frame. Noise provides
-confidentiality and integrity. The frame header must be authenticated; a
-versioned transport framing may encrypt it with the payload or leave it clear
-and supply it as associated data. Each protocol version defines a canonical
-record envelope containing an explicit nonce, ciphertext length, and exactly
-that many ciphertext bytes. A record decoder rejects an envelope that is
-truncated, oversized, or followed by trailing bytes within that record. A
-byte-stream adapter uses the length field to separate consecutive envelopes.
+confidentiality and integrity. The canonical record envelope, frame header,
+frame registry, and malformed-input behavior are defined by
+[wire-profile-v1](wire-profile.md#noise-record-envelope); v1 has one layout and
+does not permit an alternative clear-header or associated-data form.
 
 Path records use explicit Noise transport nonces so whole-record loss,
 duplication, and reordering do not desynchronize cipher state. The record
 envelope carries the nonce needed before decryption. Each direction allocates
 monotonically increasing outbound nonces and binds each nonce to the
-authenticated `frame_seq`. Nonces must not wrap; exhaustion closes the Path and
-requires a fresh handshake on a new Path. A sender must never encrypt different
+authenticated `frame_seq`. Nonces MUST NOT wrap; exhaustion closes the Path and
+requires a fresh handshake on a new Path. A sender MUST NOT encrypt different
 plaintexts with the same nonce and directional Path key; retransmission of the
 same encrypted record reuses its original ciphertext. After successful
 authentication, each direction applies a bounded replay window. Duplicate or
 stale sequences are discarded before Session/control processing, and an
-authentication failure or nonce/header mismatch must not advance the window.
-The replay bound and ACK/retransmission retention rules must be compatible. A
+authentication failure or nonce/header mismatch MUST NOT advance the window.
+The replay bound and ACK/retransmission retention rules MUST be compatible. A
 new encrypted copy of a control message or Stream range uses a
 fresh Path frame sequence while preserving its Session-level control sequence
 or Stream range identity.
 
-The common frame header contains:
+The common frame header contains the fields specified by the profile:
 
-```text
+~~~text
 version        protocol version
 type           frame type
 flags          frame-specific flags
@@ -140,7 +188,7 @@ session_id     logical Session identifier
 path_id        sending Path identifier
 frame_seq      monotonically increasing sequence on this Path
 payload_len    payload length
-```
+~~~
 
 `session_id` identifies the Ingress-to-Egress logical channel. `path_id` identifies only the physical Path and has no meaning to Streams. `frame_seq` is used for Path-level duplicate detection, diagnostics, and loss accounting; it is not a Stream byte offset. SessionID and PathID are 128-bit random values; RequestID is a 128-bit random value; StreamID is a 62-bit locally allocated value and is never reused within a Session.
 
@@ -148,17 +196,24 @@ TCP and other reliable byte streams use a separate data header:
 
 ```text
 stream_id      Stream identifier within the Session
-direction      Ingress-to-Egress or Egress-to-Ingress
 offset         first byte offset in this frame
 data_len       number of bytes represented by the frame
 stream_flags   FIN, RST, or half-close flags
 ```
 
-ACK frames carry one or more inclusive offset ranges for a `(stream_id, direction)` pair. A receiver may acknowledge ranges out of order. Duplicate ranges are harmless and may be repeated on multiple Paths.
+The direction is derived from the authenticated endpoint that sent the Path
+frame; it is not encoded a second time in the v1 payload. `STREAM_ACK` confirms
+ranges received from the peer, so its acknowledged direction is the opposite of
+the authenticated sender direction. A peer MUST NOT supply a conflicting
+direction field.
 
-Retransmission does not allocate a new Stream offset. A retransmitted frame carries the same Stream range and may use a different `path_id`; replicated copies are deduplicated by the Stream range.
+ACK frames carry one or more inclusive offset ranges for the direction inferred
+from the authenticated sender role. A receiver MAY acknowledge ranges out of
+order. Duplicate ranges are harmless and MAY be repeated on multiple Paths.
 
-Session control frames use a Session-wide `control_seqno`. A control frame may include an optional `depends_on` sequence number. Receivers discard an already applied sequence number, and defer a frame whose dependency has not been applied. Control frames are idempotent wherever possible.
+Retransmission does not allocate a new Stream offset. A retransmitted frame carries the same Stream range and MAY use a different `path_id`; replicated copies are deduplicated by the Stream range.
+
+Session control frames use a Session-wide `control_seqno`. A control frame MAY include an OPTIONAL `depends_on` sequence number. Receivers discard an already applied sequence number, and defer a frame whose dependency has not been applied. Control frames are idempotent wherever possible.
 
 Path management frames use a Path-local management sequence and are valid only for the Path that carries them. A Path management failure cannot invalidate Stream state while another Path remains available.
 
@@ -191,7 +246,10 @@ HEARTBEAT        liveness and control sequence exchange
 CONTROL_ACK      applied control sequence and selective ranges
 ```
 
-`PATH_DRAIN` is advisory and may be interrupted by an urgent failure. `PATH_CLOSE` is final for that Path. `SESSION_CLOSE` is final for the Session; a new Session is required after the last Path disappears or either endpoint restarts.
+`PATH_DRAIN` is advisory and MAY be interrupted by an urgent failure. `PATH_CLOSE`
+is final for that Path. `SESSION_CLOSE` is final for the Session; a new Session
+is REQUIRED after the last Path disappears or either endpoint restarts. Payload
+layouts and drain reasons are defined by [wire-profile-v1](wire-profile.md#path-and-session-control).
 
 ## 11. TCP Stream messages
 
@@ -200,13 +258,13 @@ STREAM_OPEN      stream_id, target endpoint, transport options
 STREAM_OPEN_OK   stream_id, target result metadata
 STREAM_OPEN_ERR  stream_id, normalized error code
 STREAM_DATA      stream_id, offset, bytes, stream flags
-STREAM_ACK       stream_id, direction, ACK ranges
+STREAM_ACK       stream_id, ACK ranges for the peer direction
 STREAM_WINDOW    stream/session receive limits
 STREAM_FIN       half-close one direction
 STREAM_RST       abort the Stream with error code
 ```
 
-`STREAM_OPEN` contains a unique RequestID. Retries with the same RequestID are idempotent at Egress. `STREAM_DATA` may be split across any number of Paths and may be sent concurrently for non-overlapping offsets. `STREAM_FIN` is ordered after all preceding bytes in its direction; `STREAM_RST` discards pending data and closes the target-side connection.
+`STREAM_OPEN` contains a unique RequestID. Retries with the same RequestID are idempotent at Egress. `STREAM_DATA` MAY be split across any number of Paths and MAY be sent concurrently for non-overlapping offsets. `STREAM_FIN` is ordered after all preceding bytes in its direction; `STREAM_RST` discards pending data and closes the target-side connection.
 
 ## 12. UDP messages
 
@@ -218,7 +276,7 @@ UDP_DATAGRAM      association identifier, datagram sequence, payload
 UDP_CLOSE         close association
 ```
 
-UDP datagrams preserve boundaries and are independent of Path identity. A datagram may use any available Path, and Path migration does not recreate or rebind the Egress-side socket. Datagram sequence numbers are for diagnostics and optional duplicate suppression; they do not imply reliable retransmission.
+UDP datagrams preserve boundaries and are independent of Path identity. A datagram MAY use any available Path, and Path migration does not recreate or rebind the Egress-side socket. Datagram sequence numbers are for diagnostics and OPTIONAL duplicate suppression; they do not imply reliable retransmission. The exact UDP payloads are defined in [wire-profile-v1](wire-profile.md#udp-session).
 
 ## 13. Error model
 
@@ -238,25 +296,23 @@ Target FIN/RST and target connection errors are propagated as target results. A 
 The protocol uses a compact binary encoding with the following rules:
 
 - integers use unsigned QUIC-style variable-length encoding;
-- fixed-width integers, when required, use network byte order;
+- fixed-width integers, when REQUIRED, use network byte order;
 - lengths count bytes, not encoded elements;
 - strings are UTF-8 and are length-prefixed;
 - endpoint addresses use an explicit address-family discriminator;
-- unknown optional fields and flags are ignored when their length is safely known;
+- v1 has no unregistered OPTIONAL fields or flags; future extensions require a
+  profile-defined length-delimited extension;
 - unknown mandatory frame types or malformed lengths terminate the Path;
 - all length fields are checked before allocation;
-- implementations must enforce both per-frame and aggregate Session limits;
+- implementations MUST enforce both per-frame and aggregate Session limits;
 - each frame is self-delimiting and cannot consume bytes belonging to the next frame.
 
-Canonical encoding is required for fields used in signatures, hashes, RequestID derivation, or control-message idempotency. Duplicate map keys and non-canonical integer encodings are rejected in those contexts.
+Canonical encoding is REQUIRED for fields used in signatures, hashes, RequestID derivation, or control-message idempotency. Duplicate map keys and non-canonical integer encodings are rejected in those contexts.
 
-Each protocol-version profile defines hard caps for frame payload, control
-payload, target-name length, Stream reordering, and aggregate Session
-buffering. A peer may negotiate values at or below those caps, never above
-them. The caps must leave room for the encoded frame header and authentication
-tag within the selected Noise implementation's record limit, and every decoder
-must enforce them before allocation. Numeric caps belong to version profiles,
-not this protocol-wide specification.
+The v1 hard caps, negotiated-limit rules, and conformance vectors are normative
+in [wire-profile-v1](wire-profile.md#profile-limits). A peer MAY negotiate
+values at or below those caps, never above them; every decoder enforces them
+before allocation.
 
 ## 15. Protocol invariants
 
@@ -275,9 +331,9 @@ The following invariants are normative:
 
 ## 16. Path transport abstraction
 
-The PathChord wire format is byte-oriented, but a Path is not required to be reliable. The complete encoded frame is the minimum delivery unit: a Path may lose, duplicate, or reorder whole frames, but it must never expose a partial frame or a frame with modified payload to the protocol core. The Path layer uses `frame_seq` and frame boundaries to detect these conditions; Session-level reliability handles recovery for control messages and reliable Stream data.
+The PathChord wire format is byte-oriented, but a Path is not REQUIRED to be reliable. The complete encoded frame is the minimum delivery unit: a Path MAY lose, duplicate, or reorder whole frames, but it MUST NOT expose a partial frame or a frame with modified payload to the protocol core. The Path layer uses `frame_seq` and frame boundaries to detect these conditions; Session-level reliability handles recovery for control messages and reliable Stream data.
 
-Each Path adapter reads and writes its underlying transport but presents only complete authenticated record envelopes and decoded PathChord frames to the protocol core. A reliable byte-stream upstream such as TCP may preserve ordering internally. An unreliable or datagram-oriented upstream may deliver complete records, lose records, duplicate records, or reorder records, but must not silently modify a record payload. The adapter or record decoder performs segmentation and reassembly needed to preserve complete records; incomplete or damaged records are discarded before delivery.
+Each Path adapter reads and writes its underlying transport but presents only complete authenticated record envelopes and decoded PathChord frames to the protocol core. A reliable byte-stream upstream such as TCP MAY preserve ordering internally. An unreliable or datagram-oriented upstream MAY deliver complete records, lose records, duplicate records, or reorder records, but MUST NOT silently modify a record payload. The adapter or record decoder performs segmentation and reassembly needed to preserve complete records; incomplete or damaged records are discarded before delivery.
 
 This keeps TCP, TLS, WebSocket, VLESS, VMess, XTLS, and other transport adapters within one framing model while allowing direct use of unreliable transports. Datagram semantics exist only above the framing layer in `UDP_DATAGRAM` messages.
 
@@ -293,33 +349,31 @@ Ingress static public key
 EgressID
 Egress static public key
 authorization state: enabled | disabled | revoked
-optional administrator labels and limits
+OPTIONAL administrator labels and limits
 record generation
 ```
 
-The Ingress stores the expected Egress public key and canonical EgressID in its static Egress topology. The Egress knows its own canonical EgressID before reading a Path handshake and stores the authorized Ingress public-key list in its local authorization database or configuration. Both sides must be configured independently before a Path can become `PATH_READY`.
+The Ingress stores the expected Egress public key and canonical EgressID in its static Egress topology. The Egress knows its own canonical EgressID before reading a Path handshake and stores the authorized Ingress public-key list in its local authorization database or configuration. Both sides MUST be configured independently before a Path can become `PATH_READY`.
 
 The Noise pattern is `Noise_IK_25519_ChaChaPoly_SHA256`. Each Path performs a
 fresh handshake and obtains independent transport keys. Both peers bind the
-configured, non-empty EgressID into the Noise prologue before the responder
-reads the first IK message. A handshake profile configured on both peers
-defines one canonical EgressID grammar, byte encoding, and domain separator.
-Both peers must use the profile encoding exactly; a missing, mismatched, or
-invalid profile prevents the Path from becoming authenticated or carrying
-business traffic.
+configured, non-empty EgressID into the exact v1 prologue defined in
+[wire-profile-v1](wire-profile.md#identifier-and-prologue-rules) before the
+responder reads the first IK message. A missing, mismatched, or invalid profile
+prevents the Path from becoming authenticated or carrying business traffic.
 
-After message one, Egress authenticates the initiator static key, resolves its enabled authorization record to an IngressID, and requires `SESSION_ATTACH` to name that exact IngressID; the IngressID is not guessed or selected by the responder-side prologue. A successful Noise handshake alone is insufficient: the Egress must also find the Ingress static public key in its enabled authorization list.
+After message one, Egress authenticates the initiator static key, resolves its enabled authorization record to an IngressID, and requires `SESSION_ATTACH` to name that exact IngressID; the IngressID is not guessed or selected by the responder-side prologue. A successful Noise handshake alone is insufficient: the Egress MUST also find the Ingress static public key in its enabled authorization list.
 
 Authorization changes are generation-based:
 
 - enabling an Ingress key permits new Paths and Sessions;
-- disabling or revoking a key prevents new Paths immediately;
-- revocation closes all related Paths, Sessions, Streams, and Egress-to-target connections;
+- disabling or revoking a key prevents new Paths immediately and closes all
+  related Paths, Sessions, Streams, and Egress-to-target connections;
 - existing authorization state is not silently upgraded after a failed configuration write;
 - a changed static key requires the affected endpoint to restart;
 - an Egress authorization-list update does not require Ingress restart when only the Egress-side list changes.
 
-The enrollment control API is outside the data Path protocol. It may modify the Egress authorization database or configuration file, but must use atomic generation updates and preserve the previous valid record if validation or persistence fails.
+The enrollment control API is outside the data Path protocol. It MAY modify the Egress authorization database or configuration file, but MUST use atomic generation updates and preserve the previous valid record if validation or persistence fails.
 
 ## 18. Ingress control plane and management API
 
@@ -342,7 +396,7 @@ data Paths.
 
 Management messages use a length-prefixed UTF-8 JSON envelope. The envelope
 includes an API version, operation name, request ID, and typed request or
-response body. Commands carry an actor, optional expected generation, and
+response body. Commands carry an actor, OPTIONAL expected generation, and
 idempotency request ID. JSON is limited to management adapters; the data Path
 continues to use the dedicated binary frame codec.
 
@@ -359,10 +413,10 @@ and policy generations. Current state and metrics MUST be queryable without
 parsing logs. `STATUS_REPORT` remains a compact authenticated data-Path health
 message and is not the management or metrics API.
 
-An optional authenticated Web Gateway provides the frontend access point. It
+An OPTIONAL authenticated Web Gateway provides the frontend access point. It
 calls the same typed command/query service and is disabled by default. The
 selected built-in adapter exposes REST resources plus Server-Sent Events (SSE);
-alternative adapters must preserve the same typed command/query, authorization,
+alternative adapters MUST preserve the same typed command/query, authorization,
 redaction, audit, generation, and resource-limit contracts. The gateway MUST
 NOT expose the local socket/pipe directly to a
 browser, and it MUST NOT be reachable through a Transit Proxy or data Path. A
@@ -380,9 +434,35 @@ Enrollment operations are transactional:
 2. Egress validates identifiers, key encoding, duplicate identities, and policy constraints.
 3. Egress writes the new authorization generation atomically to its database or configuration store.
 4. Egress replaces its in-memory authorization snapshot without restarting.
-5. Egress applies revocation or disable effects to live Paths and Sessions.
+5. Egress applies revocation or disable effects to live Paths, Sessions, and
+   related target connections.
 6. The API returns the applied generation and effective state.
 
-If persistence succeeds but the in-memory update fails, Egress must roll back the persistent generation where possible; otherwise it reports the generation as `pending_apply`, rejects further mutations, and exposes the mismatch through status. If validation or persistence fails, no generation change is published.
+If persistence succeeds but the in-memory update fails, Egress MUST roll back the persistent generation where possible; otherwise it reports the generation as `pending_apply`, rejects further mutations, and exposes the mismatch through status. If validation or persistence fails, no generation change is published.
 
-Authorization changes that revoke or disable an Ingress are applied to new handshakes immediately and then terminate all matching live Paths and Sessions according to the revocation rules.
+Authorization changes that revoke or disable an Ingress are applied to new
+handshakes immediately and then terminate all matching live Paths, Sessions,
+Streams, and target connections.
+
+## Security Considerations
+
+Noise IK authenticates each Path independently and binds the configured Egress
+identity before the responder processes the handshake. A successful Noise
+handshake alone is insufficient authorization; the Egress MUST verify the
+initiator key against its enabled authorization record. Implementations MUST
+NOT treat a Transit Proxy as an authenticated peer, MUST NOT use TOFU, and MUST
+NOT expose private keys, handshake material, bearer tokens, subscription
+credentials, ciphertext, or application payloads through management APIs.
+
+Replay windows, explicit nonces, frame sequence binding, bounded allocation,
+and generation-checked authorization updates are security properties, not
+OPTIONAL diagnostics. Implementations SHOULD test key erasure and failure
+cleanup under process termination and transport loss.
+
+## Registry and Extension Policy
+
+`wire-profile-v1` owns frame type, capability, error, and numeric-limit
+registries. An implementation MUST NOT assign an unregistered value locally.
+New values or payload fields require a new versioned profile or a profile-defined
+length-delimited extension; an extension MUST define its negotiation, bounds,
+unknown-value behavior, and security impact.

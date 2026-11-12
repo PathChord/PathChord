@@ -2,32 +2,48 @@
 
 [English](observability.md) | **简体中文**
 
-Ingress 可观测性是本地控制平面的结构化查询和事件接口。它面向 Web 仪表板、CLI 诊断、
-自动健康检查和事件分析。日志是补充手段；运维人员需要查询的指标或状态不得（MUST NOT）
-仅存在于日志文本中。
+Ingress 可观测性是本地控制平面的结构化查询和事件接口。日志只是补充；运维人员需要的
+状态或指标不得仅存在于日志文本中。
 
 ## 与数据 Path 分离
 
-`STATUS_REPORT` 是数据 Path 协议消息。它传达 Session 准入和调度所需的最少 Egress
-容量及健康信息。它不是管理 API，也不是浏览器 API，不能替代本地指标。
+`STATUS_REPORT` 是经过认证的数据 Path 消息。其线编码由[线协议 profile](wire-profile.zh-CN.md)
+定义；语义字段是 Session 准入和调度所需的最少 Egress 信息。它不是管理 API、浏览器 API，
+也不能替代本地指标。
 
-可观测性服务与 Ingress 运行时并行运行，并从策略、Session、Path、目标连接、订阅和授权
-组件读取类型化快照。它不得（MUST NOT）解析日志来重建主要状态。
-
-Ingress 暴露一个有界的类型化快照/事件提供器。运行时生产者通过此提供器发布结构化观测，
-外部适配器读取其快照和事件。提供器契约独立于外部 API 适配器和日志后端。
+可观测性提供器从策略、Session、Path、目标连接、订阅和授权组件读取类型化快照。它不得
+解析日志来重建主要状态。运行时生产者通过一个有界提供器发布数据，该提供器独立于外部 API
+适配器和日志后端。
 
 ## 快照模型
 
-`GET /api/v1/metrics/snapshot` 返回某一时刻的文档：
+`GET /api/v1/metrics/snapshot` 返回包含控制面通用响应元数据的时点文档：
 
 ```json
 {
   "api_version": "1",
+  "request_id": "01JEXAMPLE",
+  "observed_generation": {"scope": "observation", "value": 42},
   "snapshot_generation": 42,
   "captured_at": "2026-11-12T00:00:00Z",
+  "freshness": "fresh",
   "ingress": {"state": "running", "uptime_seconds": 3600},
-  "sessions": {"configured": 3, "active": 2, "degraded": 1},
+  "system_proxy": {"enabled": false, "listener_id": null, "platform_effect": "disabled"},
+  "egress": {"configured": 3, "up": 2, "degraded": 1, "draining": 0, "down": 0},
+  "egress_reports": [{
+    "egress_id": "jp-1",
+    "state": "up",
+    "load_ratio": 0.42,
+    "connection_utilization_ratio": 0.35,
+    "bandwidth_utilization_ratio": 0.51,
+    "active_sessions": 2,
+    "active_streams": 12,
+    "active_target_connections": 16,
+    "capacity_bps": 180000000,
+    "recommended_path_count": 2,
+    "status_report_age_ms": 120
+  }],
+  "sessions": {"configured": 3, "active": 2, "degraded": 1, "draining": 0},
   "paths": {"ready": 2, "draining": 0, "failed": 1},
   "streams": {"open": 12, "half_closed": 2, "reset": 1},
   "udp": {"associations": 4},
@@ -37,58 +53,65 @@ Ingress 暴露一个有界的类型化快照/事件提供器。运行时生产�
 }
 ```
 
-确切的 JSON 名称属于适配器契约，不是线上 Path 格式。每个快照都有代次和捕获时间戳。
-对于名称暗示单调性的计数器，在单个进程的整个生命周期内必须（MUST）保持单调；
-仪表值可以（MAY）增大或减小。
+`load_ratio`、利用率和丢包率是 `[0, 1]` 中的数值；`capacity_bps` 是无符号比特率；计数
+是非负整数；`status_report_age_ms` 是最新认证报告的年龄。报告超过配置的新鲜度阈值时，
+相应 Egress 观测必须标记为 `stale`，不能当作当前零负载。名称表示单调性的计数器在单个
+进程生命周期内必须单调；仪表值可以双向变化。本响应中的 `snapshot_generation` 与
+`observed_generation` 标识同一个观测快照。
+`system_proxy.platform_effect` 的值为 `disabled`、`applied` 或 `unsupported`；Linux 的系统代理控制
+仅限 Windows，因此必须报告 `unsupported`。
 
-结构化资源视图提供下钻查询：
+结构化下钻资源如下：
 
 ```text
 GET /api/v1/nodes
 GET /api/v1/sessions
 GET /api/v1/sessions/{session_id}
 GET /api/v1/connections
+GET /api/v1/listeners
+GET /api/v1/authorizations
+GET /api/v1/system-proxy
 GET /api/v1/metrics/paths
 GET /api/v1/metrics/streams
 ```
 
-查询必须（MUST）返回类型化字段和稳定的资源 ID。它不得（MUST NOT）要求客户端解析
-供人阅读的状态字符串。
+每个查询返回类型化字段、稳定资源 ID 和通用响应元数据。列表使用控制面规范定义的有界
+分页、过滤和排序合同。
 
 ## 节点与 Path 指标
 
-节点视图结合静态身份、导入的来源数据、管理员标签和运行时观测，同时保留各自的所有权：
+节点视图组合保持所有权分离的字段：
 
 ```text
 node.id, node.protocol, node.endpoint
 source.subscription, source.imported_at
 admin.labels, admin.tags
-observed.connected, observed.rtt_ms, observed.jitter_ms
-observed.loss_rate, observed.throughput_bps
-observed.effective_capacity_bps, observed.state
+observed.connected, observed.state, observed.freshness
+observed.rtt_ms, observed.jitter_ms, observed.loss_rate
+observed.throughput_bps, observed.effective_capacity_bps
 quota.remaining_ratio, quota.reset_at
 ```
 
-每个 Path 的视图暴露：
+每个 Path 视图暴露：
 
 ```text
 path_id, session_id, egress_id, transit_proxy_id
-state, ready_since, last_change_at
+state, ready_since, last_change_at, freshness
 frame_sent, frame_received, frame_lost, frame_duplicate
 rtt_ms, jitter_ms, loss_rate, reorder_count
 throughput_bps, congestion_window, available_capacity_bps
 control_pending, control_retransmissions
 ```
 
-Path ID、Session ID 和 Transit Proxy ID 是基数有界的标签。原始 Transit 凭据、包含机密的
-代理 URL、Noise 密钥和密文绝不作为指标字段。
+Path、Session 和 Transit Proxy ID 是基数有界的标签。原始 Transit 凭据、包含机密的代理 URL、
+Noise 密钥和密文绝不作为指标字段。
 
 ## Session、Stream 与连接指标
 
 Session 视图暴露：
 
 ```text
-session_id, ingress_id, egress_id, state
+session_id, ingress_id, egress_id, state, freshness
 admission_generation, created_at, last_change_at
 ready_path_count, active_streams, active_udp_associations
 control_pending, control_acked, control_retransmissions
@@ -106,13 +129,22 @@ opened_at, closed_at, close_reason
 ```
 
 目标连接视图暴露稳定的本地连接 ID、SessionID 和 StreamID、生命周期状态、字节计数器、
-时间信息及规范化的关闭原因。可以（MAY）向已授权的本地管理员显示原始主机名，
-但绝不得（MUST）返回原始凭据、嵌入机密的完整 URL 和载荷字节。对于非特权 Web 角色，
-应当（SHOULD）根据配置的脱敏策略截断主机名或对其进行哈希处理。
+时间信息和规范化关闭原因。已授权的本地管理员可以获得原始主机名；原始凭据、包含机密的
+URL 和载荷字节绝不得返回。
 
-## 计数器、仪表值与直方图
+## 调度和 STATUS_REPORT 观测
 
-可观测性服务应当（SHOULD）提供以下指标族：
+观测提供器必须保留调度器所需的 Egress 字段：负载、连接利用率、带宽利用率、活跃
+Session/Stream/目标连接数量、聚合容量、建议 Path 数量和报告新鲜度。Ingress 的 Path 观测
+必须包含 RTT、抖动、丢包、乱序、吞吐量、有效容量和连接建立质量。
+
+调度器使用这些类型化字段，不能使用人类可读日志。报告过期时，除非策略明确允许降级运行，
+否则 Egress 必须从新的准入中移除。质量下降时快速减少分配；恢复和缩容遵循状态机的排空及
+稳定化规则。当 Path 因新增容量低于自身开销而被排除时，观测 API 必须暴露原因。
+
+## 计数器、仪表值和直方图
+
+服务应提供以下指标族：
 
 ```text
 pathchord_sessions_total
@@ -128,38 +160,32 @@ pathchord_path_rtt_ms
 pathchord_path_jitter_ms
 pathchord_path_loss_ratio
 pathchord_path_capacity_bps
+pathchord_egress_load_ratio
+pathchord_egress_connection_utilization_ratio
+pathchord_egress_bandwidth_utilization_ratio
+pathchord_egress_recommended_paths
 pathchord_stream_reorder_bytes
 ```
 
-直方图必须（MUST）在其适配器模式中定义单位和桶边界。比率为 `[0, 1]` 范围内的数值；
-字节率和比特率使用显式的 `_bytes` 或 `_bps` 后缀。指标族必须（MUST）说明它属于计数器、
-仪表值还是直方图。
+直方图必须在其适配器 schema 中定义单位和桶边界。每个指标族必须声明自己是计数器、仪表值
+还是直方图。
 
 ## 基数控制
 
-指标标签必须（MUST）从有界取值域中选择。不得将原始主机名、URL、RequestID、StreamID、
-进程命令行、错误消息或任意管理员标记用作无界指标标签。高基数详情应放在分页资源查询或
-采样事件中，而非聚合指标标签中。
+指标标签必须来自有界域。原始主机名、URL、RequestID、StreamID、进程命令行、错误消息或
+任意管理员标记不得作为无界聚合标签。高基数详情应位于分页资源查询或采样事件中。
 
-服务必须（MUST）对以下内容实施限制：
+服务必须限制跟踪资源数量、每客户端事件积压、不同 label/tag 键和值，以及每资源历史记录。
+达到上限时报告带原因的类型化 `degraded` 观测，只丢弃可选历史，绝不丢弃当前生命周期状态
+或安全决策所需计数器。
 
-- 跟踪的节点、Path、Session、Stream 和目标连接数量；
-- 每个客户端保留的事件积压量；
-- 不同标签/标记键和值的数量；
-- 为图表保留的每个资源的历史记录。
+## 事件和实时更新
 
-达到限制时，快照报告带有原因的类型化 `degraded` 观测，仅丢弃可选历史记录，绝不丢弃
-当前生命周期状态或安全决策所需的计数器。
+选定的 REST 适配器通过 SSE 提供 `GET /api/v1/events`。每个事件包含 `id`、`type`、
+`generation`、`emitted_at`、`resource_type`、`resource_id` 和类型化 `payload`。`generation`
+使用与响应元数据相同的 `{scope,value}` 形式；资源载荷可以另外携带自身的 `revision`。
 
-## 事件与实时更新
-
-`GET /api/v1/events` 在选定的 REST + SSE Web 适配器中使用 SSE。每个事件包含：
-
-```text
-id, type, generation, emitted_at, resource_type, resource_id, payload
-```
-
-必需的事件类型为：
+规范事件注册表为：
 
 ```text
 metrics.snapshot
@@ -170,33 +196,31 @@ stream.changed
 connection.changed
 subscription.changed
 authorization.changed
+system_proxy.changed
 audit.notice
 ```
 
-事件在每个 Ingress 进程内有序。重新连接的客户端提供 `Last-Event-ID`；服务器要么从其
-有界事件缓冲区重放，要么发送新的完整快照，随后发送新事件。事件载荷使用与时点查询
-相同的授权和脱敏规则。
+事件在每个 Ingress 进程内有序。`Last-Event-ID` 要么从有界缓冲区重放，要么先发送完整快照
+事件再发送新增量。事件载荷使用与时点查询相同的授权和脱敏规则。`subscription.refresh` 不
+是独立事件类型；刷新结果通过带类型化结果的 `subscription.changed` 表示。
 
 ## 脱敏与隐私
 
-可观测性层必须（MUST）在暴露 Web 网关之前定义脱敏规则：
+暴露 Web Gateway 前，可观测性层必须定义脱敏：
 
-- 绝不暴露私钥、Noise 握手材料或持有者令牌；
-- 绝不暴露订阅凭据或带签名的订阅 URL；
-- 绝不暴露密文或应用载荷字节；
-- 对不需要这些信息的角色，脱敏目标主机名和进程元数据；
-- 在返回错误消息之前对其规范化，尽可能移除文件系统路径和对端提供的任意文本；
-- 确保审计记录不包含完整请求正文和机密。
+- 绝不暴露私钥、Noise 握手材料、持有者令牌、订阅凭据、签名订阅 URL、密文或载荷；
+- 对不需要的角色脱敏目标主机名和进程元数据；
+- 规范化错误，移除文件系统路径和对端任意文本；
+- 审计记录不得包含完整请求正文和机密。
 
-脱敏策略是操作者能力配置的一部分，并在序列化之前应用，而非仅在前端 JavaScript 中应用。
+脱敏属于 actor capability 配置的一部分，并在序列化前执行，而不是只在前端代码中执行。
 
-## 健康状态与新鲜度
+## 健康状态和新鲜度
 
-每个快照都报告捕获时间和新鲜度。如果某个运行时生产者停止更新，可观测性服务将该
-生产者报告为过期，而非将最后一个值呈现为当前值。建议阈值属于实现配置，但过期状态
-必须（MUST）能够与测量值为零的情况区分。
+每个快照报告捕获时间和新鲜度。停止更新的运行时生产者标记为 `stale` 或 `unavailable`，
+绝不能呈现为当前零值。阈值属于配置，但 `stale` 必须与测量值为零区分开。
 
-本地控制平面将服务健康状态与 Egress 数据 Path 健康状态分别暴露：
+本地控制平面暴露相互独立的健康值：
 
 ```text
 control_plane: running | degraded | stopped
@@ -204,19 +228,12 @@ runtime_snapshot: fresh | stale | unavailable
 data_path_summary: connected | degraded | down
 ```
 
-这些值不可互换。健康的本地控制平面可以报告 Egress 不可用，而 Egress 已连接并不意味着
-Web 网关可用。
+这些值不可互换。健康的控制平面可以报告 Egress down，而 Egress 已连接也不代表 Web Gateway
+可用。
 
-## 禁止仅依赖日志的要求
+## 禁止仅依赖日志
 
-以下内容必须能作为结构化数据查询，不得仅在日志中提供：
-
-- 当前 Session、Path、Stream、UDP 和目标连接状态；
-- 策略和订阅代次；
-- 节点标签/标记和运行时观测；
-- 控制重传计数和待处理队列；
-- 授权状态和撤销效果；
-- 资源限制和生产者过期情况。
-
-日志可以（MAY）提供解释和采样追踪，但删除或禁用日志不得（MUST NOT）导致控制平面 API
-无法回答这些运维查询。
+以下内容必须作为结构化数据可查询：当前 Session、Path、Stream、UDP 和目标连接状态；策略、
+订阅、观测和授权代次；节点 label/tag 和运行时观测；控制重传计数和队列；授权清理影响；
+监听器清单以及系统代理选择/效果；
+资源限制或生产者过期条件。禁用日志不得导致控制面 API 无法回答这些查询。

@@ -8,11 +8,10 @@ PathChord provides ordinary proxy semantics to local applications while maintain
 
 ## Status
 
-Initial implementation. The repository contains the design baseline, Phase 0
-protocol/transport primitives, the Phase 1A TCP single-path implementation
-scope and provisional wire contract, and core reliability/control-service
-foundations. The proxy data plane and Web Gateway adapters are not implemented
-yet.
+Initial implementation. The repository contains the design baseline, the
+`wire-profile-v1` protocol contract, Kubernetes-style configuration contracts,
+and Phase 0/Phase 1A reliability and control-service foundations. The proxy
+data plane and Web Gateway adapters are not implemented yet.
 
 ## Terminology
 
@@ -41,7 +40,10 @@ source.
 ### Specifications
 
 - [Protocol](docs/spec/protocol.md)
+- [Wire profile v1](docs/spec/wire-profile.md)
 - [Configuration model](docs/spec/configuration.md)
+- [Configuration schema](docs/spec/configuration-schema.md)
+- [Platform and DNS](docs/spec/platform-and-dns.md)
 - [State machines](docs/spec/state-machines.md)
 - [Ingress control plane](docs/spec/ingress-control-plane.md)
 - [Ingress observability](docs/spec/observability.md)

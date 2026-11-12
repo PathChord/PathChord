@@ -5,8 +5,8 @@ use crate::id::{PathId, SessionId};
 use crate::limits::ProtocolLimits;
 use crate::varint::{MAX_VARINT, VarIntError, decode_varint, encode_varint};
 
-/// Bootstrap protocol version. Its wire value is explicitly not stable yet.
-pub const EXPERIMENTAL_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(0);
+/// The wire value assigned to `wire-profile-v1`.
+pub const WIRE_PROFILE_V1_VERSION: ProtocolVersion = ProtocolVersion(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion(u64);
@@ -25,7 +25,7 @@ impl ProtocolVersion {
     }
 }
 
-/// Raw frame flags. Individual bit assignments are not stable in Phase 0.
+/// Raw frame flags. The v1 profile reserves this field and requires zero.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FrameFlags(u64);
 
@@ -47,10 +47,7 @@ impl FrameFlags {
     }
 }
 
-/// Frame kinds in the protocol baseline.
-///
-/// The explicit values make the bootstrap codec deterministic, but they are
-/// pre-stable and must not yet be treated as an interoperability registry.
+/// Stable frame kinds in the v1 registry.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u64)]
 pub enum FrameType {
@@ -223,10 +220,15 @@ impl PathFrame {
         if frame_seq > MAX_VARINT {
             return Err(FrameCodecError::FrameSequenceTooLarge { frame_seq });
         }
+        if flags.bits() != 0 {
+            return Err(FrameCodecError::UnsupportedFlags {
+                flags: flags.bits(),
+            });
+        }
         validate_payload(frame_type, payload.len(), limits)?;
         Ok(Self {
             header: PathFrameHeader {
-                version: EXPERIMENTAL_PROTOCOL_VERSION,
+                version: WIRE_PROFILE_V1_VERSION,
                 frame_type,
                 flags,
                 session_id,
@@ -269,10 +271,10 @@ impl PathFrame {
         let mut cursor = 0;
 
         let version = read_varint(input, &mut cursor, "version")?;
-        if version != EXPERIMENTAL_PROTOCOL_VERSION.get() {
+        if version != WIRE_PROFILE_V1_VERSION.get() {
             return Err(FrameCodecError::UnsupportedVersion {
                 found: version,
-                supported: EXPERIMENTAL_PROTOCOL_VERSION.get(),
+                supported: WIRE_PROFILE_V1_VERSION.get(),
             });
         }
 
@@ -286,6 +288,11 @@ impl PathFrame {
                     source,
                 }
             })?;
+        if flags.bits() != 0 {
+            return Err(FrameCodecError::UnsupportedFlags {
+                flags: flags.bits(),
+            });
+        }
         let session_id = SessionId::from_be_bytes(read_fixed_16(input, &mut cursor, "session_id")?);
         let path_id = PathId::from_be_bytes(read_fixed_16(input, &mut cursor, "path_id")?);
         let frame_seq = read_varint(input, &mut cursor, "frame_seq")?;
@@ -317,7 +324,7 @@ impl PathFrame {
         let payload = input[cursor..].to_vec();
         Ok(Self {
             header: PathFrameHeader {
-                version: EXPERIMENTAL_PROTOCOL_VERSION,
+                version: WIRE_PROFILE_V1_VERSION,
                 frame_type,
                 flags,
                 session_id,
@@ -401,6 +408,9 @@ pub enum FrameCodecError {
     FrameSequenceTooLarge {
         frame_seq: u64,
     },
+    UnsupportedFlags {
+        flags: u64,
+    },
     PayloadTooLarge {
         frame_type: FrameType,
         length: u64,
@@ -433,6 +443,12 @@ impl fmt::Display for FrameCodecError {
             Self::UnknownFrameType { code } => write!(formatter, "unknown frame type {code}"),
             Self::FrameSequenceTooLarge { frame_seq } => {
                 write!(formatter, "frame sequence {frame_seq} exceeds 62 bits")
+            }
+            Self::UnsupportedFlags { flags } => {
+                write!(
+                    formatter,
+                    "frame flags {flags} are not assigned in wire-profile-v1"
+                )
             }
             Self::PayloadTooLarge {
                 frame_type,
@@ -478,7 +494,7 @@ mod tests {
     fn example_frame(frame_type: FrameType, payload: Vec<u8>) -> PathFrame {
         PathFrame::new(
             frame_type,
-            FrameFlags::try_new(3).unwrap(),
+            FrameFlags::empty(),
             SessionId::new(0x1122),
             PathId::new(0x3344),
             7,
@@ -489,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn every_bootstrap_frame_type_has_a_distinct_code() {
+    fn every_v1_frame_type_has_a_distinct_code() {
         for (index, frame_type) in FrameType::ALL.iter().enumerate() {
             assert_eq!(FrameType::try_from(frame_type.code()), Ok(*frame_type));
             assert!(
@@ -508,7 +524,7 @@ mod tests {
 
         assert_eq!(decoded, frame);
         assert_eq!(decoded.header().payload_len(), 10);
-        assert_eq!(decoded.header().version(), EXPERIMENTAL_PROTOCOL_VERSION);
+        assert_eq!(decoded.header().version(), WIRE_PROFILE_V1_VERSION);
     }
 
     #[test]
@@ -516,7 +532,7 @@ mod tests {
         let payload = vec![0xaa; 64];
         let frame = PathFrame::new(
             FrameType::StreamData,
-            FrameFlags::try_new(16_384).unwrap(),
+            FrameFlags::empty(),
             SessionId::new(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff),
             PathId::new(0xffee_ddcc_bbaa_9988_7766_5544_3322_1100),
             1_073_741_824,
@@ -526,9 +542,9 @@ mod tests {
         .unwrap();
 
         let mut expected = vec![
-            0x00, // experimental version, one-byte varint
+            0x01, // wire-profile-v1 version, one-byte varint
             0x23, // STREAM_DATA, one-byte varint
-            0x80, 0x00, 0x40, 0x00, // flags, four-byte varint
+            0x00, // flags, one-byte varint
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, // SessionID
             0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa,
             0x99, 0x88, // PathID
@@ -548,12 +564,12 @@ mod tests {
     #[test]
     fn maximum_frame_fits_one_noise_message_with_its_tag() {
         const NOISE_TAG_LEN: usize = 16;
-        const WORST_CASE_BOOTSTRAP_HEADER_LEN: usize = 55;
+        const WORST_CASE_V1_HEADER_LEN: usize = 48;
 
         let limits = ProtocolLimits::default();
         let frame = PathFrame::new(
             FrameType::UdpDatagram,
-            FrameFlags::try_new(MAX_VARINT).unwrap(),
+            FrameFlags::empty(),
             SessionId::new(u128::MAX),
             PathId::new(u128::MAX),
             MAX_VARINT,
@@ -565,14 +581,14 @@ mod tests {
 
         assert_eq!(
             encoded.len(),
-            limits.max_frame_payload() + WORST_CASE_BOOTSTRAP_HEADER_LEN
+            limits.max_frame_payload() + WORST_CASE_V1_HEADER_LEN
         );
         assert!(encoded.len() + NOISE_TAG_LEN <= 65_535);
     }
 
     #[test]
     fn unknown_type_is_rejected_immediately() {
-        let input = [0, 63];
+        let input = [1, 63];
         assert_eq!(
             PathFrame::decode(&input, ProtocolLimits::default()),
             Err(FrameCodecError::UnknownFrameType { code: 63 })
@@ -580,12 +596,28 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_v1_flags_are_rejected() {
+        assert_eq!(
+            PathFrame::new(
+                FrameType::Heartbeat,
+                FrameFlags::try_new(1).unwrap(),
+                SessionId::new(1),
+                PathId::new(2),
+                0,
+                Vec::new(),
+                ProtocolLimits::default(),
+            ),
+            Err(FrameCodecError::UnsupportedFlags { flags: 1 })
+        );
+    }
+
+    #[test]
     fn unsupported_version_is_rejected() {
         assert_eq!(
-            PathFrame::decode(&[1], ProtocolLimits::default()),
+            PathFrame::decode(&[0], ProtocolLimits::default()),
             Err(FrameCodecError::UnsupportedVersion {
-                found: 1,
-                supported: 0
+                found: 0,
+                supported: 1
             })
         );
     }
@@ -603,7 +635,7 @@ mod tests {
 
     #[test]
     fn truncated_fixed_header_field_is_rejected() {
-        let input = [0, FrameType::PathHello.code() as u8, 0, 1, 2];
+        let input = [1, FrameType::PathHello.code() as u8, 0, 1, 2];
         assert_eq!(
             PathFrame::decode(&input, ProtocolLimits::default()),
             Err(FrameCodecError::TruncatedField {
@@ -647,7 +679,7 @@ mod tests {
     fn oversized_declared_payload_is_rejected_before_truncation() {
         let limits = ProtocolLimits::default();
         let mut input = Vec::new();
-        encode_varint(0, &mut input).unwrap();
+        encode_varint(1, &mut input).unwrap();
         encode_varint(FrameType::StreamData.code(), &mut input).unwrap();
         encode_varint(0, &mut input).unwrap();
         input.extend_from_slice(&SessionId::new(1).to_be_bytes());
@@ -706,12 +738,11 @@ mod tests {
             session_id in any::<u128>(),
             path_id in any::<u128>(),
             frame_seq in 0_u64..=MAX_VARINT,
-            flags in 0_u64..=MAX_VARINT,
             payload in proptest::collection::vec(any::<u8>(), 0..2048),
         ) {
             let frame = PathFrame::new(
                 FrameType::StreamData,
-                FrameFlags::try_new(flags).unwrap(),
+                FrameFlags::empty(),
                 SessionId::new(session_id),
                 PathId::new(path_id),
                 frame_seq,

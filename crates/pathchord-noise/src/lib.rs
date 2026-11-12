@@ -7,11 +7,10 @@
 //! its enabled authorization snapshot before allowing the Path to become
 //! `PATH_READY`.
 //!
-//! `snow` 0.10 does not zeroize all private/DH and traffic-key storage held in
-//! its handshake and transport states. The wrapper zeroizes generated static
-//! key material, but this limitation remains a Phase-0 non-production concern;
-//! see the technology-selection document before using this crate for deployed
-//! long-lived secrets.
+//! The selected production crypto provider must zeroize all private/DH and
+//! traffic-key storage it owns. The wrapper zeroizes generated static key
+//! material; deployments must use a reviewed resolver/provider that also
+//! covers provider-owned state.
 
 use std::fmt;
 
@@ -22,6 +21,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// The only Noise protocol name supported by PathChord.
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
+
+/// Canonical wire-profile-v1 prologue prefix. Callers append the configured
+/// EgressID bytes without normalization.
+pub const WIRE_PROFILE_V1_PROLOGUE_PREFIX: &[u8] = b"PathChord/wire-v1/egress/";
 
 /// Size of Curve25519 static private and public keys.
 pub const STATIC_KEY_LEN: usize = 32;
@@ -197,6 +200,10 @@ pub enum NoiseError {
     /// transcript.
     #[error("the Egress identity binding must not be empty")]
     EmptyEgressIdentity,
+
+    /// The Egress identity does not use the canonical v1 prologue grammar.
+    #[error("the Egress identity is not a valid wire-profile-v1 prologue")]
+    InvalidEgressIdentity,
 
     /// A key returned by the crypto provider had an unexpected size.
     #[error("{kind} key has length {actual}, expected {STATIC_KEY_LEN}")]
@@ -439,9 +446,9 @@ fn validate_ciphertext_len(length: usize) -> Result<(), NoiseError> {
 
 /// Initiator side of one Path's Noise IK handshake.
 ///
-/// `egress_identity` is mixed into the Noise prologue and must be the same on
-/// both peers. It must contain the canonical configured EgressID bytes, which
-/// are known to the responder before it can read the first IK message. The
+/// `egress_identity` is the complete wire-profile-v1 prologue and must be the
+/// same on both peers. It contains the canonical configured EgressID bytes,
+/// which are known to the responder before it can read the first IK message. The
 /// authenticated initiator static key is mapped to an authorized IngressID
 /// after message one; Session attachment must then match that mapping.
 pub struct InitiatorHandshake {
@@ -781,10 +788,22 @@ fn noise_params() -> Result<NoiseParams, NoiseError> {
 
 fn require_egress_identity(egress_identity: &[u8]) -> Result<(), NoiseError> {
     if egress_identity.is_empty() {
-        Err(NoiseError::EmptyEgressIdentity)
-    } else {
-        Ok(())
+        return Err(NoiseError::EmptyEgressIdentity);
     }
+    let Some(identifier) = egress_identity.strip_prefix(WIRE_PROFILE_V1_PROLOGUE_PREFIX) else {
+        return Err(NoiseError::InvalidEgressIdentity);
+    };
+    if identifier.is_empty()
+        || identifier.len() > 128
+        || !identifier.iter().enumerate().all(|(index, byte)| {
+            (index == 0 && byte.is_ascii_alphanumeric())
+                || (index > 0
+                    && (byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-')))
+        })
+    {
+        return Err(NoiseError::InvalidEgressIdentity);
+    }
+    Ok(())
 }
 
 fn require_record_nonce(nonce: u64) -> Result<(), NoiseError> {
@@ -851,7 +870,7 @@ fn into_transport(state: HandshakeState) -> Result<NoiseTransport, NoiseError> {
 mod tests {
     use super::*;
 
-    const EGRESS_IDENTITY: &[u8] = b"PathChord/v1/egress-id";
+    const EGRESS_IDENTITY: &[u8] = b"PathChord/wire-v1/egress/egress-id";
     const INITIATOR_PRIVATE: [u8; STATIC_KEY_LEN] = [1; STATIC_KEY_LEN];
     const INITIATOR_PUBLIC: [u8; STATIC_KEY_LEN] = [
         0xa4, 0xe0, 0x92, 0x92, 0xb6, 0x51, 0xc2, 0x78, 0xb9, 0x77, 0x2c, 0x56, 0x9f, 0x5f, 0xa9,
@@ -975,7 +994,7 @@ mod tests {
         .expect("initiator state");
         let mut responder = ResponderHandshake::with_fixed_ephemeral(
             &RESPONDER_PRIVATE,
-            b"PathChord/v1/other-egress",
+            b"PathChord/wire-v1/egress/other-egress",
             &[23; 32],
         )
         .expect("responder state");
