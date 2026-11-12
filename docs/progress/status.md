@@ -25,18 +25,22 @@ separate from `docs/design/`, which describes the intended architecture, and
   system-proxy switch contract with idempotent enable/disable transitions and
   structured events. Platform-side Windows environment/OS proxy mutation is
   still an adapter integration task.
-- The CLI command tree exposes `ingress`, `egress`, `status`, and `enroll` for
-  interface discovery.
+- The local control protocol now has canonical length-prefixed JSON framing,
+  typed request/response envelopes, a Unix-domain server, a transport-neutral
+  dispatcher for status/listener/system-proxy operations, and a Unix CLI client.
+  Named Pipe transport and the actual Windows OS proxy side-effect adapter are
+  still pending.
+- The CLI implements Unix `status` and `system-proxy` requests through the local
+  control socket; `ingress`, `egress`, and `enroll` remain placeholders.
 
 ## Missing operational integration
 
-- CLI operational commands still return the bootstrap error.
+- CLI `ingress`, `egress`, and `enroll` commands still return the bootstrap error.
 - SOCKS, HTTP, TPROXY, TUN, Windows system-proxy, and production Transit
   adapters are not implemented.
 - The end-to-end proxy data plane is not operational.
-- The local length-prefixed JSON adapter, persistent authorization and metadata
-  stores, subscription worker, REST/SSE Web Gateway, and frontend are not
-  integrated.
+- Named Pipe transport, persistent authorization and metadata stores,
+  subscription worker, REST/SSE Web Gateway, and frontend are not integrated.
 - Multipath scheduling and production cross-Path retransmission remain outside
   the implemented slice; v1 UDP and Path lifecycle payload codecs are present
   as protocol primitives but are not integrated into the data plane.
