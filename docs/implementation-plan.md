@@ -57,4 +57,4 @@
 
 ## Deferred implementation choices
 
-The design does not yet select the implementation language, Noise library, rule VM, control-plane encoding, database format, proxy adapter libraries, exact probe intervals, buffer sizes, or autoscaler constants.
+The implementation baseline is selected in the technology-selection document. Still deferred are the exact proxy adapter libraries, Tokio task topology, persistent key encoding, stable wire discriminants and capability IDs, operational buffer tuning, exact probe intervals, and autoscaler constants.

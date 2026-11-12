@@ -48,11 +48,16 @@ pathchord-cli        local management API client and operational commands
 Each Path owns an independent Noise session and transport cipher state. The record layer must:
 
 - authenticate the Path before `PATH_READY`;
-- bind the authenticated static keys to IngressID and EgressID;
+- bind the configured EgressID in the Noise prologue, then map the authenticated initiator key to an authorized IngressID before `SESSION_ATTACH`;
+- use explicit record nonces so loss and reordering do not desynchronize the per-Path cipher;
+- allocate outbound nonces inside the per-Path sender and retain sealed nonce/ciphertext records for retransmission;
 - reject oversized records before allocation;
+- cap frame plaintext so the encoded header, payload, and authentication tag fit the Noise implementation's message limit;
 - expose complete PathChord frames only;
 - report authentication failure as a Path failure;
 - never reuse transport cipher state across Paths.
+
+The Phase-0 `snow` wrapper uses explicit nonces and a bounded replay window, but `snow` 0.10 does not guarantee zeroization of every private/DH and traffic-key buffer it owns. This is a known non-production limitation; a zeroizing resolver or reviewed library replacement is required before deployment.
 
 The implementation must not reuse WireGuard key material or treat the Transit Proxy as an authenticated peer.
 
@@ -78,11 +83,15 @@ The first milestone should avoid implementing both transparent interception plat
 
 These choices are recommended but should be verified by a small prototype before being treated as permanent:
 
-- exact Noise library API and key persistence behavior;
+- zeroization of Noise handshake and transport state, including the selected resolver;
 - Tokio task and cancellation structure under Path churn;
 - Wintun packaging and service integration;
 - Linux TPROXY behavior with IPv4 and IPv6;
 - SQLite behavior under concurrent status and enrollment operations;
 - throughput and allocation cost of the custom frame codec;
 - rule compiler latency and worst-case evaluation cost.
+
+The Phase-0 replay window is intentionally bounded to 64 records. Session-level
+ACK retention and retransmission behavior must be validated against that bound
+before the multipath data plane is considered production-ready.
 

@@ -1,0 +1,16 @@
+[package]
+name = "pathchord-noise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+pathchord-core = { path = "../pathchord-core" }
+snow.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

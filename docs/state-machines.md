@@ -6,6 +6,7 @@
 
 ```text
 CONFIGURED → CONNECTING → CONNECTED
+CONNECTING → DOWN
 CONNECTED → DEGRADED
 DEGRADED → CONNECTED
 CONNECTED/DEGRADED → DRAINING
@@ -18,10 +19,11 @@ DOWN → CONNECTING
 ## Path
 
 ```text
-DISCOVERED → PROBING → ACTIVE → DRAINING → CLOSED
+DISCOVERED → PROBING → ACTIVE
 PROBING → FAILED
 ACTIVE → DEGRADED → ACTIVE
-ACTIVE → FAILED → CLOSED
+ACTIVE/DEGRADED → DRAINING → CLOSED
+ACTIVE/DEGRADED → FAILED → CLOSED
 ```
 
 A newly probed Path joins immediately at its configured weight; no warm-up phase. Quality degradation reduces allocation quickly. Recovery is stabilized. Scale-in uses draining.
@@ -30,9 +32,12 @@ A newly probed Path joins immediately at its configured weight; no warm-up phase
 
 ```text
 NEW → OPENING → OPEN
+NEW/OPENING → CLOSED
+NEW/OPENING → RESET
 OPEN → HALF_CLOSED_LOCAL
 OPEN → HALF_CLOSED_REMOTE
 HALF_CLOSED_* → CLOSED
+HALF_CLOSED_* → RESET
 OPEN → RESET
 ```
 
@@ -43,11 +48,12 @@ A Stream remains bound to its Egress. It may move among compliant Paths in the S
 ```text
 CONFIGURED → CONNECTING → ACTIVE
 ACTIVE → DEGRADED
-ACTIVE → DRAINING
-DEGRADED → CONNECTING
+DEGRADED → ACTIVE
+ACTIVE/DEGRADED → DRAINING
 DRAINING → CLOSED
 CONNECTING → CLOSED
-ACTIVE → CLOSED
+CONFIGURED → CLOSED
+ACTIVE/DEGRADED → CLOSED
 ```
 
-A Session is shared by one Ingress and one Egress and requires at least one active Path. Ingress attempts to create Sessions for configured Egresses at startup and maintains idle Sessions while the Egress remains online. Losing the last Path closes the old Session permanently from the protocol perspective; business Streams are closed immediately, and the Session manager may create a new Session with a new SessionID. Egress offline state, endpoint restart, authorization revocation, or hard failure closes the Session and related target connections. It is not resumed after endpoint restart. Control messages and heartbeats use currently available Paths and are deduplicated by Session control sequence number.
+A Session is shared by one Ingress and one Egress and requires at least one active Path in `ACTIVE`, `DEGRADED`, or `DRAINING`. Ingress attempts to create Sessions for configured Egresses at startup and maintains idle Sessions while the Egress remains online. A degraded Session may recover to `ACTIVE` while it still has a Path. Losing the last Path closes the old Session permanently from the protocol perspective; business Streams are closed immediately, and the Session manager may create a new `CONFIGURED` Session with a new SessionID. Egress offline state, endpoint restart, authorization revocation, or hard failure closes the Session and related target connections. It is not resumed after endpoint restart. Control messages and heartbeats use currently available Paths and are deduplicated by Session control sequence number.
