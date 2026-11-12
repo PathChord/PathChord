@@ -1,5 +1,7 @@
 # PathChord Design Review
 
+**English** | [简体中文](design-review.zh-CN.md)
+
 This review compares the architecture, protocol, configuration, state-machine, implementation, and technology-selection documents.
 
 ## Review status

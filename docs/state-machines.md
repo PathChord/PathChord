@@ -1,5 +1,7 @@
 # PathChord State Machines
 
+**English** | [简体中文](state-machines.zh-CN.md)
+
 ## Egress relationship
 
 ```text

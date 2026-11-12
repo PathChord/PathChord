@@ -1,5 +1,7 @@
 # PathChord Configuration Model
 
+**English** | [简体中文](configuration.zh-CN.md)
+
 This is a conceptual model. Exact serialization is not fixed.
 
 ## Static Egress topology

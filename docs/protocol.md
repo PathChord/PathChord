@@ -1,5 +1,7 @@
 # PathChord Protocol Design
 
+**English** | [简体中文](protocol.zh-CN.md)
+
 ## 1. Cryptography
 
 Use `Noise_IK_25519_ChaChaPoly_SHA256` through a mature implementation.

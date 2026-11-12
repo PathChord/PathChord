@@ -1,5 +1,7 @@
 # PathChord Technology Selection
 
+**English** | [简体中文](technology-selection.zh-CN.md)
+
 This document selects the initial implementation technologies. It is intentionally limited to implementation choices; protocol and behavioral requirements remain defined in the architecture and protocol documents.
 
 ## Recommended baseline

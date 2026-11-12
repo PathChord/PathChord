@@ -1,5 +1,7 @@
 # PathChord Implementation Plan
 
+**English** | [简体中文](implementation-plan.zh-CN.md)
+
 ## Phase 0: protocol and test fixtures
 
 - Freeze frame/state-machine specifications.
