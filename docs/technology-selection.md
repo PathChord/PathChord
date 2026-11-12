@@ -13,7 +13,7 @@ This document selects the initial implementation technologies. It is intentional
 | Serialization | `serde` for configuration and management API models | Shared typed models without coupling the wire protocol to a text format |
 | Wire framing | Dedicated Rust codec using QUIC-style unsigned varints | Protocol requires explicit framing and does not depend on a general RPC schema |
 | Configuration | YAML for human-authored files, normalized into typed Rust snapshots | Readable static configuration while keeping runtime evaluation typed |
-| Local management API | Versioned binary or length-delimited JSON messages over Unix Socket/Named Pipe | Local-only administration and stable CLI/API boundary |
+| Local management API | Versioned length-delimited JSON messages over Unix Socket/Named Pipe | Local-only administration, easy inspection, and stable CLI/API boundary |
 | Embedded state | SQLite for Egress authorization and durable local metadata | Atomic transactions, generation numbers, and easy inspection |
 | Rules | Dedicated restricted rule language compiled at startup | Deterministic evaluation and a narrow output model; no arbitrary host access |
 | Linux interception | `nix`/`socket2` plus platform-specific netlink and TPROXY code | Access to socket options and routing primitives without hiding kernel behavior |
