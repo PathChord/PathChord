@@ -33,14 +33,19 @@ separate from `docs/design/`, which describes the intended architecture, and
 - The CLI implements Unix `status`, `system-proxy`, and `ingress --config`
   requests through the local control socket; `egress` and `enroll` remain
   placeholders.
+- HTTP CONNECT and SOCKS5 CONNECT inbound adapters now parse bounded local
+  handshakes into typed `ConnectionContext` values, including domain/IPv4/IPv6
+  targets, optional SOCKS username/password identity, and deterministic failure
+  replies. Target dialing and Stream creation remain separate integration work.
 
 ## Missing operational integration
 
 - CLI `egress` and `enroll` commands still return the bootstrap error; `ingress`
   currently starts the local control server and does not yet start traffic
   listeners.
-- SOCKS, HTTP, TPROXY, TUN, Windows system-proxy, and production Transit
-  adapters are not implemented.
+- TPROXY, TUN, Windows system-proxy OS side effects, and production Transit
+  adapters are not implemented; HTTP/SOCKS handshake adapters are now present
+  but are not connected to target dialing or the data plane.
 - The end-to-end proxy data plane is not operational.
 - Named Pipe transport, persistent authorization and metadata stores,
   subscription worker, REST/SSE Web Gateway, and frontend are not integrated.
