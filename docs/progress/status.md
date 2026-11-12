@@ -30,12 +30,15 @@ separate from `docs/design/`, which describes the intended architecture, and
   dispatcher for status/listener/system-proxy operations, and a Unix CLI client.
   Named Pipe transport and the actual Windows OS proxy side-effect adapter are
   still pending.
-- The CLI implements Unix `status` and `system-proxy` requests through the local
-  control socket; `ingress`, `egress`, and `enroll` remain placeholders.
+- The CLI implements Unix `status`, `system-proxy`, and `ingress --config`
+  requests through the local control socket; `egress` and `enroll` remain
+  placeholders.
 
 ## Missing operational integration
 
-- CLI `ingress`, `egress`, and `enroll` commands still return the bootstrap error.
+- CLI `egress` and `enroll` commands still return the bootstrap error; `ingress`
+  currently starts the local control server and does not yet start traffic
+  listeners.
 - SOCKS, HTTP, TPROXY, TUN, Windows system-proxy, and production Transit
   adapters are not implemented.
 - The end-to-end proxy data plane is not operational.
