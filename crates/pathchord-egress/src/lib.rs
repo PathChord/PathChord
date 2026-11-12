@@ -4,12 +4,15 @@
 //! will publish validated generations as immutable `AuthorizationSnapshot`s.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use pathchord_core::{RequestId, SessionId, StreamId};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, lookup_host};
+use tokio::time::timeout;
 
 pub trait TargetConnection: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -68,6 +71,84 @@ pub trait TargetConnector: Send + Sync {
         &self,
         request: TargetRequest,
     ) -> Result<BoxedTargetConnection, TargetConnectError>;
+}
+
+/// Tokio TCP target connector used by the Egress data plane.
+///
+/// Explicit address candidates are attempted first. If they are absent or all
+/// fail and an original hostname is present, the connector asks the configured
+/// system resolver for addresses and tries those in resolver order. DNS policy
+/// selection remains above this transport adapter.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TcpTargetConnector {
+    connect_timeout: Option<Duration>,
+}
+
+impl TcpTargetConnector {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            connect_timeout: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_timeout(connect_timeout: Duration) -> Self {
+        Self {
+            connect_timeout: Some(connect_timeout),
+        }
+    }
+
+    async fn connect_addr(&self, address: SocketAddr) -> Result<TcpStream, TargetConnectError> {
+        let result = match self.connect_timeout {
+            Some(limit) => timeout(limit, TcpStream::connect(address))
+                .await
+                .map_err(|_| {
+                    TargetConnectError::Connection("target connection timed out".into())
+                })?,
+            None => TcpStream::connect(address).await,
+        };
+        result.map_err(|_| TargetConnectError::Connection("target connection failed".into()))
+    }
+}
+
+#[async_trait]
+impl TargetConnector for TcpTargetConnector {
+    async fn connect(
+        &self,
+        request: TargetRequest,
+    ) -> Result<BoxedTargetConnection, TargetConnectError> {
+        request.validate()?;
+
+        let mut last_error = None;
+        for address in request
+            .resolved_ip_candidates
+            .iter()
+            .copied()
+            .map(|ip| SocketAddr::new(ip, request.port))
+        {
+            match self.connect_addr(address).await {
+                Ok(stream) => return Ok(Box::new(stream)),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        if let Some(hostname) = request.original_hostname.as_deref() {
+            let addresses = lookup_host((hostname, request.port)).await.map_err(|_| {
+                TargetConnectError::Connection("target name resolution failed".into())
+            })?;
+            for address in addresses {
+                match self.connect_addr(address).await {
+                    Ok(stream) => return Ok(Box::new(stream)),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            TargetConnectError::Connection("no target addresses were available".into())
+        }))
+    }
 }
 
 /// Semantic result cached for a Session-scoped RequestID.
@@ -820,6 +901,71 @@ mod tests {
             })
         );
         assert_eq!(egress.connector().call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_connector_tries_explicit_candidates() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target listener");
+        let address = listener.local_addr().expect("target address");
+        let accepted = tokio::spawn(async move { listener.accept().await.expect("accept target") });
+
+        let connection = TcpTargetConnector::new()
+            .connect(TargetRequest {
+                original_hostname: None,
+                resolved_ip_candidates: vec![address.ip()],
+                port: address.port(),
+            })
+            .await
+            .expect("connect target");
+        drop(connection);
+        accepted.await.expect("target task");
+    }
+
+    #[tokio::test]
+    async fn tcp_connector_resolves_hostname_when_candidates_are_absent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target listener");
+        let address = listener.local_addr().expect("target address");
+        let accepted = tokio::spawn(async move { listener.accept().await.expect("accept target") });
+
+        let connection = TcpTargetConnector::new()
+            .connect(TargetRequest {
+                original_hostname: Some("127.0.0.1".into()),
+                resolved_ip_candidates: Vec::new(),
+                port: address.port(),
+            })
+            .await
+            .expect("resolve and connect target");
+        drop(connection);
+        accepted.await.expect("target task");
+    }
+
+    #[tokio::test]
+    async fn tcp_connector_preserves_target_validation_errors() {
+        let connector = TcpTargetConnector::new();
+        assert!(matches!(
+            connector
+                .connect(TargetRequest {
+                    original_hostname: None,
+                    resolved_ip_candidates: Vec::new(),
+                    port: 443,
+                })
+                .await,
+            Err(TargetConnectError::MissingDestination)
+        ));
+        assert!(matches!(
+            connector
+                .connect(TargetRequest {
+                    original_hostname: Some("example.test".into()),
+                    resolved_ip_candidates: Vec::new(),
+                    port: 0,
+                })
+                .await,
+            Err(TargetConnectError::InvalidPort)
+        ));
     }
 
     fn record(state: AuthorizationState) -> AuthorizationRecord {
