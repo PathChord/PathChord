@@ -21,6 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 mod control;
 mod control_views;
+mod local_protocol;
 
 pub use control::{
     ConnectionObservation, ConnectionState, ControlError, ControlEvent, ControlEventKind,
@@ -34,6 +35,11 @@ pub use control::{
 pub use control_views::{
     ListenerInventory, ListenerSelectionError, ListenerView, ListenerViewState,
     SystemProxyPlatformEffect, SystemProxyRestorationState, SystemProxyStatusView,
+};
+pub use local_protocol::{
+    Actor, ErrorBody, ErrorCode, GenerationExpectation, LOCAL_API_VERSION, LocalProtocolError,
+    MAX_ENVELOPE_BYTES, RequestEnvelope, ResponseEnvelope, decode_object, encode_object,
+    read_object, write_object,
 };
 
 pub trait LocalConnection: AsyncRead + AsyncWrite + Send + Unpin {}
