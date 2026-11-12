@@ -8,7 +8,7 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 ## 状态
 
-目前处于初始实现阶段。本仓库包含设计基线、`wire-profile-v1` 协议契约、Kubernetes 风格配置契约，以及阶段 0/阶段 1A reliability/control-service 基础。代理数据面和 Web Gateway 适配器尚未实现。
+目前处于初始实现阶段。本仓库包含设计基线、`wire-profile-v1` 协议契约、Kubernetes 风格配置契约，以及阶段 0/阶段 1A reliability/control-service 基础。在 Unix 上，Ingress 命令现在可以启动配置的 HTTP/SOCKS 监听器和有界 direct TCP bootstrap bridge；Session/Path 多路径数据面、Windows Named Pipe 控制传输和 Web Gateway 适配器尚未实现。
 
 ## 术语
 
@@ -58,7 +58,9 @@ pathchord status
 pathchord enroll
 ```
 
-目前可通过命令树查看规划中的界面；在对应实现阶段完成前，运行操作命令会返回明确的初始化阶段错误。
+`ingress` 命令会启动配置的本地监听器和控制 socket；`status` 与
+`system-proxy` 通过本地控制 socket 工作；`egress` 与 `enroll` 仍会返回
+初始化阶段错误。
 
 ## 开发
 

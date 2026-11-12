@@ -10,8 +10,10 @@ PathChord provides ordinary proxy semantics to local applications while maintain
 
 Initial implementation. The repository contains the design baseline, the
 `wire-profile-v1` protocol contract, Kubernetes-style configuration contracts,
-and Phase 0/Phase 1A reliability and control-service foundations. The proxy
-data plane and Web Gateway adapters are not implemented yet.
+and Phase 0/Phase 1A reliability and control-service foundations. On Unix, the
+Ingress command can run configured HTTP/SOCKS listeners through a bounded
+direct TCP bootstrap bridge; the Session/Path multipath data plane, Windows
+Named Pipe control transport, and Web Gateway adapters are not implemented yet.
 
 ## Terminology
 
@@ -66,7 +68,9 @@ pathchord status
 pathchord enroll
 ```
 
-The command tree is available for interface discovery, but operational commands currently return a bootstrap error until their implementation phase is complete.
+The `ingress` command starts the configured local listeners and control socket.
+`status` and `system-proxy` use the local control socket; `egress` and `enroll`
+still return a bootstrap error.
 
 ## Development
 

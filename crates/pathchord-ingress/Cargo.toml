@@ -14,10 +14,10 @@ pathchord-policy = { path = "../pathchord-policy" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "macros"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "net"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "sync"] }
 
 [lints]
 workspace = true

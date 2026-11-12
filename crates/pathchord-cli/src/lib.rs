@@ -2,12 +2,15 @@
 
 use std::path::PathBuf;
 
+use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
 use getrandom::fill;
+use pathchord_egress::{TargetRequest, TcpTargetConnector};
 use pathchord_ingress::{
-    Actor, ErrorCode, LOCAL_API_VERSION, ListenerDescriptor, ListenerKind, LocalControlDispatcher,
-    LocalControlServer, LocalProtocolError, RequestEnvelope, ResponseEnvelope, SystemProxyPlatform,
-    read_object, write_object,
+    Actor, BoxedLocalConnection, ErrorCode, FlowBridgeError, IngressTargetDialer,
+    LOCAL_API_VERSION, ListenerDescriptor, ListenerKind, ListenerRuntime, LocalControlDispatcher,
+    LocalControlServer, LocalProtocolError, RequestEnvelope, ResponseEnvelope, RuntimeError,
+    SystemProxyPlatform, TargetAddress, TargetHost, read_object, write_object,
 };
 use pathchord_policy::{
     AuthenticationMode, KubeConfig, ListenerConfig, ListenerKind as PolicyListenerKind,
@@ -104,6 +107,8 @@ pub enum CliError {
     Config(#[from] pathchord_policy::ConfigError),
     #[error("local control server failed: {0}")]
     LocalServer(#[from] pathchord_ingress::LocalServerError),
+    #[error("listener runtime failed: {0}")]
+    Runtime(#[from] RuntimeError),
     #[error("listener {listener_id} has invalid bind address {bind}")]
     InvalidListenerBind { listener_id: String, bind: String },
 }
@@ -208,15 +213,37 @@ async fn run_ingress(
     } else {
         SystemProxyPlatform::Linux
     };
+    let descriptors = policy
+        .listeners
+        .into_iter()
+        .map(listener_descriptor)
+        .collect::<Result<Vec<_>, _>>()?;
+    let runtime = ListenerRuntime::bind_descriptors(
+        TcpIngressDialer::new(),
+        Default::default(),
+        descriptors.clone(),
+    )
+    .await?;
     let mut dispatcher = LocalControlDispatcher::new(platform);
-    for listener in policy.listeners {
-        dispatcher
-            .service_mut()
-            .register_listener(listener_descriptor(listener)?);
+    for descriptor in descriptors {
+        dispatcher.service_mut().register_listener(descriptor);
     }
     let server = LocalControlServer::bind(socket.to_owned(), dispatcher)?;
-    server.run().await?;
-    Ok(())
+
+    // Both surfaces are long-lived. Pinning the futures lets whichever side
+    // fails first tear down the other by dropping its owner.
+    let runtime_future = runtime.run();
+    let server_future = server.run();
+    tokio::pin!(runtime_future);
+    tokio::pin!(server_future);
+    tokio::select! {
+        result = &mut runtime_future => {
+            result.map(|_| ()).map_err(CliError::from)
+        }
+        result = &mut server_future => {
+            result.map(|_| ()).map_err(CliError::from)
+        }
+    }
 }
 
 fn listener_descriptor(listener: ListenerConfig) -> Result<ListenerDescriptor, CliError> {
@@ -248,6 +275,51 @@ fn parse_bind(host: &str, port: u16) -> Option<std::net::SocketAddr> {
         format!("{host}:{port}")
     };
     value.parse().ok()
+}
+
+/// Adapts the concrete Egress TCP connector to the transport-neutral local
+/// flow bridge used by listener runtimes.
+#[derive(Debug, Clone, Copy, Default)]
+struct TcpIngressDialer {
+    connector: TcpTargetConnector,
+}
+
+impl TcpIngressDialer {
+    const fn new() -> Self {
+        Self {
+            connector: TcpTargetConnector::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl IngressTargetDialer for TcpIngressDialer {
+    async fn connect(
+        &self,
+        target: TargetAddress,
+    ) -> Result<BoxedLocalConnection, FlowBridgeError> {
+        let request = target_request(target);
+        self.connector
+            .connect_tcp(request)
+            .await
+            .map(|stream| Box::new(stream) as BoxedLocalConnection)
+            .map_err(|error| FlowBridgeError::Dial(error.to_string()))
+    }
+}
+
+fn target_request(target: TargetAddress) -> TargetRequest {
+    match target.host {
+        TargetHost::Hostname(host) => TargetRequest {
+            original_hostname: Some(host),
+            resolved_ip_candidates: Vec::new(),
+            port: target.port,
+        },
+        TargetHost::Ip(address) => TargetRequest {
+            original_hostname: None,
+            resolved_ip_candidates: vec![address],
+            port: target.port,
+        },
+    }
 }
 
 fn print_response(response: ResponseEnvelope) -> Result<(), CliError> {
@@ -289,6 +361,48 @@ async fn call_unix(
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{mpsc, oneshot};
+
+    async fn echo_target() -> (SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let address = listener.local_addr().expect("target address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("target accept");
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).await.expect("target read");
+            stream.write_all(&payload).await.expect("target write");
+            payload
+        });
+        (address, task)
+    }
+
+    async fn start_runtime(
+        listener: impl pathchord_ingress::IngressListener + 'static,
+    ) -> (
+        SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<pathchord_ingress::RuntimeReport>,
+        mpsc::UnboundedReceiver<pathchord_ingress::ListenerRuntimeEvent>,
+    ) {
+        let mut runtime = ListenerRuntime::new(TcpIngressDialer::new());
+        let address = listener.local_addr().expect("proxy address");
+        runtime.add_listener(listener).expect("runtime listener");
+        let (events, receiver) = mpsc::unbounded_channel();
+        runtime.set_event_sender(events);
+        let (shutdown, signal) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            runtime
+                .run_until_shutdown(async move {
+                    let _ = signal.await;
+                })
+                .await
+                .expect("runtime")
+        });
+        (address, shutdown, task, receiver)
+    }
 
     #[test]
     fn parses_status_with_global_socket_and_actor() {
@@ -332,6 +446,150 @@ mod tests {
         assert_eq!(descriptor.kind, ListenerKind::Http);
         assert_eq!(descriptor.bind.port(), 8080);
         assert!(descriptor.authentication_required);
+    }
+
+    #[test]
+    fn preserves_hostname_for_egress_resolution() {
+        let request = target_request(TargetAddress {
+            host: TargetHost::Hostname("example.test".to_owned()),
+            port: 443,
+        });
+        assert_eq!(request.original_hostname.as_deref(), Some("example.test"));
+        assert!(request.resolved_ip_candidates.is_empty());
+        assert_eq!(request.port, 443);
+    }
+
+    #[test]
+    fn maps_ip_target_to_an_explicit_egress_candidate() {
+        let address = "192.0.2.10".parse().expect("IP address");
+        let request = target_request(TargetAddress {
+            host: TargetHost::Ip(address),
+            port: 8443,
+        });
+        assert_eq!(request.original_hostname, None);
+        assert_eq!(request.resolved_ip_candidates, vec![address]);
+        assert_eq!(request.port, 8443);
+    }
+
+    #[tokio::test]
+    async fn http_listener_bridges_to_a_tcp_target() {
+        let (target_address, target_task) = echo_target().await;
+        let descriptor = ListenerDescriptor {
+            id: pathchord_ingress::ListenerId::new("http-e2e"),
+            kind: ListenerKind::Http,
+            bind: "127.0.0.1:0".parse().expect("proxy bind"),
+            authentication_required: false,
+        };
+        let listener = pathchord_ingress::HttpConnectListener::bind(descriptor)
+            .await
+            .expect("HTTP bind");
+        let (proxy_address, shutdown, runtime_task, mut events) = start_runtime(listener).await;
+
+        let mut client = TcpStream::connect(proxy_address)
+            .await
+            .expect("proxy connect");
+        let request = format!(
+            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+            target_address, target_address
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("HTTP request");
+        let mut response = [0_u8; 39];
+        client
+            .read_exact(&mut response)
+            .await
+            .expect("HTTP response");
+        assert_eq!(&response, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        client.write_all(b"http-e2e").await.expect("HTTP payload");
+        client.shutdown().await.expect("HTTP half-close");
+        let mut echoed = Vec::new();
+        client.read_to_end(&mut echoed).await.expect("HTTP echo");
+        assert_eq!(echoed, b"http-e2e");
+
+        loop {
+            match events.recv().await {
+                Some(pathchord_ingress::ListenerRuntimeEvent::ConnectionCompleted { .. }) => {
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("runtime event channel closed before completion"),
+            }
+        }
+        shutdown.send(()).expect("runtime shutdown");
+        let report = runtime_task.await.expect("runtime task");
+        assert_eq!(report.accepted_connections, 1);
+        assert_eq!(report.completed_connections, 1);
+        assert_eq!(report.local_to_target_bytes, 8);
+        assert_eq!(target_task.await.expect("target task"), b"http-e2e");
+    }
+
+    #[tokio::test]
+    async fn socks_listener_bridges_to_a_tcp_target() {
+        let (target_address, target_task) = echo_target().await;
+        let descriptor = ListenerDescriptor {
+            id: pathchord_ingress::ListenerId::new("socks-e2e"),
+            kind: ListenerKind::Socks5,
+            bind: "127.0.0.1:0".parse().expect("proxy bind"),
+            authentication_required: false,
+        };
+        let listener = pathchord_ingress::Socks5Listener::bind(descriptor)
+            .await
+            .expect("SOCKS bind");
+        let (proxy_address, shutdown, runtime_task, mut events) = start_runtime(listener).await;
+
+        let mut client = TcpStream::connect(proxy_address)
+            .await
+            .expect("proxy connect");
+        client.write_all(&[5, 1, 0]).await.expect("SOCKS greeting");
+        let mut method = [0_u8; 2];
+        client.read_exact(&mut method).await.expect("SOCKS method");
+        assert_eq!(method, [5, 0]);
+        let target_ip = match target_address.ip() {
+            std::net::IpAddr::V4(address) => address.octets(),
+            std::net::IpAddr::V6(_) => panic!("test target must be IPv4"),
+        };
+        let target_port = target_address.port().to_be_bytes();
+        client
+            .write_all(&[
+                5,
+                1,
+                0,
+                1,
+                target_ip[0],
+                target_ip[1],
+                target_ip[2],
+                target_ip[3],
+                target_port[0],
+                target_port[1],
+            ])
+            .await
+            .expect("SOCKS CONNECT");
+        let mut reply = [0_u8; 10];
+        client.read_exact(&mut reply).await.expect("SOCKS reply");
+        assert_eq!(reply[1], 0);
+        client.write_all(b"socks-e2e").await.expect("SOCKS payload");
+        client.shutdown().await.expect("SOCKS half-close");
+        let mut echoed = Vec::new();
+        client.read_to_end(&mut echoed).await.expect("SOCKS echo");
+        assert_eq!(echoed, b"socks-e2e");
+
+        loop {
+            match events.recv().await {
+                Some(pathchord_ingress::ListenerRuntimeEvent::ConnectionCompleted { .. }) => {
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("runtime event channel closed before completion"),
+            }
+        }
+        shutdown.send(()).expect("runtime shutdown");
+        let report = runtime_task.await.expect("runtime task");
+        assert_eq!(report.accepted_connections, 1);
+        assert_eq!(report.completed_connections, 1);
+        assert_eq!(report.local_to_target_bytes, 9);
+        assert_eq!(target_task.await.expect("target task"), b"socks-e2e");
     }
 
     #[test]

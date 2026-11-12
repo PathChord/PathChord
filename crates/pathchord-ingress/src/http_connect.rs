@@ -39,13 +39,13 @@ impl HttpConnectListener {
     /// Binds an HTTP listener at the descriptor's configured address.
     pub async fn bind(descriptor: ListenerDescriptor) -> Result<Self, ListenerError> {
         if descriptor.kind != ListenerKind::Http {
-            return Err(ListenerError::Accept(
+            return Err(ListenerError::InvalidDescriptor(
                 "HTTP CONNECT adapter requires an HTTP ListenerDescriptor".to_owned(),
             ));
         }
         let listener = TcpListener::bind(descriptor.bind)
             .await
-            .map_err(|error| ListenerError::Accept(error.to_string()))?;
+            .map_err(|error| ListenerError::Bind(error.to_string()))?;
         Ok(Self {
             descriptor,
             listener,
@@ -66,6 +66,12 @@ impl HttpConnectListener {
         &self.descriptor
     }
 
+    pub fn local_addr(&self) -> Result<SocketAddr, ListenerError> {
+        self.listener
+            .local_addr()
+            .map_err(|error| ListenerError::Accept(error.to_string()))
+    }
+
     /// Parses one HTTP CONNECT request from a generic stream. This is useful for
     /// deterministic adapter tests and for platform wrappers that already own
     /// an accepted stream.
@@ -79,7 +85,7 @@ impl HttpConnectListener {
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         if descriptor.kind != ListenerKind::Http {
-            return Err(ListenerError::Accept(
+            return Err(ListenerError::InvalidDescriptor(
                 "HTTP CONNECT adapter requires an HTTP ListenerDescriptor".to_owned(),
             ));
         }
@@ -89,17 +95,30 @@ impl HttpConnectListener {
 
         let mut reader = BufReader::new(stream);
         let mut first_line = Vec::new();
-        if reader.read_until(b'\n', &mut first_line).await.is_err()
+        let first_line_bytes = reader
+            .read_until(b'\n', &mut first_line)
+            .await
+            .unwrap_or_default();
+        if first_line_bytes == 0
+            || first_line.last() != Some(&b'\n')
             || first_line.len() > MAX_HEADER_BYTES
         {
             return Err(reject(reader, "malformed HTTP request line").await);
         }
-        let first_line = trim_line(&first_line);
+        let mut consumed = first_line.len();
+        let first_line = match trim_line(&first_line) {
+            Some(line) => line,
+            None => return Err(reject(reader, "HTTP request line is not UTF-8").await),
+        };
         let mut fields = first_line.split_ascii_whitespace();
         let method = fields.next();
         let authority = fields.next();
         let version = fields.next();
-        if method != Some("CONNECT") || authority.is_none() || version != Some("HTTP/1.1") {
+        if method != Some("CONNECT")
+            || authority.is_none()
+            || version != Some("HTTP/1.1")
+            || fields.next().is_some()
+        {
             return Err(reject(reader, "HTTP CONNECT is required").await);
         }
         let authority = authority.expect("checked above");
@@ -108,17 +127,23 @@ impl HttpConnectListener {
             Err(reason) => return Err(reject(reader, &reason).await),
         };
 
-        let mut consumed = first_line.len() + 1;
         loop {
             let mut line = Vec::new();
-            if reader.read_until(b'\n', &mut line).await.is_err() {
+            let line_bytes = reader
+                .read_until(b'\n', &mut line)
+                .await
+                .unwrap_or_default();
+            if line_bytes == 0 || line.last() != Some(&b'\n') {
                 return Err(reject(reader, "truncated HTTP headers").await);
             }
             consumed = consumed.saturating_add(line.len());
             if consumed > MAX_HEADER_BYTES {
                 return Err(reject(reader, "HTTP headers exceed the configured limit").await);
             }
-            let line = trim_line(&line);
+            let line = match trim_line(&line) {
+                Some(line) => line,
+                None => return Err(reject(reader, "HTTP header is not UTF-8").await),
+            };
             if line.is_empty() {
                 break;
             }
@@ -130,11 +155,11 @@ impl HttpConnectListener {
         reader
             .write_all(CONNECTED_RESPONSE)
             .await
-            .map_err(|error| ListenerError::Accept(error.to_string()))?;
+            .map_err(|error| ListenerError::Protocol(error.to_string()))?;
         reader
             .flush()
             .await
-            .map_err(|error| ListenerError::Accept(error.to_string()))?;
+            .map_err(|error| ListenerError::Protocol(error.to_string()))?;
 
         Ok(AcceptedConnection {
             io: Box::new(reader) as BoxedLocalConnection,
@@ -156,6 +181,10 @@ impl IngressListener for HttpConnectListener {
         &self.descriptor
     }
 
+    fn local_addr(&self) -> Result<SocketAddr, ListenerError> {
+        Self::local_addr(self)
+    }
+
     async fn accept(&self) -> Result<AcceptedConnection, ListenerError> {
         let (stream, source) = self
             .listener
@@ -172,17 +201,21 @@ impl IngressListener for HttpConnectListener {
     }
 }
 
-fn trim_line(line: &[u8]) -> &str {
+fn trim_line(line: &[u8]) -> Option<&str> {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
-    std::str::from_utf8(line).unwrap_or("")
+    std::str::from_utf8(line).ok()
 }
 
 fn parse_authority(authority: &str) -> Result<TargetEndpoint, String> {
+    let bracketed = authority.starts_with('[');
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         let (host, port) = rest
             .split_once("]:")
             .ok_or_else(|| "bracketed IPv6 authority must include a port".to_owned())?;
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("bracketed authority host is not IPv6".to_owned());
+        }
         (host, port)
     } else {
         authority
@@ -191,6 +224,12 @@ fn parse_authority(authority: &str) -> Result<TargetEndpoint, String> {
     };
     if host.is_empty() {
         return Err("CONNECT authority host is empty".to_owned());
+    }
+    if !bracketed && host.contains(':') {
+        return Err("IPv6 CONNECT authority must use brackets".to_owned());
+    }
+    if host.len() > 255 {
+        return Err("CONNECT authority host is too long".to_owned());
     }
     let port = port
         .parse::<u16>()
@@ -212,7 +251,7 @@ where
 {
     let _ = stream.write_all(BAD_REQUEST_RESPONSE).await;
     let _ = stream.flush().await;
-    ListenerError::Accept(reason.to_owned())
+    ListenerError::Protocol(reason.to_owned())
 }
 
 #[cfg(test)]
@@ -267,6 +306,12 @@ mod tests {
         assert_eq!(target.host, TargetHost::Ip("2001:db8::1".parse().unwrap()));
     }
 
+    #[test]
+    fn rejects_unbracketed_or_non_ipv6_bracketed_authorities() {
+        assert!(parse_authority("2001:db8::1:8443").is_err());
+        assert!(parse_authority("[example.com]:443").is_err());
+    }
+
     #[tokio::test]
     async fn rejects_method_auth_and_oversized_headers() {
         let descriptor_oversized = descriptor(false);
@@ -315,6 +360,88 @@ mod tests {
         request.extend(std::iter::repeat_n(b'x', MAX_HEADER_BYTES));
         request.extend_from_slice(b"\r\n\r\n");
         client.write_all(&request).await.unwrap();
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_eof_before_request_headers_are_complete() {
+        let descriptor = descriptor(false);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            HttpConnectListener::accept_stream(
+                &descriptor,
+                server,
+                "127.0.0.1:12345".parse().unwrap(),
+                None,
+            )
+            .await
+        });
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_request_line_without_a_line_ending() {
+        let descriptor = descriptor(false);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            HttpConnectListener::accept_stream(
+                &descriptor,
+                server,
+                "127.0.0.1:12345".parse().unwrap(),
+                None,
+            )
+            .await
+        });
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_non_utf8_headers_instead_of_treating_them_as_empty() {
+        let descriptor = descriptor(false);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            HttpConnectListener::accept_stream(
+                &descriptor,
+                server,
+                "127.0.0.1:12345".parse().unwrap(),
+                None,
+            )
+            .await
+        });
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\xff\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_extra_request_line_tokens() {
+        let descriptor = descriptor(false);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            HttpConnectListener::accept_stream(
+                &descriptor,
+                server,
+                "127.0.0.1:12345".parse().unwrap(),
+                None,
+            )
+            .await
+        });
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1 extra\r\n\r\n")
+            .await
+            .unwrap();
         assert!(task.await.unwrap().is_err());
     }
 
