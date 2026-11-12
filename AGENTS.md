@@ -2,20 +2,21 @@
 
 ## Project Structure & Module Organization
 
-PathChord is currently in the design phase. `README.md` defines the project vocabulary and links the design baseline. The `docs/` directory contains architecture, protocol, configuration, state-machine, implementation-plan, technology-selection, and design-review documents. There is not yet a `src/`, `tests/`, or assets directory, nor a Cargo workspace.
+PathChord is in initial implementation. `README.md` defines the project vocabulary and links the design baseline. The `docs/` directory contains architecture, protocol, configuration, state-machine, implementation-plan, technology-selection, and design-review documents. The root Cargo workspace contains Phase 0 protocol primitives and test fixtures under `crates/`.
 
-The recommended Rust layout separates `pathchord-core`, `pathchord-noise`, `pathchord-path`, `pathchord-policy`, `pathchord-transit`, `pathchord-egress`, `pathchord-ingress`, and `pathchord-cli`. Keep `pathchord-core` independent of platforms, subscription formats, and listener implementations.
+The Rust layout separates `pathchord-core`, `pathchord-noise`, `pathchord-path`, `pathchord-policy`, `pathchord-transit`, `pathchord-egress`, `pathchord-ingress`, and `pathchord-cli`. Keep `pathchord-core` independent of platforms, subscription formats, and listener implementations.
 
 ## Build, Test, and Development Commands
 
-No application build or runtime command is available yet; the CLI commands in `README.md` are planned interfaces. For current documentation changes, run:
+The CLI exposes the planned command tree but operational commands remain bootstrap placeholders. Run the workspace quality gates with:
 
 ```sh
-git diff --check
-rg -n '^#{1,6} ' README.md docs/*.md AGENTS.md
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
 ```
 
-The first command detects whitespace errors; the second makes heading structure easy to review. Once the Rust workspace exists, the expected checks are `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`.
+For documentation changes, also run `git diff --check` and `rg -n '^#{1,6} ' README.md docs/*.md AGENTS.md`.
 
 ## Coding Style & Naming Conventions
 

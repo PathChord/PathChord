@@ -48,11 +48,16 @@ pathchord-cli        local management API client and operational commands
 每个 Path 都拥有独立的 Noise 会话和传输密码状态。记录层必须：
 
 - 在 `PATH_READY` 之前验证 Path 的身份；
-- 将经过身份验证的静态密钥绑定到 IngressID 和 EgressID；
+- 在 Noise prologue 中绑定已配置的 EgressID，然后在 `SESSION_ATTACH` 之前将经过身份验证的 initiator 密钥映射到已授权的 IngressID；
+- 使用显式记录 nonce，避免丢失和乱序导致逐 Path 密码状态失步；
+- 由逐 Path 发送端分配出站 nonce，并保留 nonce/密文记录用于重传；
 - 在分配内存之前拒绝过大的记录；
+- 限制帧明文大小，确保编码后的帧头、载荷和认证标签不超过 Noise 实现的消息上限；
 - 只暴露完整的 PathChord 帧；
 - 将身份验证失败报告为 Path 故障；
 - 绝不跨 Path 重用传输密码状态。
+
+阶段 0 的 `snow` 封装使用显式 nonce 和有界重放窗口，但 `snow` 0.10 不保证清零其拥有的全部私钥、DH 和传输密钥缓冲区。这是已知的非生产限制；正式部署前必须采用支持清零的 resolver 或经过审查的库替代方案。
 
 实现不得重用 WireGuard 密钥材料，也不得将 Transit Proxy 视为经过身份验证的对等方。
 
@@ -78,11 +83,13 @@ Linux 是第一个实现目标，因为 TPROXY、REDIRECT、进程元数据和�
 
 推荐采用这些选型，但在将其视为永久决定之前，应使用小型原型进行验证：
 
-- Noise 库的确切 API 和密钥持久化行为；
+- Noise 握手和传输状态（包括所选 resolver）的密钥清零行为；
 - Path 频繁变动时的 Tokio 任务和取消结构；
 - Wintun 打包和服务集成；
 - Linux TPROXY 在 IPv4 和 IPv6 下的行为；
 - 并发状态查询和注册操作下的 SQLite 行为；
 - 自定义帧编解码器的吞吐量和分配成本；
 - 规则编译器延迟和最坏情况求值成本。
+
+阶段 0 的重放窗口有意限制为 64 条记录。在多路径数据面达到生产就绪前，必须验证 Session 级 ACK 保留和重传行为与该上限的协调关系。
 

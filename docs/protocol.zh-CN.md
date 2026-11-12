@@ -46,27 +46,23 @@ RequestID
 
 ## 4. 控制消息
 
-协议至少需要以下消息：
+规范帧注册表由第 10 至 12 节中的生命周期、TCP Stream 和 UDP 列表定义。Session 和 Path 控制使用：
 
 ```text
-VERSION_NEGOTIATE
+PATH_HELLO
 SESSION_ATTACH
 SESSION_ATTACH_OK
-EGRESS_STATUS
-PATH_PROBE
-PATH_PROBE_ACK
+SESSION_ATTACH_REJECT
+PATH_READY
 PATH_DRAIN
 PATH_CLOSE
-STREAM_OPEN
-STREAM_OPEN_ACK
-STREAM_FIN
-STREAM_RST
-STREAM_DATA
-STREAM_ACK
-STREAM_WINDOW
+STATUS_REPORT
+HEARTBEAT
+CONTROL_ACK
 SESSION_CLOSE
-ERROR
 ```
+
+版本和能力协商属于 `PATH_HELLO`。`STATUS_REPORT` 是 Egress 状态报告的规范名称，`HEARTBEAT` 用于 Path 存活检测。需要返回结果的操作使用各自的成功和错误帧，例如 `STREAM_OPEN_OK` 和 `STREAM_OPEN_ERR`，而不是通用 `ERROR` 帧。
 
 控制流量拥有预留容量。一个 Session 至少需要一条活跃 Path；最后一条 Path 丢失时，Session 终止。状态报告、心跳和 Session 控制消息使用当前可用的 Path，并通过 Session 控制序列号抑制重复。当执行顺序很重要时，控制消息可以选择携带依赖序列号。任何可用 Path 都可以承载任何控制或数据交换。
 
@@ -109,7 +105,9 @@ Ingress 负责 Path 的创建和准入。Path 状态对 Stream 和 UDP Session �
 
 ## 9. 帧格式与编号
 
-每条加密 Path 记录包含一个 Path 帧。Noise 提供机密性和完整性；帧头作为关联数据进行认证，除非所选传输成帧方式要求，否则不单独加密。
+每条加密 Path 记录包含一个 Path 帧。Noise 提供机密性和完整性。帧头必须经过认证；它可以像初始 `snow` 集成那样与载荷一同加密，也可以由保留明文帧头的传输成帧方式将其作为关联数据认证。阶段 0 的记录封装为网络字节序 `nonce:u64`、网络字节序 `ciphertext_len:u16`，以及恰好该长度的密文字节。封装被截断、超限或后跟尾随字节时必须拒绝。
+
+Path 记录使用显式 Noise 传输 nonce，因此整条记录的丢失、重复和乱序不会导致密码状态失步。记录封装携带解密前所需的 nonce。初始实现分配单调递增的 62 位出站 nonce，并使用 `frame_seq` 作为该 nonce；解密后会先验证封装 nonce 与已认证帧头中的值一致，再提交重放窗口状态。发送端绝不能在同一方向的 Path 密钥下使用相同 nonce 加密不同明文；重传同一帧必须复用原始密文。认证成功后，每个方向都应用有界重放窗口：重复或过旧的 `frame_seq` 会在进入 Session/控制处理前被丢弃。阶段 0 的窗口为 64 条记录；正式的 ACK/重传策略必须让保留策略与此上限协调，例如为新的密文副本分配新的 Path 帧序号，同时保留 Session 级控制序列或 Stream 范围标识。
 
 通用帧头包含：
 
@@ -234,14 +232,14 @@ TARGET_FAILURE     the Egress-to-target operation failed
 建议的初始限制为：
 
 ```text
-maximum frame payload       64 KiB
+maximum frame payload       63 KiB
 maximum control payload      4 KiB
 maximum target name          255 bytes
 maximum Stream reordering   configurable, default 4 MiB
 maximum Session buffering   configurable, default 32 MiB
 ```
 
-这些是协议安全默认值，不是性能调优常量。协商值可以低于这些值，但不能超过实现的硬限制。
+这些是协议安全默认值，不是性能调优常量。63 KiB 的帧载荷限制为 PathChord 帧头和 Noise 认证标签预留了空间，使完整消息不超过 `snow` 的 65,535 字节限制。协商值可以低于这些默认值，但不能超过实现的硬限制。
 
 ## 15. 协议不变量
 
@@ -262,7 +260,7 @@ maximum Session buffering   configurable, default 32 MiB
 
 PathChord 线路格式面向字节，但不要求 Path 可靠。完整编码帧是最小交付单元：Path 可以丢失、复制或重排完整帧，但绝不能向协议核心暴露部分帧或载荷被修改的帧。Path 层使用 `frame_seq` 和帧边界检测这些情况；Session 级可靠性负责恢复控制消息和可靠 Stream 数据。
 
-每个 Path 适配器读写字节流，但只向协议核心呈现完整的 PathChord 帧。TCP 等可靠字节流上游可以在内部保持顺序。不可靠或面向数据报的上游可能交付完整帧、丢失帧、复制帧或重排帧，但不能静默修改帧载荷。适配器或记录解码器执行保持完整帧所需的分段和重组；不完整或损坏的帧会在交付前被丢弃。
+每个 Path 适配器读写其底层传输，但只向协议核心呈现完整且已认证的记录封装和解码后的 PathChord 帧。TCP 等可靠字节流上游可以在内部保持顺序。不可靠或面向数据报的上游可能交付完整记录、丢失记录、复制记录或重排记录，但不能静默修改记录载荷。适配器或记录解码器执行保持完整记录所需的分段和重组；不完整或损坏的记录会在交付前被丢弃。
 
 这样可将 TCP、TLS、WebSocket、VLESS、VMess、XTLS 和未来适配器统一在一个成帧模型中，同时允许直接使用不可靠传输。数据报语义只存在于成帧层之上的 `UDP_DATAGRAM` 消息中。
 
@@ -282,9 +280,9 @@ optional administrator labels and limits
 record generation
 ```
 
-Ingress 在其静态 Egress 拓扑中存储预期的 Egress 公钥。Egress 在其本地授权数据库或配置中存储已授权的 Ingress 公钥列表。在 Path 可以进入 `PATH_READY` 状态之前，双方必须各自独立完成配置。
+Ingress 在其静态 Egress 拓扑中存储预期的 Egress 公钥和规范 EgressID。Egress 在读取 Path 握手前已知自己的规范 EgressID，并在其本地授权数据库或配置中存储已授权的 Ingress 公钥列表。在 Path 可以进入 `PATH_READY` 状态之前，双方必须各自独立完成配置。
 
-Noise 模式为 `Noise_IK_25519_ChaChaPoly_SHA256`。每条 Path 执行全新握手并获得独立的传输密钥。握手验证静态密钥，并将生成的 Path 绑定到配置的 IngressID 和 EgressID。仅成功完成 Noise 握手并不足够：Egress 还必须在已启用的授权列表中找到 Ingress 静态公钥。
+Noise 模式为 `Noise_IK_25519_ChaChaPoly_SHA256`。每条 Path 执行全新握手并获得独立的传输密钥。初始实现将规范化且非空的 EgressID 编码混入 Noise prologue，因为 responder 在读取第一条 IK 消息前已经知道该值。确切的规范字节编码仍是阶段 0 的实现夹具，并非稳定的线格式注册表。第一条消息之后，Egress 验证 initiator 静态公钥，并从启用的授权记录中解析对应的 IngressID；随后 `SESSION_ATTACH` 必须携带完全匹配的 IngressID。仅成功完成 Noise 握手并不足够：Egress 还必须在已启用的授权列表中找到 Ingress 静态公钥。
 
 授权变更基于代次：
 

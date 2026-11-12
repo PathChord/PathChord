@@ -8,7 +8,7 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 ## 状态
 
-目前处于设计阶段。本仓库包含架构和协议设计基线；实现选型尚未全部冻结。
+目前处于初始实现阶段。本仓库包含设计基线，以及用于协议原语、逐 Path Noise 实验和确定性传输测试夹具的阶段 0 Rust 工作区。代理数据面尚未实现。
 
 ## 术语
 
@@ -29,7 +29,7 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 - [技术选型](docs/technology-selection.zh-CN.md)
 - [设计审查](docs/design-review.zh-CN.md)
 
-## 计划中的命令
+## 命令界面
 
 ```text
 pathchord ingress
@@ -37,3 +37,16 @@ pathchord egress
 pathchord status
 pathchord enroll
 ```
+
+目前可通过命令树查看规划中的界面；在对应实现阶段完成前，运行操作命令会返回明确的初始化阶段错误。
+
+## 开发
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
+cargo run -p pathchord-cli -- --help
+```
+
+工作区在 dev/test profile 中关闭 rustc 增量产物，以便已配置的 `RUSTC_WRAPPER=sccache` 复用完整编译单元。仓库不强制机器专属 wrapper；是否使用 sccache 由本地 Cargo 配置决定。

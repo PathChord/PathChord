@@ -46,27 +46,23 @@ A new Path authenticates with Noise, negotiates protocol version and capabilitie
 
 ## 4. Control messages
 
-The protocol needs at least:
+The canonical frame registry is defined by the lifecycle, TCP Stream, and UDP lists in sections 10 through 12. Session and Path control uses:
 
 ```text
-VERSION_NEGOTIATE
+PATH_HELLO
 SESSION_ATTACH
 SESSION_ATTACH_OK
-EGRESS_STATUS
-PATH_PROBE
-PATH_PROBE_ACK
+SESSION_ATTACH_REJECT
+PATH_READY
 PATH_DRAIN
 PATH_CLOSE
-STREAM_OPEN
-STREAM_OPEN_ACK
-STREAM_FIN
-STREAM_RST
-STREAM_DATA
-STREAM_ACK
-STREAM_WINDOW
+STATUS_REPORT
+HEARTBEAT
+CONTROL_ACK
 SESSION_CLOSE
-ERROR
 ```
+
+Version and capability negotiation is part of `PATH_HELLO`. `STATUS_REPORT` is the canonical Egress-status name, and `HEARTBEAT` provides Path liveness. Operations with a result use their specific success and error frames, such as `STREAM_OPEN_OK` and `STREAM_OPEN_ERR`, rather than a generic `ERROR` frame.
 
 Control traffic has reserved capacity. A Session requires at least one active Path; loss of the last Path terminates the Session. Status reports, heartbeats, and Session control messages use the currently available Paths, with a Session control sequence number for duplicate suppression. Control messages may optionally carry a dependency sequence number when execution order matters. Any available Path may carry any control or data exchange.
 
@@ -109,7 +105,9 @@ Session creation negotiates protocol version and capabilities. Required capabili
 
 ## 9. Frame format and numbering
 
-Each encrypted Path record contains one Path frame. Noise provides confidentiality and integrity; the frame header is authenticated as associated data and is not independently encrypted unless required by the selected transport framing.
+Each encrypted Path record contains one Path frame. Noise provides confidentiality and integrity. The frame header must be authenticated; it may be encrypted with the payload, as in the initial `snow` integration, or supplied as associated data by a transport framing that leaves it clear. The Phase-0 record envelope is `nonce:u64` in network byte order, followed by `ciphertext_len:u16` in network byte order and exactly that many ciphertext bytes. The envelope is rejected if truncated, oversized, or followed by trailing bytes.
+
+Path records use explicit Noise transport nonces so whole-record loss, duplication, and reordering do not desynchronize cipher state. The record envelope carries the nonce needed before decryption. The initial implementation allocates a monotonic 62-bit outbound nonce and uses `frame_seq` as that nonce; it verifies after decryption that the envelope nonce equals the authenticated header value before committing replay-window state. A sender must never encrypt different plaintexts with the same nonce and directional Path key; retransmission of one frame reuses its original ciphertext. After successful authentication, each direction applies a bounded replay window: duplicate or stale `frame_seq` values are discarded before Session/control processing. The Phase-0 window is 64 records; production ACK/retransmission policy must coordinate retention with this bound, for example by issuing a fresh Path frame sequence for a new ciphertext copy while preserving the Session-level control or Stream range identity.
 
 The common frame header contains:
 
@@ -234,14 +232,14 @@ Canonical encoding is required for fields used in signatures, hashes, RequestID 
 Recommended initial limits are:
 
 ```text
-maximum frame payload       64 KiB
+maximum frame payload       63 KiB
 maximum control payload      4 KiB
 maximum target name          255 bytes
 maximum Stream reordering   configurable, default 4 MiB
 maximum Session buffering   configurable, default 32 MiB
 ```
 
-These are protocol safety defaults, not performance tuning constants. Negotiated values may reduce them, but cannot exceed the implementation's hard limits.
+These are protocol safety defaults, not performance tuning constants. The 63 KiB frame-payload limit leaves room for the PathChord header and the Noise authentication tag within `snow`'s 65,535-byte message limit. Negotiated values may reduce these defaults, but cannot exceed the implementation's hard limits.
 
 ## 15. Protocol invariants
 
@@ -262,7 +260,7 @@ The following invariants are normative:
 
 The PathChord wire format is byte-oriented, but a Path is not required to be reliable. The complete encoded frame is the minimum delivery unit: a Path may lose, duplicate, or reorder whole frames, but it must never expose a partial frame or a frame with modified payload to the protocol core. The Path layer uses `frame_seq` and frame boundaries to detect these conditions; Session-level reliability handles recovery for control messages and reliable Stream data.
 
-Each Path adapter reads and writes a byte stream but presents only complete PathChord frames to the protocol core. A reliable byte-stream upstream such as TCP may preserve ordering internally. An unreliable or datagram-oriented upstream may deliver complete frames, lose frames, duplicate frames, or reorder frames, but must not silently modify a frame payload. The adapter or record decoder performs segmentation and reassembly needed to preserve complete frames; incomplete or damaged frames are discarded before delivery.
+Each Path adapter reads and writes its underlying transport but presents only complete authenticated record envelopes and decoded PathChord frames to the protocol core. A reliable byte-stream upstream such as TCP may preserve ordering internally. An unreliable or datagram-oriented upstream may deliver complete records, lose records, duplicate records, or reorder records, but must not silently modify a record payload. The adapter or record decoder performs segmentation and reassembly needed to preserve complete records; incomplete or damaged records are discarded before delivery.
 
 This keeps TCP, TLS, WebSocket, VLESS, VMess, XTLS, and future adapters within one framing model while allowing direct use of unreliable transports. Datagram semantics exist only above the framing layer in `UDP_DATAGRAM` messages.
 
@@ -282,9 +280,9 @@ optional administrator labels and limits
 record generation
 ```
 
-The Ingress stores the expected Egress public key in its static Egress topology. The Egress stores the authorized Ingress public-key list in its local authorization database or configuration. Both sides must be configured independently before a Path can become `PATH_READY`.
+The Ingress stores the expected Egress public key and canonical EgressID in its static Egress topology. The Egress knows its own canonical EgressID before reading a Path handshake and stores the authorized Ingress public-key list in its local authorization database or configuration. Both sides must be configured independently before a Path can become `PATH_READY`.
 
-The Noise pattern is `Noise_IK_25519_ChaChaPoly_SHA256`. Each Path performs a fresh handshake and obtains independent transport keys. The handshake authenticates the static keys and binds the resulting Path to the configured IngressID and EgressID. A successful Noise handshake alone is insufficient: the Egress must also find the Ingress static public key in its enabled authorization list.
+The Noise pattern is `Noise_IK_25519_ChaChaPoly_SHA256`. Each Path performs a fresh handshake and obtains independent transport keys. The initial implementation mixes a canonical, non-empty EgressID encoding into the Noise prologue because that value is known to both peers before the responder reads the first IK message. The exact canonical byte encoding is still a Phase-0 implementation fixture, not a stable wire registry. After message one, Egress authenticates the initiator static key, resolves its enabled authorization record to an IngressID, and requires `SESSION_ATTACH` to name that exact IngressID; the IngressID is not guessed or selected by the responder-side prologue. A successful Noise handshake alone is insufficient: the Egress must also find the Ingress static public key in its enabled authorization list.
 
 Authorization changes are generation-based:
 

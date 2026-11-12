@@ -8,7 +8,7 @@ PathChord provides ordinary proxy semantics to local applications while maintain
 
 ## Status
 
-Design phase. The current repository contains the architecture and protocol design baseline; implementation choices are intentionally not frozen yet.
+Initial implementation. The repository contains the design baseline and a Phase 0 Rust workspace for protocol primitives, per-Path Noise experiments, and deterministic transport fixtures. The proxy data plane is not implemented yet.
 
 ## Terminology
 
@@ -29,7 +29,7 @@ Design phase. The current repository contains the architecture and protocol desi
 - [Technology selection](docs/technology-selection.md)
 - [Design review](docs/design-review.md)
 
-## Planned commands
+## Command surface
 
 ```text
 pathchord ingress
@@ -37,3 +37,16 @@ pathchord egress
 pathchord status
 pathchord enroll
 ```
+
+The command tree is available for interface discovery, but operational commands currently return a bootstrap error until their implementation phase is complete.
+
+## Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
+cargo run -p pathchord-cli -- --help
+```
+
+The workspace disables rustc incremental artifacts in dev/test profiles so a configured `RUSTC_WRAPPER=sccache` can reuse complete compilation units. The repository does not require a machine-specific wrapper; local Cargo configuration decides whether sccache is available.

@@ -1,0 +1,21 @@
+[package]
+name = "pathchord-ingress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+getrandom.workspace = true
+pathchord-core = { path = "../pathchord-core" }
+pathchord-policy = { path = "../pathchord-policy" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true
