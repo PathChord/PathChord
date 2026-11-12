@@ -68,9 +68,9 @@ pathchord status
 pathchord enroll
 ```
 
-The `ingress` command starts the configured local listeners and control socket.
-`status` and `system-proxy` use the local control socket; `egress` and `enroll`
-still return a bootstrap error.
+On Unix, the `ingress` command starts the configured local listeners and control
+socket. `status` and `system-proxy` use the local control socket; `egress` and
+`enroll` still return a bootstrap error.
 
 ## Development
 
