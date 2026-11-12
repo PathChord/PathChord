@@ -82,9 +82,23 @@ transit_rules:
     reject:
       tags: [quota-exhausted]
     weight: 100
+    traffic_policy: gaming-default
 ```
 
 Rules are ordered. The first matching rule determines admission and base relationship weight.
+
+Traffic policies may define multipath scheduling and replication budgets:
+
+```yaml
+traffic_policies:
+  gaming-default:
+    scheduler: effective_capacity_weighted
+    session_replication_budget_bps: 2000000
+    class_replication_budget_bps: 1000000
+    retransmission_replication: allowed
+```
+
+The Session budget is the hard upper bound. A traffic-class budget can reduce the allocation for that class but cannot exceed the remaining Session budget.
 
 ## Ordinary Proxy rules and fallback
 
