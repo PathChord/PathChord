@@ -40,10 +40,10 @@ spec:
 
 `metadata.name` 是唯一资源名。`spec.type` 为矩阵中的一种类型，`spec.platform` 为 `linux`、`windows` 或 `any`
 （默认 `any`）。`bind` 是套接字地址，对 `http`、`socks5`、`tproxy` 和 `redirect` 必填；对 `tun`
-和 `tun` 禁止。系统代理集成由仅限 Windows 的控制面开关管理，不增加 Listener 类型。`spec.allowedSources` 是最多 256 个 CIDR 的列表；回环绑定默认只允许本机，
+禁止。系统代理集成由仅限 Windows 的控制面开关管理，不增加 Listener 类型。`spec.allowedSources` 是最多 256 个 CIDR 的列表；回环绑定默认只允许本机，
 显式非回环监听器的空列表表示“所有来源地址”。非回环绑定应当使用显式列表。
 
-认证可以是标量 `disabled`，也可以是映射：
+以下是 `spec.authentication` 片段，不是独立资源对象。认证可以是标量 `disabled`，也可以是映射：
 
 ```yaml
 authentication:

@@ -42,6 +42,8 @@ items:
       name: default-dns
     spec:
       defaultRoute: local
+      local:
+        servers: [192.168.1.1:53]
   - apiVersion: pathchord.io/v1
     kind: FallbackPolicy
     metadata:
@@ -119,6 +121,7 @@ kind: EgressRule
 metadata:
   name: jp-gaming
 spec:
+  order: 10
   match:
     flowTags: [gaming]
     protocols: [tcp, udp]
@@ -137,6 +140,7 @@ kind: TransitRule
 metadata:
   name: jp-1-gaming
 spec:
+  order: 20
   egressRef: jp-1
   match:
     flowTags: [gaming]
@@ -176,6 +180,7 @@ kind: ProxyRule
 metadata:
   name: direct-jp
 spec:
+  order: 30
   match:
     flowTags: [web]
   require:

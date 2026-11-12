@@ -31,7 +31,7 @@ The Egress is selected first. Transit Proxies are then admitted and scheduled fo
 ## 3. Routing modes
 
 - `egress: <id-or-selector>`: Ingress reaches the selected Egress through one or more Transit Paths. Multipath aggregation is the default.
-- `egress: none`: Ingress selects one Transit Proxy and that proxy connects to the target. This is the ordinary-proxy fallback mode.
+- `mode: none`: Ingress selects one Transit Proxy and that proxy connects to the target. This is the ordinary-proxy fallback mode.
 - `proxy: direct`: direct is a Transit Proxy transport that connects without a third-party relay.
 - Global fallback must be explicitly configured as `reject` or `direct`.
 
