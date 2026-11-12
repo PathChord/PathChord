@@ -1,4 +1,4 @@
-# PathChord 状态机
+# PathChord 状态机规范
 
 [English](state-machines.md) | **简体中文**
 

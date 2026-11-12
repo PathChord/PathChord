@@ -1,8 +1,8 @@
-# PathChord 配置模型
+# PathChord 配置规范
 
 [English](configuration.md) | **简体中文**
 
-这是一个概念模型。确切的序列化格式尚未确定。
+本文档定义下列 YAML 示例所表示的配置模型。配置适配器验证人工编写的 YAML，并在发布前将其转换为类型化配置快照。这些片段定义模型语义，但不构成完整的序列化 schema；版本化 schema 定义可接受字段、默认值、未知字段处理和验证规则。运行时观测与管理员配置分开维护。管理操作使用[协议规范](protocol.zh-CN.md)定义的 JSON 封装；配置 YAML 不作为管理消息或 data Path 的线编码。
 
 ## 静态 Egress 拓扑
 

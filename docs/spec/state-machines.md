@@ -1,4 +1,4 @@
-# PathChord State Machines
+# PathChord state-machine specification
 
 **English** | [简体中文](state-machines.zh-CN.md)
 

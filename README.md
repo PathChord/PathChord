@@ -9,9 +9,10 @@ PathChord provides ordinary proxy semantics to local applications while maintain
 ## Status
 
 Initial implementation. The repository contains the design baseline, Phase 0
-protocol/transport primitives, and the Phase 1A TCP single-path specification
-and core reliability/control-service foundations. The proxy data plane and Web
-Gateway adapters are not implemented yet.
+protocol/transport primitives, the Phase 1A TCP single-path implementation
+scope and provisional wire contract, and core reliability/control-service
+foundations. The proxy data plane and Web Gateway adapters are not implemented
+yet.
 
 ## Terminology
 
@@ -22,20 +23,37 @@ Gateway adapters are not implemented yet.
 - **Path**: a long-lived bidirectional connection carried by one Transit Proxy.
 - **Stream**: a logical TCP byte stream carried over one Session.
 
-## Design documents
+## Documentation
 
-- [Architecture](docs/architecture.md)
-- [Protocol](docs/protocol.md)
-- [Configuration model](docs/configuration.md)
-- [State machines](docs/state-machines.md)
-- [Implementation plan](docs/implementation-plan.md)
-- [Technology selection](docs/technology-selection.md)
-- [Design review](docs/design-review.md)
-- [Phase 1 specifications](docs/spec/phase-1-single-path.md)
-- [Phase 1 wire contract](docs/spec/phase-1-wire.md)
-- [Phase 1 acceptance criteria](docs/spec/phase-1-acceptance.md)
+Design documents describe the intended architecture and durable decisions.
+Specifications define the final behavioral and format contracts. Implementation
+status, sequencing, phase scope, and acceptance tracking live only under
+`docs/progress/` (or in the repository status summary above).
+Every design and specification document is available in both English and
+Simplified Chinese. Progress documents use English as their single maintained
+source.
+
+### Design
+
+- [Architecture](docs/design/architecture.md)
+- [Technology selection](docs/design/technology-selection.md)
+
+### Specifications
+
+- [Protocol](docs/spec/protocol.md)
+- [Configuration model](docs/spec/configuration.md)
+- [State machines](docs/spec/state-machines.md)
 - [Ingress control plane](docs/spec/ingress-control-plane.md)
 - [Ingress observability](docs/spec/observability.md)
+
+### Progress
+
+- [Implementation status](docs/progress/status.md)
+- [Implementation plan](docs/progress/implementation-plan.md)
+- [Design review record](docs/progress/design-review.md)
+- [Phase 1 single-path scope](docs/progress/phase-1-single-path.md)
+- [Phase 1 provisional wire contract](docs/progress/phase-1-wire.md)
+- [Phase 1 acceptance tracking](docs/progress/phase-1-acceptance.md)
 
 ## Command surface
 

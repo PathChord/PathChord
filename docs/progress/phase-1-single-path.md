@@ -1,6 +1,10 @@
-# Phase 1 single-path specification
+# Phase 1 single-path implementation scope
 
-This document is the normative scope for the first runnable PathChord slice.
+This progress document tracks the normative acceptance scope for the first
+runnable PathChord slice. It is not the final product specification; durable
+behavior is defined in the [protocol specification](../spec/protocol.md) and
+[state-machine specification](../spec/state-machines.md).
+
 Phase 1A defines one Ingress, one Egress, one authenticated Path, and one TCP
 Stream. A subsequent Phase 1B adds one UDP association after the TCP slice is
 stable. Both build on the Phase 0 frame and Noise primitives.
@@ -68,7 +72,7 @@ The following sequence is required for every new Path:
 2. Ingress opens the configured Transit connection.
 3. Both endpoints perform a fresh `Noise_IK_25519_ChaChaPoly_SHA256` handshake.
    The prologue contains the canonical non-empty EgressID fixture defined in
-   `phase-1-wire.md`.
+   [phase-1-wire.md](phase-1-wire.md).
 4. Egress obtains the authenticated initiator static public key and maps it to
    exactly one enabled IngressID. Noise authentication alone does not authorize
    the Path.
@@ -179,8 +183,9 @@ The following are not Phase 1A acceptance requirements:
   compiled rule evaluation;
 - transport adapters for the Unix-socket/Named-Pipe control API and optional
   Web Gateway; the typed service foundation is present, while the control-plane
-  contract is defined separately in `ingress-control-plane.md` and
-  `observability.md`;
+  contract is defined separately in the
+  [Ingress control-plane specification](../spec/ingress-control-plane.md) and
+  [Ingress observability specification](../spec/observability.md);
 - SQLite persistence;
 - dynamic enrollment mutation and production crash/network restoration logic;
 - production-grade Noise key-buffer zeroization beyond the documented `snow`

@@ -1,14 +1,15 @@
-# PathChord Design Review
+# PathChord design review record
 
-**English** | [简体中文](design-review.zh-CN.md)
-
-This review compares the architecture, protocol, configuration, state-machine, implementation, and technology-selection documents.
+This historical review compares the architecture, protocol, configuration,
+state-machine, implementation, and technology-selection documents. Its issue
+wording records the state at review time; the current final-state contracts are
+under `docs/design/` and `docs/spec/`.
 
 ## Review status
 
 The Session lifecycle, control ACK, identifier, DNS, naming, and frame-boundary
-issues from this review have been applied to the main design documents and the
-Phase 1 specifications under `docs/spec/`. The Ingress control-plane and
+issues from this review have been applied to the main design and specification
+documents and the Phase 1 tracking documents under `docs/progress/`. The Ingress control-plane and
 observability specifications now define typed mutations, subscription refresh,
 structured snapshots, and an optional authenticated Web Gateway. Remaining
 items are implementation specifications for later subsystems, not permission

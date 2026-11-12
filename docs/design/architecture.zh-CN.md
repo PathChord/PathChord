@@ -6,7 +6,7 @@
 
 PathChord 支持 Linux 和 Windows。Linux 支持 TPROXY、REDIRECT 以及 HTTP/SOCKS 监听器。Windows 支持 TUN 和系统代理集成。两个平台共享策略、节点、Noise、Session 和多路径核心。
 
-首个版本的范围包括 TCP、UDP 和独立 DNS。Fake-IP、通用 ICMP 转发、组播代理和任意 IP 隧道不在首个协议基线的范围内。
+系统支持 TCP、UDP 和独立 DNS。Fake-IP、通用 ICMP 转发、组播代理和任意 IP 隧道不在协议范围内。
 
 ## 2. 拓扑
 

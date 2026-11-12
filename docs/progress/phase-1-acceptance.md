@@ -1,6 +1,8 @@
-# Phase 1 acceptance criteria
+# Phase 1 acceptance tracking
 
-Phase 1 is complete only when the following behaviors are reproducible with a
+This progress document tracks the gates for the Phase 1 implementation slice;
+it is not a final-state product specification. Phase 1 is complete only when
+the following behaviors are reproducible with a
 deterministic fake Transit/Egress harness and, for the TCP path, a local SOCKS5
 or equivalent test listener. Tests MUST assert protocol results and cleanup,
 not only that a task returned without an error.
@@ -139,7 +141,8 @@ The following are deliberately not gates for this document:
 - multiple-Path effective-capacity scheduling;
 - subscription normalization and hot reload;
 - implementation of the local control API, Web Gateway, and SQLite persistence
-  (their contracts are defined in the Ingress control-plane and observability
-  specifications);
+  (their contracts are defined in the
+  [Ingress control-plane specification](../spec/ingress-control-plane.md) and
+  [Ingress observability specification](../spec/observability.md));
 - autoscaling, quotas, and production key-buffer zeroization;
 - stable cross-version wire compatibility beyond the Phase 1 fixture.

@@ -1,4 +1,4 @@
-# PathChord 协议设计
+# PathChord 协议规范
 
 [English](protocol.md) | **简体中文**
 
@@ -105,9 +105,9 @@ Ingress 负责 Path 的创建和准入。Path 状态对 Stream 和 UDP Session �
 
 ## 9. 帧格式与编号
 
-每条加密 Path 记录包含一个 Path 帧。Noise 提供机密性和完整性。帧头必须经过认证；它可以像初始 `snow` 集成那样与载荷一同加密，也可以由保留明文帧头的传输成帧方式将其作为关联数据认证。阶段 0 的记录封装为网络字节序 `nonce:u64`、网络字节序 `ciphertext_len:u16`，以及恰好该长度的密文字节。封装被截断、超限或后跟尾随字节时必须拒绝。
+每条加密 Path 记录包含一个 Path 帧。Noise 提供机密性和完整性。帧头必须经过认证；版本化传输成帧方式可以将帧头与载荷一同加密，也可以保留明文帧头并将其作为关联数据。每个协议版本定义一种规范记录封装，其中包含显式 nonce、密文长度以及恰好该长度的密文字节。记录解码器拒绝被截断、超限或在该记录内后跟尾随字节的封装。字节流适配器使用长度字段分隔连续封装。
 
-Path 记录使用显式 Noise 传输 nonce，因此整条记录的丢失、重复和乱序不会导致密码状态失步。记录封装携带解密前所需的 nonce。初始实现分配单调递增的 62 位出站 nonce，并使用 `frame_seq` 作为该 nonce；解密后会先验证封装 nonce 与已认证帧头中的值一致，再提交重放窗口状态。发送端绝不能在同一方向的 Path 密钥下使用相同 nonce 加密不同明文；重传同一帧必须复用原始密文。认证成功后，每个方向都应用有界重放窗口：重复或过旧的 `frame_seq` 会在进入 Session/控制处理前被丢弃。阶段 0 的窗口为 64 条记录；正式的 ACK/重传策略必须让保留策略与此上限协调，例如为新的密文副本分配新的 Path 帧序号，同时保留 Session 级控制序列或 Stream 范围标识。
+Path 记录使用显式 Noise 传输 nonce，因此整条记录的丢失、重复和乱序不会导致密码状态失步。记录封装携带解密前所需的 nonce。每个方向分配单调递增的出站 nonce，并将每个 nonce 与已认证的 `frame_seq` 绑定。nonce 不得回绕；耗尽时关闭 Path，并在新 Path 上重新握手。发送端绝不能在同一方向的 Path 密钥下使用相同 nonce 加密不同明文；重传同一条加密记录必须复用原始密文。认证成功后，每个方向应用有界重放窗口。重复或过旧的序列号在进入 Session/控制处理前被丢弃；认证失败或 nonce 与帧头不匹配时不得推进窗口。重放窗口上限必须与 ACK 和重传保留规则兼容。控制消息或 Stream 范围的新加密副本使用新的 Path 帧序号，同时保留 Session 级控制序列号或 Stream 范围标识。
 
 通用帧头包含：
 
@@ -229,17 +229,7 @@ TARGET_FAILURE     the Egress-to-target operation failed
 
 用于签名、哈希、RequestID 派生或控制消息幂等性的字段必须使用规范编码。在这些上下文中，重复的映射键和非规范整数编码会被拒绝。
 
-建议的初始限制为：
-
-```text
-maximum frame payload       63 KiB
-maximum control payload      4 KiB
-maximum target name          255 bytes
-maximum Stream reordering   configurable, default 4 MiB
-maximum Session buffering   configurable, default 32 MiB
-```
-
-这些是协议安全默认值，不是性能调优常量。63 KiB 的帧载荷限制为 PathChord 帧头和 Noise 认证标签预留了空间，使完整消息不超过 `snow` 的 65,535 字节限制。协商值可以低于这些默认值，但不能超过实现的硬限制。
+每个协议版本 profile 都为帧载荷、控制载荷、目标名称长度、Stream 重排序和 Session 聚合缓冲定义硬上限。对等方可以协商不高于这些上限的值，绝不能协商更高的值。这些上限必须在所选 Noise 实现的 record 限制内为编码后的帧头和认证标签保留空间，而且每个解码器都必须在分配内存前执行限制。数值上限属于版本 profile，不属于这份跨版本规范。
 
 ## 15. 协议不变量
 
@@ -262,7 +252,7 @@ PathChord 线路格式面向字节，但不要求 Path 可靠。完整编码帧�
 
 每个 Path 适配器读写其底层传输，但只向协议核心呈现完整且已认证的记录封装和解码后的 PathChord 帧。TCP 等可靠字节流上游可以在内部保持顺序。不可靠或面向数据报的上游可能交付完整记录、丢失记录、复制记录或重排记录，但不能静默修改记录载荷。适配器或记录解码器执行保持完整记录所需的分段和重组；不完整或损坏的记录会在交付前被丢弃。
 
-这样可将 TCP、TLS、WebSocket、VLESS、VMess、XTLS 和未来适配器统一在一个成帧模型中，同时允许直接使用不可靠传输。数据报语义只存在于成帧层之上的 `UDP_DATAGRAM` 消息中。
+这样可将 TCP、TLS、WebSocket、VLESS、VMess、XTLS 和其他传输适配器统一在一个成帧模型中，同时允许直接使用不可靠传输。数据报语义只存在于成帧层之上的 `UDP_DATAGRAM` 消息中。
 
 ## 17. 注册与授权
 
@@ -282,7 +272,9 @@ record generation
 
 Ingress 在其静态 Egress 拓扑中存储预期的 Egress 公钥和规范 EgressID。Egress 在读取 Path 握手前已知自己的规范 EgressID，并在其本地授权数据库或配置中存储已授权的 Ingress 公钥列表。在 Path 可以进入 `PATH_READY` 状态之前，双方必须各自独立完成配置。
 
-Noise 模式为 `Noise_IK_25519_ChaChaPoly_SHA256`。每条 Path 执行全新握手并获得独立的传输密钥。初始实现将规范化且非空的 EgressID 编码混入 Noise prologue，因为 responder 在读取第一条 IK 消息前已经知道该值。确切的规范字节编码仍是阶段 0 的实现夹具，并非稳定的线格式注册表。第一条消息之后，Egress 验证 initiator 静态公钥，并从启用的授权记录中解析对应的 IngressID；随后 `SESSION_ATTACH` 必须携带完全匹配的 IngressID。仅成功完成 Noise 握手并不足够：Egress 还必须在已启用的授权列表中找到 Ingress 静态公钥。
+Noise 模式为 `Noise_IK_25519_ChaChaPoly_SHA256`。每条 Path 执行全新握手并获得独立的传输密钥。双方在 responder 读取第一条 IK 消息前，将配置的非空 EgressID 绑定到 Noise prologue。双方预先配置的握手 profile 只定义一种规范 EgressID 语法、字节编码和域分隔符。双方必须严格使用该 profile 的编码；profile 缺失、不匹配或无效时，Path 不能通过认证，也不能承载业务流量。
+
+第一条消息之后，Egress 验证 initiator 静态公钥，并从启用的授权记录中解析对应的 IngressID；随后 `SESSION_ATTACH` 必须携带完全匹配的 IngressID。IngressID 不由 responder 侧的 prologue 猜测或选择。仅成功完成 Noise 握手并不足够：Egress 还必须在已启用的授权列表中找到 Ingress 静态公钥。
 
 授权变更基于代次：
 
@@ -314,7 +306,7 @@ Ingress 变更包括管理员节点 tag/label 修改、订阅创建/删除和手
 
 Ingress 同时发布节点、Path、Session、Stream、目标连接、订阅和策略代次的结构化观测快照及有界事件流。当前状态和 metrics 必须可以查询，不能要求解析日志。`STATUS_REPORT` 仍然是认证 data-Path 健康消息，不是管理 API 或 metrics API。
 
-可选的认证 Web Gateway 为前端提供接入点。它调用同一个类型化 command/query service，默认关闭。首个 Web 适配器使用 REST 资源接口和 Server-Sent Events（SSE）；如果 dashboard 的查询组合确实需要，未来可以为同一 service 提供 GraphQL 适配器。Gateway 不得把本地 socket/pipe 直接暴露给浏览器，也不得通过 Transit Proxy 或数据 Path 访问。非 loopback 监听必须显式配置，并启用强认证、来源控制、限流、脱敏和审计日志。
+可选的认证 Web Gateway 为前端提供接入点。它调用同一个类型化 command/query service，默认关闭。选定的内置适配器提供 REST 资源接口和 Server-Sent Events（SSE）；替代适配器必须保留相同的类型化 command/query、授权、脱敏、审计、代次和资源限制契约。Gateway 不得把本地 socket/pipe 直接暴露给浏览器，也不得通过 Transit Proxy 或数据 Path 访问。非 loopback 监听必须显式配置，并启用强认证、来源控制、限流、脱敏和审计日志。
 
 运行中的 Egress 进程拥有 Egress 授权存储，Ingress 控制服务拥有 Ingress 节点/订阅快照。客户端从不直接编辑数据库、配置文件或订阅缓存；它们向拥有者 service 提交类型化操作。
 
