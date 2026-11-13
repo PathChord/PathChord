@@ -209,7 +209,8 @@ system_proxy.disable
 }
 ```
 
-`source.type` 必须是 `static`、`clash` 或 `sip008`；`source.url` 必须是不能包含内嵌凭据的
+`source.type` 必须是规范[订阅类型](transit-proxies.zh-CN.md#订阅文档类型)或已定义输入别名；
+`source.url` 必须是不能包含内嵌凭据的
 HTTP(S) URL；`credentials_ref` 必须是不透明引用，不能是机密值。刷新和缓存字段使用配置
 schema 中相同的边界；`cache` 可以为 null。列表读模型返回这些字段，但绝不解析或返回引用的
 机密值。

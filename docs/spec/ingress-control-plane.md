@@ -230,7 +230,8 @@ The canonical `subscriptions.create` body is:
 }
 ```
 
-`source.type` MUST be `static`, `clash`, or `sip008`; `source.url` MUST be an
+`source.type` MUST be a canonical [subscription type](transit-proxies.md#subscription-document-families)
+or a documented input alias; `source.url` MUST be an
 HTTP(S) URL without embedded credentials; and `credentials_ref` MUST be an
 opaque reference rather than a secret value. Refresh and cache fields use the
 same bounds as the configuration schema. `cache` MAY be null. The list read

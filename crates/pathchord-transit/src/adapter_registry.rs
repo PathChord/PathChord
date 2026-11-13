@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +17,7 @@ pub struct AdapterRegistry<P> {
     credentials: Arc<P>,
     connect_timeout: Duration,
     tls: Arc<ClientConfig>,
+    engine: Option<Arc<crate::outbound_engine::OutboundEngine>>,
 }
 
 impl<P> std::fmt::Debug for AdapterRegistry<P> {
@@ -36,7 +39,32 @@ where
             credentials,
             connect_timeout,
             tls,
+            engine: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_outbound_engine(mut self, executable: PathBuf, state_dir: PathBuf) -> Self {
+        self.engine = Some(Arc::new(crate::outbound_engine::OutboundEngine::new(
+            executable, state_dir,
+        )));
+        self
+    }
+
+    #[must_use]
+    pub fn available_protocols(&self) -> BTreeSet<String> {
+        let mut protocols: BTreeSet<_> = ["direct", "http", "https", "socks5", "ss"]
+            .map(str::to_owned)
+            .into();
+        if self.engine.is_some() {
+            protocols.insert("sing_box_outbound".to_owned());
+            protocols.extend(
+                crate::outbound_engine::PROTOCOLS
+                    .iter()
+                    .map(|value| (*value).to_owned()),
+            );
+        }
+        protocols
     }
 
     pub fn with_native_roots(
@@ -68,7 +96,9 @@ where
         connect_timeout: Duration,
         configs: impl IntoIterator<Item = &'a TransitProxyConfig>,
     ) -> Result<Self, TransitError> {
-        if configs.into_iter().any(|config| config.protocol == "https") {
+        if configs.into_iter().any(|config| {
+            config.protocol == "https" || config.options.tls.as_ref().is_some_and(|tls| tls.enabled)
+        }) {
             return Self::with_native_roots(credentials, connect_timeout);
         }
         let tls = ClientConfig::builder()
@@ -105,11 +135,58 @@ where
         config: &TransitProxyConfig,
         credential: &TransitCredential,
     ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
+        if credential.field("sing_box_outbound").is_some() {
+            return self.engine_adapter(config, credential);
+        }
+        match self.build_native(config, credential) {
+            Ok(adapter) => Ok(adapter),
+            Err(_) if self.engine.is_some() => self.engine_adapter(config, credential),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn engine_adapter(
+        &self,
+        config: &TransitProxyConfig,
+        credential: &TransitCredential,
+    ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| TransitError::AdapterUnavailable {
+                protocol: config.protocol.clone(),
+                reason: "this node requires the configured sing-box outbound engine",
+            })?;
+        Ok(Arc::new(crate::outbound_engine::EngineAdapter::new(
+            config,
+            credential,
+            Arc::clone(engine),
+            self.connect_timeout,
+        )?))
+    }
+
+    fn build_native(
+        &self,
+        config: &TransitProxyConfig,
+        credential: &TransitCredential,
+    ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
         let adapter: Arc<dyn TransitAdapter> = match config.protocol.as_str() {
-            "direct" => Arc::new(DirectTransitAdapter::new(
-                config.id.as_str(),
-                self.connect_timeout,
-            )),
+            "direct" => {
+                validate_native_options(config, false, false, true)?;
+                validate_credentials(nonempty_credential(credential), &[])?;
+                Arc::new(
+                    DirectTransitAdapter::new(config.id.as_str(), self.connect_timeout)
+                        .with_udp_enabled(config.options.udp != Some(false)),
+                )
+            }
+            "http" if config.options.tls.as_ref().is_some_and(|tls| tls.enabled) => {
+                Arc::new(HttpsConnectTransitAdapter::from_config(
+                    config,
+                    nonempty_credential(credential),
+                    self.connect_timeout,
+                    Arc::clone(&self.tls),
+                )?)
+            }
             "http" => Arc::new(HttpConnectTransitAdapter::from_config(
                 config,
                 nonempty_credential(credential),
@@ -181,6 +258,87 @@ fn nonempty_credential(credential: &TransitCredential) -> Option<&TransitCredent
     (!credential.is_empty()).then_some(credential)
 }
 
+pub(crate) fn native_tls_roots() -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    for certificate in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(certificate);
+    }
+    Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+pub(crate) fn validate_credentials(
+    credential: Option<&TransitCredential>,
+    allowed: &[&str],
+) -> Result<(), TransitError> {
+    if credential.is_some_and(|credential| {
+        credential
+            .fields
+            .keys()
+            .any(|name| !allowed.contains(&name.as_str()))
+    }) {
+        return Err(TransitError::Unsupported(
+            "node contains unsupported credential parameters".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_subscription_credentials(
+    credential: &SubscriptionCredential,
+    allowed: &[&str],
+) -> Result<(), TransitError> {
+    validate_credentials(Some(&TransitCredential::new(credential.fields())), allowed)
+}
+
+pub(crate) fn validate_native_options(
+    config: &TransitProxyConfig,
+    tls: bool,
+    headers: bool,
+    udp: bool,
+) -> Result<(), TransitError> {
+    let options = &config.options;
+    let transport_supported = options.transport.as_ref().is_none_or(|transport| {
+        transport.kind == "tcp"
+            && transport.path.is_none()
+            && transport.host.is_empty()
+            && transport.headers.is_empty()
+            && transport.service_name.is_none()
+            && transport.max_early_data.is_none()
+            && transport.early_data_header_name.is_none()
+    });
+    let multiplex_supported = options.multiplex.as_ref().is_none_or(|multiplex| {
+        !multiplex.enabled
+            && multiplex.protocol.is_none()
+            && multiplex.max_connections.is_none()
+            && multiplex.min_streams.is_none()
+            && multiplex.max_streams.is_none()
+            && !multiplex.padding
+    });
+    if (!tls
+        && options
+            .tls
+            .as_ref()
+            .is_some_and(|options| options != &pathchord_policy::TransitTls::default()))
+        || (!headers && !options.headers.is_empty())
+        || (!udp && options.udp == Some(true))
+        || !transport_supported
+        || !multiplex_supported
+        || options.tcp_fast_open == Some(true)
+        || options.bind_interface.is_some()
+        || options.routing_mark.is_some()
+        || options.packet_encoding.is_some()
+    {
+        return Err(TransitError::Unsupported(
+            "node options require a compatible configured outbound engine".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +378,7 @@ mod tests {
             labels: BTreeMap::new(),
             tags: BTreeSet::new(),
             weight: 100,
+            options: Default::default(),
         }
     }
 

@@ -53,7 +53,7 @@
 
       <section id="view-nodes" class="view" aria-labelledby="nodes-title">
         <div class="section-head"><div><h1 id="nodes-title">Nodes</h1><p>Administrative metadata and current generation</p></div></div>
-        <div class="table-wrap"><table><thead><tr><th>Node</th><th>Labels</th><th>Tags</th><th>Generation</th><th></th></tr></thead><tbody id="nodes-body"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Node</th><th>Labels</th><th>Tags</th><th>State / reason</th><th>Generation</th><th></th></tr></thead><tbody id="nodes-body"></tbody></table></div>
       </section>
 
       <section id="view-sessions" class="view" aria-labelledby="sessions-title">
@@ -108,7 +108,7 @@
       <div class="dialog-head"><h2>New subscription</h2><button class="close" value="cancel" aria-label="Close" type="submit">Close</button></div>
       <label for="subscription-id">ID</label><input id="subscription-id" required>
       <label for="subscription-name">Display name</label><input id="subscription-name" required>
-      <label for="subscription-type">Source type</label><select id="subscription-type"><option value="clash">Clash</option><option value="sip008">SIP008</option><option value="static">Static</option></select>
+      <label for="subscription-type">Source type</label><select id="subscription-type"><option value="auto">Automatic</option><option value="uri">Share links / Base64</option><option value="sing_box">sing-box</option><option value="surge">Surge</option><option value="quantumult">Quantumult X</option><option value="loon">Loon</option><option value="clash">Clash</option><option value="sip008">SIP008</option><option value="static">Static</option></select>
       <label for="subscription-url">Source URL</label><input id="subscription-url" type="url" placeholder="https://provider.example/subscription" required>
       <label for="subscription-credentials">Credentials reference</label><input id="subscription-credentials" placeholder="provider-token">
       <label for="subscription-interval">Refresh interval (seconds)</label><input id="subscription-interval" type="number" min="60" max="604800" value="3600" required>

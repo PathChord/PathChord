@@ -217,6 +217,7 @@ fn policy(
                 },
             }],
             transit_proxies: vec![TransitProxyConfig {
+                options: Default::default(),
                 id: transit_id,
                 source: None,
                 protocol: "direct".into(),

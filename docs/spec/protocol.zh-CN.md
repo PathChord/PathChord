@@ -123,6 +123,10 @@ REQUIRED 的语义：
 
 ## 6. UDP Session
 
+本节描述通过 PathChord Egress 承载的 UDP。普通 direct 或第三方代理 UDP 不创建 PathChord
+Session，遵循[原生 UDP 适配器契约](transit-proxies.zh-CN.md#udp-路由边界)。Egress UDP Session
+需要可用的字节流 Transit Path，不要求第三方节点支持原生 UDP。
+
 一个 UDP Session 绑定到一个 Egress 和一个 Egress 端套接字上下文。TCP 和 UDP 都独立于 Path 身份。Path 迁移不会重新创建或重新绑定 Egress 端套接字，因此目标所见的地址和端口保持不变。
 
 UDP 保留数据报边界。普通应用程序数据报不会由聚合层重传，并可能在过期或超出预算时被丢弃。控制消息仍然可靠。如果 Path 由可靠的字节流传输承载，则接受其自身的队头阻塞行为作为实现限制。

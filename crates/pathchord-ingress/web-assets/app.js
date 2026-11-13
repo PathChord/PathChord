@@ -117,13 +117,20 @@ function renderStatus(status) {
 function renderNodes(result) {
   const body = $("nodes-body");
   const items = result.items || [];
-  if (!items.length) return emptyRow(body, 5, "No nodes");
+  if (!items.length) return emptyRow(body, 6, "No nodes");
   body.replaceChildren();
   items.forEach((item) => {
     const row = body.insertRow();
     cell(row, item.id, "mono");
     cell(row, tags(item.admin?.labels));
     cell(row, tags(item.admin?.tags || [], "blue"));
+    const diagnostic = item.observed?.diagnostic;
+    const stateText = item.observed?.state || "unknown";
+    const quota = item.observed?.quota;
+    const remaining = Number.isFinite(quota?.remaining_ratio) ? `, ${(quota.remaining_ratio * 100).toFixed(1)}% remaining` : "";
+    const multiplier = item.observed?.billing?.traffic_multiplier_basis_points;
+    const billing = Number.isFinite(multiplier) ? `, ×${multiplier / 10000}` : "";
+    cell(row, diagnostic ? `${stateText}: ${diagnostic.message} ${(diagnostic.fields || []).join(", ")}` : `${stateText}${remaining}${billing}`, diagnostic ? "state bad" : "muted");
     cell(row, item.generation, "mono");
     const actions = document.createElement("div");
     actions.className = "row-actions";

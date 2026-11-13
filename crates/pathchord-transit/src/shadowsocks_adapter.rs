@@ -21,6 +21,7 @@ pub struct ShadowsocksTransitAdapter {
     context: SharedContext,
     server: ServerConfig,
     connect_timeout: Duration,
+    udp_enabled: bool,
 }
 
 impl ShadowsocksTransitAdapter {
@@ -34,6 +35,11 @@ impl ShadowsocksTransitAdapter {
                 "Shadowsocks adapter requires protocol ss".into(),
             ));
         }
+        crate::adapter_registry::validate_native_options(config, false, false, true)?;
+        crate::adapter_registry::validate_subscription_credentials(
+            credential,
+            &["cipher", "password", "plugin", "plugin_opts"],
+        )?;
         if credential
             .field("plugin")
             .is_some_and(|value| !value.is_empty())
@@ -71,6 +77,7 @@ impl ShadowsocksTransitAdapter {
             context: Context::new_shared(ServerType::Local),
             server,
             connect_timeout,
+            udp_enabled: config.options.udp != Some(false),
         })
     }
 }
@@ -99,6 +106,28 @@ impl TransitAdapter for ShadowsocksTransitAdapter {
         .map_err(|_| TransitError::Connection("Shadowsocks connection timed out".into()))?
         .map_err(|_| TransitError::Connection("Shadowsocks connection failed".into()))?;
         Ok(Box::new(stream))
+    }
+
+    fn supports_udp(&self) -> bool {
+        self.udp_enabled
+    }
+
+    async fn connect_udp(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<crate::BoxedTransitDatagram, TransitError> {
+        if !self.udp_enabled {
+            return Err(TransitError::Unsupported(
+                "Shadowsocks UDP is disabled".into(),
+            ));
+        }
+        crate::datagram::ss_connect_udp(
+            self.context.clone(),
+            &self.server,
+            &request.destination,
+            self.connect_timeout,
+        )
+        .await
     }
 }
 
@@ -131,6 +160,7 @@ mod tests {
             labels: BTreeMap::new(),
             tags: BTreeSet::new(),
             weight: 100,
+            options: Default::default(),
         }
     }
 

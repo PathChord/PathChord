@@ -71,14 +71,32 @@ in the current scope.
   `CompiledPolicy` evaluates Egress, Transit, ordinary Proxy, and fallback
   routes without I/O.
 - Transit adapters include direct TCP, HTTP CONNECT, HTTPS CONNECT over
-  rustls, SOCKS5, and Shadowsocks. Credential files are bounded, permission
-  checked, symlink/TOCTOU checked, redacted, and zeroized. VLESS, VMess, and
-  XTLS are rejected as typed unavailable adapters until their missing transport
-  schema and interoperability evidence exist.
-- Subscription refresh supports Clash/SIP008 normalization, bounded fetch and
-  retry, atomic private cache, last-good retention, dynamic-node draining, and
-  runtime adapter publication. Control-plane subscription mutations persist the
-  complete source/refresh/cache model.
+  rustls, SOCKS5, and Shadowsocks, with direct/SOCKS5/SS UDP and SS2022.
+  Typed TLS settings include SNI, ALPN, custom CA, explicit insecure, and
+  client-certificate/key references. HTTP custom headers are validated. Unknown
+  credentials/options are rejected instead of ignored; TLS options cannot
+  silently become plaintext. Credential files retain bounded, private,
+  symlink/TOCTOU-checked, redacted handling.
+- The optional sing-box 1.14.4 backend carries advanced protocols and
+  transports through a supervised, private authenticated endpoint. Schema and
+  version checks run before publication; secret configuration travels on stdin.
+  VLESS, WebSocket VLESS, and TLS Trojan have local interoperability evidence.
+  Complete private engine documents preserve parameters and reject local-file,
+  command, external detour, and system-interface references.
+- Subscription refresh supports automatic detection, Clash/Mihomo, SIP008
+  arrays and object wrappers, URI/Base64 lists, sing-box outbounds/endpoints,
+  and supported Surge/Quantumult X/Loon node lines. HTTP provider references
+  are bounded by depth/count/aggregate bytes and propagate bearer credentials
+  only to the same origin. Individual invalid nodes retain sanitized
+  diagnostics; malformed documents and failed providers retain applicable
+  last-good data. Cache, draining, controls, and reload preserve diagnostics.
+- Subscription usage is collected from `Subscription-Userinfo`; an explicit
+  `PathChord-Traffic-Multiplier` extension supplies billing metadata. Cache,
+  node queries, the console, and Path economics consume the metadata. Unknown
+  statistics stay unknown; expiry is not a quota reset timestamp.
+- `/metrics` exposes bounded aggregate Prometheus gauges through the optional
+  Web Gateway's existing authentication, Origin, and capability checks. JSON
+  metric queries and SSE remain available.
 - DNSRuntime supports local, Transit, Egress, and blocked routes, Hickory
   parsing, same-upstream TCP fallback for truncated UDP replies, positive and
   negative TTL cache, inflight/size/time limits, protected endpoint output,
@@ -107,9 +125,11 @@ in the current scope.
 
 ## Remaining explicit-listener work
 
-- Complete reproducible deployment examples and separate CLI-process
-  validation from key generation and enrollment through configured
-  Ingress/Transit/Egress TCP, UDP, and DNS forwarding.
+- The deployment guide and example configurations cover direct,
+  subscription, and authenticated Egress use. Separate CLI-process smoke
+  validation covers key generation, enrollment, HTTP Transit, Mixed HTTP, and
+  Session UDP forwarding. Cross-machine and long-running deployment evidence
+  remains to be gathered.
 - Linux, Windows, and FreeBSD HTTP/SOCKS5 need end-to-end and long-running
   validation of authentication, source restrictions, TCP/UDP forwarding, DNS, bounded
   resources, shutdown, reload, and local control. Existing automated loopback
@@ -133,12 +153,14 @@ in the current scope.
 
 - TrafficPolicy replication budgets and retransmission mode are applied by the
   Session runtime. Class priority/share fields are parsed into the policy
-  model but are not consumed by runtime class scheduling.
-- Subscription quota, reset-time, and billing multiplier fields exist in the
-  observation model, but provider metadata ingestion, runtime publication, and
-  end-to-end consumption are not connected.
-- JSON metric queries, SSE, and the embedded console exist. Production metric
-  export and deployed monitoring dashboards remain to be integrated.
+  model but are not consumed by runtime class scheduling. Complete class
+  scheduling needs explicit flow classification and negotiated bidirectional
+  class metadata; the v1 wire contract has not been changed for that feature.
+- Native Windows/FreeBSD runtime matrices, provider soak tests, external
+  monitoring deployment, and a broad real-provider protocol/parameter matrix
+  remain validation work. SSR and unregistered protocols are explicitly
+  unavailable. Third-party policy groups, rules, and scripts are not imported
+  as PathChord policy.
 
 ## Deferred work
 
@@ -147,9 +169,9 @@ in the current scope.
   baseline. Route ownership journals are designed to fail closed and never
   remove foreign rules. Wintun packaging and native TUN validation are also
   deferred.
-- VLESS/VMess/XTLS remain outside the built-in adapter set. Enabling them needs
-  explicit UUID/flow/outer-transport/TLS-Reality configuration and upstream
-  interoperability fixtures.
+- Protocols outside the registered native or configured engine set remain
+  unavailable with node diagnostics. Further native implementations need
+  protocol-specific interoperability fixtures.
 
 ## Validation evidence
 
@@ -162,18 +184,18 @@ cargo test --locked --workspace --all-targets
 cargo check --locked --workspace --all-targets --target x86_64-pc-windows-gnu
 cargo check --locked --workspace --all-targets --target x86_64-unknown-freebsd
 cargo build --locked -p pathchord-cli --target x86_64-unknown-freebsd
-cargo audit
 git diff --check
 ```
 
 The full workspace test run covers protocol, policy, Noise, Path, Transit,
 Ingress, Egress, CLI, real loopback Egress/Ingress TCP and UDP paths, platform
 fakes, route rollback, TUN packet flows, Web REST/SSE, persistence, reload,
-subscription normalization, and fault/retransmission cases. `cargo audit`
-currently reports no advisories; the dependency graph excludes the previously
-unmaintained `paste` path from the TUN adapter feature set.
+subscription normalization, and fault/retransmission cases. The dependency
+graph excludes the previously unmaintained `paste` path from the TUN adapter
+feature set.
 
-The Linux workspace run passes 391 tests. The portable explicit-listener
+The Linux workspace run with the pinned backend available passes 450 tests,
+including the two normally ignored engine interoperability tests. The portable explicit-listener
 integration test binds listeners for the actual host platform and checks HTTP
 CONNECT, SOCKS5 CONNECT, SOCKS5 UDP ASSOCIATE, TCP half-close, and cancellation
 with an open UDP control connection.
@@ -189,6 +211,16 @@ Mixed listener tests exercise all supported HTTP/SOCKS TCP protocols on one
 address, coalesced handshake/application bytes, common credentials and flow
 context, source/protocol rejection, SOCKS5 UDP forwarding while other clients
 are idle, and bounded shutdown with open handshakes and a UDP control socket.
+
+The final run includes explicit key generation/enrollment with separate
+Ingress and Egress CLI processes, an HTTP Transit, HTTP forwarding, and Session
+UDP. Transit coverage includes TLS CA/SNI and mutual authentication, classic
+and 2022 SS TCP/UDP, native SOCKS5 UDP/control lifetime, provider expansion and
+credential boundaries, strict import diagnostics, usage/cache restoration,
+engine schema/process cleanup, node queries, and authenticated Prometheus
+export. Engine tests run explicitly with `PATHCHORD_TEST_SING_BOX` pointing to
+sing-box 1.14.4 and `--include-ignored`; the normal Rust CI does not require an
+installed backend executable.
 
 The FreeBSD target check and CLI build use Zig 0.17.1 C/C++ compiler and archiver
 wrappers with the official FreeBSD 15.1 SDK, including the bundled SQLite and

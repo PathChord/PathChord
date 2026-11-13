@@ -1,0 +1,118 @@
+# PathChord deployment and local operation
+
+**English** | [简体中文](deployment.zh-CN.md)
+
+The `pathchord` executable provides the Ingress and Egress service subcommands
+and local management commands. Each service invocation owns a separate
+process. Configuration examples use explicit listeners and require no packet
+interception or TUN privileges.
+
+## Local explicit proxy
+
+Build the executable and run the direct-routing example:
+
+```sh
+cargo build --locked --release -p pathchord-cli
+./target/release/pathchord ingress --config examples/ingress-direct.yaml
+```
+
+The mixed listener binds to `127.0.0.1:7890`. Its unauthenticated example is
+restricted to loopback. Applications can select HTTP or SOCKS on that address:
+
+```sh
+curl -x http://127.0.0.1:7890 https://example.com
+curl -x socks5h://127.0.0.1:7890 https://example.com
+```
+
+The direct example sends target traffic directly. The subscription example
+uses ordinary third-party Proxy routing and explicitly rejects flows with no
+usable matching node. Its provider URL MUST be replaced before use:
+
+```sh
+pathchord ingress --config examples/ingress-subscriptions.yaml
+```
+
+## Optional outbound engine
+
+The native transports do not require an external executable. Advanced nodes
+can use an explicitly selected, locally installed `sing-box` version 1.14.4:
+
+```sh
+pathchord ingress --config examples/ingress-subscriptions.yaml \
+  --outbound-engine /absolute/path/to/sing-box
+```
+
+The supplied executable MUST match the version contract. Engine configuration
+is private, passed on stdin, and checked before the adapter is made eligible.
+The Ingress supervises the child and its private authenticated loopback
+endpoint. A missing engine, rejected node parameter, or unavailable protocol
+MUST remain visible as a node diagnostic and MUST NOT become a plaintext or
+direct fallback. See the [Transit Proxy contract](transit-proxies.md).
+
+## Ingress and Egress enrollment
+
+Generate a private identity on each corresponding machine. The command prints
+only the public key; the private file MUST remain local to its owner:
+
+```sh
+pathchord keygen --output ingress.key.json
+pathchord keygen --output egress.key.json
+```
+
+Start Egress in its own terminal. The Unix control socket is local to Egress:
+
+```sh
+pathchord egress --egress-id exit --identity egress.key.json \
+  --bind 127.0.0.1:9443 --control-socket /tmp/pathchord-egress.sock
+```
+
+On the Egress machine, explicitly enroll the Ingress public key. Replace
+`INGRESS_PUBLIC_KEY` with the public output from the Ingress key generation.
+Generation 0 applies to a new authorization database; subsequent mutations
+MUST use its observed generation:
+
+```sh
+pathchord --socket /tmp/pathchord-egress.sock enroll add \
+  --ingress-id entry --egress-id exit --public-key INGRESS_PUBLIC_KEY \
+  --expected-generation 0
+```
+
+In `examples/ingress-egress.yaml`, replace `REPLACE_WITH_EGRESS_PUBLIC_KEY`
+with the Egress public key. The example uses a loopback Egress address;
+cross-machine deployments MUST set the reachable Egress bind/address and keep
+the same explicitly verified key and canonical Egress ID. Start Ingress in a
+separate terminal:
+
+```sh
+pathchord --socket /tmp/pathchord-ingress.sock ingress \
+  --ingress-id entry --identity ingress.key.json \
+  --config examples/ingress-egress.yaml
+pathchord --socket /tmp/pathchord-ingress.sock status
+pathchord --socket /tmp/pathchord-egress.sock enroll list
+```
+
+The example's `direct-path` is a direct transport to the authenticated Egress.
+Replacing it with an HTTP, HTTPS, SOCKS5, Shadowsocks, or engine-backed Transit
+changes the transport while preserving the end-to-end Noise and enrollment
+contracts. UDP flows through an Egress require its UDP capability and a TCP
+Transit Path; ordinary third-party UDP routing additionally requires native
+UDP support from the selected node.
+
+## Credentials, management, and shutdown
+
+Listener and node secrets are stored in private JSON files named by opaque
+`credentialsRef` values under the selected `--credentials-dir`. A Basic or
+SOCKS5 credential document contains `username` and `password`; it MUST NOT be
+committed. Required listener authentication refuses SOCKS4/4a.
+
+Unix socket ownership/permissions and Windows Named Pipe ACLs protect local
+management. Socket paths are local to their service machine. Windows uses
+Named Pipe names for the corresponding control endpoints. The Web Gateway is
+opt-in through `--web-bind` and shares the local dispatcher. A configured
+`--web-token-file` supplies its bearer token. Prometheus scraping uses the
+same authentication, Origin checks, and `metrics:read` capability at `/metrics`.
+
+Each service accepts Ctrl-C shutdown and owns its task/connection cleanup.
+Persistent configuration changes follow the reload contract; identity,
+listener topology, and other startup-only settings require a service restart
+when the reload response reports that requirement.

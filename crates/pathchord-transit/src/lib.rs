@@ -15,10 +15,13 @@ use zeroize::Zeroize;
 
 mod adapter_registry;
 mod credential_provider;
+mod datagram;
 mod http_connect_adapter;
+mod outbound_engine;
 mod shadowsocks_adapter;
 mod socks5_adapter;
 mod subscription;
+mod tls;
 
 pub use adapter_registry::AdapterRegistry;
 pub use credential_provider::FileTransitCredentialProvider;
@@ -28,9 +31,10 @@ pub use socks5_adapter::Socks5TransitAdapter;
 pub use subscription::{
     CacheLoadOutcome, DynamicNodeState, DynamicTransitNode, DynamicTransitSnapshot,
     HttpSubscriptionFetcher, MAX_SUBSCRIPTION_BYTES, MAX_SUBSCRIPTION_NODES,
-    NoSubscriptionCredentials, NodeUnavailableReason, RefreshOutcome, SnapshotDiff,
-    SubscriptionCredential, SubscriptionCredentialProvider, SubscriptionError,
-    SubscriptionFetchRequest, SubscriptionFetcher, SubscriptionManager,
+    NoSubscriptionCredentials, NodeDiagnostic, NodeUnavailableReason, RefreshOutcome, SnapshotDiff,
+    SubscriptionCredential, SubscriptionCredentialProvider, SubscriptionDocument,
+    SubscriptionError, SubscriptionFetchRequest, SubscriptionFetcher, SubscriptionManager,
+    SubscriptionUsage,
 };
 
 pub trait TransitConnection: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -38,6 +42,17 @@ pub trait TransitConnection: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> TransitConnection for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 pub type BoxedTransitConnection = Box<dyn TransitConnection>;
+
+#[async_trait]
+pub trait TransitDatagram: std::fmt::Debug + Send {
+    async fn send(&mut self, payload: &[u8]) -> Result<(), TransitError>;
+    async fn receive(&mut self) -> Result<Vec<u8>, TransitError>;
+    async fn close(self: Box<Self>) -> Result<(), TransitError> {
+        Ok(())
+    }
+}
+
+pub type BoxedTransitDatagram = Box<dyn TransitDatagram>;
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct TransitCredential {
@@ -168,6 +183,28 @@ pub enum TransitError {
 pub trait TransitAdapter: Send + Sync {
     fn metadata(&self) -> &TransitMetadata;
 
+    fn supports_tcp(&self) -> bool {
+        true
+    }
+
+    /// Validates an optional external backend before publishing this adapter.
+    async fn prepare(&self) -> Result<(), TransitError> {
+        Ok(())
+    }
+
+    fn supports_udp(&self) -> bool {
+        false
+    }
+
+    async fn connect_udp(
+        &self,
+        _request: ConnectRequest,
+    ) -> Result<BoxedTransitDatagram, TransitError> {
+        Err(TransitError::Unsupported(
+            "this Transit adapter does not support UDP".to_owned(),
+        ))
+    }
+
     async fn connect(
         &self,
         request: ConnectRequest,
@@ -225,6 +262,7 @@ pub(crate) fn validate_destination(destination: &Endpoint) -> Result<(), Transit
 pub struct DirectTransitAdapter {
     metadata: TransitMetadata,
     connect_timeout: Duration,
+    udp_enabled: bool,
 }
 
 impl DirectTransitAdapter {
@@ -237,7 +275,14 @@ impl DirectTransitAdapter {
                 labels: BTreeMap::new(),
             },
             connect_timeout,
+            udp_enabled: true,
         }
+    }
+
+    #[must_use]
+    pub fn with_udp_enabled(mut self, enabled: bool) -> Self {
+        self.udp_enabled = enabled;
+        self
     }
 
     async fn connect_address(
@@ -255,6 +300,22 @@ impl DirectTransitAdapter {
 impl TransitAdapter for DirectTransitAdapter {
     fn metadata(&self) -> &TransitMetadata {
         &self.metadata
+    }
+
+    fn supports_udp(&self) -> bool {
+        self.udp_enabled
+    }
+
+    async fn connect_udp(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<BoxedTransitDatagram, TransitError> {
+        if !self.udp_enabled {
+            return Err(TransitError::Unsupported(
+                "UDP is disabled for this node".to_owned(),
+            ));
+        }
+        datagram::direct_connect_udp(&request.destination, self.connect_timeout).await
     }
 
     async fn connect(

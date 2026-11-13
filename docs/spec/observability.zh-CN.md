@@ -145,6 +145,26 @@ Session/Stream/目标连接数量、聚合容量、建议 Path 数量和报告�
 
 ## 计数器、仪表值和直方图
 
+Web Gateway 通过 `GET /metrics` 提供 Prometheus text format 0.0.4，使用
+`Content-Type: text/plain; version=0.0.4; charset=utf-8`。它与 JSON metric 查询使用相同的
+认证、Origin 限制和 `metrics:read` 授权，不是独立特权或未认证的监听器。响应读取同一份
+规范观测快照，并提供以下聚合 gauge，不带用户控制或目标地址标签：
+
+```text
+pathchord_active_sessions
+pathchord_ready_paths
+pathchord_active_streams
+pathchord_target_connections
+pathchord_observed_nodes
+pathchord_observed_connections
+pathchord_observation_generation
+```
+
+这些值描述快照当前状态，不得表示为历史事件 counter 或生命周期总量；不得伪造缺失的快照
+事实。高基数连接详情保留在经过授权的资源查询中。提供方 quota、到期时间和显式计费元数据
+遵循[Transit Proxy 用量契约](transit-proxies.zh-CN.md#提供方用量元数据)。
+
+
 服务应提供以下指标族：
 
 ```text

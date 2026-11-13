@@ -12,6 +12,15 @@ use pathchord_policy::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroize;
+
+#[path = "subscription_import.rs"]
+mod import;
+#[path = "subscription_providers.rs"]
+mod providers;
+#[path = "subscription_usage.rs"]
+mod usage;
+pub use usage::{SubscriptionDocument, SubscriptionUsage};
 
 pub const MAX_SUBSCRIPTION_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SUBSCRIPTION_NODES: usize = 10_000;
@@ -65,6 +74,15 @@ pub enum SubscriptionError {
 #[async_trait]
 pub trait SubscriptionFetcher: Send + Sync {
     async fn fetch(&self, request: SubscriptionFetchRequest) -> Result<Vec<u8>, SubscriptionError>;
+
+    async fn fetch_document(
+        &self,
+        request: SubscriptionFetchRequest,
+    ) -> Result<SubscriptionDocument, SubscriptionError> {
+        self.fetch(request)
+            .await
+            .map(|body| SubscriptionDocument { body, usage: None })
+    }
 }
 
 pub trait SubscriptionCredentialProvider: Send + Sync {
@@ -112,9 +130,11 @@ impl HttpSubscriptionFetcher {
     }
 }
 
-#[async_trait]
-impl SubscriptionFetcher for HttpSubscriptionFetcher {
-    async fn fetch(&self, request: SubscriptionFetchRequest) -> Result<Vec<u8>, SubscriptionError> {
+impl HttpSubscriptionFetcher {
+    async fn request_document(
+        &self,
+        request: SubscriptionFetchRequest,
+    ) -> Result<SubscriptionDocument, SubscriptionError> {
         let parsed =
             reqwest::Url::parse(&request.url).map_err(|_| SubscriptionError::InvalidUrl)?;
         if !matches!(parsed.scheme(), "http" | "https")
@@ -152,6 +172,7 @@ impl SubscriptionFetcher for HttpSubscriptionFetcher {
             });
         }
 
+        let usage = usage::parse_usage(response.headers());
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -165,7 +186,22 @@ impl SubscriptionFetcher for HttpSubscriptionFetcher {
             }
             body.extend_from_slice(&chunk);
         }
-        Ok(body)
+        Ok(SubscriptionDocument { body, usage })
+    }
+}
+
+#[async_trait]
+impl SubscriptionFetcher for HttpSubscriptionFetcher {
+    async fn fetch(&self, request: SubscriptionFetchRequest) -> Result<Vec<u8>, SubscriptionError> {
+        self.request_document(request)
+            .await
+            .map(|document| document.body)
+    }
+    async fn fetch_document(
+        &self,
+        request: SubscriptionFetchRequest,
+    ) -> Result<SubscriptionDocument, SubscriptionError> {
+        self.request_document(request).await
     }
 }
 
@@ -180,6 +216,14 @@ impl fmt::Debug for SubscriptionCredential {
             .debug_struct("SubscriptionCredential")
             .field("field_names", &self.fields.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SubscriptionCredential {
+    fn drop(&mut self) {
+        for value in self.fields.values_mut() {
+            value.zeroize();
+        }
     }
 }
 
@@ -202,6 +246,18 @@ impl SubscriptionCredential {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeUnavailableReason {
     AdapterUnavailable,
+    InvalidNode,
+    UnsupportedProtocol,
+    UnsupportedParameters,
+}
+
+/// Sanitized import diagnostics. Field names are bounded; values and parse
+/// error text from secret-bearing source documents never enter this model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeDiagnostic {
+    pub code: NodeUnavailableReason,
+    pub fields: Vec<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +272,10 @@ pub struct DynamicTransitNode {
     pub config: TransitProxyConfig,
     pub source_subscription: SubscriptionId,
     pub state: DynamicNodeState,
+    #[serde(default)]
+    pub diagnostic: Option<NodeDiagnostic>,
+    #[serde(default)]
+    pub usage: Option<SubscriptionUsage>,
     credential: SubscriptionCredential,
 }
 
@@ -226,6 +286,8 @@ impl fmt::Debug for DynamicTransitNode {
             .field("config", &self.config)
             .field("source_subscription", &self.source_subscription)
             .field("state", &self.state)
+            .field("diagnostic", &self.diagnostic)
+            .field("usage", &self.usage)
             .field("credential", &self.credential)
             .finish()
     }
@@ -273,6 +335,14 @@ impl DynamicTransitSnapshot {
                     labels: BTreeMap::new(),
                     tags: BTreeSet::new(),
                     selection_score: 1,
+                    quota_remaining: node
+                        .usage
+                        .as_ref()
+                        .and_then(SubscriptionUsage::remaining_bytes),
+                    traffic_multiplier_basis_points: node
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.traffic_multiplier_basis_points),
                 },
             );
         }
@@ -408,9 +478,10 @@ impl SubscriptionManager {
                 timeout: Duration::from_secs(config.refresh.timeout_seconds.clamp(1, 300)),
                 max_bytes: MAX_SUBSCRIPTION_BYTES,
             };
-            let fetched = tokio::time::timeout(request.timeout, self.fetcher.fetch(request)).await;
+            let fetched =
+                tokio::time::timeout(request.timeout, self.fetcher.fetch_document(request)).await;
             let candidate = match fetched {
-                Ok(Ok(body)) => normalize(config, &body, &self.available_adapters),
+                Ok(Ok(document)) => providers::normalize_fetched(self, config, document).await,
                 Ok(Err(error)) => Err(error),
                 Err(_) => Err(SubscriptionError::Timeout),
             };
@@ -515,7 +586,12 @@ impl SubscriptionManager {
             .map(|node| NormalizedNode {
                 config: node.config,
                 credential: node.credential,
-                state: adapter_state(&node.protocol, &self.available_adapters),
+                state: node.diagnostic.as_ref().map_or_else(
+                    || adapter_state(&node.protocol, &self.available_adapters),
+                    |diagnostic| DynamicNodeState::Unavailable(diagnostic.code),
+                ),
+                diagnostic: node.diagnostic,
+                usage: node.usage,
             })
             .collect();
         let diff = self.publish(&config.id, nodes)?;
@@ -627,6 +703,8 @@ impl SubscriptionManager {
                 config: normalized.config,
                 source_subscription: subscription_id.clone(),
                 state: normalized.state,
+                diagnostic: normalized.diagnostic,
+                usage: normalized.usage,
                 credential: normalized.credential,
             };
             match self.snapshot.nodes.insert(id.clone(), node) {
@@ -666,6 +744,8 @@ impl SubscriptionManager {
                 source_subscription: config.id.clone(),
                 protocol: node.config.protocol.clone(),
                 credential: node.credential.clone(),
+                diagnostic: node.diagnostic.clone(),
+                usage: node.usage.clone(),
             })
             .collect();
         let envelope = CacheEnvelope {
@@ -687,6 +767,8 @@ struct NormalizedNode {
     config: TransitProxyConfig,
     credential: SubscriptionCredential,
     state: DynamicNodeState,
+    diagnostic: Option<NodeDiagnostic>,
+    usage: Option<SubscriptionUsage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -703,6 +785,10 @@ struct CachedNode {
     source_subscription: SubscriptionId,
     protocol: String,
     credential: SubscriptionCredential,
+    #[serde(default)]
+    diagnostic: Option<NodeDiagnostic>,
+    #[serde(default)]
+    usage: Option<SubscriptionUsage>,
 }
 
 fn normalize(
@@ -715,197 +801,7 @@ fn normalize(
             maximum: MAX_SUBSCRIPTION_BYTES,
         });
     }
-    match config.source.source_type {
-        SubscriptionSourceType::Clash => normalize_clash(config, body, available_adapters),
-        SubscriptionSourceType::Sip008 => normalize_sip008(config, body, available_adapters),
-        SubscriptionSourceType::Static => Err(SubscriptionError::StaticSource),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ClashDocument {
-    proxies: Vec<ClashNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClashNode {
-    name: String,
-    #[serde(rename = "type")]
-    protocol: String,
-    server: String,
-    port: u16,
-    #[serde(default)]
-    tags: BTreeSet<String>,
-    #[serde(default = "default_weight")]
-    weight: u32,
-    username: Option<String>,
-    password: Option<String>,
-    cipher: Option<String>,
-    uuid: Option<String>,
-    #[serde(rename = "alterId")]
-    alter_id: Option<u64>,
-    tls: Option<bool>,
-    servername: Option<String>,
-    network: Option<String>,
-    flow: Option<String>,
-    plugin: Option<String>,
-    #[serde(rename = "plugin-opts")]
-    plugin_opts: Option<serde_yaml::Value>,
-}
-
-fn normalize_clash(
-    config: &SubscriptionConfig,
-    body: &[u8],
-    available_adapters: &BTreeSet<String>,
-) -> Result<Vec<NormalizedNode>, SubscriptionError> {
-    let document: ClashDocument = serde_yaml::from_slice(body)
-        .map_err(|_| SubscriptionError::MalformedDocument { format: "clash" })?;
-    if document.proxies.len() > MAX_SUBSCRIPTION_NODES {
-        return Err(SubscriptionError::TooManyNodes);
-    }
-    let mut used = BTreeSet::new();
-    document
-        .proxies
-        .into_iter()
-        .enumerate()
-        .map(|(index, node)| {
-            validate_node(index, &node.protocol, &node.server, node.port, node.weight)?;
-            validate_display_name(index, &node.name)?;
-            validate_tags(index, &node.tags)?;
-            let protocol = node.protocol.to_ascii_lowercase();
-            validate_registered_protocol(&protocol)?;
-            let mut credentials = BTreeMap::new();
-            insert_optional(&mut credentials, "username", node.username);
-            insert_optional(&mut credentials, "password", node.password);
-            insert_optional(&mut credentials, "cipher", node.cipher);
-            insert_optional(&mut credentials, "uuid", node.uuid);
-            insert_optional(
-                &mut credentials,
-                "alter_id",
-                node.alter_id.map(|value| value.to_string()),
-            );
-            insert_optional(
-                &mut credentials,
-                "tls",
-                node.tls.map(|value| value.to_string()),
-            );
-            insert_optional(&mut credentials, "servername", node.servername);
-            insert_optional(&mut credentials, "network", node.network);
-            insert_optional(&mut credentials, "flow", node.flow);
-            insert_optional(&mut credentials, "plugin", node.plugin);
-            if let Some(plugin_opts) = node.plugin_opts {
-                let encoded = serde_yaml::to_string(&plugin_opts).map_err(|_| {
-                    SubscriptionError::InvalidNode {
-                        index,
-                        reason: "plugin options are invalid".into(),
-                    }
-                })?;
-                credentials.insert("plugin_opts".into(), encoded);
-            }
-            validate_credentials(index, &protocol, &credentials)?;
-            let id = unique_node_id(config.id.as_str(), &node.name, index, &mut used);
-            Ok(NormalizedNode {
-                config: TransitProxyConfig {
-                    id: TransitProxyId::new(id),
-                    source: Some(TransitSource {
-                        source_type: "clash".into(),
-                        subscription: config.id.as_str().to_owned(),
-                    }),
-                    protocol: protocol.clone(),
-                    endpoint: Endpoint {
-                        host: node.server,
-                        port: node.port,
-                    },
-                    credentials_ref: None,
-                    labels: BTreeMap::from([
-                        ("source.name".into(), node.name),
-                        ("source.format".into(), "clash".into()),
-                    ]),
-                    tags: node.tags,
-                    weight: node.weight,
-                },
-                credential: SubscriptionCredential {
-                    fields: credentials,
-                },
-                state: adapter_state(&protocol, available_adapters),
-            })
-        })
-        .collect()
-}
-
-#[derive(Debug, Deserialize)]
-struct Sip008Node {
-    remarks: Option<String>,
-    server: String,
-    server_port: u16,
-    method: String,
-    password: String,
-    plugin: Option<String>,
-    plugin_opts: Option<String>,
-}
-
-fn normalize_sip008(
-    config: &SubscriptionConfig,
-    body: &[u8],
-    available_adapters: &BTreeSet<String>,
-) -> Result<Vec<NormalizedNode>, SubscriptionError> {
-    let document: Vec<Sip008Node> = serde_json::from_slice(body)
-        .map_err(|_| SubscriptionError::MalformedDocument { format: "sip008" })?;
-    if document.len() > MAX_SUBSCRIPTION_NODES {
-        return Err(SubscriptionError::TooManyNodes);
-    }
-    let mut used = BTreeSet::new();
-    document
-        .into_iter()
-        .enumerate()
-        .map(|(index, node)| {
-            validate_node(index, "ss", &node.server, node.server_port, 100)?;
-            if node.method.is_empty() || node.password.is_empty() {
-                return Err(SubscriptionError::InvalidNode {
-                    index,
-                    reason: "method and password are required".into(),
-                });
-            }
-            let name = node
-                .remarks
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| format!("node-{}", index + 1));
-            validate_display_name(index, &name)?;
-            let id = unique_node_id(config.id.as_str(), &name, index, &mut used);
-            let mut credentials = BTreeMap::from([
-                ("cipher".into(), node.method.clone()),
-                ("password".into(), node.password),
-            ]);
-            insert_optional(&mut credentials, "plugin", node.plugin);
-            insert_optional(&mut credentials, "plugin_opts", node.plugin_opts);
-            Ok(NormalizedNode {
-                config: TransitProxyConfig {
-                    id: TransitProxyId::new(id),
-                    source: Some(TransitSource {
-                        source_type: "sip008".into(),
-                        subscription: config.id.as_str().to_owned(),
-                    }),
-                    protocol: "ss".into(),
-                    endpoint: Endpoint {
-                        host: node.server,
-                        port: node.server_port,
-                    },
-                    credentials_ref: None,
-                    labels: BTreeMap::from([
-                        ("source.name".into(), name),
-                        ("source.format".into(), "sip008".into()),
-                        ("source.method".into(), node.method),
-                    ]),
-                    tags: BTreeSet::new(),
-                    weight: 100,
-                },
-                credential: SubscriptionCredential {
-                    fields: credentials,
-                },
-                state: adapter_state("ss", available_adapters),
-            })
-        })
-        .collect()
+    import::normalize(config, body, available_adapters)
 }
 
 fn validate_node(
@@ -958,46 +854,6 @@ fn validate_tags(index: usize, tags: &BTreeSet<String>) -> Result<(), Subscripti
     } else {
         Ok(())
     }
-}
-
-fn validate_registered_protocol(protocol: &str) -> Result<(), SubscriptionError> {
-    if ["http", "https", "socks5", "ss", "vless", "vmess", "xtls"].contains(&protocol) {
-        Ok(())
-    } else {
-        Err(SubscriptionError::UnsupportedProtocol)
-    }
-}
-
-fn validate_credentials(
-    index: usize,
-    protocol: &str,
-    fields: &BTreeMap<String, String>,
-) -> Result<(), SubscriptionError> {
-    let required: &[&str] = match protocol {
-        "ss" => &["cipher", "password"],
-        "vless" | "xtls" | "vmess" => &["uuid"],
-        _ => &[],
-    };
-    if required
-        .iter()
-        .any(|field| fields.get(*field).is_none_or(String::is_empty))
-    {
-        return Err(SubscriptionError::InvalidNode {
-            index,
-            reason: format!("{protocol} credentials are incomplete"),
-        });
-    }
-    Ok(())
-}
-
-fn insert_optional(fields: &mut BTreeMap<String, String>, name: &str, value: Option<String>) {
-    if let Some(value) = value {
-        fields.insert(name.to_owned(), value);
-    }
-}
-
-fn default_weight() -> u32 {
-    100
 }
 
 fn unique_node_id(

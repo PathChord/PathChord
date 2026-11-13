@@ -22,6 +22,8 @@
 | Linux TUN | 通过 `PacketDevice` 封装 `tun-rs` 异步包设备，并使用直接的 `smoltcp` reactor | 安全、可替换的设备生命周期以及维护中的 TCP/UDP 状态机 |
 | Windows TUN | 通过同一接口封装 `tun-rs` Wintun 包设备，并使用直接的 `smoltcp` reactor | 无需平台专用 TCP 重建的标准 Windows 驱动集成方式 |
 | HTTP/SOCKS | Hyper HTTP/1 消息 codec，配合内部 HTTP 路由和 SOCKS4/4a/5 adapter | 维护中的 HTTP 解析、消息 framing、流式背压，以及显式的策略和认证边界 |
+| Transit 协议 | 带类型化 rustls TLS 选项的原生 direct/HTTP/SOCKS/SS adapter，以及可选的受监督 sing-box 1.14.4 后端 | 复用维护中的协议实现，同时保留节点参数、进程所有权和明确的不支持错误 |
+| 订阅导入 | 有界节点规范化及 HTTP provider 展开，之后执行适配器验证 | 文档格式不等于协议可用性；错误节点保持可见且不丢弃有效兄弟节点 |
 | DNS 线协议处理 | 路由 adapter 后使用 `hickory-proto` | 使用成熟的 DNS 解析/编码，同时保持 local、Transit、Egress 和 blocked 路由可替换 |
 | 测试 | `cargo test`、确定性模拟传输、属性测试、数据包跟踪和故障注入 | 多路径正确性依赖可复现的丢包、重复、重排序和重启测试 |
 
@@ -53,6 +55,11 @@ Ingress 拥有一个类型化 command/query service，用于节点元数据、�
 节点 tag/label 修改、订阅创建/删除/刷新及其他变更都是带代次检查、幂等和审计的 command。动态快照原子替换；订阅刷新失败时保留最近一次成功快照。观测 provider 发布类型化的节点、Path、Session、Stream、目标连接、订阅和策略 metric。Web Gateway 暴露这些快照和有界事件流；运维人员不能依靠解析日志重建当前状态。
 
 `STATUS_REPORT` 仍然是用于 Egress 准入和健康状态的紧凑认证 data-Path 消息，不是管理 API，也不是 metrics 传输。
+
+Prometheus 导出通过 Web Gateway 的认证与 capability 边界，从同一份观测快照读取聚合 gauge。
+提供方用量是可选的显式元数据，与私有订阅快照共同持久化，并由调度器消费；不得变成硬性限制。
+[Transit Proxy 契约](../spec/transit-proxies.zh-CN.md)拥有节点和导入语义，包括原生 UDP 与可选
+引擎生命周期。
 
 ## Noise 和记录处理
 

@@ -77,6 +77,10 @@ spec:
 
 ## Dynamic Transit Proxy data
 
+Node protocols, typed `options`, import formats, credential boundaries, and
+provider accounting follow the [Transit Proxy contract](transit-proxies.md).
+Subscription formats and executable node protocols are independent capabilities.
+
 ```yaml
 apiVersion: pathchord.io/v1
 kind: TransitProxy
@@ -173,6 +177,11 @@ spec:
 The Session budget is the hard upper bound. A traffic-class budget can reduce the allocation for that class but cannot exceed the remaining Session budget.
 
 ## Ordinary Proxy rules and fallback
+
+Ordinary routes support native UDP through direct, SOCKS5, and SS adapters
+when the selected node permits UDP. Egress UDP Session traffic is independent
+of a Transit node's native UDP capability. Unsupported ordinary UDP routes
+fail according to policy without a direct bypass.
 
 ```yaml
 apiVersion: pathchord.io/v1

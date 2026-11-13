@@ -1,0 +1,52 @@
+apiVersion: pathchord.io/v1
+kind: Subscription
+metadata:
+  name: provider
+spec:
+  source:
+    type: auto
+    url: https://provider.example/subscription
+  refresh:
+    intervalSeconds: 3600
+    timeoutSeconds: 30
+    maxAttempts: 3
+    backoffSeconds: 5
+  cache:
+    path: provider.json
+    maxAgeSeconds: 86400
+---
+apiVersion: pathchord.io/v1
+kind: ProxyRule
+metadata:
+  name: ordinary-proxy
+spec:
+  order: 10
+  catchAll: true
+  select: any
+---
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata:
+  name: local-mixed
+spec:
+  type: mixed
+  platform: any
+  bind: 127.0.0.1:7890
+  protocols: [tcp, udp]
+  authentication: disabled
+---
+apiVersion: pathchord.io/v1
+kind: DNSPolicy
+metadata:
+  name: dns
+spec:
+  defaultRoute: local
+  local:
+    servers: [9.9.9.9:53]
+---
+apiVersion: pathchord.io/v1
+kind: FallbackPolicy
+metadata:
+  name: fallback
+spec:
+  action: reject

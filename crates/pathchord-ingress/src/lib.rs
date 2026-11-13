@@ -40,6 +40,7 @@ mod linux_udp_runtime;
 mod local_dispatch;
 mod local_protocol;
 mod local_server;
+mod metrics_export;
 mod mixed;
 mod platform;
 mod platform_runtime;

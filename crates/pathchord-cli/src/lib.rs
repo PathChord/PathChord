@@ -127,6 +127,9 @@ pub struct IngressArgs {
     /// Directory containing private JSON credential maps named by credentialsRef.
     #[arg(long, default_value = "pathchord-secrets")]
     pub credentials_dir: PathBuf,
+    /// Optional sing-box executable for advanced outbound protocols and transports.
+    #[arg(long)]
+    pub outbound_engine: Option<PathBuf>,
     /// Optional Web Gateway bind. Omit to keep the browser adapter disabled.
     #[arg(long)]
     pub web_bind: Option<SocketAddr>,
@@ -624,7 +627,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     ))?);
     std::fs::create_dir_all(&args.data_dir)?;
     let credentials = Arc::new(FileTransitCredentialProvider::new(&args.credentials_dir)?);
-    let adapter_registry = Arc::new(if policy_config.subscriptions.is_empty() {
+    let adapter_registry = if policy_config.subscriptions.is_empty() {
         AdapterRegistry::for_configs(
             Arc::clone(&credentials),
             pathchord_ingress::DEFAULT_PATH_CONNECT_TIMEOUT,
@@ -635,19 +638,27 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
             Arc::clone(&credentials),
             pathchord_ingress::DEFAULT_PATH_CONNECT_TIMEOUT,
         )?
+    };
+    let adapter_registry = Arc::new(match args.outbound_engine {
+        Some(path) => adapter_registry.with_outbound_engine(path, args.data_dir.join("outbounds")),
+        None => adapter_registry,
     });
     for proxy in &policy_config.transit_proxies {
         let adapter = adapter_registry.build(proxy).await?;
+        adapter.prepare().await?;
+        let capabilities = adapter_capabilities(adapter.as_ref(), &proxy.options);
         data_plane
             .register_transit_adapter(
                 proxy.id.clone(),
                 adapter,
                 TransitProxyRuntimeStatus {
                     state: RuntimeNodeState::Ready,
-                    capabilities: transit_capabilities(&proxy.protocol),
+                    capabilities,
                     labels: BTreeMap::new(),
                     tags: BTreeSet::new(),
                     selection_score: 1,
+                    quota_remaining: None,
+                    traffic_multiplier_basis_points: None,
                 },
             )
             .await?;
@@ -659,19 +670,13 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     let mut subscription_manager = SubscriptionManager::new(
         fetcher,
         args.data_dir.join("subscriptions"),
-        BTreeSet::from([
-            "direct".to_owned(),
-            "http".to_owned(),
-            "https".to_owned(),
-            "socks5".to_owned(),
-            "ss".to_owned(),
-        ]),
+        adapter_registry.available_protocols(),
     );
     subscription_manager.reconcile(&policy_config.subscriptions);
     for subscription in &policy_config.subscriptions {
         let _ = subscription_manager.load_cache(subscription).await;
     }
-    publish_dynamic_transit(
+    let initial_adapter_diagnostics = publish_dynamic_transit(
         data_plane.as_ref(),
         adapter_registry.as_ref(),
         subscription_manager.snapshot(),
@@ -762,6 +767,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         &control_dispatcher,
         data_plane.as_ref(),
         subscription_manager.snapshot(),
+        &initial_adapter_diagnostics,
     )
     .await?;
     let web_gateway = if let Some(bind) = args.web_bind {
@@ -897,6 +903,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     let subscription_registry = Arc::clone(&adapter_registry);
     let subscription_configs = policy_config.subscriptions.clone();
     let subscription_future = SubscriptionWorker {
+        adapter_diagnostics: initial_adapter_diagnostics,
         manager: subscription_manager,
         configs: subscription_configs,
         registry: subscription_registry,
@@ -1150,6 +1157,8 @@ fn platform_proxy_adapter(_data_dir: &std::path::Path) -> Arc<dyn PlatformProxyA
 }
 
 struct SubscriptionWorker {
+    adapter_diagnostics:
+        BTreeMap<pathchord_policy::TransitProxyId, pathchord_transit::NodeDiagnostic>,
     manager: SubscriptionManager,
     configs: Vec<pathchord_policy::SubscriptionConfig>,
     registry: Arc<AdapterRegistry<FileTransitCredentialProvider>>,
@@ -1172,6 +1181,7 @@ impl SubscriptionWorker {
         let protected_endpoints = self.protected_endpoints;
         let dns_runtime = self.dns_runtime;
         let dynamic_snapshot = self.dynamic_snapshot;
+        let mut adapter_diagnostics = self.adapter_diagnostics;
         let mut due: BTreeMap<_, _> = configs
             .iter()
             .map(|config| (config.id.clone(), tokio::time::Instant::now()))
@@ -1185,6 +1195,8 @@ impl SubscriptionWorker {
                     }
                 }
                 _ = tick.tick() => {
+                    let mut tick_shutdown = shutdown.clone();
+                    let work = async {
                     let mut refreshed = false;
                     let latest = control
                         .lock()
@@ -1228,7 +1240,7 @@ impl SubscriptionWorker {
                             let Some(outcome) = cancellable_subscription_refresh(
                                 &mut manager,
                                 config,
-                                &mut shutdown,
+                                &mut tick_shutdown,
                             )
                             .await else {
                                 return Ok(());
@@ -1259,7 +1271,7 @@ impl SubscriptionWorker {
                         let Some(outcome) = cancellable_subscription_refresh(
                             &mut manager,
                             config,
-                            &mut shutdown,
+                            &mut tick_shutdown,
                         )
                         .await else {
                             return Ok(());
@@ -1304,7 +1316,7 @@ impl SubscriptionWorker {
                     }
                     if refreshed {
                     *dynamic_snapshot.write().await = manager.snapshot().clone();
-                        publish_dynamic_transit(data_plane.as_ref(), registry.as_ref(), manager.snapshot()).await;
+                        adapter_diagnostics = publish_dynamic_transit(data_plane.as_ref(), registry.as_ref(), manager.snapshot()).await;
                         data_plane.warmup().await;
                         let policy = reload.snapshot()?.config;
                         protected_endpoints.replace(
@@ -1316,11 +1328,34 @@ impl SubscriptionWorker {
                             .await,
                         );
                     }
-                    sync_control_nodes(&control, data_plane.as_ref(), manager.snapshot()).await?;
+                    sync_control_nodes(&control, data_plane.as_ref(), manager.snapshot(), &adapter_diagnostics).await?;
+                    Ok::<(), CliError>(())
+                    };
+                    match cancellable_ingress_work(shutdown.clone(), work).await {
+                        Some(result) => result?,
+                        None => return Ok(()),
+                    }
                 }
             }
         }
     }
+}
+
+async fn cancellable_ingress_work<T>(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let cancelled = async move {
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            if shutdown.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! { result = work => Some(result), () = cancelled => None }
 }
 
 async fn cancellable_subscription_refresh(
@@ -1354,7 +1389,11 @@ async fn run_data_plane_maintenance(
                     return Ok(());
                 }
             }
-            _ = interval.tick() => data_plane.warmup().await,
+            _ = interval.tick() => {
+                if cancellable_ingress_work(shutdown.clone(), data_plane.warmup()).await.is_none() {
+                    return Ok(());
+                }
+            },
         }
     }
 }
@@ -1395,14 +1434,11 @@ async fn apply_reloaded_policies(
                             subscriptions,
                         )?;
                     let dynamic = dynamic_snapshot.read().await.clone();
-                    protected_endpoints.replace(
-                        collect_protected_endpoints(
-                            &snapshot.config,
-                            dns_runtime.as_deref(),
-                            Some(&dynamic),
-                        )
-                        .await,
-                    );
+                    let endpoints = cancellable_ingress_work(shutdown.clone(),
+                        collect_protected_endpoints(&snapshot.config, dns_runtime.as_deref(), Some(&dynamic)),
+                    ).await;
+                    let Some(endpoints) = endpoints else { return Ok(()); };
+                    protected_endpoints.replace(endpoints);
                     applied_generation = snapshot.generation;
                 }
             }
@@ -1424,12 +1460,7 @@ fn declarative_control_resources(
         .map(|subscription| {
             Ok(ControlSubscriptionSpec {
                 id: ControlSubscriptionId::new(subscription.id.as_str())?,
-                source_type: match subscription.source.source_type {
-                    pathchord_policy::SubscriptionSourceType::Static => "static",
-                    pathchord_policy::SubscriptionSourceType::Clash => "clash",
-                    pathchord_policy::SubscriptionSourceType::Sip008 => "sip008",
-                }
-                .to_owned(),
+                source_type: subscription.source.source_type.as_str().to_owned(),
                 display_name: subscription.id.as_str().to_owned(),
                 enabled: subscription.enabled,
                 url: subscription.source.url.clone(),
@@ -1509,7 +1540,8 @@ async fn publish_dynamic_transit(
     data_plane: &IngressDataPlane,
     registry: &AdapterRegistry<FileTransitCredentialProvider>,
     snapshot: &DynamicTransitSnapshot,
-) {
+) -> BTreeMap<pathchord_policy::TransitProxyId, pathchord_transit::NodeDiagnostic> {
+    let mut diagnostics = BTreeMap::new();
     for node in snapshot.nodes.values() {
         let mut status = TransitProxyRuntimeStatus {
             state: match node.state {
@@ -1521,28 +1553,61 @@ async fn publish_dynamic_transit(
             labels: BTreeMap::new(),
             tags: BTreeSet::new(),
             selection_score: 1,
+            quota_remaining: node
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.remaining_bytes()),
+            traffic_multiplier_basis_points: node
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.traffic_multiplier_basis_points),
         };
         if node.state == DynamicNodeState::Active {
-            match registry.build_dynamic(node) {
+            let built = match registry.build_dynamic(node) {
+                Ok(adapter) => match adapter.prepare().await {
+                    Ok(()) => Ok(adapter),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            match built {
                 Ok(adapter) => {
+                    status.capabilities =
+                        adapter_capabilities(adapter.as_ref(), &node.config.options);
                     data_plane
                         .register_dynamic_transit_adapter(node.config.clone(), adapter, status)
                         .await;
                     continue;
                 }
-                Err(_) => status.state = RuntimeNodeState::Down,
+                Err(error) => {
+                    status.state = RuntimeNodeState::Down;
+                    status.capabilities.clear();
+                    diagnostics.insert(
+                        node.config.id.clone(),
+                        pathchord_transit::NodeDiagnostic {
+                            code: pathchord_transit::NodeUnavailableReason::AdapterUnavailable,
+                            fields: Vec::new(),
+                            message: error.to_string(),
+                        },
+                    );
+                }
             }
         }
         data_plane
             .publish_dynamic_transit_status(node.config.clone(), status)
             .await;
     }
+    diagnostics
 }
 
 async fn sync_control_nodes(
     control: &Arc<tokio::sync::Mutex<LocalControlDispatcher>>,
     data_plane: &IngressDataPlane,
     snapshot: &DynamicTransitSnapshot,
+    adapter_diagnostics: &BTreeMap<
+        pathchord_policy::TransitProxyId,
+        pathchord_transit::NodeDiagnostic,
+    >,
 ) -> Result<(), CliError> {
     let admin = {
         let mut dispatcher = control.lock().await;
@@ -1552,11 +1617,20 @@ async fn sync_control_nodes(
             dispatcher.service_mut().set_node_observation(
                 id,
                 NodeObservation {
-                    state: match node.state {
-                        DynamicNodeState::Active => NodeHealthState::Up,
-                        DynamicNodeState::Draining => NodeHealthState::Degraded,
-                        DynamicNodeState::Unavailable(_) => NodeHealthState::Down,
+                    state: if adapter_diagnostics.contains_key(&node.config.id) {
+                        NodeHealthState::Down
+                    } else {
+                        match node.state {
+                            DynamicNodeState::Active => NodeHealthState::Unknown,
+                            DynamicNodeState::Draining => NodeHealthState::Degraded,
+                            DynamicNodeState::Unavailable(_) => NodeHealthState::Down,
+                        }
                     },
+                    diagnostic: adapter_diagnostics
+                        .get(&node.config.id)
+                        .cloned()
+                        .or_else(|| node.diagnostic.clone()),
+                    usage: node.usage.clone(),
                     rtt_ms: None,
                     jitter_ms: None,
                     loss_ppm: None,
@@ -1577,11 +1651,37 @@ async fn sync_control_nodes(
 }
 
 fn transit_capabilities(protocol: &str) -> BTreeSet<FlowProtocol> {
-    if protocol == "direct" {
+    if matches!(
+        protocol,
+        "direct"
+            | "socks5"
+            | "ss"
+            | "trojan"
+            | "vless"
+            | "vmess"
+            | "hysteria"
+            | "hysteria2"
+            | "tuic"
+            | "wireguard"
+    ) {
         BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp])
     } else {
         BTreeSet::from([FlowProtocol::Tcp])
     }
+}
+
+fn adapter_capabilities(
+    adapter: &dyn pathchord_transit::TransitAdapter,
+    options: &pathchord_policy::TransitOptions,
+) -> BTreeSet<FlowProtocol> {
+    let mut capabilities = BTreeSet::new();
+    if adapter.supports_tcp() {
+        capabilities.insert(FlowProtocol::Tcp);
+    }
+    if adapter.supports_udp() && options.udp != Some(false) {
+        capabilities.insert(FlowProtocol::Udp);
+    }
+    capabilities
 }
 
 fn run_keygen(args: KeygenArgs) -> Result<(), CliError> {
@@ -1901,6 +2001,36 @@ where
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[tokio::test]
+    async fn shutdown_cancels_inflight_subscription_backend_work() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owner = DropFlag(Arc::clone(&dropped));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (cancel, shutdown) = tokio::sync::watch::channel(false);
+        let work = async move {
+            let _owner = owner;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        };
+        let task = tokio::spawn(cancellable_ingress_work(shutdown, work));
+        ready.await.unwrap();
+        cancel.send(true).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+    }
     use std::net::SocketAddr;
     #[cfg(unix)]
     use std::sync::Arc;

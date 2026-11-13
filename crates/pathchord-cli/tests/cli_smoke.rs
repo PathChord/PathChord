@@ -1,0 +1,213 @@
+#![cfg(unix)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+const BIN: &str = env!("CARGO_BIN_EXE_pathchord");
+
+struct Process(Child);
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+struct Directory(PathBuf);
+impl Drop for Directory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+struct Task<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for Task<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn command_json(arguments: &[&str]) -> Value {
+    let output = Command::new(BIN).args(arguments).output().expect("run CLI");
+    assert!(
+        output.status.success(),
+        "CLI command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("CLI JSON response")
+}
+
+fn spawn(arguments: &[&str], directory: &Path) -> Process {
+    Process(
+        Command::new(BIN)
+            .args(arguments)
+            .current_dir(directory)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start service"),
+    )
+}
+
+fn unused_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn wait_for_socket(path: &Path, process: &mut Process) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            let mut error = String::new();
+            if let Some(mut output) = process.0.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut output, &mut error);
+            }
+            panic!("service exited during startup ({status}): {error}");
+        }
+        if tokio::net::UnixStream::connect(path).await.is_ok() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "service startup timed out");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn separate_cli_processes_enroll_and_forward_http_and_udp_through_a_transit() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = std::env::temp_dir().join(format!("pc-cli-{}-{}", std::process::id(), unused_port()));
+        std::fs::create_dir(&directory).unwrap();
+        let directory = Directory(directory);
+        let ingress_key = directory.0.join("ingress.json");
+        let egress_key = directory.0.join("egress.json");
+        let ingress_public = command_json(&["keygen", "--output", ingress_key.to_str().unwrap()]);
+        let egress_public = command_json(&["keygen", "--output", egress_key.to_str().unwrap()]);
+        let egress_port = unused_port();
+        let proxy_port = unused_port();
+        let egress_socket = directory.0.join("e.sock");
+        let ingress_socket = directory.0.join("i.sock");
+        let egress_address = format!("127.0.0.1:{egress_port}");
+        let mut egress = spawn(&["egress", "--egress-id", "exit", "--identity", egress_key.to_str().unwrap(),
+            "--bind", &egress_address, "--control-socket", egress_socket.to_str().unwrap()], &directory.0);
+        wait_for_socket(&egress_socket, &mut egress).await;
+        let enrolled = command_json(&["--socket", egress_socket.to_str().unwrap(), "enroll", "add",
+            "--ingress-id", "entry", "--egress-id", "exit", "--public-key", ingress_public["public_key"].as_str().unwrap(), "--expected-generation", "0"]);
+        assert_eq!(enrolled["ok"], true);
+
+        let transit = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transit_port = transit.local_addr().unwrap().port();
+        let transit_task = Task(tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    next = transit.accept() => {
+                        let (mut client, _) = next.unwrap();
+                        let address = egress_address.clone();
+                        tasks.spawn(async move {
+                            let mut header = Vec::new();
+                            while !header.ends_with(b"\r\n\r\n") {
+                                assert!(header.len() < 8192);
+                                header.push(client.read_u8().await.unwrap());
+                            }
+                            assert!(header.starts_with(format!("CONNECT {address} HTTP/1.1").as_bytes()));
+                            let mut target = TcpStream::connect(address).await.unwrap();
+                            client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.unwrap();
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut target).await;
+                        });
+                    }
+                    _ = tasks.join_next(), if !tasks.is_empty() => {}
+                }
+            }
+        }));
+        let yaml = format!(r#"apiVersion: pathchord.io/v1
+kind: Egress
+metadata: {{name: exit}}
+spec:
+  address: 127.0.0.1
+  port: {egress_port}
+  publicKey: {public}
+  capabilities: {{tcp: true, udp: true}}
+---
+apiVersion: pathchord.io/v1
+kind: TransitProxy
+metadata: {{name: relay}}
+spec: {{protocol: http, address: 127.0.0.1, port: {transit_port}}}
+---
+apiVersion: pathchord.io/v1
+kind: TrafficPolicy
+metadata: {{name: default}}
+spec: {{scheduler: effectiveCapacityWeighted}}
+---
+apiVersion: pathchord.io/v1
+kind: EgressRule
+metadata: {{name: egress-route}}
+spec: {{order: 10, catchAll: true, egressRef: exit}}
+---
+apiVersion: pathchord.io/v1
+kind: TransitRule
+metadata: {{name: transit-route}}
+spec: {{order: 20, catchAll: true, egressRef: exit, trafficPolicyRef: default}}
+---
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata: {{name: mixed}}
+spec: {{type: mixed, bind: '127.0.0.1:{proxy_port}', protocols: [tcp, udp]}}
+---
+apiVersion: pathchord.io/v1
+kind: DNSPolicy
+metadata: {{name: default}}
+spec: {{defaultRoute: local, local: {{servers: ['127.0.0.1:53']}}}}
+---
+apiVersion: pathchord.io/v1
+kind: FallbackPolicy
+metadata: {{name: default}}
+spec: {{action: reject}}
+"#, public = egress_public["public_key"].as_str().unwrap());
+        let config_path = directory.0.join("ingress.yaml");
+        std::fs::write(&config_path, yaml).unwrap();
+        let mut ingress = spawn(&["--socket", ingress_socket.to_str().unwrap(), "ingress", "--ingress-id", "entry",
+            "--config", config_path.to_str().unwrap(), "--identity", ingress_key.to_str().unwrap()], &directory.0);
+        wait_for_socket(&ingress_socket, &mut ingress).await;
+        assert_eq!(command_json(&["--socket", ingress_socket.to_str().unwrap(), "status"])["ok"], true);
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_task = Task(tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") { header.push(stream.read_u8().await.unwrap()); }
+            assert!(header.starts_with(b"GET /smoke HTTP/1.1"));
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready").await.unwrap();
+        }));
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        client.write_all(format!("GET http://{origin_address}/smoke HTTP/1.1\r\nHost: {origin_address}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(response.ends_with(b"ready"));
+
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let udp_task = Task(tokio::spawn(async move {
+            let mut data = [0; 128];
+            let (count, peer) = target.recv_from(&mut data).await.unwrap();
+            target.send_to(&data[..count], peer).await.unwrap();
+        }));
+        let mut control = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        control.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 2]; control.read_exact(&mut method).await.unwrap(); assert_eq!(method, [5, 0]);
+        control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut relay = [0; 10]; control.read_exact(&mut relay).await.unwrap(); assert_eq!(&relay[..4], &[5, 0, 0, 1]);
+        let relay = std::net::SocketAddr::from(([relay[4], relay[5], relay[6], relay[7]], u16::from_be_bytes([relay[8], relay[9]])));
+        let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1]; packet.extend_from_slice(&target_address.port().to_be_bytes()); packet.extend_from_slice(b"datagram");
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap(); udp.send_to(&packet, relay).await.unwrap();
+        let mut data = [0; 128]; let (count, _) = udp.recv_from(&mut data).await.unwrap(); assert_eq!(&data[..count], packet);
+        drop(control); drop(ingress); drop(egress); drop(transit_task); drop(origin_task); drop(udp_task);
+    }).await.expect("bounded two-process CLI smoke test");
+}

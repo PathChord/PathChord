@@ -166,6 +166,13 @@ backoff before retry. `DISABLED` subscriptions do not refresh. Deletion
 removes the source from future refreshes and drains nodes imported solely from
 that source.
 
+Document fetch/parse failures and individual node failures are distinct.
+Valid siblings may publish while invalid or unsupported nodes remain visible
+and unselectable with redacted diagnostics. Bounded provider expansion may
+retain failed providers' prior nodes while other providers succeed. Cache
+reload preserves these failure states; the [Transit Proxy contract](transit-proxies.md)
+defines normalization, validation, and metadata ownership.
+
 ## Authorization record
 
 ```text

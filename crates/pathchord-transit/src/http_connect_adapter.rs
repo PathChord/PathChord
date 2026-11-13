@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,10 +7,10 @@ use async_trait::async_trait;
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use pathchord_policy::TransitProxyConfig;
 use rustls::ClientConfig;
-use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
+use zeroize::Zeroize;
 
 use crate::{
     AdapterKind, BoxedTransitConnection, ConnectRequest, Endpoint, TransitAdapter,
@@ -24,6 +25,7 @@ pub struct HttpConnectTransitAdapter {
     metadata: TransitMetadata,
     proxy: Endpoint,
     authorization: Option<String>,
+    headers: BTreeMap<String, String>,
     connect_timeout: Duration,
 }
 
@@ -39,6 +41,14 @@ impl std::fmt::Debug for HttpConnectTransitAdapter {
     }
 }
 
+impl Drop for HttpConnectTransitAdapter {
+    fn drop(&mut self) {
+        if let Some(value) = &mut self.authorization {
+            value.zeroize();
+        }
+    }
+}
+
 impl HttpConnectTransitAdapter {
     pub fn from_config(
         config: &TransitProxyConfig,
@@ -50,6 +60,9 @@ impl HttpConnectTransitAdapter {
                 "HTTP CONNECT adapter requires protocol http".to_owned(),
             ));
         }
+        crate::adapter_registry::validate_native_options(config, false, true, false)?;
+        crate::adapter_registry::validate_credentials(credential, &["username", "password"])?;
+        validate_headers(&config.options.headers)?;
         Ok(Self {
             metadata: metadata(config, "http"),
             proxy: Endpoint {
@@ -57,6 +70,7 @@ impl HttpConnectTransitAdapter {
                 port: config.endpoint.port,
             },
             authorization: proxy_authorization(credential)?,
+            headers: config.options.headers.clone(),
             connect_timeout,
         })
     }
@@ -80,6 +94,7 @@ impl TransitAdapter for HttpConnectTransitAdapter {
                 &mut stream,
                 &request.destination,
                 self.authorization.as_deref(),
+                &self.headers,
             ),
         )
         .await
@@ -93,8 +108,10 @@ pub struct HttpsConnectTransitAdapter {
     metadata: TransitMetadata,
     proxy: Endpoint,
     authorization: Option<String>,
+    headers: BTreeMap<String, String>,
     connect_timeout: Duration,
     tls: Arc<ClientConfig>,
+    server_name: rustls::pki_types::ServerName<'static>,
 }
 
 impl std::fmt::Debug for HttpsConnectTransitAdapter {
@@ -109,6 +126,14 @@ impl std::fmt::Debug for HttpsConnectTransitAdapter {
     }
 }
 
+impl Drop for HttpsConnectTransitAdapter {
+    fn drop(&mut self) {
+        if let Some(value) = &mut self.authorization {
+            value.zeroize();
+        }
+    }
+}
+
 impl HttpsConnectTransitAdapter {
     pub fn from_config(
         config: &TransitProxyConfig,
@@ -116,11 +141,37 @@ impl HttpsConnectTransitAdapter {
         connect_timeout: Duration,
         tls: Arc<ClientConfig>,
     ) -> Result<Self, TransitError> {
-        if config.protocol != "https" {
+        if config.protocol != "https"
+            && !(config.protocol == "http"
+                && config.options.tls.as_ref().is_some_and(|tls| tls.enabled))
+        {
             return Err(TransitError::Unsupported(
                 "HTTPS CONNECT adapter requires protocol https".to_owned(),
             ));
         }
+        crate::adapter_registry::validate_native_options(config, true, true, false)?;
+        let key = config
+            .options
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_key_field.as_deref());
+        let mut allowed = vec!["username", "password"];
+        allowed.extend(key);
+        crate::adapter_registry::validate_credentials(credential, &allowed)?;
+        validate_headers(&config.options.headers)?;
+        if config
+            .options
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.alpn.iter().any(|protocol| protocol != "http/1.1"))
+        {
+            return Err(TransitError::Unsupported(
+                "native HTTPS CONNECT requires HTTP/1.1 ALPN".into(),
+            ));
+        }
+        let server_name =
+            crate::tls::server_name(&config.endpoint.host, config.options.tls.as_ref())?;
+        let tls = crate::tls::configure(tls, config.options.tls.as_ref(), credential)?;
         Ok(Self {
             metadata: metadata(config, "https"),
             proxy: Endpoint {
@@ -128,8 +179,10 @@ impl HttpsConnectTransitAdapter {
                 port: config.endpoint.port,
             },
             authorization: proxy_authorization(credential)?,
+            headers: config.options.headers.clone(),
             connect_timeout,
             tls,
+            server_name,
         })
     }
 }
@@ -146,12 +199,9 @@ impl TransitAdapter for HttpsConnectTransitAdapter {
     ) -> Result<BoxedTransitConnection, TransitError> {
         validate_destination(&request.destination)?;
         let stream = connect_tcp_endpoint(&self.proxy, self.connect_timeout).await?;
-        let server_name = ServerName::try_from(self.proxy.host.clone()).map_err(|_| {
-            TransitError::Unsupported("HTTPS proxy TLS server name is invalid".to_owned())
-        })?;
         let mut stream = timeout(
             self.connect_timeout,
-            TlsConnector::from(Arc::clone(&self.tls)).connect(server_name, stream),
+            TlsConnector::from(Arc::clone(&self.tls)).connect(self.server_name.clone(), stream),
         )
         .await
         .map_err(|_| TransitError::Connection("HTTPS proxy TLS handshake timed out".to_owned()))?
@@ -162,6 +212,7 @@ impl TransitAdapter for HttpsConnectTransitAdapter {
                 &mut stream,
                 &request.destination,
                 self.authorization.as_deref(),
+                &self.headers,
             ),
         )
         .await
@@ -190,6 +241,7 @@ fn proxy_authorization(
         (Some(username), Some(password))
             if username.len().saturating_add(password.len()) <= MAX_PROXY_CREDENTIAL_BYTES
                 && !username.bytes().any(|byte| byte.is_ascii_control())
+                && !username.contains(':')
                 && !password.bytes().any(|byte| byte.is_ascii_control()) =>
         {
             Ok(Some(
@@ -206,6 +258,7 @@ async fn establish_connect_tunnel<S>(
     stream: &mut S,
     destination: &Endpoint,
     authorization: Option<&str>,
+    headers: &BTreeMap<String, String>,
 ) -> Result<(), TransitError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -217,6 +270,12 @@ where
     if let Some(authorization) = authorization {
         request.push_str("Proxy-Authorization: Basic ");
         request.push_str(authorization);
+        request.push_str("\r\n");
+    }
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
         request.push_str("\r\n");
     }
     request.push_str("\r\n");
@@ -263,6 +322,37 @@ where
     Ok(())
 }
 
+fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), TransitError> {
+    if headers.len() > 64
+        || headers.iter().any(|(name, value)| {
+            name.is_empty()
+                || name.len() > 128
+                || value.len() > 4096
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+                || value
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() && byte != b'\t')
+                || [
+                    "host",
+                    "proxy-authorization",
+                    "proxy-connection",
+                    "connection",
+                    "content-length",
+                    "transfer-encoding",
+                ]
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        })
+    {
+        return Err(TransitError::Unsupported(
+            "HTTP proxy headers contain invalid or reserved fields".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn authority(endpoint: &Endpoint) -> String {
     if endpoint
         .host
@@ -304,6 +394,7 @@ mod tests {
             labels: BTreeMap::new(),
             tags: BTreeSet::new(),
             weight: 100,
+            options: Default::default(),
         }
     }
 
@@ -424,6 +515,153 @@ mod tests {
         assert_tunnel(&adapter, target).await;
         target_task.await.unwrap();
         proxy_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_tls_options_use_custom_ca_and_server_name_instead_of_plaintext() {
+        let (target, target_task) = echo_target().await;
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["proxy.test".to_owned()]).unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
+            )
+            .unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = proxy.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (stream, _) = proxy.accept().await.unwrap();
+            let stream = TlsAcceptor::from(Arc::new(server))
+                .accept(stream)
+                .await
+                .expect("actual TLS before CONNECT");
+            serve_connect(stream, target).await;
+        });
+        let mut node = config("http", address);
+        node.options.tls = Some(pathchord_policy::TransitTls {
+            enabled: true,
+            server_name: Some("proxy.test".to_owned()),
+            certificate: vec![cert.pem()],
+            alpn: vec!["http/1.1".to_owned()],
+            ..Default::default()
+        });
+        node.options
+            .headers
+            .insert("X-Proxy-Test".into(), "custom".into());
+        let adapter = HttpsConnectTransitAdapter::from_config(
+            &node,
+            Some(&credential()),
+            Duration::from_secs(2),
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+        )
+        .unwrap();
+        assert_tunnel(&adapter, target).await;
+        target_task.await.unwrap();
+        proxy_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn https_proxy_client_certificate_uses_only_the_referenced_secret_key() {
+        let (target, target_task) = echo_target().await;
+        let CertifiedKey {
+            cert: server_cert,
+            signing_key: server_key,
+        } = generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();
+        let CertifiedKey {
+            cert: client_cert,
+            signing_key: client_key,
+        } = generate_simple_self_signed(vec!["client.test".into()]).unwrap();
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(client_cert.der().clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+            )
+            .unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = proxy.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = proxy.accept().await.unwrap();
+            let tls = TlsAcceptor::from(Arc::new(server))
+                .accept(stream)
+                .await
+                .expect("mutual TLS");
+            assert!(
+                tls.get_ref()
+                    .1
+                    .peer_certificates()
+                    .is_some_and(|certs| !certs.is_empty())
+            );
+            serve_connect(tls, target).await;
+        });
+        let mut node = config("https", address);
+        node.options.tls = Some(pathchord_policy::TransitTls {
+            enabled: true,
+            server_name: Some("proxy.test".into()),
+            certificate: vec![server_cert.pem()],
+            client_certificate: vec![client_cert.pem()],
+            client_key_field: Some("tls_key".into()),
+            ..Default::default()
+        });
+        let credentials = TransitCredential::new(BTreeMap::from([
+            ("username".into(), "user".into()),
+            ("password".into(), "secret".into()),
+            ("tls_key".into(), client_key.serialize_pem()),
+        ]));
+        let adapter = HttpsConnectTransitAdapter::from_config(
+            &node,
+            Some(&credentials),
+            Duration::from_secs(2),
+            crate::adapter_registry::native_tls_roots(),
+        )
+        .unwrap();
+        assert_tunnel(&adapter, target).await;
+        target_task.await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn unknown_proxy_credentials_and_reserved_headers_fail_before_dialing() {
+        let mut node = config("http", "127.0.0.1:1".parse().unwrap());
+        let credentials = TransitCredential::new(BTreeMap::from([
+            ("username".into(), "user".into()),
+            ("password".into(), "secret".into()),
+            ("ignored_flag".into(), "true".into()),
+        ]));
+        assert!(
+            HttpConnectTransitAdapter::from_config(
+                &node,
+                Some(&credentials),
+                Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        node.options
+            .headers
+            .insert("Proxy-Authorization".into(), "secret".into());
+        assert!(
+            HttpConnectTransitAdapter::from_config(&node, None, Duration::from_secs(1)).is_err()
+        );
+        node.options.headers.clear();
+        node.options.tls = Some(pathchord_policy::TransitTls {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(
+            HttpConnectTransitAdapter::from_config(&node, None, Duration::from_secs(1)).is_err(),
+            "plain HTTP constructor must not ignore TLS"
+        );
     }
 
     #[tokio::test]

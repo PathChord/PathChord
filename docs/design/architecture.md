@@ -92,6 +92,14 @@ Autoscaling adds Paths when effective aggregate capacity is insufficient and rem
 
 Subscription quota and traffic multiplier are optional reference metadata. They may produce tags or affect weight; they are not hard limits and do not directly change Egress connectivity.
 
+Subscription document normalization is independent of node transport support.
+Adapters preserve typed connection semantics and reject unsupported parameters
+before admission; an HTTP node that requests TLS cannot become a plaintext
+connection. Optional external protocol engines remain behind the Transit
+boundary and do not own PathChord authorization or Noise state. The
+[Transit Proxy contract](../spec/transit-proxies.md) defines supported document
+families, private engine ownership, provider expansion, and accounting facts.
+
 ## 9. Metadata
 
 Nodes have separated namespaces:

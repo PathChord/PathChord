@@ -45,6 +45,8 @@ pub struct TransitProxyRuntimeStatus {
     pub tags: BTreeSet<String>,
     /// A precomputed, bounded score derived from published observations.
     pub selection_score: u64,
+    pub quota_remaining: Option<u64>,
+    pub traffic_multiplier_basis_points: Option<u32>,
 }
 
 /// Published runtime state captured once at the beginning of rule evaluation.
@@ -541,10 +543,10 @@ fn transit_is_usable(
     rule: &TransitRule,
     proxy: &TransitProxyConfig,
     status: &TransitProxyRuntimeStatus,
-    protocol: FlowProtocol,
+    _protocol: FlowProtocol,
 ) -> bool {
     status.state.admits_new_work()
-        && status.capabilities.contains(&protocol)
+        && status.capabilities.contains(&FlowProtocol::Tcp)
         && labels_match(&rule.require.labels, &proxy.labels, &status.labels)
         && tags_match(&rule.require.tags, &proxy.tags, &status.tags)
         && rule.require.capabilities.is_subset(&status.capabilities)
@@ -709,6 +711,7 @@ mod tests {
 
     fn proxy(id: &str, labels: &[(&str, &str)], tags: &[&str], weight: u32) -> TransitProxyConfig {
         TransitProxyConfig {
+            options: Default::default(),
             id: TransitProxyId::new(id),
             source: None,
             protocol: "direct".into(),
@@ -840,6 +843,47 @@ mod tests {
         };
         assert_eq!(route.egress_rule_id.as_str(), "second-rule");
         assert_eq!(route.candidates[0].egress_id.as_str(), "second");
+    }
+
+    #[test]
+    fn udp_over_egress_needs_a_tcp_transit_but_ordinary_udp_needs_native_support() {
+        let policy = compile(PolicyConfig {
+            egresses: vec![egress("egress", &[], true, true)],
+            transit_proxies: vec![proxy("tcp-only", &[], &[], 100)],
+            egress_rules: vec![egress_rule("egress-route", "egress", 1)],
+            transit_rules: vec![transit_rule("transit", "egress", Selector::default())],
+            traffic_policies: vec![traffic_policy("default")],
+            fallback: Some(FallbackAction::Reject),
+            ..PolicyConfig::default()
+        });
+        let mut runtime = RuntimeCatalog::default();
+        runtime.set_egress(EgressId::new("egress"), ready_egress(1));
+        runtime.set_transit_proxy(
+            TransitProxyId::new("tcp-only"),
+            ready_proxy(&[FlowProtocol::Tcp], 1),
+        );
+        let mut udp = context();
+        udp.protocol = FlowProtocol::Udp;
+        assert!(matches!(
+            policy.evaluate(&udp, &runtime),
+            Evaluation::Route(RoutePlan::Egress(_))
+        ));
+        let rule = ProxyRule {
+            id: RuleId::new("ordinary"),
+            matches: FlowMatch::default(),
+            require: Selector::default(),
+            select: ProxySelection::Any,
+        };
+        let ordinary = compile(PolicyConfig {
+            transit_proxies: vec![proxy("tcp-only", &[], &[], 100)],
+            proxy_rules: vec![rule],
+            fallback: Some(FallbackAction::Reject),
+            ..PolicyConfig::default()
+        });
+        assert!(matches!(
+            ordinary.evaluate(&udp, &runtime),
+            Evaluation::Reject { .. }
+        ));
     }
 
     #[test]
