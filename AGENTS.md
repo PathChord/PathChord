@@ -2,13 +2,13 @@
 
 ## Project structure and module organization
 
-PathChord is in initial implementation. `README.md` defines the project vocabulary and links the documentation sets. The `docs/design/` directory contains final-state architecture and design decisions, `docs/spec/` contains final-state behavioral and format contracts, and `docs/progress/` contains only the current implementation status and active implementation plan. Superseded reviews, phase-specific acceptance records, temporary fixtures, and other process history belong in Git history, not in the maintained progress directory. The root Cargo workspace contains protocol primitives and test fixtures under `crates/`.
+PathChord has a runnable Rust implementation. Current work prioritizes HTTP CONNECT and SOCKS5 on Linux and Windows, with FreeBSD under portability assessment; transparent interception and TUN work follow this listener baseline. `README.md` defines the project vocabulary and links the documentation sets. The `docs/design/` directory contains final-state architecture and design decisions, `docs/spec/` contains final-state behavioral and format contracts, and `docs/progress/` contains only the current implementation status and active implementation plan. Superseded reviews, phase-specific acceptance records, temporary fixtures, and other process history belong in Git history, not in the maintained progress directory. The root Cargo workspace contains protocol primitives and test fixtures under `crates/`.
 
 The Rust layout separates `pathchord-core`, `pathchord-noise`, `pathchord-path`, `pathchord-policy`, `pathchord-transit`, `pathchord-egress`, `pathchord-ingress`, and `pathchord-cli`. Keep `pathchord-core` independent of platforms, subscription formats, and listener implementations.
 
 ## Build, test, and development commands
 
-The CLI exposes the planned command tree but operational commands remain bootstrap placeholders. Run the workspace quality gates with:
+The CLI starts the Ingress/Egress runtimes and exposes local control commands. Run the workspace quality gates with:
 
 ```sh
 cargo fmt --all -- --check

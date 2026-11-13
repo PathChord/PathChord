@@ -6,6 +6,19 @@ This document records the current implementation and validation state. Final
 architecture and behavioral contracts remain under `docs/design/` and
 `docs/spec/`.
 
+## Current focus
+
+Active work prioritizes HTTP CONNECT and SOCKS5 CONNECT/UDP ASSOCIATE on
+Linux and Windows, with FreeBSD under assessment as an additional target for
+the same explicit listeners and Unix local control. FreeBSD support has not
+been established by a target build or native host tests.
+
+TPROXY, REDIRECT, transparent UDP interception, TUN integration, privileged
+routing validation, and Wintun packaging follow the explicit-listener
+baseline. Existing transparent/TUN modules remain implementation facts below;
+they are outside the active acceptance scope. SOCKS5 UDP forwarding remains
+in the current scope.
+
 ## Implemented
 
 - The eight-crate Rust workspace builds on Linux and cross-checks for Windows
@@ -68,25 +81,50 @@ architecture and behavioral contracts remain under `docs/design/` and
   documented query/mutation registry. Egress authorization routes are mounted
   only on the Egress-owned dispatcher; Ingress intentionally omits them.
 
-## Remaining validation or external work
+## Remaining explicit-listener work
 
-- Windows registry, WinINet refresh, Named Pipe ACL, Wintun packaging, and
-  crash recovery still need validation on a real Windows host. Cross-compiling
-  and fake adapters are not equivalent to host evidence.
+- Linux and Windows HTTP/SOCKS5 need end-to-end and long-running validation of
+  authentication, source restrictions, TCP/UDP forwarding, DNS, bounded
+  resources, shutdown, reload, and local control. Existing automated loopback
+  tests are recorded below; they do not establish native Windows coverage.
+- Windows registry, WinINet refresh, Named Pipe ACL, and system-proxy crash
+  recovery still need validation on a real Windows host. Cross-compiling and
+  fake adapters are not equivalent to host evidence.
+- FreeBSD is a candidate target. The listener schema currently accepts only
+  `any`, `linux`, and `windows`; the CLI treats every non-Windows platform as
+  Linux for system-proxy reporting. Unix local-control code offers a reuse
+  point. The unconditional `tun-rs` dependency and the `notify` watcher have
+  FreeBSD support in their cached source; this does not establish a working
+  PathChord build. Native dependencies, configuration watching, SQLite,
+  credential/socket permissions, and signal behavior still need target-build
+  and native-host validation.
+- Process metadata is best-effort: Linux has a procfs provider; other platforms
+  currently report unknown. Windows and FreeBSD native process discovery is
+  an additional capability, not a prerequisite for explicit listeners.
+- Long-running failure/restart tests and real subscription refresh soak tests
+  remain to be exercised through the explicit listeners.
+
+## Shared implementation gaps
+
+- TrafficPolicy replication budgets and retransmission mode are applied by the
+  Session runtime. Class priority/share fields are parsed into the policy
+  model but are not consumed by runtime class scheduling.
+- Subscription quota, reset-time, and billing multiplier fields exist in the
+  observation model, but provider metadata ingestion, runtime publication, and
+  end-to-end consumption are not connected.
+- JSON metric queries, SSE, and the embedded console exist. Production metric
+  export and deployed monitoring dashboards remain to be integrated.
+
+## Deferred work
+
 - Linux TPROXY mark/routing behavior, IPv4/IPv6 transparent UDP, and TUN
-  integration need privileged host validation. Route ownership journals are
-  designed to fail closed and never remove foreign rules.
+  integration need privileged host validation after the explicit-listener
+  baseline. Route ownership journals are designed to fail closed and never
+  remove foreign rules. Wintun packaging and native TUN validation are also
+  deferred.
 - VLESS/VMess/XTLS remain outside the built-in adapter set. Enabling them needs
   explicit UUID/flow/outer-transport/TLS-Reality configuration and upstream
   interoperability fixtures.
-- Process metadata providers are best-effort and represent missing facts as
-  unknown; platform-specific coverage still needs host matrices.
-- Subscription provider quotas, billing metadata, long-running refresh soak
-  tests, production dashboards, and deployed metric export remain to be
-  exercised against real infrastructure.
-- TrafficPolicy replication budgets and retransmission mode are applied by the
-  Session runtime; class priority/share scheduling remains represented in the
-  policy model but still needs runtime validation and tuning.
 
 ## Validation evidence
 

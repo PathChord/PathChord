@@ -16,10 +16,12 @@ Proxies, and route TCP/UDP flows through authenticated Session/Path runtimes.
 Egress exposes the authenticated Path listener and authorization control plane;
 the optional REST/SSE Web Gateway is shared by both control planes.
 
-The remaining production work is platform validation and packaging: real
-Windows-host validation of Named Pipe ACL and OS proxy refresh, Wintun
-packaging, privileged Linux TPROXY validation, and interoperability-backed
-VLESS/VMess/XTLS adapters.
+Current work prioritizes HTTP CONNECT and SOCKS5 on Linux and Windows, with
+FreeBSD under assessment for the same explicit listeners and Unix local
+control. FreeBSD has no recorded target build or native host validation.
+Transparent interception and TUN work follow this listener baseline. See the
+[implementation plan](docs/progress/implementation-plan.md) for platform
+validation, shared runtime gaps, and subsequent adapter work.
 
 ## Terminology
 
