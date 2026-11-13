@@ -976,6 +976,11 @@ fn validate_resource_set(resources: &[KubeResource]) -> Result<(), ConfigError> 
                 validate_subscription_spec(value)?;
             }
             KubeResource::EgressRule(value) => {
+                validate_flow_match(
+                    value.spec.matches.as_ref(),
+                    &value.kind,
+                    &value.metadata.name,
+                )?;
                 validate_rule_spec(
                     value.kind.as_str(),
                     &value.metadata.name,
@@ -985,6 +990,11 @@ fn validate_resource_set(resources: &[KubeResource]) -> Result<(), ConfigError> 
                 )?;
             }
             KubeResource::TransitRule(value) => {
+                validate_flow_match(
+                    value.spec.matches.as_ref(),
+                    &value.kind,
+                    &value.metadata.name,
+                )?;
                 validate_rule_spec(
                     value.kind.as_str(),
                     &value.metadata.name,
@@ -994,6 +1004,11 @@ fn validate_resource_set(resources: &[KubeResource]) -> Result<(), ConfigError> 
                 )?;
             }
             KubeResource::ProxyRule(value) => {
+                validate_flow_match(
+                    value.spec.matches.as_ref(),
+                    &value.kind,
+                    &value.metadata.name,
+                )?;
                 validate_rule_spec(
                     value.kind.as_str(),
                     &value.metadata.name,
@@ -1312,6 +1327,50 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
             "platform must be any, linux, or windows",
         ));
     }
+    match value.spec.kind {
+        ListenerKind::Tun => {
+            if value.spec.interface.as_deref().is_none_or(str::is_empty)
+                || value.spec.address.as_deref().is_none_or(str::is_empty)
+            {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "tun interface and address are required",
+                ));
+            }
+            validate_prefix(value.spec.address.as_deref().unwrap())
+                .map_err(|reason| invalid_spec(kind, name, reason))?;
+            if value
+                .spec
+                .mtu
+                .is_some_and(|mtu| !(576..=65_535).contains(&mtu))
+            {
+                return Err(invalid_spec(kind, name, "tun mtu must be in 576..=65535"));
+            }
+        }
+        ListenerKind::Tproxy => {
+            if value.spec.mark.is_none() || value.spec.route_table.is_none() {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "tproxy mark and routeTable are required",
+                ));
+            }
+            if value.spec.route_table == Some(0) {
+                return Err(invalid_spec(kind, name, "routeTable must be non-zero"));
+            }
+        }
+        ListenerKind::Redirect => {
+            if value.spec.protocols.contains(&FlowProtocol::Udp) {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "redirect listeners support TCP only",
+                ));
+            }
+        }
+        ListenerKind::Http | ListenerKind::Socks5 => {}
+    }
     let bind_required = !matches!(value.spec.kind, ListenerKind::Tun);
     if bind_required && value.spec.bind.is_none() {
         return Err(invalid_spec(
@@ -1346,6 +1405,28 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
     Ok(())
 }
 
+fn validate_flow_match(
+    matches: Option<&FlowMatchSpec>,
+    kind: &str,
+    name: &str,
+) -> Result<(), ConfigError> {
+    let Some(matches) = matches else {
+        return Ok(());
+    };
+    if matches.source_networks.len() > 10_000 {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "sourceNetworks has too many entries",
+        ));
+    }
+    for network in &matches.source_networks {
+        validate_cidr(network)
+            .map_err(|reason| invalid_spec(kind, name, format!("sourceNetworks: {reason}")))?;
+    }
+    Ok(())
+}
+
 fn validate_cidr(value: &str) -> Result<(), String> {
     let (address, prefix) = value
         .split_once('/')
@@ -1364,6 +1445,10 @@ fn validate_cidr(value: &str) -> Result<(), String> {
         return Err("CIDR prefix length is outside the address family".to_owned());
     }
     Ok(())
+}
+
+fn validate_prefix(value: &str) -> Result<(), String> {
+    validate_cidr(value)
 }
 
 fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), ConfigError> {
