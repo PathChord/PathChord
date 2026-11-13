@@ -3,13 +3,15 @@
 //! This layer deliberately owns request validation and response shaping while
 //! leaving sockets, named pipes, and platform side effects to adapters.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
 use serde_json::{Value, json};
 
 use crate::{
     ErrorBody, ErrorCode, GenerationExpectation, IngressControlService, LOCAL_API_VERSION,
-    ListenerDescriptor, RequestEnvelope, ResponseEnvelope, SystemProxyPlatform,
+    ListenerDescriptor, NodeAdminPatch, RequestEnvelope, ResponseEnvelope, SubscriptionSpec,
+    SystemProxyPlatform,
 };
 use pathchord_core::RequestId;
 use pathchord_policy::ListenerId;
@@ -71,10 +73,15 @@ impl LocalControlDispatcher {
         match request.operation.as_str() {
             "status.get" => self.dispatch_status(request),
             "nodes.list" => self.dispatch_nodes_list(request),
+            "nodes.patch_labels" => self.dispatch_node_patch(request, false),
+            "nodes.patch_tags" => self.dispatch_node_patch(request, true),
             "sessions.list" => self.dispatch_empty_list(request, "sessions", "status:read"),
             "connections.list" => self.dispatch_connections_list(request),
             "listeners.list" => self.dispatch_listeners(request),
             "subscriptions.list" => self.dispatch_subscriptions_list(request),
+            "subscriptions.create" => self.dispatch_subscription_create(request),
+            "subscriptions.delete" => self.dispatch_subscription_delete(request),
+            "subscriptions.refresh" => self.dispatch_subscription_refresh(request),
             "metrics.snapshot" => self.dispatch_metrics_snapshot(request),
             "events.subscribe" => self.dispatch_events(request),
             "system_proxy.get" => self.dispatch_system_proxy_get(request),
@@ -177,6 +184,239 @@ impl LocalControlDispatcher {
             request.request_id,
             json!({"items": items, "next_page_token": Value::Null}),
         )
+    }
+
+    fn dispatch_node_patch(
+        &mut self,
+        request: RequestEnvelope,
+        tags_only: bool,
+    ) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "nodes:write") {
+            return *response;
+        }
+        let expected = match self.required_configuration_generation(&request) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let node_id = match request.body.get("node_id").and_then(Value::as_str) {
+            Some(value) => match crate::NodeId::new(value) {
+                Ok(id) => id,
+                Err(error) => return self.control_error(request.request_id, error),
+            },
+            None => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    "node_id is required",
+                    None,
+                );
+            }
+        };
+        let patch = if tags_only {
+            NodeAdminPatch {
+                add_tags: parse_string_set(request.body.get("add")),
+                remove_tags: parse_string_set(request.body.get("remove")),
+                ..NodeAdminPatch::default()
+            }
+        } else {
+            NodeAdminPatch {
+                set_labels: parse_string_map(request.body.get("set")),
+                remove_labels: parse_string_set(request.body.get("remove")),
+                ..NodeAdminPatch::default()
+            }
+        };
+        let internal_request_id = match request_id(&request.request_id) {
+            Ok(value) => value,
+            Err(message) => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    &message,
+                    None,
+                );
+            }
+        };
+        match self.service.patch_node(
+            &request.actor.id,
+            internal_request_id,
+            node_id.clone(),
+            expected,
+            patch,
+        ) {
+            Ok(receipt) => self.success(
+                request.request_id,
+                json!({
+                    "applied_generation": {"scope": "configuration", "value": receipt.generation},
+                    "resource": {"node_id": node_id.as_str()},
+                    "cleanup": zero_cleanup(),
+                }),
+            ),
+            Err(error) => self.control_error(request.request_id, error),
+        }
+    }
+
+    fn dispatch_subscription_create(&mut self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "subscriptions:write") {
+            return *response;
+        }
+        let expected = match self.required_configuration_generation(&request) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let body = &request.body;
+        let id = match body.get("id").and_then(Value::as_str) {
+            Some(value) => match crate::SubscriptionId::new(value) {
+                Ok(id) => id,
+                Err(error) => return self.control_error(request.request_id, error),
+            },
+            None => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    "id is required",
+                    None,
+                );
+            }
+        };
+        let spec = SubscriptionSpec {
+            id,
+            source_type: body
+                .get("source_type")
+                .and_then(Value::as_str)
+                .unwrap_or("static")
+                .to_owned(),
+            display_name: body
+                .get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            enabled: body.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        };
+        let internal_request_id = match request_id(&request.request_id) {
+            Ok(value) => value,
+            Err(message) => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    &message,
+                    None,
+                );
+            }
+        };
+        match self.service.add_subscription(
+            &request.actor.id,
+            internal_request_id,
+            expected,
+            spec.clone(),
+        ) {
+            Ok(receipt) => self.success(
+                request.request_id,
+                json!({
+                    "applied_generation": {"scope": "configuration", "value": receipt.generation},
+                    "resource": {"id": spec.id.as_str(), "state": "configured"},
+                    "cleanup": zero_cleanup(),
+                }),
+            ),
+            Err(error) => self.control_error(request.request_id, error),
+        }
+    }
+
+    fn dispatch_subscription_delete(&mut self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "subscriptions:write") {
+            return *response;
+        }
+        let expected = match self.required_configuration_generation(&request) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let id = match subscription_id_from_body(&request.body) {
+            Ok(id) => id,
+            Err(message) => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    &message,
+                    None,
+                );
+            }
+        };
+        let internal_request_id = match request_id(&request.request_id) {
+            Ok(value) => value,
+            Err(message) => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    &message,
+                    None,
+                );
+            }
+        };
+        match self.service.delete_subscription(
+            &request.actor.id,
+            internal_request_id,
+            expected,
+            &id,
+        ) {
+            Ok(receipt) => self.success(
+                request.request_id,
+                json!({
+                    "applied_generation": {"scope": "configuration", "value": receipt.generation},
+                    "resource": {"id": id.as_str(), "state": "deleted"},
+                    "cleanup": zero_cleanup(),
+                }),
+            ),
+            Err(error) => self.control_error(request.request_id, error),
+        }
+    }
+
+    fn dispatch_subscription_refresh(&mut self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "subscriptions:write") {
+            return *response;
+        }
+        let id = match subscription_id_from_body(&request.body) {
+            Ok(id) => id,
+            Err(message) => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    &message,
+                    None,
+                );
+            }
+        };
+        let internal_request_id = match request_id(&request.request_id) {
+            Ok(value) => value,
+            Err(message) => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    &message,
+                    None,
+                );
+            }
+        };
+        match self
+            .service
+            .request_subscription_refresh(&request.actor.id, internal_request_id, &id)
+        {
+            Ok(receipt) => self.success(
+                request.request_id,
+                json!({
+                    "applied_generation": {"scope": "configuration", "value": receipt.generation},
+                    "resource": {"id": id.as_str(), "state": "refresh_queued"},
+                    "cleanup": zero_cleanup(),
+                }),
+            ),
+            Err(error) => self.control_error(request.request_id, error),
+        }
     }
 
     fn dispatch_subscriptions_list(&self, request: RequestEnvelope) -> ResponseEnvelope {
@@ -411,6 +651,12 @@ impl LocalControlDispatcher {
             crate::ControlError::ListenerNotFound(_) => {
                 (ErrorCode::NotFound, "listener was not found")
             }
+            crate::ControlError::NodeNotFound(_) | crate::ControlError::SubscriptionNotFound(_) => {
+                (ErrorCode::NotFound, "resource was not found")
+            }
+            crate::ControlError::SubscriptionExists(_) => {
+                (ErrorCode::ValidationFailed, "subscription already exists")
+            }
             crate::ControlError::InvalidSystemProxyListener { .. } => (
                 ErrorCode::ValidationFailed,
                 "listener cannot back system proxy",
@@ -469,6 +715,29 @@ impl LocalControlDispatcher {
             ))
         } else {
             None
+        }
+    }
+
+    fn required_configuration_generation(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<u64, ResponseEnvelope> {
+        match request.expected_generation.as_ref() {
+            Some(expected) if expected.scope == "configuration" => Ok(expected.value),
+            Some(_) => Err(self.failure(
+                request.request_id.clone(),
+                self.observed_generation(),
+                ErrorCode::ValidationFailed,
+                "configuration generation precondition is required",
+                None,
+            )),
+            None => Err(self.failure(
+                request.request_id.clone(),
+                self.observed_generation(),
+                ErrorCode::ValidationFailed,
+                "expected_generation is required for this mutation",
+                None,
+            )),
         }
     }
 
@@ -674,6 +943,38 @@ fn listener_sort_key(descriptor: &ListenerDescriptor, sort: &str) -> String {
     }
 }
 
+fn parse_string_set(value: Option<&Value>) -> BTreeSet<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_string_map(value: Option<&Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn subscription_id_from_body(body: &Value) -> Result<crate::SubscriptionId, String> {
+    let value = body
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "id is required".to_owned())?;
+    crate::SubscriptionId::new(value).map_err(|error| error.to_string())
+}
+
 fn zero_cleanup() -> Value {
     json!({"paths": 0, "sessions": 0, "streams": 0, "target_connections": 0})
 }
@@ -788,6 +1089,46 @@ mod tests {
         assert_eq!(
             invalid.error.expect("validation error").code,
             ErrorCode::ValidationFailed
+        );
+    }
+
+    #[test]
+    fn node_and_subscription_mutations_use_generation_preconditions() {
+        let mut dispatcher = dispatcher(SystemProxyPlatform::Linux);
+        dispatcher
+            .service_mut()
+            .add_node(crate::NodeId::new("node-1").expect("node"))
+            .expect("add node");
+        let patch = request(
+            "nodes.patch_labels",
+            &["nodes:write"],
+            json!({"node_id": "node-1", "set": {"admin.region": "jp"}, "remove": []}),
+        );
+        let mut patch = patch;
+        patch.expected_generation = Some(GenerationExpectation {
+            scope: "configuration".to_owned(),
+            value: 0,
+        });
+        assert!(dispatcher.dispatch(patch).ok);
+
+        let mut create = request(
+            "subscriptions.create",
+            &["subscriptions:write"],
+            json!({"id": "source-a", "source_type": "clash", "display_name": "A", "enabled": true}),
+        );
+        create.expected_generation = Some(GenerationExpectation {
+            scope: "configuration".to_owned(),
+            value: 1,
+        });
+        assert!(dispatcher.dispatch(create).ok);
+        let subscriptions =
+            dispatcher.dispatch(request("subscriptions.list", &["status:read"], json!({})));
+        assert_eq!(
+            subscriptions.result.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
     }
 
