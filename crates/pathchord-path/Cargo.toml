@@ -13,7 +13,8 @@ pathchord-noise = { path = "../pathchord-noise" }
 thiserror.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+pathchord-egress = { path = "../pathchord-egress" }
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 
 [lints]
 workspace = true

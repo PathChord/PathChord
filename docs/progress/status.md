@@ -52,7 +52,7 @@ separate from `docs/design/`, which describes the intended architecture, and
   Noise IK, EgressID prologue validation, `PATH_HELLO`, `SESSION_ATTACH`,
   authorization generation/key checks, capability negotiation, `PATH_READY`
   limits, and typed attach rejection. It remains an in-memory protocol harness
-  and is not yet connected to a live Transit adapter or `STREAM_OPEN` routing.
+  for the live adapter boundary rather than a socket-owning Path runtime.
 - Configuration validation now enforces the documented resource-name, bounded
   map, Egress key/capability, Transit adapter, subscription URL/refresh/cache,
   DNS route/limit, listener platform, rule catch-all, and proxy-action rules.
@@ -74,8 +74,9 @@ separate from `docs/design/`, which describes the intended architecture, and
   PathChord Sessions or Paths and therefore is not the full multipath data
   plane.
 - The single-Path admission harness is not yet wired to a Transit byte/record
-  loop, Session manager, or live `FakeEgress` integration; its Stream opener is
-  still an injected transport-neutral boundary.
+  loop or Session manager; its Stream opener is still an injected
+  transport-neutral boundary. A cross-crate test now routes `STREAM_OPEN`
+  through `FakeEgress` and verifies target-dial idempotency.
 - The Session/Path end-to-end proxy data plane is not operational.
 - Named Pipe transport, persistent authorization and metadata stores,
   subscription worker, REST/SSE Web Gateway, and frontend are not integrated.
