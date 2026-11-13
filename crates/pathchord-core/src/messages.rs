@@ -752,6 +752,9 @@ fn get_endpoint(
             maximum: MAX_ENDPOINT_ADDRESSES,
         });
     }
+    if hostname.is_empty() && count == 0 {
+        return Err(MessageCodecError::InvalidField { field: "target" });
+    }
     let mut resolved_addresses = Vec::with_capacity(count);
     for _ in 0..count {
         let family = reader.byte("address_family")?;
@@ -837,7 +840,15 @@ impl SessionAttach {
                 field: "ingress_id",
             });
         }
+        if std::str::from_utf8(&self.ingress_id).is_err() {
+            return Err(MessageCodecError::InvalidField {
+                field: "ingress_id",
+            });
+        }
         if self.egress_id.is_empty() {
+            return Err(MessageCodecError::InvalidField { field: "egress_id" });
+        }
+        if std::str::from_utf8(&self.egress_id).is_err() {
             return Err(MessageCodecError::InvalidField { field: "egress_id" });
         }
         put_bytes(
@@ -865,7 +876,15 @@ impl SessionAttach {
                 field: "ingress_id",
             });
         }
+        if std::str::from_utf8(&ingress_id).is_err() {
+            return Err(MessageCodecError::InvalidField {
+                field: "ingress_id",
+            });
+        }
         if egress_id.is_empty() {
+            return Err(MessageCodecError::InvalidField { field: "egress_id" });
+        }
+        if std::str::from_utf8(&egress_id).is_err() {
             return Err(MessageCodecError::InvalidField { field: "egress_id" });
         }
         Ok(Self {
@@ -1505,6 +1524,51 @@ mod tests {
             Message::decode(FrameType::Heartbeat, &encoded, limits),
             Err(MessageCodecError::Trailing { remaining: 1 })
         ));
+    }
+
+    #[test]
+    fn target_without_hostname_or_candidates_is_rejected_on_decode() {
+        let mut payload = vec![7];
+        payload.extend_from_slice(&RequestId::new(1).to_be_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&443_u16.to_be_bytes());
+        payload.push(0);
+        assert_eq!(
+            Message::decode(FrameType::StreamOpen, &payload, ProtocolLimits::default()),
+            Err(MessageCodecError::InvalidField { field: "target" })
+        );
+    }
+
+    #[test]
+    fn session_attach_ids_must_be_utf8() {
+        let invalid = Message::SessionAttach(SessionAttach {
+            ingress_id: vec![0xff],
+            session_id: SessionId::new(1),
+            egress_id: b"egress".to_vec(),
+            control_seq: 0,
+        });
+        assert_eq!(
+            invalid.encode(ProtocolLimits::default()),
+            Err(MessageCodecError::InvalidField {
+                field: "ingress_id"
+            })
+        );
+
+        let mut payload = vec![1, 0xff];
+        payload.extend_from_slice(&SessionId::new(1).to_be_bytes());
+        payload.push(6);
+        payload.extend_from_slice(b"egress");
+        payload.push(0);
+        assert_eq!(
+            Message::decode(
+                FrameType::SessionAttach,
+                &payload,
+                ProtocolLimits::default()
+            ),
+            Err(MessageCodecError::InvalidField {
+                field: "ingress_id"
+            })
+        );
     }
 
     #[test]
