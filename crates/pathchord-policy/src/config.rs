@@ -75,6 +75,8 @@ pub struct EgressSpec {
     public_key: String,
     #[serde(default)]
     capabilities: Capabilities,
+    #[serde(default)]
+    status_requirements: RequirementsSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -225,6 +227,15 @@ impl Default for RequirementsSpec {
         Self {
             min_usable_paths: 1,
             capabilities: BTreeSet::new(),
+        }
+    }
+}
+
+impl From<RequirementsSpec> for crate::EgressStatusRequirements {
+    fn from(value: RequirementsSpec) -> Self {
+        Self {
+            min_usable_paths: value.min_usable_paths,
+            capabilities: value.capabilities,
         }
     }
 }
@@ -610,6 +621,7 @@ impl KubeConfig {
                     public_key: value.spec.public_key,
                     labels: value.metadata.labels,
                     capabilities: value.spec.capabilities,
+                    status_requirements: value.spec.status_requirements.into(),
                 }),
                 KubeResource::TransitProxy(value) => {
                     let source = value.spec.source.map(|source| TransitSource {
@@ -762,6 +774,20 @@ impl KubeConfig {
                             ReplicationSpec::Allowed => RetransmissionReplication::Allowed,
                             ReplicationSpec::Disabled => RetransmissionReplication::Disabled,
                         },
+                        classes: value
+                            .spec
+                            .classes
+                            .into_iter()
+                            .map(|(name, class)| {
+                                (
+                                    name,
+                                    crate::TrafficClass {
+                                        priority: class.priority,
+                                        share: class.share,
+                                    },
+                                )
+                            })
+                            .collect(),
                     });
                 }
                 KubeResource::Listener(value) => {
@@ -824,6 +850,7 @@ impl KubeConfig {
                 session_replication_budget_bps: 0,
                 class_replication_budget_bps: None,
                 retransmission_replication: RetransmissionReplication::Disabled,
+                classes: BTreeMap::new(),
             });
         }
         crate::validate(&config)?;

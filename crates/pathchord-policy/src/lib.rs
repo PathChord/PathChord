@@ -108,6 +108,13 @@ pub struct EgressConfig {
     pub public_key: String,
     pub labels: BTreeMap<String, String>,
     pub capabilities: Capabilities,
+    pub status_requirements: EgressStatusRequirements,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressStatusRequirements {
+    pub min_usable_paths: u32,
+    pub capabilities: BTreeSet<FlowProtocol>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +230,13 @@ pub struct TrafficPolicy {
     pub session_replication_budget_bps: u64,
     pub class_replication_budget_bps: Option<u64>,
     pub retransmission_replication: RetransmissionReplication,
+    pub classes: BTreeMap<String, TrafficClass>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficClass {
+    pub priority: u8,
+    pub share: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +530,7 @@ mod tests {
                     tcp: true,
                     udp: true,
                 },
+                status_requirements: EgressStatusRequirements::default(),
             }],
             traffic_policies: vec![TrafficPolicy {
                 id: TrafficPolicyId::new("default"),
@@ -523,6 +538,7 @@ mod tests {
                 session_replication_budget_bps: 2_000_000,
                 class_replication_budget_bps: Some(1_000_000),
                 retransmission_replication: RetransmissionReplication::Allowed,
+                classes: BTreeMap::new(),
             }],
             fallback: Some(FallbackAction::Reject),
             ..PolicyConfig::default()
