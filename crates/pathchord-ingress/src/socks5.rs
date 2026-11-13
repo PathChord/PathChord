@@ -312,6 +312,7 @@ mod tests {
             id: crate::ListenerId::new("socks"),
             kind: ListenerKind::Socks5,
             bind: SocketAddr::from_str("127.0.0.1:1080").unwrap(),
+            allowed_sources: Vec::new(),
             authentication_required,
         }
     }

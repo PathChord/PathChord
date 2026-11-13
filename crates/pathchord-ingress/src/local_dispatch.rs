@@ -322,6 +322,7 @@ fn listener_value(descriptor: &ListenerDescriptor, generation: u64) -> Value {
         "kind": format!("{:?}", descriptor.kind).to_ascii_lowercase(),
         "platform": std::env::consts::OS,
         "bind": descriptor.bind.to_string(),
+        "allowed_sources": descriptor.allowed_sources,
         "authentication": if descriptor.authentication_required {"required"} else {"disabled"},
         "state": "available",
         "generation": generation,
@@ -373,6 +374,7 @@ mod tests {
                 id: ListenerId::new("local-http"),
                 kind: ListenerKind::Http,
                 bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+                allowed_sources: Vec::new(),
                 authentication_required: false,
             });
         dispatcher
@@ -381,6 +383,7 @@ mod tests {
                 id: ListenerId::new("lan-tun"),
                 kind: ListenerKind::Tun,
                 bind: "0.0.0.0:15000".parse::<SocketAddr>().unwrap(),
+                allowed_sources: Vec::new(),
                 authentication_required: false,
             });
         dispatcher

@@ -265,6 +265,7 @@ mod tests {
             id: crate::ListenerId::new("local-http"),
             kind: ListenerKind::Http,
             bind: "127.0.0.1:8080".parse().expect("bind"),
+            allowed_sources: Vec::new(),
             authentication_required: authenticated,
         }
     }

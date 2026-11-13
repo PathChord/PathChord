@@ -245,6 +245,7 @@ mod tests {
                 id: crate::ListenerId::new("local-http"),
                 kind: crate::ListenerKind::Http,
                 bind: "127.0.0.1:8080".parse().expect("address"),
+                allowed_sources: Vec::new(),
                 authentication_required: false,
             });
         let mut client = UnixStream::connect(&path).await.expect("connect");
