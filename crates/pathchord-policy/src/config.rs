@@ -518,8 +518,7 @@ pub enum ConfigError {
 impl KubeConfig {
     pub fn from_yaml(input: &str) -> Result<Self, ConfigError> {
         let mut values = Vec::new();
-        for document in serde_yaml::Deserializer::from_str(input) {
-            let value = Value::deserialize(document)?;
+        for value in serde_yaml::from_str_multi::<Value>(input)? {
             if value == Value::Null {
                 continue;
             }
@@ -830,7 +829,7 @@ fn kind_of(value: &Value) -> Result<String, ConfigError> {
     let map = value
         .as_mapping()
         .ok_or_else(|| ConfigError::InvalidEnvelope("object must be a mapping".into()))?;
-    map.get(Value::String("kind".into()))
+    map.get("kind")
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| ConfigError::InvalidEnvelope("kind is required".into()))
