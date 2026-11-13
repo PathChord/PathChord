@@ -7,10 +7,11 @@ use clap::{Args, Parser, Subcommand};
 use getrandom::fill;
 use pathchord_egress::{TargetRequest, TcpTargetConnector};
 use pathchord_ingress::{
-    Actor, BoxedLocalConnection, ErrorCode, FlowBridgeError, IngressTargetDialer,
-    LOCAL_API_VERSION, ListenerDescriptor, ListenerKind, ListenerRuntime, LocalControlDispatcher,
-    LocalControlServer, LocalProtocolError, RequestEnvelope, ResponseEnvelope, RuntimeError,
-    SystemProxyPlatform, TargetAddress, TargetHost, read_object, write_object,
+    Actor, BoxedLocalConnection, DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS, ErrorCode,
+    FlowBridgeError, IngressTargetDialer, LOCAL_API_VERSION, ListenerDescriptor, ListenerKind,
+    ListenerRuntime, LocalControlDispatcher, LocalControlServer, LocalProtocolError,
+    RequestEnvelope, ResponseEnvelope, RuntimeError, SystemProxyPlatform, TargetAddress,
+    TargetHost, read_object, write_object,
 };
 use pathchord_policy::{
     AuthenticationMode, FallbackAction, KubeConfig, ListenerConfig,
@@ -233,7 +234,7 @@ async fn run_ingress(
     // Both surfaces are long-lived. Pinning the futures lets whichever side
     // fails first tear down the other by dropping its owner.
     let runtime_future = runtime.run();
-    let server_future = server.run();
+    let server_future = server.run_concurrent(DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS);
     tokio::pin!(runtime_future);
     tokio::pin!(server_future);
     tokio::select! {
