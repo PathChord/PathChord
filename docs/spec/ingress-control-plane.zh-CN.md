@@ -23,6 +23,9 @@ Unix socket / named pipe ----------+             +--> atomic snapshots
 所有者/ACL 是第一道授权边界。可选 Web Gateway 默认关闭，必须与数据 Path 分离，不能通过
 Transit Proxy 或 Egress 数据 Path 访问。非 loopback 绑定还必须显式配置受保护通道、强身份
 认证、来源允许列表、限流、脱敏和管理员可见的审计记录。
+选定的 Gateway 默认绑定 loopback。非 loopback 绑定 MUST 要求显式 protected-transport 声明、
+至少 32 字节的 bearer token 和非空的精确 origin allowlist。静态控制台资源不授予 API 访问；
+每个 REST 和 SSE 请求都经过与本地 adapter 相同的 actor/capability 检查。
 
 本地协议使用带长度前缀的 UTF-8 JSON 封装。长度是一个规范的 QUIC 风格无符号变长整数，
 表示恰好一个 JSON 对象的 UTF-8 字节数。封装上限为 1 MiB；零长度、截断前缀、非规范变长
@@ -181,6 +184,36 @@ system_proxy.disable
 订阅创建/刷新正文包含来源引用、验证策略、启用状态和当前 revision。成功刷新原子发布一个
 动态配置代次；失败保留最近成功快照并返回类型化失败。删除会排空仅由该来源导入的节点。
 
+规范的 `subscriptions.create` 正文如下：
+
+```json
+{
+  "id": "provider-a",
+  "display_name": "Provider A",
+  "enabled": true,
+  "source": {
+    "type": "clash",
+    "url": "https://example.invalid/subscription",
+    "credentials_ref": "provider-a-token"
+  },
+  "refresh": {
+    "interval_seconds": 3600,
+    "timeout_seconds": 30,
+    "max_attempts": 3,
+    "backoff_seconds": 5
+  },
+  "cache": {
+    "path": "provider-a.snapshot",
+    "max_age_seconds": 86400
+  }
+}
+```
+
+`source.type` 必须是 `static`、`clash` 或 `sip008`；`source.url` 必须是不能包含内嵌凭据的
+HTTP(S) URL；`credentials_ref` 必须是不透明引用，不能是机密值。刷新和缓存字段使用配置
+schema 中相同的边界；`cache` 可以为 null。列表读模型返回这些字段，但绝不解析或返回引用的
+机密值。
+
 系统代理开关是控制面运行时 mutation，不是 YAML 资源。`system_proxy.enable` 必须包含 `listener_id`，
 且该 ID 必须引用 HTTP 或 SOCKS Listener。Windows 将其应用到环境变量和操作系统代理配置；
 `system_proxy.disable` 恢复之前的值。Linux 对启用和关闭都返回 `UNSUPPORTED_OPERATION`，并继续通过
@@ -223,6 +256,9 @@ POST   /api/v1/authorizations/{ingress_id}/disable
 POST   /api/v1/authorizations/{ingress_id}/revoke
 DELETE /api/v1/authorizations/{ingress_id}
 ```
+
+这些 REST 路由只在 Web Gateway 连接到 Egress 授权 dispatcher 时挂载。Ingress Web Gateway
+会有意省略 `/api/v1/authorizations*`；授权是 Egress 本地操作，不得伪装成 Ingress 能力。
 
 注册正文包含 `ingress_id`、使用无填充小写 base64url 编码的 32 字节公钥、规范
 `egress_id`、可选管理员 label/limit 和 `expected_generation`。Enable 允许新 Path。
@@ -313,6 +349,8 @@ audit.notice
 类型化 `payload`。`generation` 使用与响应元数据相同的 `{scope,value}` 形式；资源载荷可以
 另外携带自身的 `revision`。事件在每个 Ingress 进程内有序。`Last-Event-ID` 要么从有界缓冲区重放，
 要么先发送完整快照事件再发送新的增量。查询和事件载荷使用相同的 actor 授权和脱敏策略。
+SSE 连接使用独立的有界 client 预算。producer MUST 施加背压，不得为每个 client 建立无界事件
+队列，并 MUST 定期发送 comment heartbeat，使失效 client 释放其预算。
 
 ## 明确边界
 

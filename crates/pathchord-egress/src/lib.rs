@@ -1,7 +1,4 @@
 //! Egress target-dialing and authorization boundaries.
-//!
-//! Persistence is intentionally absent in Phase 0. A future Egress-owned store
-//! will publish validated generations as immutable `AuthorizationSnapshot`s.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -13,6 +10,17 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, lookup_host};
 use tokio::time::timeout;
+
+mod authorization_store;
+mod control;
+mod node;
+
+pub use authorization_store::{
+    AuthorizationCleanup, AuthorizationMutation, AuthorizationMutationRequest,
+    AuthorizationMutationResult, AuthorizationStore, AuthorizationStoreError,
+};
+pub use control::AuthorizationControlDispatcher;
+pub use node::{EgressNode, EgressNodeConfig, EgressNodeError, EgressNodeSnapshot};
 
 /// Default bound for target connection establishment when callers do not
 /// provide an explicit policy timeout.
@@ -493,6 +501,10 @@ impl AuthorizationSnapshot {
 
     pub const fn egress_public_key(&self) -> &[u8; 32] {
         &self.egress_public_key
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = &AuthorizationRecord> {
+        self.records.values()
     }
 
     pub fn authorize(

@@ -2,12 +2,14 @@
 //!
 //! This crate deliberately contains no listener, operating-system, transport,
 //! subscription, or asynchronous runtime integration. Its frame and payload
-//! values implement the stable wire-profile-v1 contract.
+//! values implement wire-profile-v1; its management module defines the shared,
+//! transport-independent local control envelope.
 
 mod error;
 mod frame;
 mod id;
 mod limits;
+pub mod management;
 mod messages;
 mod reliability;
 mod state;

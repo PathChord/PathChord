@@ -10,7 +10,7 @@ This document defines the selected technologies and implementation boundaries. P
 |---|---|---|
 | Language | Rust | Strong control over buffers, concurrency, platform integration, and long-lived networking services |
 | Async runtime | Tokio | Mature async I/O, timers, cancellation, task supervision, and Windows/Linux support |
-| Cryptography | `Noise_IK_25519_ChaChaPoly_SHA256` behind a replaceable crypto interface; `snow` with a reviewed zeroizing resolver where it satisfies the security requirements | Direct Noise pattern support, independent handshake state per Path, and enforceable secret-state cleanup |
+| Cryptography | `Noise_IK_25519_ChaChaPoly_SHA256` through Clatter, with zeroizing key/cipher containers and an Orion SHA-256/HMAC adapter | Direct Noise pattern support, independent handshake state per Path, explicit-nonce transport, and enforceable secret-state cleanup |
 | Symmetric primitives | ChaCha20-Poly1305 through the Noise implementation | Matches the selected Noise pattern |
 | Serialization | `serde` for configuration and management API models | Shared typed models without coupling the wire protocol to a text format |
 | Wire framing | Dedicated Rust codec using QUIC-style unsigned varints | Protocol requires explicit framing and does not depend on a general RPC schema |
@@ -19,9 +19,10 @@ This document defines the selected technologies and implementation boundaries. P
 | Embedded state | SQLite for Egress authorization and durable local metadata | Atomic transactions, generation numbers, and easy inspection |
 | Rules | Dedicated restricted rule language compiled at startup | Deterministic evaluation and a narrow output model; no arbitrary host access |
 | Linux interception | `nix`/`socket2` plus platform-specific netlink and TPROXY code | Access to socket options and routing primitives without hiding kernel behavior |
-| Linux TUN | `tun` or equivalent OS adapter behind an internal interface | Keeps TUN implementation replaceable |
-| Windows TUN | Wintun adapter behind the same internal interface | Standard Windows TUN integration |
+| Linux TUN | `tun-rs` async packet device behind `PacketDevice`, with a direct `smoltcp` reactor | Safe replaceable device lifecycle and a maintained TCP/UDP state machine |
+| Windows TUN | `tun-rs` Wintun packet device behind the same interface and direct `smoltcp` reactor | Standard Windows driver integration without platform-specific TCP reconstruction |
 | HTTP/SOCKS | Internal protocol adapters | Required semantics are small and avoid unnecessary proxy-framework coupling |
+| DNS wire handling | `hickory-proto` behind route adapters | Mature DNS parsing/encoding while keeping local, Transit, Egress, and blocked routing replaceable |
 | Testing | `cargo test`, deterministic fake transports, property tests, packet traces, and fault injection | Multipath correctness depends on reproducible loss, duplication, reordering, and restart tests |
 
 The scheduler uses effective-capacity weighting. Configured relationship weights provide the baseline; Path-reported capacity, congestion window, RTT, jitter, and loss adjust the instantaneous allocation. Retransmission replication uses both a Session-wide budget and optional per-traffic-class budgets, with the Session budget as the hard upper bound.
@@ -59,6 +60,8 @@ metrics and events. A GraphQL adapter is permitted behind the same typed service
 boundary, but carries additional authorization, query-cost, caching, and
 subscription complexity. The typed service owns the internal state model
 independently of the browser API style.
+The built-in console assets are embedded into the Rust binary and require no
+Node.js runtime in production.
 
 Node label/tag edits, subscription create/delete/refresh, and other mutations
 are generation-checked, idempotent, audited commands. Dynamic snapshots replace
@@ -85,7 +88,7 @@ Each Path owns an independent Noise session and transport cipher state. The reco
 - report authentication failure as a Path failure;
 - never reuse transport cipher state across Paths.
 
-The Noise implementation must zeroize all private-key, DH, and traffic-key buffers it owns, including resolver-owned state. The record layer uses a bounded replay window whose size and retention semantics accommodate Session-level ACK retention and retransmission behavior.
+Clatter owns the IK state machine, X25519 secret/DH-output containers, and transport cipher states. Its secret-bearing containers zeroize on drop. The SHA-256/HMAC adapter uses Orion with zeroization enabled so keyed hash state, chaining-key intermediates, and HMAC pads are cleared as well. PathChord explicitly clears live transport ciphers on teardown and freezes deterministic compatibility vectors in the wire profile. The record layer uses a bounded replay window whose size and retention semantics accommodate Session-level ACK retention and retransmission behavior.
 
 The implementation must not reuse WireGuard key material or treat the Transit Proxy as an authenticated peer.
 
@@ -106,7 +109,14 @@ SQLite transactions are used for Egress authorization changes. The running Egres
 
 ## Platform architecture
 
-Linux integrates TPROXY, REDIRECT, process metadata, and transparent routing through platform adapters. Windows uses Wintun and system-proxy integration selected through the control plane. Both platforms reuse the core and policy crates.
+Linux integrates TPROXY, REDIRECT, process metadata, and transparent routing through platform adapters. Windows uses Wintun and system-proxy integration selected through the control plane. TUN adapters expose bounded IP packets only; one single-owner `smoltcp` reactor owns `Interface`, `SocketSet`, TCP listeners, UDP sockets, timers, and flow lifecycle and connects accepted flows through the same Ingress openers as ordinary listeners. Both platforms reuse the core and policy crates.
+
+One Ingress platform-runtime module owns startup and shutdown across ordinary
+listeners, transparent listeners, policy routing, UDP adapters, and TUN
+reactors. Startup validates every Listener and acquires resources as one
+transaction; any failure rolls back already-owned routes and drops acquired
+devices. One cancellation tree supervises every adapter and joins them before
+route restoration, so the CLI does not reproduce platform lifecycle logic.
 
 Platform adapters own operating-system-specific packaging, service integration, socket behavior, and routing behavior. Linux transparent routing supports IPv4 and IPv6. Tokio task supervision and cancellation must handle Path churn without leaking tasks or resources. SQLite transactions preserve authorization consistency during concurrent status queries and enrollment operations. The frame codec bounds allocation by protocol limits, and the rule compiler enforces bounded evaluation cost.
 

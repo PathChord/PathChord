@@ -8,7 +8,9 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 ## 状态
 
-目前处于初始实现阶段。本仓库包含设计基线、`wire-profile-v1` 协议契约、Kubernetes 风格配置契约，以及阶段 0/阶段 1A reliability/control-service 基础。在 Unix 上，Ingress 命令现在可以启动配置的 HTTP/SOCKS 监听器和有界 direct TCP bootstrap bridge；Session/Path 多路径数据面、Windows Named Pipe 控制传输和 Web Gateway 适配器尚未实现。
+本仓库包含设计基线、`wire-profile-v1` 协议契约、Kubernetes 风格配置契约，以及可运行的 Rust 实现。Ingress 可以绑定 HTTP、SOCKS5、Linux 透明模式和 TUN 监听器，维护持久化控制状态，刷新由订阅提供的 Transit Proxy，并通过经过认证的 Session/Path 运行时承载 TCP/UDP 流量。Egress 提供经过认证的 Path 监听器和授权控制面；可选的 REST/SSE Web Gateway 由两个控制面共享。
+
+剩余的生产化工作集中在平台验证和打包：在真实 Windows 主机验证 Named Pipe ACL 与系统代理刷新、Wintun 打包、需要特权的 Linux TPROXY 验证，以及有互操作性证据支持的 VLESS/VMess/XTLS 适配器。
 
 ## 术语
 
@@ -54,9 +56,11 @@ pathchord status
 pathchord enroll
 ```
 
-在 Unix 上，`ingress` 命令会启动配置的本地监听器和控制 socket；`status`
-与 `system-proxy` 通过本地控制 socket 工作；`egress` 与 `enroll` 仍会
-返回初始化阶段错误。
+在 Unix 上，`ingress` 命令会启动配置的监听器、持久化本地控制 socket、订阅
+worker 和请求的 Web Gateway。`egress` 会启动经过认证的 Path 监听器和授权
+控制 socket；`status`、`system-proxy` 与 `enroll` 通过对应的本地控制端点工作。
+只有在策略没有 Egress/Transit 路由且显式选择 direct fallback 时，才会使用 direct
+target bridge。
 
 ## 开发
 

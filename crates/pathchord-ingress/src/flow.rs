@@ -6,26 +6,51 @@
 //! Path multiplexing remain outside this direct bridge.
 
 use async_trait::async_trait;
+use pathchord_core::ErrorClass;
 use std::sync::Mutex;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, copy_bidirectional};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 
-use crate::{AcceptedConnection, BoxedLocalConnection, TargetAddress};
+use crate::{AcceptedConnection, BoxedLocalConnection, ConnectionContext, ConnectionResponse};
+
+const HTTP_CONNECTED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+const HTTP_FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+const HTTP_BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
+const HTTP_UNAVAILABLE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FlowBridgeError {
+    #[error("local policy rejected the TCP flow")]
+    PolicyRejected,
+    #[error("no usable route is available for the TCP flow")]
+    NoUsableRoute,
+    #[error("PathChord Session is unavailable")]
+    SessionUnavailable,
+    #[error("Egress rejected the Stream with {error:?}")]
+    EgressRejected { error: ErrorClass, reason: Vec<u8> },
+    #[error("TCP flow resource limit is exhausted")]
+    ResourceLimit,
+    #[error("TCP flow runtime is shutting down")]
+    ShuttingDown,
     #[error("target dial failed: {0}")]
     Dial(String),
+    #[error("local proxy response failed: {0}")]
+    Reply(String),
     #[error("TCP flow copy failed: {0}")]
     Copy(String),
 }
 
-/// Supplies a target connection for one accepted local flow.
+/// Opens one TCP flow using the complete policy and target context.
 #[async_trait]
-pub trait IngressTargetDialer: Send + Sync {
-    async fn connect(&self, target: TargetAddress)
-    -> Result<BoxedLocalConnection, FlowBridgeError>;
+pub trait TcpFlowOpener: Send + Sync {
+    async fn connect(
+        &self,
+        context: ConnectionContext,
+    ) -> Result<BoxedLocalConnection, FlowBridgeError>;
 }
+
+/// Compatibility name retained for existing embedders.
+pub use TcpFlowOpener as IngressTargetDialer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlowBridgeStats {
@@ -43,18 +68,93 @@ pub async fn bridge_connection<D>(
     dialer: &D,
 ) -> Result<FlowBridgeStats, FlowBridgeError>
 where
-    D: IngressTargetDialer,
+    D: IngressTargetDialer + ?Sized,
 {
-    let mut local = accepted.io;
-    let mut target = dialer.connect(accepted.context.target).await?;
-    let (local_to_target_bytes, target_to_local_bytes) =
-        copy_bidirectional(&mut local, &mut target)
-            .await
-            .map_err(|error| FlowBridgeError::Copy(error.to_string()))?;
+    let AcceptedConnection {
+        mut io,
+        context,
+        response,
+    } = accepted;
+    let mut target = match dialer.connect(context).await {
+        Ok(target) => {
+            send_success(&mut io, response).await?;
+            target
+        }
+        Err(error) => {
+            send_failure(&mut io, response, &error).await?;
+            return Err(error);
+        }
+    };
+    let (local_to_target_bytes, target_to_local_bytes) = copy_bidirectional(&mut io, &mut target)
+        .await
+        .map_err(|error| FlowBridgeError::Copy(error.to_string()))?;
     Ok(FlowBridgeStats {
         local_to_target_bytes,
         target_to_local_bytes,
     })
+}
+
+async fn send_success(
+    io: &mut BoxedLocalConnection,
+    response: ConnectionResponse,
+) -> Result<(), FlowBridgeError> {
+    let bytes: &[u8] = match response {
+        ConnectionResponse::None => return Ok(()),
+        ConnectionResponse::HttpConnect => HTTP_CONNECTED,
+        ConnectionResponse::Socks5 => &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+    };
+    io.write_all(bytes)
+        .await
+        .map_err(|error| FlowBridgeError::Reply(error.to_string()))?;
+    io.flush()
+        .await
+        .map_err(|error| FlowBridgeError::Reply(error.to_string()))
+}
+
+async fn send_failure(
+    io: &mut BoxedLocalConnection,
+    response: ConnectionResponse,
+    error: &FlowBridgeError,
+) -> Result<(), FlowBridgeError> {
+    let bytes: &[u8] = match response {
+        ConnectionResponse::None => return Ok(()),
+        ConnectionResponse::HttpConnect => match error {
+            FlowBridgeError::PolicyRejected => HTTP_FORBIDDEN,
+            FlowBridgeError::EgressRejected { .. } | FlowBridgeError::Dial(_) => HTTP_BAD_GATEWAY,
+            _ => HTTP_UNAVAILABLE,
+        },
+        ConnectionResponse::Socks5 => {
+            let code = match error {
+                FlowBridgeError::PolicyRejected => 2,
+                FlowBridgeError::NoUsableRoute => 4,
+                FlowBridgeError::EgressRejected { .. } | FlowBridgeError::Dial(_) => 5,
+                _ => 1,
+            };
+            let response = [5, code, 0, 1, 0, 0, 0, 0, 0, 0];
+            io.write_all(&response)
+                .await
+                .map_err(|error| FlowBridgeError::Reply(error.to_string()))?;
+            return io
+                .flush()
+                .await
+                .map_err(|error| FlowBridgeError::Reply(error.to_string()));
+        }
+    };
+    io.write_all(bytes)
+        .await
+        .map_err(|error| FlowBridgeError::Reply(error.to_string()))?;
+    io.flush()
+        .await
+        .map_err(|error| FlowBridgeError::Reply(error.to_string()))
+}
+
+impl AcceptedConnection {
+    /// Completes the local proxy handshake after the remote TCP flow has opened.
+    /// Runtime owners normally call this through [`bridge_connection`].
+    pub async fn confirm_success(&mut self) -> Result<(), FlowBridgeError> {
+        let response = std::mem::replace(&mut self.response, ConnectionResponse::None);
+        send_success(&mut self.io, response).await
+    }
 }
 
 /// Convenience adapter for tests and platform wrappers that already own a
@@ -75,24 +175,25 @@ impl<F> FixedTargetDialer<F> {
 #[async_trait]
 impl<F, S> IngressTargetDialer for FixedTargetDialer<F>
 where
-    F: FnMut(TargetAddress) -> Result<S, FlowBridgeError> + Send,
+    F: FnMut(ConnectionContext) -> Result<S, FlowBridgeError> + Send,
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     async fn connect(
         &self,
-        target: TargetAddress,
+        context: ConnectionContext,
     ) -> Result<BoxedLocalConnection, FlowBridgeError> {
         let mut factory = self
             .factory
             .lock()
             .map_err(|_| FlowBridgeError::Dial("target dialer lock poisoned".to_owned()))?;
-        Ok(Box::new((factory)(target)?) as BoxedLocalConnection)
+        Ok(Box::new((factory)(context)?) as BoxedLocalConnection)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TargetAddress;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -101,6 +202,7 @@ mod tests {
         AcceptedConnection {
             io: Box::new(local),
             context: crate::ConnectionContext {
+                flow_tags: std::collections::BTreeSet::new(),
                 listener_id: crate::ListenerId::new("local-http"),
                 source: "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
                 authentication_identity: None,
@@ -111,6 +213,7 @@ mod tests {
                     port: 443,
                 },
             },
+            response: crate::ConnectionResponse::None,
         }
     }
 
@@ -150,7 +253,11 @@ mod tests {
         let stats = bridge.await.unwrap().unwrap();
         assert_eq!(stats.local_to_target_bytes, 9);
         assert_eq!(stats.target_to_local_bytes, 8);
-        assert_eq!(seen_target.lock().unwrap().as_ref().unwrap().port, 443);
+        let seen = seen_target.lock().unwrap();
+        let context = seen.as_ref().unwrap();
+        assert_eq!(context.listener_id.as_str(), "local-http");
+        assert_eq!(context.source, "127.0.0.1:12345".parse().unwrap());
+        assert_eq!(context.target.port, 443);
     }
 
     #[tokio::test]
@@ -163,6 +270,45 @@ mod tests {
             bridge_connection(accepted(local_stream), &dialer).await,
             Err(FlowBridgeError::Dial("offline".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn reports_policy_failure_before_http_connect_success() {
+        let (mut local_peer, local_stream) = duplex(1024);
+        let mut connection = accepted(local_stream);
+        connection.response = crate::ConnectionResponse::HttpConnect;
+        let dialer = FixedTargetDialer::new(|_| {
+            Err::<tokio::io::DuplexStream, _>(FlowBridgeError::PolicyRejected)
+        });
+        let bridge = tokio::spawn(async move { bridge_connection(connection, &dialer).await });
+        let mut response = Vec::new();
+        local_peer.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+        assert_eq!(bridge.await.unwrap(), Err(FlowBridgeError::PolicyRejected));
+    }
+
+    #[tokio::test]
+    async fn reports_target_failure_with_a_socks_reply() {
+        let (mut local_peer, local_stream) = duplex(1024);
+        let mut connection = accepted(local_stream);
+        connection.response = crate::ConnectionResponse::Socks5;
+        let dialer = FixedTargetDialer::new(|_| {
+            Err::<tokio::io::DuplexStream, _>(FlowBridgeError::EgressRejected {
+                error: ErrorClass::TargetFailure,
+                reason: b"refused".to_vec(),
+            })
+        });
+        let bridge = tokio::spawn(async move { bridge_connection(connection, &dialer).await });
+        let mut response = [0_u8; 10];
+        local_peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(response[1], 5);
+        assert!(matches!(
+            bridge.await.unwrap(),
+            Err(FlowBridgeError::EgressRejected {
+                error: ErrorClass::TargetFailure,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

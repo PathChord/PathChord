@@ -4,26 +4,30 @@
 //! and Stream creation remain owned by the policy/Session layers.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use pathchord_policy::{TargetEndpoint, TargetHost};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     AcceptedConnection, BoxedLocalConnection, ConnectionContext, IngressListener,
-    ListenerDescriptor, ListenerError, ListenerKind,
+    ListenerCredentialVerifier, ListenerDescriptor, ListenerError, ListenerKind,
+    RejectListenerCredentials,
 };
 
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
-const CONNECTED_RESPONSE: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+const PROXY_AUTHENTICATION_REQUIRED_RESPONSE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"PathChord\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// A local HTTP CONNECT listener.
 pub struct HttpConnectListener {
     descriptor: ListenerDescriptor,
     listener: TcpListener,
-    authentication_identity: Option<String>,
+    credential_verifier: Arc<dyn ListenerCredentialVerifier>,
 }
 
 impl std::fmt::Debug for HttpConnectListener {
@@ -43,21 +47,22 @@ impl HttpConnectListener {
                 "HTTP CONNECT adapter requires an HTTP ListenerDescriptor".to_owned(),
             ));
         }
-        let listener = TcpListener::bind(descriptor.bind)
+        let listener = TcpListener::bind(descriptor.required_bind()?)
             .await
             .map_err(|error| ListenerError::Bind(error.to_string()))?;
         Ok(Self {
             descriptor,
             listener,
-            authentication_identity: None,
+            credential_verifier: Arc::new(RejectListenerCredentials),
         })
     }
 
-    /// Associates a pre-authenticated local identity with accepted requests.
-    /// HTTP authentication parsing is intentionally outside this adapter.
     #[must_use]
-    pub fn with_authentication_identity(mut self, identity: impl Into<String>) -> Self {
-        self.authentication_identity = Some(identity.into());
+    pub fn with_credential_verifier(
+        mut self,
+        credential_verifier: Arc<dyn ListenerCredentialVerifier>,
+    ) -> Self {
+        self.credential_verifier = credential_verifier;
         self
     }
 
@@ -79,7 +84,24 @@ impl HttpConnectListener {
         descriptor: &ListenerDescriptor,
         stream: S,
         source: SocketAddr,
-        authentication_identity: Option<String>,
+    ) -> Result<AcceptedConnection, ListenerError>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::accept_stream_with_verifier(
+            descriptor,
+            stream,
+            source,
+            Arc::new(RejectListenerCredentials),
+        )
+        .await
+    }
+
+    pub async fn accept_stream_with_verifier<S>(
+        descriptor: &ListenerDescriptor,
+        stream: S,
+        source: SocketAddr,
+        credential_verifier: Arc<dyn ListenerCredentialVerifier>,
     ) -> Result<AcceptedConnection, ListenerError>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -90,25 +112,18 @@ impl HttpConnectListener {
             ));
         }
         if !descriptor.allows_source(source.ip()) {
-            return Err(reject(stream, "source address is not allowed").await);
-        }
-        if descriptor.authentication_required && authentication_identity.is_none() {
-            return Err(reject(stream, "HTTP listener authentication is required").await);
+            return Err(reject_policy(stream, "source address is not allowed").await);
         }
 
         let mut reader = BufReader::new(stream);
-        let mut first_line = Vec::new();
-        let first_line_bytes = reader
-            .read_until(b'\n', &mut first_line)
+        let mut remaining = MAX_HEADER_BYTES;
+        let first_line = read_header_line(&mut reader, &mut remaining)
             .await
-            .unwrap_or_default();
-        if first_line_bytes == 0
-            || first_line.last() != Some(&b'\n')
-            || first_line.len() > MAX_HEADER_BYTES
-        {
-            return Err(reject(reader, "malformed HTTP request line").await);
-        }
-        let mut consumed = first_line.len();
+            .map_err(|reason| ListenerError::Protocol(reason.to_owned()));
+        let first_line = match first_line {
+            Ok(line) => line,
+            Err(error) => return Err(reject(reader, &error.to_string()).await),
+        };
         let first_line = match trim_line(&first_line) {
             Some(line) => line,
             None => return Err(reject(reader, "HTTP request line is not UTF-8").await),
@@ -130,43 +145,54 @@ impl HttpConnectListener {
             Err(reason) => return Err(reject(reader, &reason).await),
         };
 
+        let mut proxy_authorization: Option<Zeroizing<String>> = None;
         loop {
-            let mut line = Vec::new();
-            let line_bytes = reader
-                .read_until(b'\n', &mut line)
-                .await
-                .unwrap_or_default();
-            if line_bytes == 0 || line.last() != Some(&b'\n') {
-                return Err(reject(reader, "truncated HTTP headers").await);
-            }
-            consumed = consumed.saturating_add(line.len());
-            if consumed > MAX_HEADER_BYTES {
-                return Err(reject(reader, "HTTP headers exceed the configured limit").await);
-            }
-            let line = match trim_line(&line) {
-                Some(line) => line,
-                None => return Err(reject(reader, "HTTP header is not UTF-8").await),
+            let mut line = match read_header_line(&mut reader, &mut remaining).await {
+                Ok(line) => line,
+                Err(reason) => return Err(reject(reader, reason).await),
             };
-            if line.is_empty() {
+            let Some(header) = trim_line(&line) else {
+                line.zeroize();
+                return Err(reject(reader, "HTTP header is not UTF-8").await);
+            };
+            if header.is_empty() {
+                line.zeroize();
                 break;
             }
-            if !line.contains(':') {
+            let Some((name, value)) = header.split_once(':') else {
+                line.zeroize();
                 return Err(reject(reader, "malformed HTTP header").await);
+            };
+            let authorization = name
+                .eq_ignore_ascii_case("Proxy-Authorization")
+                .then(|| value.trim().to_owned());
+            line.zeroize();
+            if let Some(authorization) = authorization {
+                if proxy_authorization.is_some() {
+                    return Err(reject_authentication(reader).await);
+                }
+                proxy_authorization = Some(Zeroizing::new(authorization));
             }
         }
 
-        reader
-            .write_all(CONNECTED_RESPONSE)
+        let authentication_identity = if descriptor.authentication_required {
+            match authenticate_basic(
+                proxy_authorization.as_deref().map(String::as_str),
+                credential_verifier.as_ref(),
+            )
             .await
-            .map_err(|error| ListenerError::Protocol(error.to_string()))?;
-        reader
-            .flush()
-            .await
-            .map_err(|error| ListenerError::Protocol(error.to_string()))?;
+            {
+                Some(identity) => Some(identity),
+                None => return Err(reject_authentication(reader).await),
+            }
+        } else {
+            None
+        };
 
         Ok(AcceptedConnection {
             io: Box::new(reader) as BoxedLocalConnection,
             context: ConnectionContext {
+                flow_tags: descriptor.flow_tags.clone(),
                 listener_id: descriptor.id.clone(),
                 source,
                 authentication_identity,
@@ -174,6 +200,7 @@ impl HttpConnectListener {
                 protocol: crate::FlowProtocol::Tcp,
                 target,
             },
+            response: crate::ConnectionResponse::HttpConnect,
         })
     }
 }
@@ -194,14 +221,81 @@ impl IngressListener for HttpConnectListener {
             .accept()
             .await
             .map_err(|error| ListenerError::Accept(error.to_string()))?;
-        Self::accept_stream(
+        Self::accept_stream_with_verifier(
             &self.descriptor,
             stream,
             source,
-            self.authentication_identity.clone(),
+            Arc::clone(&self.credential_verifier),
         )
         .await
     }
+}
+
+async fn authenticate_basic(
+    authorization: Option<&str>,
+    credential_verifier: &dyn ListenerCredentialVerifier,
+) -> Option<String> {
+    let mut fields = authorization?.split_ascii_whitespace();
+    let scheme = fields.next()?;
+    let encoded = fields.next()?;
+    if !scheme.eq_ignore_ascii_case("Basic") || fields.next().is_some() {
+        return None;
+    }
+    let decoded = Zeroizing::new(BASE64_STANDARD.decode(encoded).ok()?);
+    let separator = decoded.iter().position(|byte| *byte == b':')?;
+    let username = std::str::from_utf8(&decoded[..separator]).ok()?;
+    let password = &decoded[separator + 1..];
+    if username.is_empty()
+        || password.is_empty()
+        || !credential_verifier.verify(username, password).await
+    {
+        return None;
+    }
+    Some(username.to_owned())
+}
+
+async fn read_header_line<R>(
+    reader: &mut BufReader<R>,
+    remaining: &mut usize,
+) -> Result<Vec<u8>, &'static str>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        if *remaining == 0 {
+            return Err("HTTP headers exceed the configured limit");
+        }
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|_| "HTTP header read failed")?;
+        if available.is_empty() {
+            return Err("truncated HTTP headers");
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |offset| offset + 1);
+        if take > *remaining {
+            return Err("HTTP headers exceed the configured limit");
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        *remaining -= take;
+        if newline.is_some() {
+            return Ok(line);
+        }
+    }
+}
+
+async fn reject_authentication<S>(mut stream: S) -> ListenerError
+where
+    S: AsyncWrite + Unpin,
+{
+    let _ = stream
+        .write_all(PROXY_AUTHENTICATION_REQUIRED_RESPONSE)
+        .await;
+    let _ = stream.flush().await;
+    ListenerError::Policy("HTTP proxy authentication failed".to_owned())
 }
 
 fn trim_line(line: &[u8]) -> Option<&str> {
@@ -257,6 +351,15 @@ where
     ListenerError::Protocol(reason.to_owned())
 }
 
+async fn reject_policy<S>(mut stream: S, reason: &str) -> ListenerError
+where
+    S: AsyncWrite + Unpin,
+{
+    let _ = stream.write_all(BAD_REQUEST_RESPONSE).await;
+    let _ = stream.flush().await;
+    ListenerError::Policy(reason.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,7 +370,12 @@ mod tests {
         ListenerDescriptor {
             id: crate::ListenerId::new("local-http"),
             kind: ListenerKind::Http,
-            bind: "127.0.0.1:8080".parse().expect("bind"),
+            bind: Some("127.0.0.1:8080".parse().expect("bind")),
+            interface: None,
+            address: None,
+            mtu: None,
+            flow_tags: std::collections::BTreeSet::new(),
+            process_metadata: crate::ProcessMetadataRequest::default(),
             allowed_sources: Vec::new(),
             authentication_required: authenticated,
         }
@@ -278,14 +386,15 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let descriptor_method = descriptor(false);
         let task = tokio::spawn(async move {
-            HttpConnectListener::accept_stream(
+            let mut accepted = HttpConnectListener::accept_stream(
                 &descriptor_method,
                 server,
                 "127.0.0.1:12345".parse().unwrap(),
-                None,
             )
             .await
-            .expect("accepted")
+            .expect("accepted");
+            accepted.confirm_success().await.expect("CONNECT success");
+            accepted
         });
         client
             .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
@@ -325,12 +434,14 @@ mod tests {
                 &descriptor_oversized,
                 server,
                 "127.0.0.1:12345".parse().unwrap(),
-                None,
             )
             .await
         });
         client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
-        assert!(task.await.unwrap().is_err());
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(ListenerError::Protocol(_))
+        ));
 
         let descriptor_required = descriptor(true);
         let (mut client, server) = tokio::io::duplex(4096);
@@ -339,7 +450,6 @@ mod tests {
                 &descriptor_required,
                 server,
                 "127.0.0.1:12345".parse().unwrap(),
-                None,
             )
             .await
         });
@@ -347,7 +457,15 @@ mod tests {
             .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
             .await
             .unwrap();
-        assert!(task.await.unwrap().is_err());
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 407"));
+        assert!(
+            response
+                .windows(b"Proxy-Authenticate: Basic".len())
+                .any(|window| window == b"Proxy-Authenticate: Basic")
+        );
+        assert!(matches!(task.await.unwrap(), Err(ListenerError::Policy(_))));
 
         let descriptor = descriptor(false);
         let (mut client, server) = tokio::io::duplex(MAX_HEADER_BYTES + 64);
@@ -356,7 +474,6 @@ mod tests {
                 &descriptor,
                 server,
                 "127.0.0.1:12345".parse().unwrap(),
-                None,
             )
             .await
         });
@@ -377,7 +494,6 @@ mod tests {
                 &descriptor,
                 server,
                 "127.0.0.1:12345".parse().unwrap(),
-                None,
             )
             .await
         });
@@ -388,7 +504,7 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 400"));
-        assert!(task.await.unwrap().is_err());
+        assert!(matches!(task.await.unwrap(), Err(ListenerError::Policy(_))));
     }
 
     #[tokio::test]
@@ -400,7 +516,6 @@ mod tests {
                 &descriptor,
                 server,
                 "127.0.0.1:12345".parse().unwrap(),
-                None,
             )
             .await
         });
@@ -421,7 +536,6 @@ mod tests {
                 &descriptor,
                 server,
                 "127.0.0.1:12345".parse().unwrap(),
-                None,
             )
             .await
         });
@@ -442,7 +556,6 @@ mod tests {
                 &descriptor,
                 server,
                 "127.0.0.1:12345".parse().unwrap(),
-                None,
             )
             .await
         });
@@ -462,7 +575,6 @@ mod tests {
                 &descriptor,
                 server,
                 "127.0.0.1:12345".parse().unwrap(),
-                None,
             )
             .await
         });
@@ -471,6 +583,67 @@ mod tests {
             .await
             .unwrap();
         assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn required_basic_authentication_sets_the_verified_identity() {
+        let descriptor = descriptor(true);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            let mut accepted = HttpConnectListener::accept_stream_with_verifier(
+                &descriptor,
+                server,
+                "127.0.0.1:12345".parse().unwrap(),
+                Arc::new(crate::StaticListenerCredentialVerifier::new(
+                    "alice", b"secret",
+                )),
+            )
+            .await
+            .expect("authenticated CONNECT");
+            accepted.confirm_success().await.unwrap();
+            accepted.context.authentication_identity
+        });
+        client
+            .write_all(
+                b"CONNECT example.com:443 HTTP/1.1\r\nproxy-authorization: Basic YWxpY2U6c2VjcmV0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = [0_u8; 39];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        assert_eq!(task.await.unwrap().as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_or_invalid_proxy_authorization_is_rejected_with_407() {
+        for headers in [
+            "Proxy-Authorization: Bearer token\r\n",
+            "Proxy-Authorization: Basic YWxpY2U6d3Jvbmc=\r\n",
+            "Proxy-Authorization: Basic YWxpY2U6c2VjcmV0\r\nProxy-Authorization: Basic YWxpY2U6c2VjcmV0\r\n",
+        ] {
+            let descriptor = descriptor(true);
+            let (mut client, server) = tokio::io::duplex(4096);
+            let task = tokio::spawn(async move {
+                HttpConnectListener::accept_stream_with_verifier(
+                    &descriptor,
+                    server,
+                    "127.0.0.1:12345".parse().unwrap(),
+                    Arc::new(crate::StaticListenerCredentialVerifier::new(
+                        "alice", b"secret",
+                    )),
+                )
+                .await
+            });
+            client
+                .write_all(format!("CONNECT example.com:443 HTTP/1.1\r\n{headers}\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 407"));
+            assert!(matches!(task.await.unwrap(), Err(ListenerError::Policy(_))));
+        }
     }
 
     #[test]

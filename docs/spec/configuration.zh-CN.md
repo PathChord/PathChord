@@ -76,7 +76,7 @@ spec:
   source:
     type: clash
     subscriptionRef: provider-a
-  protocol: vless
+  protocol: socks5
   address: proxy.example.net
   port: 443
   tags: [gaming]
@@ -207,8 +207,12 @@ spec:
   type: socks5
   bind: 0.0.0.0:1080
   allowedSources: [192.168.1.0/24]
+  flowTags: [interactive]
+  processMetadata:
+    executable: true
   authentication:
     mode: required
+    credentialsRef: lan-socks-users
 ```
 
 规则可以使用 `listener_id`、来源地址、认证身份、进程元数据、协议和目标地址。

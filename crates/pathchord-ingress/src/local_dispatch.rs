@@ -5,13 +5,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
+use pathchord_core::management::ManagementDispatcher;
 use serde_json::{Value, json};
 
 use crate::{
     ErrorBody, ErrorCode, GenerationExpectation, IngressControlService, LOCAL_API_VERSION,
-    ListenerDescriptor, NodeAdminPatch, RequestEnvelope, ResponseEnvelope, SubscriptionSpec,
-    SystemProxyPlatform,
+    ListenerDescriptor, NodeAdminPatch, PlatformProxyAdapter, RequestEnvelope, ResponseEnvelope,
+    SubscriptionCacheSpec, SubscriptionRefreshSpec, SubscriptionSpec, SystemProxyPlatform,
 };
 use pathchord_core::RequestId;
 use pathchord_policy::ListenerId;
@@ -27,7 +29,18 @@ impl LocalControlDispatcher {
     #[must_use]
     pub fn new(platform: SystemProxyPlatform) -> Self {
         Self {
-            service: IngressControlService::new(),
+            service: IngressControlService::with_platform_proxy(default_platform_adapter(platform)),
+            platform,
+        }
+    }
+
+    #[must_use]
+    pub fn with_platform_proxy(
+        platform: SystemProxyPlatform,
+        adapter: Arc<dyn PlatformProxyAdapter>,
+    ) -> Self {
+        Self {
+            service: IngressControlService::with_platform_proxy(adapter),
             platform,
         }
     }
@@ -73,16 +86,22 @@ impl LocalControlDispatcher {
         match request.operation.as_str() {
             "status.get" => self.dispatch_status(request),
             "nodes.list" => self.dispatch_nodes_list(request),
+            "nodes.get" => self.dispatch_node_get(request),
             "nodes.patch_labels" => self.dispatch_node_patch(request, false),
             "nodes.patch_tags" => self.dispatch_node_patch(request, true),
-            "sessions.list" => self.dispatch_empty_list(request, "sessions", "status:read"),
+            "sessions.list" => self.dispatch_sessions_list(request),
+            "sessions.get" => self.dispatch_session_get(request),
             "connections.list" => self.dispatch_connections_list(request),
             "listeners.list" => self.dispatch_listeners(request),
             "subscriptions.list" => self.dispatch_subscriptions_list(request),
             "subscriptions.create" => self.dispatch_subscription_create(request),
             "subscriptions.delete" => self.dispatch_subscription_delete(request),
+            "subscriptions.enable" => self.dispatch_subscription_enabled(request, true),
+            "subscriptions.disable" => self.dispatch_subscription_enabled(request, false),
             "subscriptions.refresh" => self.dispatch_subscription_refresh(request),
             "metrics.snapshot" => self.dispatch_metrics_snapshot(request),
+            "metrics.paths" => self.dispatch_path_metrics(request),
+            "metrics.streams" => self.dispatch_stream_metrics(request),
             "events.subscribe" => self.dispatch_events(request),
             "system_proxy.get" => self.dispatch_system_proxy_get(request),
             "system_proxy.enable" => self.dispatch_system_proxy_enable(request),
@@ -102,13 +121,33 @@ impl LocalControlDispatcher {
             return *response;
         }
         let snapshot = self.service.observation_snapshot();
+        let runtime_state = match snapshot.runtime_state {
+            crate::control::RuntimeSnapshotState::Fresh => "fresh",
+            crate::control::RuntimeSnapshotState::Stale => "stale",
+            crate::control::RuntimeSnapshotState::Unavailable => "unavailable",
+        };
+        let data_path_summary = match snapshot.runtime_state {
+            crate::control::RuntimeSnapshotState::Unavailable => "down",
+            crate::control::RuntimeSnapshotState::Stale => "degraded",
+            crate::control::RuntimeSnapshotState::Fresh
+                if snapshot.runtime.sessions > 0 && snapshot.runtime.ready_paths == 0 =>
+            {
+                "degraded"
+            }
+            crate::control::RuntimeSnapshotState::Fresh
+                if snapshot.runtime.sessions > 0 && snapshot.runtime.ready_paths > 0 =>
+            {
+                "connected"
+            }
+            crate::control::RuntimeSnapshotState::Fresh => "down",
+        };
         self.success(
             request.request_id,
             json!({
                 "ingress": {"state": "running"},
                 "control_plane": {"state": "running"},
-                "runtime_snapshot": {"state": "unavailable", "generation": snapshot.generation},
-                "data_path_summary": "down",
+                "runtime_snapshot": {"state": runtime_state, "generation": snapshot.generation},
+                "data_path_summary": data_path_summary,
                 "configuration_generation": self.service.snapshot().generation,
                 "observation_generation": snapshot.generation,
                 "sessions": snapshot.runtime.sessions,
@@ -183,6 +222,39 @@ impl LocalControlDispatcher {
         self.success(
             request.request_id,
             json!({"items": items, "next_page_token": Value::Null}),
+        )
+    }
+
+    fn dispatch_node_get(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "nodes:read") {
+            return *response;
+        }
+        let Some(node_id) = request.body.get("node_id").and_then(Value::as_str) else {
+            return self.failure(
+                request.request_id,
+                self.observed_generation(),
+                ErrorCode::ValidationFailed,
+                "node_id is required",
+                None,
+            );
+        };
+        let snapshot = self.service.snapshot();
+        let Some((id, state)) = snapshot.nodes.iter().find(|(id, _)| id.as_str() == node_id) else {
+            return self.failure(
+                request.request_id,
+                self.observed_generation(),
+                ErrorCode::NotFound,
+                "node was not found",
+                None,
+            );
+        };
+        self.success(
+            request.request_id,
+            json!({
+                "id": id.as_str(),
+                "admin": {"labels": state.labels, "tags": state.tags},
+                "generation": snapshot.generation,
+            }),
         )
     }
 
@@ -265,35 +337,17 @@ impl LocalControlDispatcher {
             Ok(value) => value,
             Err(response) => return *response,
         };
-        let body = &request.body;
-        let id = match body.get("id").and_then(Value::as_str) {
-            Some(value) => match crate::SubscriptionId::new(value) {
-                Ok(id) => id,
-                Err(error) => return self.control_error(request.request_id, error),
-            },
-            None => {
+        let spec = match parse_subscription_spec(&request.body) {
+            Ok(spec) => spec,
+            Err(message) => {
                 return self.failure(
                     request.request_id,
                     self.observed_generation(),
                     ErrorCode::ValidationFailed,
-                    "id is required",
+                    &message,
                     None,
                 );
             }
-        };
-        let spec = SubscriptionSpec {
-            id,
-            source_type: body
-                .get("source_type")
-                .and_then(Value::as_str)
-                .unwrap_or("static")
-                .to_owned(),
-            display_name: body
-                .get("display_name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            enabled: body.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         };
         let internal_request_id = match request_id(&request.request_id) {
             Ok(value) => value,
@@ -375,6 +429,61 @@ impl LocalControlDispatcher {
         }
     }
 
+    fn dispatch_subscription_enabled(
+        &mut self,
+        request: RequestEnvelope,
+        enabled: bool,
+    ) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "subscriptions:write") {
+            return *response;
+        }
+        let expected = match self.required_configuration_generation(&request) {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
+        let id = match subscription_id_from_body(&request.body) {
+            Ok(id) => id,
+            Err(message) => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    &message,
+                    None,
+                );
+            }
+        };
+        let internal_request_id = match request_id(&request.request_id) {
+            Ok(value) => value,
+            Err(message) => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    &message,
+                    None,
+                );
+            }
+        };
+        match self.service.set_subscription_enabled(
+            &request.actor.id,
+            internal_request_id,
+            expected,
+            &id,
+            enabled,
+        ) {
+            Ok(receipt) => self.success(
+                request.request_id,
+                json!({
+                    "applied_generation": {"scope": "configuration", "value": receipt.generation},
+                    "resource": {"id": id.as_str(), "state": if enabled {"enabled"} else {"disabled"}},
+                    "cleanup": zero_cleanup(),
+                }),
+            ),
+            Err(error) => self.control_error(request.request_id, error),
+        }
+    }
+
     fn dispatch_subscription_refresh(&mut self, request: RequestEnvelope) -> ResponseEnvelope {
         if let Err(response) = self.require_capability(&request, "subscriptions:write") {
             return *response;
@@ -430,10 +539,29 @@ impl LocalControlDispatcher {
             .map(|subscription| {
                 json!({
                     "id": subscription.spec.id.as_str(),
+                    "display_name": subscription.spec.display_name,
                     "source_type": subscription.spec.source_type,
+                    "source": {
+                        "type": subscription.spec.source_type,
+                        "url": subscription.spec.url,
+                        "credentials_ref": subscription.spec.credentials_ref,
+                    },
+                    "refresh": {
+                        "interval_seconds": subscription.spec.refresh.interval_seconds,
+                        "timeout_seconds": subscription.spec.refresh.timeout_seconds,
+                        "max_attempts": subscription.spec.refresh.max_attempts,
+                        "backoff_seconds": subscription.spec.refresh.backoff_seconds,
+                    },
+                    "cache": subscription.spec.cache.as_ref().map(|cache| json!({
+                        "path": cache.path,
+                        "max_age_seconds": cache.max_age_seconds,
+                    })),
                     "enabled": subscription.spec.enabled,
                     "revision": subscription.revision,
                     "state": format!("{:?}", subscription.refresh_state).to_ascii_lowercase(),
+                    "last_refresh_at": subscription.last_refresh_at_ms,
+                    "next_refresh_at": Value::Null,
+                    "imported_node_count": 0,
                     "last_error": subscription.last_error,
                 })
             })
@@ -444,10 +572,57 @@ impl LocalControlDispatcher {
         )
     }
 
+    fn dispatch_sessions_list(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "status:read") {
+            return *response;
+        }
+        let snapshot = self.service.observation_snapshot();
+        let items: Vec<_> = snapshot.sessions.values().map(session_value).collect();
+        self.success(
+            request.request_id,
+            json!({"items": items, "next_page_token": Value::Null}),
+        )
+    }
+
+    fn dispatch_session_get(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "status:read") {
+            return *response;
+        }
+        let Some(session_id) = request.body.get("session_id").and_then(Value::as_str) else {
+            return self.failure(
+                request.request_id,
+                self.observed_generation(),
+                ErrorCode::ValidationFailed,
+                "session_id is required",
+                None,
+            );
+        };
+        let snapshot = self.service.observation_snapshot();
+        let Some(session) = snapshot
+            .sessions
+            .values()
+            .find(|session| session.session_id.to_string() == session_id)
+        else {
+            return self.failure(
+                request.request_id,
+                self.observed_generation(),
+                ErrorCode::NotFound,
+                "Session was not found",
+                None,
+            );
+        };
+        self.success(request.request_id, session_value(session))
+    }
+
     fn dispatch_connections_list(&self, request: RequestEnvelope) -> ResponseEnvelope {
         if let Err(response) = self.require_capability(&request, "metrics:read") {
             return *response;
         }
+        let reveal_targets = request
+            .actor
+            .capabilities
+            .iter()
+            .any(|capability| capability == "targets:read");
         let snapshot = self.service.observation_snapshot();
         let items: Vec<_> = snapshot
             .connections
@@ -455,12 +630,13 @@ impl LocalControlDispatcher {
             .map(|connection| {
                 json!({
                     "connection_id": connection.connection_id,
-                    "session_id": connection.session_id.to_string(),
+                    "session_id": connection.session_id.map(|id| id.to_string()),
                     "stream_id": connection.stream_id.map(|id| id.get()),
                     "state": format!("{:?}", connection.state).to_ascii_lowercase(),
                     "bytes_sent": connection.bytes_sent,
                     "bytes_received": connection.bytes_received,
-                    "target": connection.target_display,
+                    "target": if reveal_targets { connection.target_display.clone() } else { None },
+                    "target_redacted": !reveal_targets && connection.target_display.is_some(),
                 })
             })
             .collect();
@@ -492,6 +668,55 @@ impl LocalControlDispatcher {
         )
     }
 
+    fn dispatch_path_metrics(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "metrics:read") {
+            return *response;
+        }
+        let snapshot = self.service.observation_snapshot();
+        let items: Vec<_> = snapshot
+            .paths
+            .values()
+            .map(|path| {
+                json!({
+                    "path_id": path.path_id.to_string(),
+                    "session_id": path.session_id.to_string(),
+                    "state": format!("{:?}", path.state).to_ascii_lowercase(),
+                    "rtt_ms": path.rtt_ms,
+                    "jitter_ms": path.jitter_ms,
+                    "loss_ppm": path.loss_ppm,
+                    "throughput_bps": path.throughput_bps,
+                    "reordering_events": path.reordering_events,
+                    "exclusion_reason": path.exclusion_reason,
+                })
+            })
+            .collect();
+        self.success(request.request_id, json!({"items": items}))
+    }
+
+    fn dispatch_stream_metrics(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "metrics:read") {
+            return *response;
+        }
+        let snapshot = self.service.observation_snapshot();
+        let items: Vec<_> = snapshot
+            .sessions
+            .values()
+            .map(|session| {
+                json!({
+                    "session_id": session.session_id.to_string(),
+                    "egress_id": session.egress_id,
+                    "state": format!("{:?}", session.state).to_ascii_lowercase(),
+                    "ready_paths": session.ready_paths,
+                    "active_streams": session.active_streams,
+                    "retained_outbound_bytes": session.retained_outbound_bytes,
+                    "bytes_sent": session.bytes_sent,
+                    "bytes_received": session.bytes_received,
+                })
+            })
+            .collect();
+        self.success(request.request_id, json!({"items": items}))
+    }
+
     fn dispatch_events(&self, request: RequestEnvelope) -> ResponseEnvelope {
         if let Err(response) = self.require_capability(&request, "metrics:read") {
             return *response;
@@ -511,21 +736,6 @@ impl LocalControlDispatcher {
             })
             .collect();
         self.success(request.request_id, json!({"items": events}))
-    }
-
-    fn dispatch_empty_list(
-        &self,
-        request: RequestEnvelope,
-        _resource: &str,
-        capability: &str,
-    ) -> ResponseEnvelope {
-        if let Err(response) = self.require_capability(&request, capability) {
-            return *response;
-        }
-        self.success(
-            request.request_id,
-            json!({"items": [], "next_page_token": Value::Null}),
-        )
     }
 
     fn dispatch_system_proxy_get(&self, request: RequestEnvelope) -> ResponseEnvelope {
@@ -671,6 +881,10 @@ impl LocalControlDispatcher {
             crate::ControlError::IdempotencyConflict { .. } => {
                 (ErrorCode::IdempotencyConflict, "idempotency conflict")
             }
+            crate::ControlError::PlatformProxy { .. } => (
+                ErrorCode::PersistenceUnavailable,
+                "platform system-proxy operation failed",
+            ),
             _ => (ErrorCode::ValidationFailed, "control operation failed"),
         };
         self.failure(request_id, self.observed_generation(), code, message, None)
@@ -792,10 +1006,51 @@ impl LocalControlDispatcher {
     }
 }
 
+fn default_platform_adapter(platform: SystemProxyPlatform) -> Arc<dyn PlatformProxyAdapter> {
+    match platform {
+        SystemProxyPlatform::Linux => Arc::new(crate::UnsupportedPlatformProxyAdapter),
+        SystemProxyPlatform::Windows => default_windows_platform_adapter(),
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+fn default_windows_platform_adapter() -> Arc<dyn PlatformProxyAdapter> {
+    Arc::new(crate::WindowsSystemProxyAdapter::default())
+}
+
+#[cfg(any(not(windows), test))]
+fn default_windows_platform_adapter() -> Arc<dyn PlatformProxyAdapter> {
+    Arc::new(crate::FakePlatformProxyAdapter::new())
+}
+
 impl Default for LocalControlDispatcher {
     fn default() -> Self {
         Self::new(crate::SystemProxyPlatform::Linux)
     }
+}
+
+#[async_trait::async_trait]
+impl ManagementDispatcher for LocalControlDispatcher {
+    async fn dispatch(&mut self, request: RequestEnvelope) -> ResponseEnvelope {
+        LocalControlDispatcher::dispatch(self, request)
+    }
+
+    async fn record_authentication_failure(&mut self, source: &str) {
+        let _ = self.service.record_authentication_failure(source);
+    }
+}
+
+fn session_value(session: &crate::SessionObservation) -> Value {
+    json!({
+        "session_id": session.session_id.to_string(),
+        "egress_id": session.egress_id,
+        "state": format!("{:?}", session.state).to_ascii_lowercase(),
+        "ready_paths": session.ready_paths,
+        "active_streams": session.active_streams,
+        "retained_outbound_bytes": session.retained_outbound_bytes,
+        "bytes_sent": session.bytes_sent,
+        "bytes_received": session.bytes_received,
+    })
 }
 
 fn listener_value(descriptor: &ListenerDescriptor, generation: u64) -> Value {
@@ -803,7 +1058,12 @@ fn listener_value(descriptor: &ListenerDescriptor, generation: u64) -> Value {
         "id": descriptor.id.as_str(),
         "kind": format!("{:?}", descriptor.kind).to_ascii_lowercase(),
         "platform": std::env::consts::OS,
-        "bind": descriptor.bind.to_string(),
+        "bind": descriptor.bind.map(|value| value.to_string()),
+        "interface": descriptor.interface,
+        "address": descriptor.address,
+        "mtu": descriptor.mtu,
+        "flow_tags": descriptor.flow_tags,
+        "process_metadata": descriptor.process_metadata,
         "allowed_sources": descriptor.allowed_sources,
         "authentication": if descriptor.authentication_required {"required"} else {"disabled"},
         "state": "available",
@@ -938,7 +1198,10 @@ fn listener_sort_key(descriptor: &ListenerDescriptor, sort: &str) -> String {
         "kind" => format!("{:?}", descriptor.kind).to_ascii_lowercase(),
         "platform" => std::env::consts::OS.to_owned(),
         "state" => "available".to_owned(),
-        "bind" => descriptor.bind.to_string(),
+        "bind" => descriptor
+            .bind
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
         _ => descriptor.id.as_str().to_owned(),
     }
 }
@@ -965,6 +1228,170 @@ fn parse_string_map(value: Option<&Value>) -> BTreeMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_subscription_spec(body: &Value) -> Result<SubscriptionSpec, String> {
+    let object = body
+        .as_object()
+        .ok_or_else(|| "subscriptions.create body must be an object".to_owned())?;
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "id" | "display_name"
+                | "enabled"
+                | "source"
+                | "refresh"
+                | "cache"
+                | "source_type"
+                | "url"
+                | "credentials_ref"
+        ) {
+            return Err(format!("unknown subscriptions.create field: {key}"));
+        }
+    }
+
+    let id_value = object
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "id is required".to_owned())?;
+    let id = crate::SubscriptionId::new(id_value).map_err(|error| error.to_string())?;
+    let display_name = match object.get("display_name") {
+        None => id.as_str().to_owned(),
+        Some(Value::String(value)) => value.clone(),
+        Some(_) => return Err("display_name must be a string".to_owned()),
+    };
+    let enabled = match object.get("enabled") {
+        None => true,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Err("enabled must be a boolean".to_owned()),
+    };
+
+    let source = match object.get("source") {
+        None => None,
+        Some(Value::Object(source)) => {
+            for key in source.keys() {
+                if !matches!(key.as_str(), "type" | "url" | "credentials_ref") {
+                    return Err(format!("unknown source field: {key}"));
+                }
+            }
+            Some(source)
+        }
+        Some(_) => return Err("source must be an object".to_owned()),
+    };
+    let source_type = source
+        .and_then(|source| source.get("type"))
+        .or_else(|| object.get("source_type"))
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "source.type must be a string".to_owned())
+        })
+        .transpose()?
+        .unwrap_or_else(|| "static".to_owned());
+    let url = source
+        .and_then(|source| source.get("url"))
+        .or_else(|| object.get("url"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "source.url is required".to_owned())?
+        .to_owned();
+    let credentials_ref = optional_string(
+        source
+            .and_then(|source| source.get("credentials_ref"))
+            .or_else(|| object.get("credentials_ref")),
+        "source.credentials_ref",
+    )?;
+
+    let refresh = match object.get("refresh") {
+        None => SubscriptionRefreshSpec::default(),
+        Some(Value::Object(refresh)) => {
+            for key in refresh.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "interval_seconds" | "timeout_seconds" | "max_attempts" | "backoff_seconds"
+                ) {
+                    return Err(format!("unknown refresh field: {key}"));
+                }
+            }
+            let defaults = SubscriptionRefreshSpec::default();
+            SubscriptionRefreshSpec {
+                interval_seconds: optional_u64(
+                    refresh.get("interval_seconds"),
+                    defaults.interval_seconds,
+                    "refresh.interval_seconds",
+                )?,
+                timeout_seconds: optional_u64(
+                    refresh.get("timeout_seconds"),
+                    defaults.timeout_seconds,
+                    "refresh.timeout_seconds",
+                )?,
+                max_attempts: u32::try_from(optional_u64(
+                    refresh.get("max_attempts"),
+                    u64::from(defaults.max_attempts),
+                    "refresh.max_attempts",
+                )?)
+                .map_err(|_| "refresh.max_attempts is outside the integer range".to_owned())?,
+                backoff_seconds: optional_u64(
+                    refresh.get("backoff_seconds"),
+                    defaults.backoff_seconds,
+                    "refresh.backoff_seconds",
+                )?,
+            }
+        }
+        Some(_) => return Err("refresh must be an object".to_owned()),
+    };
+    let cache = match object.get("cache") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(cache)) => {
+            for key in cache.keys() {
+                if !matches!(key.as_str(), "path" | "max_age_seconds") {
+                    return Err(format!("unknown cache field: {key}"));
+                }
+            }
+            let path = cache
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "cache.path is required".to_owned())?
+                .to_owned();
+            Some(SubscriptionCacheSpec {
+                path,
+                max_age_seconds: optional_u64(
+                    cache.get("max_age_seconds"),
+                    86_400,
+                    "cache.max_age_seconds",
+                )?,
+            })
+        }
+        Some(_) => return Err("cache must be an object or null".to_owned()),
+    };
+
+    Ok(SubscriptionSpec {
+        id,
+        source_type,
+        display_name,
+        enabled,
+        url,
+        credentials_ref,
+        refresh,
+        cache,
+    })
+}
+
+fn optional_string(value: Option<&Value>, field: &str) -> Result<Option<String>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("{field} must be a string or null")),
+    }
+}
+
+fn optional_u64(value: Option<&Value>, default: u64, field: &str) -> Result<u64, String> {
+    match value {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("{field} must be a non-negative integer")),
+    }
 }
 
 fn subscription_id_from_body(body: &Value) -> Result<crate::SubscriptionId, String> {
@@ -1018,7 +1445,12 @@ mod tests {
             .register_listener(ListenerDescriptor {
                 id: ListenerId::new("local-http"),
                 kind: ListenerKind::Http,
-                bind: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+                bind: Some("127.0.0.1:8080".parse::<SocketAddr>().unwrap()),
+                interface: None,
+                address: None,
+                mtu: None,
+                flow_tags: std::collections::BTreeSet::new(),
+                process_metadata: crate::ProcessMetadataRequest::default(),
                 allowed_sources: Vec::new(),
                 authentication_required: false,
             });
@@ -1027,7 +1459,12 @@ mod tests {
             .register_listener(ListenerDescriptor {
                 id: ListenerId::new("lan-tun"),
                 kind: ListenerKind::Tun,
-                bind: "0.0.0.0:15000".parse::<SocketAddr>().unwrap(),
+                bind: Some("0.0.0.0:15000".parse::<SocketAddr>().unwrap()),
+                interface: None,
+                address: None,
+                mtu: None,
+                flow_tags: std::collections::BTreeSet::new(),
+                process_metadata: crate::ProcessMetadataRequest::default(),
                 allowed_sources: Vec::new(),
                 authentication_required: false,
             });
@@ -1051,6 +1488,71 @@ mod tests {
             listeners.result.unwrap()["items"].as_array().unwrap().len(),
             2
         );
+    }
+
+    #[test]
+    fn metrics_expose_path_quality_and_session_stream_fields() {
+        let mut dispatcher = dispatcher(SystemProxyPlatform::Linux);
+        let observations = dispatcher.service().observation_handle();
+        let session_id = pathchord_core::SessionId::new(51);
+        let path_id = pathchord_core::PathId::new(52);
+        observations
+            .replace_session_observations(
+                [crate::SessionObservation {
+                    session_id,
+                    egress_id: "egress-a".into(),
+                    state: pathchord_core::SessionState::Active,
+                    ready_paths: 1,
+                    active_streams: 2,
+                    retained_outbound_bytes: 3,
+                    bytes_sent: 4,
+                    bytes_received: 5,
+                }],
+                [crate::PathObservation {
+                    path_id,
+                    session_id,
+                    state: pathchord_core::PathState::Active,
+                    rtt_ms: 12,
+                    jitter_ms: 3,
+                    loss_ppm: 4_000,
+                    throughput_bps: 5_000_000,
+                    reordering_events: 6,
+                    exclusion_reason: None,
+                }],
+            )
+            .unwrap();
+        let paths = dispatcher.dispatch(request("metrics.paths", &["metrics:read"], json!({})));
+        let path = &paths.result.expect("path metrics")["items"][0];
+        assert_eq!(path["rtt_ms"], 12);
+        assert_eq!(path["loss_ppm"], 4_000);
+        assert_eq!(path["reordering_events"], 6);
+        assert!(path["exclusion_reason"].is_null());
+
+        let streams = dispatcher.dispatch(request("metrics.streams", &["metrics:read"], json!({})));
+        let stream = &streams.result.expect("stream metrics")["items"][0];
+        assert_eq!(stream["egress_id"], "egress-a");
+        assert_eq!(stream["ready_paths"], 1);
+        assert_eq!(stream["active_streams"], 2);
+    }
+
+    #[test]
+    fn listener_observation_does_not_claim_data_path_connectivity() {
+        let mut dispatcher = dispatcher(SystemProxyPlatform::Linux);
+        let observations = dispatcher.service().observation_handle();
+        observations
+            .apply_listener_event(crate::ListenerRuntimeEvent::ListenerStarted {
+                listener_id: ListenerId::new("local-http"),
+                bind: Some("127.0.0.1:8080".parse().unwrap()),
+                interface: None,
+                address: None,
+                mtu: None,
+            })
+            .unwrap();
+
+        let status = dispatcher.dispatch(request("status.get", &["status:read"], json!({})));
+        let result = status.result.unwrap();
+        assert_eq!(result["runtime_snapshot"]["state"], "fresh");
+        assert_eq!(result["data_path_summary"], "down");
     }
 
     #[test]
@@ -1114,7 +1616,26 @@ mod tests {
         let mut create = request(
             "subscriptions.create",
             &["subscriptions:write"],
-            json!({"id": "source-a", "source_type": "clash", "display_name": "A", "enabled": true}),
+            json!({
+                "id": "source-a",
+                "display_name": "A",
+                "enabled": true,
+                "source": {
+                    "type": "clash",
+                    "url": "https://provider.example/subscription",
+                    "credentials_ref": "provider-a-token"
+                },
+                "refresh": {
+                    "interval_seconds": 900,
+                    "timeout_seconds": 15,
+                    "max_attempts": 4,
+                    "backoff_seconds": 7
+                },
+                "cache": {
+                    "path": "provider-a.snapshot",
+                    "max_age_seconds": 86400
+                }
+            }),
         );
         create.expected_generation = Some(GenerationExpectation {
             scope: "configuration".to_owned(),
@@ -1123,13 +1644,16 @@ mod tests {
         assert!(dispatcher.dispatch(create).ok);
         let subscriptions =
             dispatcher.dispatch(request("subscriptions.list", &["status:read"], json!({})));
+        let result = subscriptions.result.unwrap();
+        let items = result["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
         assert_eq!(
-            subscriptions.result.unwrap()["items"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
+            items[0]["source"]["url"],
+            "https://provider.example/subscription"
         );
+        assert_eq!(items[0]["source"]["credentials_ref"], "provider-a-token");
+        assert_eq!(items[0]["refresh"]["interval_seconds"], 900);
+        assert_eq!(items[0]["cache"]["path"], "provider-a.snapshot");
     }
 
     #[test]

@@ -14,37 +14,99 @@ use async_trait::async_trait;
 use getrandom::fill;
 use pathchord_core::{SessionId, SessionState, StateTransitionError};
 use pathchord_policy::{EgressId, PolicyContext};
-pub use pathchord_policy::{FlowProtocol, ListenerId, ProcessMetadata, TargetEndpoint, TargetHost};
+pub use pathchord_policy::{
+    FlowProtocol, ListenerId, ProcessMetadata, ProcessMetadataRequest, TargetEndpoint, TargetHost,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 mod control;
 mod control_views;
+mod credentials;
+mod data_plane;
+mod dns;
+mod dns_udp_opener;
 mod flow;
 mod http_connect;
+#[cfg(target_os = "linux")]
+mod linux_routing;
+#[cfg(target_os = "linux")]
+mod linux_tproxy_udp;
+#[cfg(target_os = "linux")]
+mod linux_transparent;
+#[cfg(target_os = "linux")]
+mod linux_udp_runtime;
 mod local_dispatch;
 mod local_protocol;
 mod local_server;
+mod platform;
+mod platform_runtime;
+mod process_metadata;
+mod reload;
 mod runtime;
 mod socks5;
+mod socks5_udp;
+mod store;
+mod tun_device;
+mod tun_netstack;
+mod udp_flow;
+mod web_gateway;
 
 pub use control::{
     ConnectionObservation, ConnectionState, ControlError, ControlEvent, ControlEventKind,
-    IngressControlService, IngressControlSnapshot, MAX_CONNECTION_OBSERVATIONS, MAX_EVENT_COUNT,
-    MAX_NODE_COUNT, MAX_REFRESH_QUEUE_COUNT, MAX_REQUEST_CACHE_COUNT, MAX_SUBSCRIPTION_COUNT,
-    MutationReceipt, NodeAdminPatch, NodeAdminState, NodeHealthState, NodeId, NodeObservation,
-    ObservationSnapshot, RuntimeCounts, SubscriptionId, SubscriptionRefreshState, SubscriptionSpec,
-    SubscriptionState, SystemProxyMutation, SystemProxyPlatform, SystemProxyState,
-    SystemProxyStatus,
+    DEFAULT_OBSERVATION_STALE_AFTER_MS, IngressControlService, IngressControlSnapshot,
+    IngressObservationHandle, MAX_CONNECTION_OBSERVATIONS, MAX_EVENT_COUNT, MAX_NODE_COUNT,
+    MAX_REFRESH_QUEUE_COUNT, MAX_REQUEST_CACHE_COUNT, MAX_SUBSCRIPTION_COUNT, MutationReceipt,
+    NodeAdminPatch, NodeAdminState, NodeHealthState, NodeId, NodeObservation, ObservationSnapshot,
+    PathObservation, RuntimeCounts, RuntimeSnapshotState, SessionObservation, SubscriptionCache,
+    SubscriptionCacheSpec, SubscriptionId, SubscriptionRefresh, SubscriptionRefreshSpec,
+    SubscriptionRefreshState, SubscriptionSpec, SubscriptionState, SystemProxyMutation,
+    SystemProxyPlatform, SystemProxyState, SystemProxyStatus,
 };
 pub use control_views::{
     ListenerInventory, ListenerSelectionError, ListenerView, ListenerViewState,
     SystemProxyPlatformEffect, SystemProxyRestorationState, SystemProxyStatusView,
 };
+pub use credentials::{
+    ListenerCredentialError, ListenerCredentialVerifier, ListenerCredentialVerifierFactory,
+    RejectListenerCredentials, StaticListenerCredentialVerifier,
+    UnavailableListenerCredentialFactory,
+};
+pub use credentials::{
+    ListenerCredentialVerifier as SocksCredentialVerifier,
+    RejectListenerCredentials as RejectSocksCredentials,
+};
+pub use data_plane::{
+    DEFAULT_PATH_CONNECT_TIMEOUT, DataPlaneError, DataPlaneSessionSnapshot, DataPlaneSnapshot,
+    IngressDataPlane, IngressDataPlaneConfig,
+};
+pub use dns::{
+    DnsAdapterError, DnsAdapters, DnsError, DnsRouteAdapter, DnsRouteRequest, DnsRouteSelection,
+    DnsRuntime, LocalDnsAdapter, MAX_DNS_MESSAGE_BYTES, SessionUdpDnsAdapter,
+};
+pub use dns_udp_opener::DnsAwareUdpFlowOpener;
 pub use flow::{
-    FixedTargetDialer, FlowBridgeError, FlowBridgeStats, IngressTargetDialer, bridge_connection,
+    FixedTargetDialer, FlowBridgeError, FlowBridgeStats, IngressTargetDialer, TcpFlowOpener,
+    bridge_connection,
 };
 pub use http_connect::{HttpConnectListener, MAX_HEADER_BYTES as HTTP_MAX_HEADER_BYTES};
+#[cfg(target_os = "linux")]
+pub use linux_routing::{
+    IpCommandRouteAdapter, IpFamily, LinuxRouteAdapter, LinuxRoutingEffect, LinuxRoutingError,
+    LinuxTransparentRouteConfig, LinuxTransparentRouteManager, RouteObjectState,
+};
+#[cfg(target_os = "linux")]
+pub use linux_tproxy_udp::{
+    FakeTransparentUdpAdapter, LinuxTproxyUdpSocket, TransparentDatagram, TransparentUdpAdapter,
+    TransparentUdpError,
+};
+#[cfg(target_os = "linux")]
+pub use linux_transparent::LinuxTransparentTcpListener;
+#[cfg(target_os = "linux")]
+pub use linux_udp_runtime::{
+    TransparentUdpRuntimeConfig, TransparentUdpRuntimeError, TransparentUdpRuntimeReport,
+    run_transparent_udp,
+};
 pub use local_dispatch::LocalControlDispatcher;
 pub use local_protocol::{
     Actor, ErrorBody, ErrorCode, GenerationExpectation, LOCAL_API_VERSION, LocalProtocolError,
@@ -54,11 +116,46 @@ pub use local_protocol::{
 pub use local_server::{
     DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS, LocalControlServer, LocalServerError,
 };
+#[cfg(windows)]
+pub use platform::WindowsSystemProxyAdapter;
+pub use platform::{
+    FakePlatformProxyAdapter, PlatformProxyAdapter, PlatformProxyEffect, PlatformProxyError,
+    PlatformProxyKind, PlatformProxyRequest, ProtectedEndpointSet, UnsupportedPlatformProxyAdapter,
+};
+pub use platform_runtime::{
+    IngressPlatformConfig, IngressPlatformError, IngressPlatformFactories, IngressPlatformReport,
+    IngressPlatformRuntime, TunPacketDeviceFactory, TunRsPacketDeviceFactory,
+};
+#[cfg(target_os = "linux")]
+pub use platform_runtime::{LinuxTransparentUdpFactory, TransparentUdpFactory};
+#[cfg(target_os = "linux")]
+pub use process_metadata::LinuxProcessMetadataProvider;
+pub use process_metadata::{
+    NoopProcessMetadataProvider, ProcessMetadataProvider, ProcessSocketTuple,
+    SystemProcessMetadataProvider, UnavailableProcessMetadataProvider,
+};
+pub use reload::{
+    ConfigHotReloader, ConfigReloadHandle, ReloadError, ReloadOutcome, ReloadSnapshot, ReloadState,
+    ReloadStatus,
+};
 pub use runtime::{
     DEFAULT_MAX_CONNECTIONS, ListenerRuntime, ListenerRuntimeConfig, ListenerRuntimeEvent,
     ListenerRuntimeEventSender, RuntimeError, RuntimeReport,
 };
 pub use socks5::Socks5Listener;
+pub use socks5_udp::{Socks5Runtime, Socks5RuntimeConfig, Socks5RuntimeError, Socks5RuntimeReport};
+pub use store::{IngressControlStore, IngressControlStoreError};
+pub use tun_device::{
+    FakePacketDevice, PacketDevice, PacketDeviceError, PacketFlowEngine, TunDeviceConfig,
+    TunRsPacketDevice, run_packet_device,
+};
+pub use tun_netstack::{
+    TunFlowRuntime, TunFlowRuntimeConfig, TunFlowRuntimeError, TunFlowRuntimeReport,
+};
+pub use udp_flow::{BoxedUdpFlowHandle, UdpFlowError, UdpFlowHandle, UdpFlowOpener};
+pub use web_gateway::{
+    SharedManagementDispatcher, WebBearerToken, WebGateway, WebGatewayConfig, WebGatewayError,
+};
 
 pub trait LocalConnection: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -79,13 +176,25 @@ pub enum ListenerKind {
 pub struct ListenerDescriptor {
     pub id: ListenerId,
     pub kind: ListenerKind,
-    pub bind: SocketAddr,
+    pub bind: Option<SocketAddr>,
+    pub interface: Option<String>,
+    pub address: Option<String>,
+    pub mtu: Option<u32>,
+    /// Static admission tags copied into every flow from this listener.
+    pub flow_tags: std::collections::BTreeSet<String>,
+    pub process_metadata: ProcessMetadataRequest,
     /// Allowed source CIDRs. An empty list means all source addresses.
     pub allowed_sources: Vec<String>,
     pub authentication_required: bool,
 }
 
 impl ListenerDescriptor {
+    pub fn required_bind(&self) -> Result<SocketAddr, ListenerError> {
+        self.bind.ok_or_else(|| {
+            ListenerError::InvalidDescriptor("listener requires a socket bind".to_owned())
+        })
+    }
+
     /// Returns whether a source address is admitted by this listener's CIDRs.
     /// Configuration parsing validates CIDR syntax; malformed values supplied
     /// by an embedding caller fail closed here.
@@ -134,6 +243,7 @@ pub type TargetAddress = TargetEndpoint;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionContext {
+    pub flow_tags: std::collections::BTreeSet<String>,
     pub listener_id: ListenerId,
     pub source: SocketAddr,
     pub authentication_identity: Option<String>,
@@ -145,9 +255,9 @@ pub struct ConnectionContext {
 impl ConnectionContext {
     /// Converts listener facts into the policy crate's typed evaluator input.
     #[must_use]
-    pub fn policy_context(&self, flow_tags: std::collections::BTreeSet<String>) -> PolicyContext {
+    pub fn policy_context(&self) -> PolicyContext {
         PolicyContext {
-            flow_tags,
+            flow_tags: self.flow_tags.clone(),
             listener_id: self.listener_id.clone(),
             source: self.source,
             authentication_identity: self.authentication_identity.clone(),
@@ -161,6 +271,14 @@ impl ConnectionContext {
 pub struct AcceptedConnection {
     pub io: BoxedLocalConnection,
     pub context: ConnectionContext,
+    pub(crate) response: ConnectionResponse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionResponse {
+    None,
+    HttpConnect,
+    Socks5,
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -173,6 +291,8 @@ pub enum ListenerError {
     Bind(String),
     #[error("listener accept failed: {0}")]
     Accept(String),
+    #[error("listener local policy rejected the connection: {0}")]
+    Policy(String),
     #[error("listener protocol rejected the connection: {0}")]
     Protocol(String),
 }
@@ -184,7 +304,9 @@ pub trait IngressListener: Send + Sync {
     /// Returns the platform resource address. Implementations that bind an
     /// ephemeral port should override this to report the assigned address.
     fn local_addr(&self) -> Result<SocketAddr, ListenerError> {
-        Ok(self.descriptor().bind)
+        self.descriptor().bind.ok_or_else(|| {
+            ListenerError::InvalidDescriptor("listener has no socket bind".to_owned())
+        })
     }
 
     async fn accept(&self) -> Result<AcceptedConnection, ListenerError>;
@@ -577,6 +699,7 @@ mod tests {
             Ok(AcceptedConnection {
                 io: Box::new(client),
                 context: ConnectionContext {
+                    flow_tags: self.descriptor.flow_tags.clone(),
                     listener_id: self.descriptor.id.clone(),
                     source: SocketAddr::from_str("127.0.0.1:12345").expect("socket address"),
                     authentication_identity: None,
@@ -587,6 +710,7 @@ mod tests {
                         port: 443,
                     },
                 },
+                response: ConnectionResponse::None,
             })
         }
     }
@@ -752,7 +876,12 @@ mod tests {
             descriptor: ListenerDescriptor {
                 id: ListenerId::new("local-http"),
                 kind: ListenerKind::Http,
-                bind: SocketAddr::from_str("127.0.0.1:8080").expect("socket address"),
+                bind: Some(SocketAddr::from_str("127.0.0.1:8080").expect("socket address")),
+                interface: None,
+                address: None,
+                mtu: None,
+                flow_tags: std::collections::BTreeSet::from(["interactive".to_owned()]),
+                process_metadata: ProcessMetadataRequest::default(),
                 allowed_sources: Vec::new(),
                 authentication_required: false,
             },
@@ -762,8 +891,12 @@ mod tests {
         assert_eq!(accepted.context.listener_id.as_str(), "local-http");
         assert_eq!(accepted.context.target.port, 443);
         assert_eq!(
-            accepted.context.policy_context(Default::default()).protocol,
+            accepted.context.policy_context().protocol,
             FlowProtocol::Tcp
+        );
+        assert_eq!(
+            accepted.context.policy_context().flow_tags,
+            std::collections::BTreeSet::from(["interactive".to_owned()])
         );
         drop(accepted.io);
     }

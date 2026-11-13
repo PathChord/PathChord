@@ -7,8 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+clatter.workspace = true
+orion.workspace = true
 pathchord-core = { path = "../pathchord-core" }
-snow.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 

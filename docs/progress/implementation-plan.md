@@ -1,71 +1,32 @@
 # PathChord implementation plan
 
-This document tracks implementation sequencing. Final-state requirements and
-contracts remain under `docs/design/` and `docs/spec/`.
+This document tracks the remaining implementation and validation sequence.
+Final-state requirements remain under `docs/design/` and `docs/spec/`.
 
-## Phase 0: protocol and test fixtures
+## Current sequence
 
-- Freeze frame/state-machine specifications.
-- Define deterministic test vectors for Noise handshakes and framing.
-- Define error mapping for HTTP, SOCKS, TUN, TCP, and UDP.
-- Build a fake Transit transport and fake Egress for fault injection.
+1. Validate the assembled Ingress platform runtime on privileged Linux and on
+   Windows hosts, including TPROXY/TUN, Named Pipe ACL, WinINet refresh, and
+   crash recovery.
+2. Run long-lived failure and restart tests for Path churn, authorization
+   revoke, subscription draining, DNS route failure, and configuration reload.
+3. Exercise real subscription providers and publish operational metrics and
+   structured dashboards.
+4. Define and review a final transport schema plus interoperability fixtures
+   before enabling VLESS, VMess, or XTLS adapters.
 
-## Phase 1: single-path Egress
+## Completed foundations
 
-- Ingress/Egress Noise connection.
-- Session attach and status reporting.
-- One TCP Stream and one UDP session.
-- Correct FIN/RST, half-close, reset, and restart semantics.
+- Protocol and wire-profile vectors.
+- Noise admission and zeroization migration.
+- Single- and multi-Path TCP/UDP Session runtime.
+- Ordered policy compilation and dynamic subscription normalization.
+- Durable Ingress/Egress control planes and local/Web adapters.
+- Linux transparent/TUN platform modules and supervised node assembly.
 
-## Phase 2: adapters
+## Deferred by design
 
-- Treat Linux as the first platform target; do not combine both transparent
-  interception platforms in one milestone. Validate the local SOCKS5,
-  single-Transit, single-Egress TCP slice before adding TPROXY or TUN.
-- Linux HTTP/SOCKS.
-- Linux TPROXY/REDIRECT.
-- Windows TUN.
-- Windows system-proxy integration.
-- Internal outbound loop prevention.
-
-## Phase 3: dynamic data and rules
-
-- Static Egress topology.
-- Subscription cache and Clash/SIP008 normalization.
-- Name-based tag/label annotations.
-- Compiled ordered Egress and Proxy rules.
-- Runtime snapshots and listener IDs.
-- Ingress command/query service for administrator labels/tags and subscription lifecycle.
-- Atomic generations, audit events, and structured observation snapshots.
-
-## Phase 4: multipath
-
-- Multiple Paths per Proxy and Egress.
-- Stream offsets, ACK ranges, reordering, and cross-Path retransmission.
-- Egress downstream scheduling.
-- Drain and per-Stream path admission.
-
-## Phase 5: observation and autoscaling
-
-- Path RTT/jitter/loss/throughput observations.
-- Egress status reports and per-Ingress limits.
-- Effective-capacity calculation.
-- Aggressive path admission, fast quality downgrade, stabilized recovery, cautious scale-in.
-- Quota and traffic-multiplier metadata.
-
-## Phase 6: control and operations
-
-- Manual public-key enrollment on both ends.
-- Dynamic Egress authorization list.
-- Local management API and status/diagnostics CLI.
-- Optional authenticated Web Gateway for frontend management and SSE observations.
-- Crash cleanup and network restoration.
-- Compatibility, restart, partition, proxy deletion, and quota tests.
-
-## Deferred implementation choices
-
-The implementation baseline is selected in the
-[technology design](../design/technology-selection.md). Still deferred are the
-exact proxy adapter libraries, Tokio task topology, persistent key encoding,
-stable wire discriminants and capability IDs, operational buffer tuning, exact
-probe intervals, and autoscaler constants.
+VLESS/VMess/XTLS transport fields, external interoperability profiles,
+platform-specific packaging details, production probe intervals, and deployed
+autoscaler constants remain deferred until the validation sequence supplies
+the required evidence.

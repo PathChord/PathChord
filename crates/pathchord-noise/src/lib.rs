@@ -7,17 +7,74 @@
 //! its enabled authorization snapshot before allowing the Path to become
 //! `PATH_READY`.
 //!
-//! The selected production crypto provider must zeroize all private/DH and
-//! traffic-key storage it owns. The wrapper zeroizes generated static key
-//! material; deployments must use a reviewed resolver/provider that also
-//! covers provider-owned state.
+//! Secret-bearing handshake, DH, chaining-key, and transport-key storage uses
+//! zeroize-on-drop containers. The wrapper also clears its transport state on
+//! explicit teardown before the owning values are dropped.
 
 use std::fmt;
 
+use clatter::bytearray::{ByteArray, SensitiveByteArray};
+use clatter::cipherstate::{CipherState, CipherStates};
+use clatter::crypto::{cipher::ChaChaPoly, dh::X25519};
+use clatter::error::{CipherError, DhError, HandshakeError};
+use clatter::handshakepattern::noise_ik;
+use clatter::traits::{CryptoComponent, Dh, Handshaker, Hash};
+use clatter::{KeyPair, NqHandshake};
+use orion::hazardous::hash::sha2::sha256::Sha256 as OrionSha256;
+use orion::hazardous::mac::hmac::sha256::{HmacSha256, SecretKey as HmacSecretKey};
 use pathchord_core::{FrameCodecError, MAX_VARINT, PathFrame, ProtocolLimits};
-use snow::{Builder, HandshakeState, StatelessTransportState, params::NoiseParams};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+type DhKeyPair = KeyPair<[u8; STATIC_KEY_LEN], SensitiveByteArray<[u8; STATIC_KEY_LEN]>>;
+type HandshakeState = NqHandshake<X25519, ChaChaPoly, ZeroizingSha256>;
+type TrafficCipher = CipherState<ChaChaPoly>;
+
+/// SHA-256/HMAC-SHA256 adapter whose digest, block, and output storage all have
+/// explicit zeroize-on-drop implementations.
+#[derive(Clone, Default)]
+struct ZeroizingSha256(OrionSha256);
+
+impl ZeroizeOnDrop for ZeroizingSha256 {}
+
+impl CryptoComponent for ZeroizingSha256 {
+    fn name() -> &'static str {
+        "SHA256"
+    }
+}
+
+impl Hash for ZeroizingSha256 {
+    type Block = SensitiveByteArray<[u8; 64]>;
+    type Output = SensitiveByteArray<[u8; 32]>;
+
+    fn input(&mut self, data: &[u8]) {
+        self.0
+            .update(data)
+            .expect("Orion SHA-256 accepts bounded Noise input");
+    }
+
+    fn result(mut self) -> Self::Output {
+        let digest = self
+            .0
+            .finalize()
+            .expect("Orion SHA-256 finalization is infallible for valid state");
+        Self::Output::from_slice(digest.as_ref())
+    }
+
+    fn hmac_many(key: &[u8], data: &[&[u8]]) -> Self::Output {
+        let key =
+            HmacSecretKey::try_from(key).expect("Orion HMAC-SHA256 accepts every Noise key length");
+        let mut mac = HmacSha256::new(&key);
+        for value in data {
+            mac.update(value)
+                .expect("Orion HMAC-SHA256 accepts bounded Noise input");
+        }
+        let tag = mac
+            .finalize()
+            .expect("Orion HMAC-SHA256 finalization is infallible for valid state");
+        Self::Output::from_slice(tag.unprotected_as_ref::<[u8]>())
+    }
+}
 
 /// The only Noise protocol name supported by PathChord.
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
@@ -29,7 +86,7 @@ pub const WIRE_PROFILE_V1_PROLOGUE_PREFIX: &[u8] = b"PathChord/wire-v1/egress/";
 /// Size of Curve25519 static private and public keys.
 pub const STATIC_KEY_LEN: usize = 32;
 
-/// Maximum Noise message size mandated by the Noise specification and `snow`.
+/// Maximum Noise message size mandated by the Noise specification.
 pub const MAX_NOISE_MESSAGE_LEN: usize = 65_535;
 
 /// Authentication tag added to each ChaCha20-Poly1305 transport message.
@@ -56,25 +113,52 @@ pub const MAX_RECORD_ENVELOPE_LEN: usize = RECORD_ENVELOPE_HEADER_LEN + MAX_NOIS
 /// A Curve25519 static keypair used by an Ingress or Egress.
 ///
 /// The custom `Debug` implementation deliberately omits the private key.
-#[derive(PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+#[derive(PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct StaticKeypair {
-    private: [u8; STATIC_KEY_LEN],
+    private: SensitiveByteArray<[u8; STATIC_KEY_LEN]>,
     public: [u8; STATIC_KEY_LEN],
 }
 
+impl Eq for StaticKeypair {}
+
 impl StaticKeypair {
+    /// Reconstructs a keypair from its persisted private key and derives the
+    /// corresponding Curve25519 public key.
+    #[must_use]
+    pub fn from_private(private: [u8; STATIC_KEY_LEN]) -> Self {
+        let private = SensitiveByteArray::new(private);
+        let public = X25519::pubkey(&private);
+        Self { private, public }
+    }
+
     /// Reconstructs a persisted keypair.
     ///
     /// This function cannot verify that the two halves match. A mismatched pair
     /// will fail to authenticate during the Noise handshake.
     #[must_use]
-    pub const fn from_parts(private: [u8; STATIC_KEY_LEN], public: [u8; STATIC_KEY_LEN]) -> Self {
-        Self { private, public }
+    pub fn from_parts(private: [u8; STATIC_KEY_LEN], public: [u8; STATIC_KEY_LEN]) -> Self {
+        Self {
+            private: SensitiveByteArray::new(private),
+            public,
+        }
+    }
+
+    /// Reconstructs a persisted keypair after checking that its public key is
+    /// derived from the supplied private key.
+    pub fn try_from_parts(
+        private: [u8; STATIC_KEY_LEN],
+        public: [u8; STATIC_KEY_LEN],
+    ) -> Result<Self, NoiseError> {
+        let derived = Self::from_private(private);
+        if derived.public != public {
+            return Err(NoiseError::PublicKeyMismatch);
+        }
+        Ok(derived)
     }
 
     /// Returns the private key bytes for secure persistence or handshake setup.
     #[must_use]
-    pub const fn private(&self) -> &[u8; STATIC_KEY_LEN] {
+    pub fn private(&self) -> &[u8; STATIC_KEY_LEN] {
         &self.private
     }
 
@@ -300,41 +384,53 @@ pub enum NoiseError {
     #[error("the Noise handshake did not expose a remote static key")]
     MissingRemoteStatic,
 
-    /// The underlying Noise implementation rejected an operation.
-    #[error("Noise operation failed: {0}")]
-    Snow(#[from] snow::Error),
+    /// Persisted key material contains a public key that does not correspond to
+    /// its private key.
+    #[error("persisted Curve25519 public key does not match its private key")]
+    PublicKeyMismatch,
+
+    /// The Noise handshake implementation rejected an operation.
+    #[error("Noise handshake failed: {0}")]
+    Handshake(HandshakeError),
+
+    /// A Noise transport cipher rejected an operation.
+    #[error("Noise transport cipher failed: {0}")]
+    Cipher(CipherError),
+
+    /// Curve25519 key generation failed.
+    #[error("Noise key generation failed: {0}")]
+    Dh(DhError),
+
+    /// An owned handshake state was already consumed.
+    #[error("Noise handshake state is unavailable")]
+    HandshakeStateUnavailable,
 }
 
-/// Generates a new Curve25519 static keypair using `snow`'s secure RNG.
-pub fn generate_static_keypair() -> Result<StaticKeypair, NoiseError> {
-    let keypair = Builder::new(noise_params()?).generate_keypair()?;
-    let private = copy_private_key(keypair.private)?;
-    let public =
-        keypair
-            .public
-            .try_into()
-            .map_err(|public: Vec<u8>| NoiseError::InvalidKeyLength {
-                kind: "public",
-                actual: public.len(),
-            })?;
-
-    Ok(StaticKeypair::from_parts(private, public))
-}
-
-fn copy_private_key(mut bytes: Vec<u8>) -> Result<[u8; STATIC_KEY_LEN], NoiseError> {
-    if bytes.len() != STATIC_KEY_LEN {
-        let actual = bytes.len();
-        bytes.zeroize();
-        return Err(NoiseError::InvalidKeyLength {
-            kind: "private",
-            actual,
-        });
+impl From<HandshakeError> for NoiseError {
+    fn from(error: HandshakeError) -> Self {
+        Self::Handshake(error)
     }
+}
 
-    let mut private = [0_u8; STATIC_KEY_LEN];
-    private.copy_from_slice(&bytes);
-    bytes.zeroize();
-    Ok(private)
+impl From<CipherError> for NoiseError {
+    fn from(error: CipherError) -> Self {
+        Self::Cipher(error)
+    }
+}
+
+impl From<DhError> for NoiseError {
+    fn from(error: DhError) -> Self {
+        Self::Dh(error)
+    }
+}
+
+/// Generates a new Curve25519 static keypair using the provider's system RNG.
+pub fn generate_static_keypair() -> Result<StaticKeypair, NoiseError> {
+    let keypair = X25519::genkey()?;
+    Ok(StaticKeypair {
+        private: keypair.secret.clone(),
+        public: keypair.public,
+    })
 }
 
 /// An authenticated, complete Noise record envelope.
@@ -452,7 +548,7 @@ fn validate_ciphertext_len(length: usize) -> Result<(), NoiseError> {
 /// authenticated initiator static key is mapped to an authorized IngressID
 /// after message one; Session attachment must then match that mapping.
 pub struct InitiatorHandshake {
-    state: HandshakeState,
+    state: Option<HandshakeState>,
 }
 
 impl InitiatorHandshake {
@@ -477,34 +573,33 @@ impl InitiatorHandshake {
         fixed_ephemeral: Option<&[u8; STATIC_KEY_LEN]>,
     ) -> Result<Self, NoiseError> {
         require_egress_identity(egress_identity)?;
-        let builder = Builder::new(noise_params()?)
-            .local_private_key(local_private)?
-            .remote_public_key(expected_responder_public)?
-            .prologue(egress_identity)?;
-        let builder = match fixed_ephemeral {
-            Some(key) => builder.fixed_ephemeral_key_for_testing_only(key),
-            None => builder,
-        };
-
         Ok(Self {
-            state: builder.build_initiator()?,
+            state: Some(HandshakeState::new(
+                noise_ik(),
+                egress_identity,
+                true,
+                Some(dh_keypair(local_private)),
+                fixed_ephemeral.map(dh_keypair),
+                Some(*expected_responder_public),
+                None,
+            )?),
         })
     }
 
     /// Writes the next IK handshake message with an optional protocol payload.
     pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        write_handshake_message(&mut self.state, payload)
+        write_handshake_message(self.state_mut()?, payload)
     }
 
     /// Reads the next IK handshake message and returns its protocol payload.
     pub fn read_message(&mut self, message: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        read_handshake_message(&mut self.state, message)
+        read_handshake_message(self.state_mut()?, message)
     }
 
     /// Returns whether the IK exchange has completed.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.state.is_handshake_finished()
+        self.state.as_ref().is_some_and(HandshakeState::is_finished)
     }
 
     /// Returns the static key authenticated by the handshake.
@@ -512,12 +607,16 @@ impl InitiatorHandshake {
     /// Authentication does not imply authorization. The caller must still
     /// validate this key against configured identity and enrollment state.
     pub fn authenticated_remote_static(&self) -> Result<[u8; STATIC_KEY_LEN], NoiseError> {
-        remote_static(&self.state)
+        remote_static(self.state_ref()?)
     }
 
     /// Consumes a finished handshake and enters explicit-nonce transport mode.
-    pub fn into_transport(self) -> Result<NoiseTransport, NoiseError> {
-        into_transport(self.state)
+    pub fn into_transport(mut self) -> Result<NoiseTransport, NoiseError> {
+        let state = self
+            .state
+            .take()
+            .ok_or(NoiseError::HandshakeStateUnavailable)?;
+        into_transport(state)
     }
 
     #[cfg(test)]
@@ -534,7 +633,29 @@ impl InitiatorHandshake {
             Some(fixed_ephemeral),
         )
     }
+
+    fn state_ref(&self) -> Result<&HandshakeState, NoiseError> {
+        self.state
+            .as_ref()
+            .ok_or(NoiseError::HandshakeStateUnavailable)
+    }
+
+    fn state_mut(&mut self) -> Result<&mut HandshakeState, NoiseError> {
+        self.state
+            .as_mut()
+            .ok_or(NoiseError::HandshakeStateUnavailable)
+    }
 }
+
+impl Drop for InitiatorHandshake {
+    fn drop(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.get_state_mut().zeroize();
+        }
+    }
+}
+
+impl ZeroizeOnDrop for InitiatorHandshake {}
 
 impl fmt::Debug for InitiatorHandshake {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -552,7 +673,7 @@ impl fmt::Debug for InitiatorHandshake {
 /// before advancing the Path to `PATH_READY`; this type intentionally performs
 /// no enrollment or authorization lookup.
 pub struct ResponderHandshake {
-    state: HandshakeState,
+    state: Option<HandshakeState>,
 }
 
 impl ResponderHandshake {
@@ -570,44 +691,48 @@ impl ResponderHandshake {
         fixed_ephemeral: Option<&[u8; STATIC_KEY_LEN]>,
     ) -> Result<Self, NoiseError> {
         require_egress_identity(egress_identity)?;
-        let builder = Builder::new(noise_params()?)
-            .local_private_key(local_private)?
-            .prologue(egress_identity)?;
-        let builder = match fixed_ephemeral {
-            Some(key) => builder.fixed_ephemeral_key_for_testing_only(key),
-            None => builder,
-        };
-
         Ok(Self {
-            state: builder.build_responder()?,
+            state: Some(HandshakeState::new(
+                noise_ik(),
+                egress_identity,
+                false,
+                Some(dh_keypair(local_private)),
+                fixed_ephemeral.map(dh_keypair),
+                None,
+                None,
+            )?),
         })
     }
 
     /// Reads the next IK handshake message and returns its protocol payload.
     pub fn read_message(&mut self, message: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        read_handshake_message(&mut self.state, message)
+        read_handshake_message(self.state_mut()?, message)
     }
 
     /// Writes the next IK handshake message with an optional protocol payload.
     pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        write_handshake_message(&mut self.state, payload)
+        write_handshake_message(self.state_mut()?, payload)
     }
 
     /// Returns whether the IK exchange has completed.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.state.is_handshake_finished()
+        self.state.as_ref().is_some_and(HandshakeState::is_finished)
     }
 
     /// Returns the authenticated initiator static key for explicit Egress-side
     /// authorization. A successful return value alone never authorizes a Path.
     pub fn authenticated_remote_static(&self) -> Result<[u8; STATIC_KEY_LEN], NoiseError> {
-        remote_static(&self.state)
+        remote_static(self.state_ref()?)
     }
 
     /// Consumes a finished handshake and enters explicit-nonce transport mode.
-    pub fn into_transport(self) -> Result<NoiseTransport, NoiseError> {
-        into_transport(self.state)
+    pub fn into_transport(mut self) -> Result<NoiseTransport, NoiseError> {
+        let state = self
+            .state
+            .take()
+            .ok_or(NoiseError::HandshakeStateUnavailable)?;
+        into_transport(state)
     }
 
     #[cfg(test)]
@@ -618,7 +743,29 @@ impl ResponderHandshake {
     ) -> Result<Self, NoiseError> {
         Self::build(local_private, egress_identity, Some(fixed_ephemeral))
     }
+
+    fn state_ref(&self) -> Result<&HandshakeState, NoiseError> {
+        self.state
+            .as_ref()
+            .ok_or(NoiseError::HandshakeStateUnavailable)
+    }
+
+    fn state_mut(&mut self) -> Result<&mut HandshakeState, NoiseError> {
+        self.state
+            .as_mut()
+            .ok_or(NoiseError::HandshakeStateUnavailable)
+    }
 }
+
+impl Drop for ResponderHandshake {
+    fn drop(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.get_state_mut().zeroize();
+        }
+    }
+}
+
+impl ZeroizeOnDrop for ResponderHandshake {}
 
 impl fmt::Debug for ResponderHandshake {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -637,7 +784,8 @@ impl fmt::Debug for ResponderHandshake {
 /// frame's `frame_seq`. A nonce must never protect different plaintexts under
 /// the same directional key; retransmission must reuse the original ciphertext.
 pub struct NoiseTransport {
-    state: StatelessTransportState,
+    send_cipher: TrafficCipher,
+    receive_cipher: TrafficCipher,
     authenticated_remote_static: [u8; STATIC_KEY_LEN],
     next_send_nonce: u64,
     replay_window: ReplayWindow,
@@ -668,8 +816,9 @@ impl NoiseTransport {
         }
 
         let mut record = vec![0_u8; plaintext.len() + TRANSPORT_TAG_LEN];
-        let written = self.state.write_message(nonce, plaintext, &mut record)?;
-        record.truncate(written);
+        self.send_cipher.set_nonce(nonce);
+        self.send_cipher
+            .encrypt_with_ad(&[], plaintext, &mut record)?;
         self.next_send_nonce = nonce + 1;
         SealedRecord::from_parts(nonce, record)
     }
@@ -741,15 +890,14 @@ impl NoiseTransport {
         Ok(frame)
     }
 
-    fn decrypt_record(&self, record: &SealedRecord) -> Result<Vec<u8>, NoiseError> {
+    fn decrypt_record(&mut self, record: &SealedRecord) -> Result<Vec<u8>, NoiseError> {
         require_record_nonce(record.nonce)?;
         validate_ciphertext_len(record.ciphertext.len())?;
 
         let mut plaintext = vec![0_u8; record.ciphertext.len() - TRANSPORT_TAG_LEN];
-        let written = self
-            .state
-            .read_message(record.nonce, &record.ciphertext, &mut plaintext)?;
-        plaintext.truncate(written);
+        self.receive_cipher.set_nonce(record.nonce);
+        self.receive_cipher
+            .decrypt_with_ad(&[], &record.ciphertext, &mut plaintext)?;
         Ok(plaintext)
     }
 
@@ -768,7 +916,21 @@ impl NoiseTransport {
     pub const fn highest_received_nonce(&self) -> Option<u64> {
         self.replay_window.highest()
     }
+
+    fn clear_sensitive(&mut self) {
+        self.send_cipher.zeroize();
+        self.receive_cipher.zeroize();
+        self.authenticated_remote_static.zeroize();
+    }
 }
+
+impl Drop for NoiseTransport {
+    fn drop(&mut self) {
+        self.clear_sensitive();
+    }
+}
+
+impl ZeroizeOnDrop for NoiseTransport {}
 
 impl fmt::Debug for NoiseTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -780,10 +942,6 @@ impl fmt::Debug for NoiseTransport {
             )
             .finish_non_exhaustive()
     }
-}
-
-fn noise_params() -> Result<NoiseParams, NoiseError> {
-    Ok(NOISE_PATTERN.parse()?)
 }
 
 fn require_egress_identity(egress_identity: &[u8]) -> Result<(), NoiseError> {
@@ -847,28 +1005,42 @@ fn read_handshake_message(
 }
 
 fn remote_static(state: &HandshakeState) -> Result<[u8; STATIC_KEY_LEN], NoiseError> {
-    let key = state
+    state
         .get_remote_static()
-        .ok_or(NoiseError::MissingRemoteStatic)?;
-    key.try_into().map_err(|_| NoiseError::InvalidKeyLength {
-        kind: "remote public",
-        actual: key.len(),
-    })
+        .ok_or(NoiseError::MissingRemoteStatic)
 }
 
 fn into_transport(state: HandshakeState) -> Result<NoiseTransport, NoiseError> {
     let authenticated_remote_static = remote_static(&state)?;
+    let initiator = state.is_initiator();
+    let CipherStates {
+        initiator_to_responder,
+        responder_to_initiator,
+    } = state.finalize()?.take();
+    let (send_cipher, receive_cipher) = if initiator {
+        (initiator_to_responder, responder_to_initiator)
+    } else {
+        (responder_to_initiator, initiator_to_responder)
+    };
     Ok(NoiseTransport {
-        state: state.into_stateless_transport_mode()?,
+        send_cipher,
+        receive_cipher,
         authenticated_remote_static,
         next_send_nonce: 0,
         replay_window: ReplayWindow::new(),
     })
 }
 
+fn dh_keypair(private: &[u8; STATIC_KEY_LEN]) -> DhKeyPair {
+    let secret = SensitiveByteArray::from_slice(private);
+    let public = X25519::pubkey(&secret);
+    KeyPair::new(public, secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clatter::symmetricstate::SymmetricState;
 
     const EGRESS_IDENTITY: &[u8] = b"PathChord/wire-v1/egress/egress-id";
     const INITIATOR_PRIVATE: [u8; STATIC_KEY_LEN] = [1; STATIC_KEY_LEN];
@@ -935,6 +1107,91 @@ mod tests {
             initiator.into_transport().expect("initiator transport"),
             responder.into_transport().expect("responder transport"),
         )
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn clatter_preserves_the_frozen_snow_wire_vector() {
+        let mut initiator = InitiatorHandshake::with_fixed_ephemeral(
+            &INITIATOR_PRIVATE,
+            &RESPONDER_PUBLIC,
+            EGRESS_IDENTITY,
+            &[4; 32],
+        )
+        .expect("initiator state");
+        let mut responder =
+            ResponderHandshake::with_fixed_ephemeral(&RESPONDER_PRIVATE, EGRESS_IDENTITY, &[5; 32])
+                .expect("responder state");
+
+        let first = initiator.write_message(&[]).expect("first IK message");
+        assert_eq!(
+            encode_hex(&first),
+            "ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10b5ff672297d0d3ade1dd319d94628c4340bb85d86f62343c56fe841734b841fb6026f297def6e19ed47946e13d165de43d0225e93eb0f307b235dc8a202b3603b"
+        );
+        responder
+            .read_message(&first)
+            .expect("read first IK message");
+        let second = responder.write_message(&[]).expect("second IK message");
+        assert_eq!(
+            encode_hex(&second),
+            "50a61409b1ddd0325e9b16b700e719e9772c07000b1bd7786e907c653d20495dc5e12927491c58f5730f88bf3154bd48"
+        );
+        initiator
+            .read_message(&second)
+            .expect("read second IK message");
+
+        let mut initiator = initiator.into_transport().expect("initiator transport");
+        let mut responder = responder.into_transport().expect("responder transport");
+        for _ in 0..7 {
+            initiator
+                .seal_record(b"advance explicit nonce")
+                .expect("advance nonce");
+        }
+        let record = initiator
+            .seal_record(b"PathChord transport vector")
+            .expect("vector record");
+        assert_eq!(record.nonce(), 7);
+        assert_eq!(
+            encode_hex(record.ciphertext()),
+            "d8cd46c9df78dbd4bc8cebae020320f9bde5dba394c98104938b74b93ba7c5b808580283263e7b5df5ac"
+        );
+        assert_eq!(
+            responder.open_record(&record).expect("open vector record"),
+            b"PathChord transport vector"
+        );
+    }
+
+    #[test]
+    fn every_secret_owner_has_a_zeroize_on_drop_path() {
+        fn assert_zeroize<T: Zeroize>() {}
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        assert_zeroize::<SensitiveByteArray<[u8; 32]>>();
+        assert_zeroize_on_drop::<SensitiveByteArray<[u8; 32]>>();
+        assert_zeroize::<TrafficCipher>();
+        assert_zeroize_on_drop::<TrafficCipher>();
+        assert_zeroize::<SymmetricState<ChaChaPoly, ZeroizingSha256>>();
+        assert_zeroize_on_drop::<SymmetricState<ChaChaPoly, ZeroizingSha256>>();
+        assert_zeroize_on_drop::<ZeroizingSha256>();
+        assert_zeroize_on_drop::<DhKeyPair>();
+        assert_zeroize_on_drop::<StaticKeypair>();
+        assert_zeroize_on_drop::<InitiatorHandshake>();
+        assert_zeroize_on_drop::<ResponderHandshake>();
+        assert_zeroize_on_drop::<NoiseTransport>();
+    }
+
+    #[test]
+    fn explicit_transport_clear_destroys_live_traffic_keys() {
+        let (mut initiator, mut responder) = establish_path([28; 32], [29; 32]);
+        initiator.clear_sensitive();
+        assert_eq!(initiator.authenticated_remote_static(), &[0; 32]);
+        let record = initiator
+            .seal_record(b"cannot authenticate after clear")
+            .expect("zero-key encryption remains a valid local operation");
+        assert!(responder.open_record(&record).is_err());
     }
 
     #[test]
@@ -1245,6 +1502,18 @@ mod tests {
             Err(NoiseError::RecordEnvelopeTooLarge { .. })
         ));
         assert_eq!(SealedRecord::decode(&encoded).unwrap(), record);
+    }
+
+    #[test]
+    fn persisted_private_key_derives_and_validates_its_public_key() {
+        let generated = generate_static_keypair().expect("generated keypair");
+        let restored = StaticKeypair::from_private(*generated.private());
+        assert_eq!(restored.public(), generated.public());
+        assert!(StaticKeypair::try_from_parts(*generated.private(), *generated.public()).is_ok());
+        assert!(matches!(
+            StaticKeypair::try_from_parts(*generated.private(), [0; STATIC_KEY_LEN]),
+            Err(NoiseError::PublicKeyMismatch)
+        ));
     }
 
     #[test]

@@ -8,12 +8,18 @@ PathChord provides ordinary proxy semantics to local applications while maintain
 
 ## Status
 
-Initial implementation. The repository contains the design baseline, the
-`wire-profile-v1` protocol contract, Kubernetes-style configuration contracts,
-and Phase 0/Phase 1A reliability and control-service foundations. On Unix, the
-Ingress command can run configured HTTP/SOCKS listeners through a bounded
-direct TCP bootstrap bridge; the Session/Path multipath data plane, Windows
-Named Pipe control transport, and Web Gateway adapters are not implemented yet.
+The repository contains the design baseline, the `wire-profile-v1` protocol
+contract, Kubernetes-style configuration contracts, and a runnable Rust
+implementation. Ingress can bind HTTP, SOCKS5, Linux transparent, and TUN
+listeners, maintain durable control state, refresh subscription-backed Transit
+Proxies, and route TCP/UDP flows through authenticated Session/Path runtimes.
+Egress exposes the authenticated Path listener and authorization control plane;
+the optional REST/SSE Web Gateway is shared by both control planes.
+
+The remaining production work is platform validation and packaging: real
+Windows-host validation of Named Pipe ACL and OS proxy refresh, Wintun
+packaging, privileged Linux TPROXY validation, and interoperability-backed
+VLESS/VMess/XTLS adapters.
 
 ## Terminology
 
@@ -64,9 +70,12 @@ pathchord status
 pathchord enroll
 ```
 
-On Unix, the `ingress` command starts the configured local listeners and control
-socket. `status` and `system-proxy` use the local control socket; `egress` and
-`enroll` still return a bootstrap error.
+On Unix, the `ingress` command starts configured listeners, the durable local
+control socket, the subscription worker, and any requested Web Gateway.
+`egress` starts the authenticated Path listener and authorization control
+socket; `status`, `system-proxy`, and `enroll` use the corresponding local
+control endpoint. The direct target bridge remains available only for an
+explicit policy with no Egress/Transit route.
 
 ## Development
 

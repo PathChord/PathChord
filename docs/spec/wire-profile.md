@@ -402,6 +402,20 @@ duplicates/stale records, nonce/frame-sequence mismatch, and stale status
 reports. A vector is valid only when both encoding and decoding reproduce the
 exact bytes.
 
+The canonical IK compatibility vector uses
+`Noise_IK_25519_ChaChaPoly_SHA256`, prologue
+`PathChord/wire-v1/egress/egress-id`, initiator static private key `01` repeated
+32 times, responder static private key `02` repeated 32 times, and initiator
+and responder ephemeral private keys `04` and `05` repeated 32 times. Handshake
+payloads are empty. The transport plaintext is ASCII
+`PathChord transport vector` under initiator-to-responder nonce 7.
+
+```text
+message_1 = ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10b5ff672297d0d3ade1dd319d94628c4340bb85d86f62343c56fe841734b841fb6026f297def6e19ed47946e13d165de43d0225e93eb0f307b235dc8a202b3603b
+message_2 = 50a61409b1ddd0325e9b16b700e719e9772c07000b1bd7786e907c653d20495dc5e12927491c58f5730f88bf3154bd48
+transport_nonce_7 = d8cd46c9df78dbd4bc8cebae020320f9bde5dba394c98104938b74b93ba7c5b808580283263e7b5df5ac
+```
+
 ## Security Considerations
 
 The record nonce is explicit and authenticated through the frame sequence. A

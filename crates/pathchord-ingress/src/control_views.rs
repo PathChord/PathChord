@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
-use crate::{ListenerDescriptor, ListenerId, ListenerKind};
+use crate::{ListenerDescriptor, ListenerId, ListenerKind, ProcessMetadataRequest};
 
 /// Runtime availability reported for one configured listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,12 @@ pub enum ListenerViewState {
 pub struct ListenerView {
     pub id: ListenerId,
     pub kind: ListenerKind,
-    pub bind: SocketAddr,
+    pub bind: Option<SocketAddr>,
+    pub interface: Option<String>,
+    pub address: Option<String>,
+    pub mtu: Option<u32>,
+    pub flow_tags: std::collections::BTreeSet<String>,
+    pub process_metadata: ProcessMetadataRequest,
     pub allowed_sources: Vec<String>,
     pub authentication_required: bool,
     pub state: ListenerViewState,
@@ -37,6 +42,11 @@ impl ListenerView {
             id: descriptor.id.clone(),
             kind: descriptor.kind,
             bind: descriptor.bind,
+            interface: descriptor.interface.clone(),
+            address: descriptor.address.clone(),
+            mtu: descriptor.mtu,
+            flow_tags: descriptor.flow_tags.clone(),
+            process_metadata: descriptor.process_metadata,
             allowed_sources: descriptor.allowed_sources.clone(),
             authentication_required: descriptor.authentication_required,
             state: ListenerViewState::Available,
@@ -156,7 +166,12 @@ mod tests {
         ListenerDescriptor {
             id: ListenerId::new(id),
             kind,
-            bind: SocketAddr::from_str("127.0.0.1:8080").expect("socket address"),
+            bind: Some(SocketAddr::from_str("127.0.0.1:8080").expect("socket address")),
+            interface: None,
+            address: None,
+            mtu: None,
+            flow_tags: std::collections::BTreeSet::new(),
+            process_metadata: crate::ProcessMetadataRequest::default(),
             allowed_sources: vec!["127.0.0.1/32".to_owned()],
             authentication_required: false,
         }
@@ -173,6 +188,7 @@ mod tests {
             .expect("listener");
         assert_eq!(view.kind, ListenerKind::Http);
         assert_eq!(view.allowed_sources, vec!["127.0.0.1/32"]);
+        assert!(view.flow_tags.is_empty());
         assert_eq!(view.state, ListenerViewState::Available);
         assert!(view.supports_system_proxy());
     }
