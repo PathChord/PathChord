@@ -17,7 +17,7 @@ Transparent interception and TUN work follow this explicit-listener baseline.
 | FreeBSD | HTTP, SOCKS, mixed | Unix socket | Native forwarding, SQLite/socket permissions, watcher, and signals. |
 
 The [Transit Proxy contract](../spec/transit-proxies.md) owns the exact native
-and optional engine parameter/format boundaries. The
+parameter and format boundaries. The
 [deployment guide](../spec/deployment.md) and `examples/` provide direct,
 subscription, and enrolled Egress entry points. Portable regressions run in
 the existing Rust CI job; target compilation/linking and native host execution

@@ -115,7 +115,7 @@ wrappers; arbitrary plugin execution is not a node capability.
 | `clash` | Clash/Mihomo `proxies` and HTTP `proxy-providers` |
 | `sip008` | SS JSON array or versioned object containing `servers` |
 | `uri` | Plain or Base64-encoded share-link lists; percent-encoded URI fields; VMess JSON and legacy/SIP002 SS forms |
-| `sing_box` | sing-box node documents with complete private outbound parameters |
+| `sing_box` | Imported sing-box node documents retained as unavailable diagnostics |
 | `surge`, `quantumult`, `loon` | Supported node-list and proxy-section forms |
 | `static` | Administrator-authored nodes; no remote subscription refresh |
 

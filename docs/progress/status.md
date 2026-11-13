@@ -113,8 +113,8 @@ in the current scope.
 - Imported complete sing-box documents are retained as opaque unavailable-node
   diagnostics. PathChord does not start or embed a compatibility process.
 - Subscription refresh supports automatic detection, Clash/Mihomo, SIP008
-  arrays and object wrappers, URI/Base64 lists, sing-box outbounds/endpoints,
-  and supported Surge/Quantumult X/Loon node lines. Complete external-engine
+  arrays and object wrappers, URI/Base64 lists, sing-box document syntax, and
+  supported Surge/Quantumult X/Loon node lines. Complete imported external
   documents remain unavailable diagnostics. HTTP provider references
   are bounded by depth/count/aggregate bytes and propagate bearer credentials
   only to the same origin. Individual invalid nodes retain sanitized
@@ -199,7 +199,7 @@ in the current scope.
   baseline. Route ownership journals are designed to fail closed and never
   remove foreign rules. Wintun packaging and native TUN validation are also
   deferred.
-- Protocols outside the registered native or configured engine set remain
+- Protocols outside the registered native set remain
   unavailable with node diagnostics. Further native implementations need
   protocol-specific interoperability fixtures.
 
