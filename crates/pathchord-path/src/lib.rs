@@ -14,7 +14,7 @@ mod single_path;
 
 pub use single_path::{
     AuthorizationState, PathAuthorization, SinglePathError, SinglePathHandshakeConfig,
-    SinglePathOutcome, SinglePathReady, establish_single_path,
+    SinglePathOutcome, SinglePathReady, StreamOpenDecision, StreamOpener, establish_single_path,
 };
 
 /// An asynchronous transport whose smallest delivery unit is one complete

@@ -56,6 +56,13 @@ separate from `docs/design/`, which describes the intended architecture, and
 - Configuration validation now enforces the documented resource-name, bounded
   map, Egress key/capability, Transit adapter, subscription URL/refresh/cache,
   DNS route/limit, listener platform, rule catch-all, and proxy-action rules.
+- Listener `allowedSources` now remains attached to the runtime descriptor,
+  appears in listener inventory, defaults loopback socket binds to the local
+  host CIDR, and is enforced before target dialing with a typed policy-rejection
+  event.
+- The single-Path harness now carries `STREAM_OPEN` over the authenticated Path
+  to an injected opener, validates `STREAM_OPEN_OK`/`STREAM_OPEN_ERR`, and
+  preserves RequestID/StreamID idempotency and conflict rules.
 
 ## Missing operational integration
 
@@ -67,7 +74,8 @@ separate from `docs/design/`, which describes the intended architecture, and
   PathChord Sessions or Paths and therefore is not the full multipath data
   plane.
 - The single-Path admission harness is not yet wired to a Transit byte/record
-  loop, Session manager, Egress target Stream, or live `FakeEgress` integration.
+  loop, Session manager, or live `FakeEgress` integration; its Stream opener is
+  still an injected transport-neutral boundary.
 - The Session/Path end-to-end proxy data plane is not operational.
 - Named Pipe transport, persistent authorization and metadata stores,
   subscription worker, REST/SSE Web Gateway, and frontend are not integrated.
