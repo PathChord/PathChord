@@ -74,10 +74,15 @@ separate from `docs/design/`, which describes the intended architecture, and
 - The local dispatcher now exposes typed read models for nodes, sessions,
   connections, subscriptions, metrics, and events, and `listeners.list`
   validates bounded pagination/filter/sort queries. Supplied configuration
-  generation preconditions are checked for system-proxy mutations.
+  generation preconditions are checked for system-proxy, node, and subscription
+  mutations. Node label and subscription create/delete/refresh commands are
+  now wired to the in-memory control service.
 - The Windows control transport now has a Tokio Named Pipe implementation and
   the Windows target compiles; Windows ACL hardening and real system-proxy OS
   side effects still require Windows-host validation.
+- The core now has a monotonic, freshness-bounded `STATUS_REPORT` tracker;
+  report ordering is available to the future runtime owner but is not yet
+  connected to admission decisions.
 - The local listener list query now validates pagination/filter/sort fields,
   returns deterministic pages, and system-proxy mutations honor supplied
   configuration generation preconditions.
@@ -98,6 +103,10 @@ separate from `docs/design/`, which describes the intended architecture, and
 - The direct Transit, record, and single-Stream session owners are not yet
   connected to the CLI listener runtime or a reconnecting production Session
   manager; CLI ingress still uses the bootstrap direct target bridge.
+- The CLI bootstrap now refuses to silently bypass configured Egress/Transit/
+  Proxy rules: only an explicit direct fallback with no such rules may use the
+  direct target bridge; other policies return a typed flow rejection until the
+  production Session/Transit runtime is connected.
 - The Session/Path end-to-end proxy data plane is not operational.
 - Named Pipe transport, persistent authorization and metadata stores,
   subscription worker, REST/SSE Web Gateway, and frontend are not integrated.
