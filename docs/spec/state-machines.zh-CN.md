@@ -173,7 +173,8 @@ FAILED → APPLYING
 `APPLYING` MUST 验证请求的 `listener_id` 在 Windows 上解析为 HTTP 或 SOCKS Listener。对已选择的
 同一 Listener 重复启用MUST 幂等，返回当前已应用状态，MUST NOT 重新覆盖已保存值。`APPLIED` MUST 记录
 环境变量和操作系统代理的精确旧值。Disable MUST 恢复这些值；恢复失败进入 `FAILED`，保留已保存值，
-且MUST NOT 报告为 `DISABLED`。Linux 对 enable/disable MUST 返回 `UNSUPPORTED_OPERATION`，MUST NOT 进入此状态机。
+且MUST NOT 报告为 `DISABLED`。Linux 和 FreeBSD 对 enable/disable MUST 返回 `UNSUPPORTED_OPERATION`，MUST NOT 进入此状态机。
+其 `system_proxy.get` 响应 MUST 返回 `enabled: false` 和 `platform_effect: unsupported`。
 每次转换都发出 `system_proxy.changed`，包含 Listener ID、平台效果以及错误/恢复状态。
 
 ## 调度和自动扩缩容守卫

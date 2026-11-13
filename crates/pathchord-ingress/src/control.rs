@@ -36,6 +36,20 @@ pub const REQUEST_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub enum SystemProxyPlatform {
     Linux,
     Windows,
+    FreeBsd,
+}
+
+impl SystemProxyPlatform {
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "freebsd") {
+            Self::FreeBsd
+        } else {
+            Self::Linux
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

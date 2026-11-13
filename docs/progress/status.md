@@ -9,9 +9,10 @@ architecture and behavioral contracts remain under `docs/design/` and
 ## Current focus
 
 Active work prioritizes HTTP CONNECT and SOCKS5 CONNECT/UDP ASSOCIATE on
-Linux and Windows, with FreeBSD under assessment as an additional target for
-the same explicit listeners and Unix local control. FreeBSD support has not
-been established by a target build or native host tests.
+Linux, Windows, and FreeBSD. FreeBSD explicit-listener configuration, platform
+identity, and Unix local control are integrated. FreeBSD x86_64 target
+compilation and CLI linking pass; native host tests remain outstanding.
+Portable listener regressions run in the existing Rust CI job.
 
 TPROXY, REDIRECT, transparent UDP interception, TUN integration, privileged
 routing validation, and Wintun packaging follow the explicit-listener
@@ -22,8 +23,9 @@ in the current scope.
 ## Implemented
 
 - The eight-crate Rust workspace builds on Linux and cross-checks for Windows
-  GNU. Core frame/message codecs, state machines, bounded reliability buffers,
-  wire vectors, and UDP/Path lifecycle payloads are implemented.
+  GNU and FreeBSD x86_64. Core frame/message codecs, state machines, bounded
+  reliability buffers, wire vectors, and UDP/Path lifecycle payloads are
+  implemented.
 - Noise IK uses Clatter zeroizing key and cipher containers with an Orion
   SHA-256/HMAC adapter. Static, ephemeral, chaining, and traffic-key owners
   have explicit cleanup paths. Frozen vectors preserve the previous wire bytes.
@@ -72,6 +74,13 @@ in the current scope.
   Administrators / SYSTEM Named Pipe ACLs, and remote-client rejection.
   Egress enrollment and authorization mutations are transactional, durable,
   generation checked, audited, idempotent, and cleanup-aware.
+- FreeBSD listener configuration accepts HTTP CONNECT and SOCKS5 CONNECT/UDP
+  ASSOCIATE with `platform: freebsd` or host-resolved `any`. Configuration and
+  runtime preflight reject FreeBSD TPROXY, REDIRECT, and TUN before resource
+  creation. The CLI and default dispatcher identify FreeBSD separately from
+  Linux; system-proxy mutations return `UNSUPPORTED_OPERATION`, and status
+  reports `platform_effect: unsupported`. The native `tun-rs` device dependency
+  is excluded from FreeBSD builds.
 - Ingress control state uses SQLite transactions, durable audit/idempotency,
   node/subscription snapshots, refresh queues, and notify-based configuration
   reload with atomic compiled-policy replacement and restart-required checks.
@@ -83,21 +92,19 @@ in the current scope.
 
 ## Remaining explicit-listener work
 
-- Linux and Windows HTTP/SOCKS5 need end-to-end and long-running validation of
-  authentication, source restrictions, TCP/UDP forwarding, DNS, bounded
+- Linux, Windows, and FreeBSD HTTP/SOCKS5 need end-to-end and long-running
+  validation of authentication, source restrictions, TCP/UDP forwarding, DNS, bounded
   resources, shutdown, reload, and local control. Existing automated loopback
-  tests are recorded below; they do not establish native Windows coverage.
+  tests are recorded below; they do not establish native Windows or FreeBSD
+  coverage.
 - Windows registry, WinINet refresh, Named Pipe ACL, and system-proxy crash
   recovery still need validation on a real Windows host. Cross-compiling and
   fake adapters are not equivalent to host evidence.
-- FreeBSD is a candidate target. The listener schema currently accepts only
-  `any`, `linux`, and `windows`; the CLI treats every non-Windows platform as
-  Linux for system-proxy reporting. Unix local-control code offers a reuse
-  point. The unconditional `tun-rs` dependency and the `notify` watcher have
-  FreeBSD support in their cached source; this does not establish a working
-  PathChord build. Native dependencies, configuration watching, SQLite,
-  credential/socket permissions, and signal behavior still need target-build
-  and native-host validation.
+- FreeBSD native dependencies, configuration watching, SQLite,
+  credential/socket permissions, and signal behavior need native-host
+  validation. A cross-compiled target check is distinct from executing the
+  workspace tests on FreeBSD; native FreeBSD execution remains a separate host
+  validation item.
 - Process metadata is best-effort: Linux has a procfs provider; other platforms
   currently report unknown. Windows and FreeBSD native process discovery is
   an additional capability, not a prerequisite for explicit listeners.
@@ -128,13 +135,15 @@ in the current scope.
 
 ## Validation evidence
 
-The current workspace passes:
+Recorded passing checks include:
 
 ```text
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 cargo check --locked --workspace --all-targets --target x86_64-pc-windows-gnu
+cargo check --locked --workspace --all-targets --target x86_64-unknown-freebsd
+cargo build --locked -p pathchord-cli --target x86_64-unknown-freebsd
 cargo audit
 git diff --check
 ```
@@ -145,3 +154,15 @@ fakes, route rollback, TUN packet flows, Web REST/SSE, persistence, reload,
 subscription normalization, and fault/retransmission cases. `cargo audit`
 currently reports no advisories; the dependency graph excludes the previously
 unmaintained `paste` path from the TUN adapter feature set.
+
+The Linux workspace run passes 365 tests. The portable explicit-listener
+integration test binds listeners for the actual host platform and checks HTTP
+CONNECT, SOCKS5 CONNECT, SOCKS5 UDP ASSOCIATE, TCP half-close, and cancellation
+with an open UDP control connection.
+
+The FreeBSD target check and CLI build use Zig 0.17.1 C/C++ compiler and archiver
+wrappers with the official FreeBSD 15.1 SDK, including the bundled SQLite and
+crypto dependencies. The resulting x86_64 ELF uses `/libexec/ld-elf.so.1` and
+links against `libthr.so.3` and `libc.so.7`. This validates target compilation
+and linking; it does not execute FreeBSD tests. Native FreeBSD validation
+remains pending a host run.

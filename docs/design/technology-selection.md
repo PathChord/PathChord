@@ -9,7 +9,7 @@ This document defines the selected technologies and implementation boundaries. P
 | Area | Selection | Reason |
 |---|---|---|
 | Language | Rust | Strong control over buffers, concurrency, platform integration, and long-lived networking services |
-| Async runtime | Tokio | Mature async I/O, timers, cancellation, task supervision, and Windows/Linux support |
+| Async runtime | Tokio | Mature async I/O, timers, cancellation, task supervision, and Linux/Windows/FreeBSD support |
 | Cryptography | `Noise_IK_25519_ChaChaPoly_SHA256` through Clatter, with zeroizing key/cipher containers and an Orion SHA-256/HMAC adapter | Direct Noise pattern support, independent handshake state per Path, explicit-nonce transport, and enforceable secret-state cleanup |
 | Symmetric primitives | ChaCha20-Poly1305 through the Noise implementation | Matches the selected Noise pattern |
 | Serialization | `serde` for configuration and management API models | Shared typed models without coupling the wire protocol to a text format |
@@ -42,15 +42,15 @@ pathchord-ingress    local listeners, transparent interception, process metadata
 pathchord-cli        local management API client and operational commands
 ```
 
-`pathchord-core` must not depend on Linux, Windows, subscription formats, or listener implementations. Platform adapters communicate through narrow traits for byte transport, local sockets, target dialing, and process metadata.
+`pathchord-core` must not depend on Linux, Windows, FreeBSD, subscription formats, or listener implementations. Platform adapters communicate through narrow traits for byte transport, local sockets, target dialing, and process metadata.
 
 ## Ingress control plane and observability
 
 Ingress owns a typed command/query service for mutable node metadata,
 subscriptions, runtime snapshots, connection views, and structured events. The
-authoritative local adapter remains a Unix domain socket on Linux or a Named
-Pipe on Windows, using the versioned length-delimited JSON envelope selected by
-the protocol design.
+authoritative local adapter is a Unix domain socket on Linux and FreeBSD or a
+Named Pipe on Windows, using the versioned length-delimited JSON envelope
+selected by the protocol design.
 
 An optional Web Gateway calls the same service. It is disabled by default and
 is not reachable through Transit or data Paths. The selected built-in browser
@@ -109,7 +109,9 @@ SQLite transactions are used for Egress authorization changes. The running Egres
 
 ## Platform architecture
 
-Linux integrates TPROXY, REDIRECT, process metadata, and transparent routing through platform adapters. Windows uses Wintun and system-proxy integration selected through the control plane. TUN adapters expose bounded IP packets only; one single-owner `smoltcp` reactor owns `Interface`, `SocketSet`, TCP listeners, UDP sockets, timers, and flow lifecycle and connects accepted flows through the same Ingress openers as ordinary listeners. Both platforms reuse the core and policy crates.
+Linux, Windows, and FreeBSD share the HTTP CONNECT and SOCKS5 CONNECT/UDP ASSOCIATE adapters. FreeBSD uses Unix local control and MUST NOT expose TPROXY, REDIRECT, or TUN listeners in the v1 platform contract. System-proxy mutations are Windows-only; Linux and FreeBSD report unsupported activation. Process metadata that a platform cannot safely obtain remains unknown.
+
+Linux integrates TPROXY, REDIRECT, process metadata, and transparent routing through platform adapters. Windows uses Wintun and system-proxy integration selected through the control plane. TUN adapters expose bounded IP packets only; one single-owner `smoltcp` reactor owns `Interface`, `SocketSet`, TCP listeners, UDP sockets, timers, and flow lifecycle and connects accepted flows through the same Ingress openers as ordinary listeners. All three platforms reuse the core and policy crates.
 
 One Ingress platform-runtime module owns startup and shutdown across ordinary
 listeners, transparent listeners, policy routing, UDP adapters, and TUN

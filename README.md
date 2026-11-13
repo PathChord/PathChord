@@ -16,10 +16,11 @@ Proxies, and route TCP/UDP flows through authenticated Session/Path runtimes.
 Egress exposes the authenticated Path listener and authorization control plane;
 the optional REST/SSE Web Gateway is shared by both control planes.
 
-Current work prioritizes HTTP CONNECT and SOCKS5 on Linux and Windows, with
-FreeBSD under assessment for the same explicit listeners and Unix local
-control. FreeBSD has no recorded target build or native host validation.
-Transparent interception and TUN work follow this listener baseline. See the
+Current work prioritizes HTTP CONNECT and SOCKS5 on Linux, Windows, and
+FreeBSD. FreeBSD has explicit-listener platform validation and Unix local
+control. Target compilation and CLI linking pass; native host validation
+remains outstanding. Portable listener regressions run in the existing Rust CI
+job. Transparent interception and TUN work follow this listener baseline. See the
 [implementation plan](docs/progress/implementation-plan.md) for platform
 validation, shared runtime gaps, and subsequent adapter work.
 

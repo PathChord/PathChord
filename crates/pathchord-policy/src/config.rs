@@ -818,6 +818,7 @@ impl KubeConfig {
                             ),
                         });
                     }
+                    validate_listener_kind_for_platform(&value, std::env::consts::OS)?;
                     let bind = match value.spec.bind.as_ref() {
                         Some(bind) => {
                             Some(parse_bind(bind).map_err(|reason| ConfigError::InvalidSpec {
@@ -1524,13 +1525,17 @@ fn validate_traffic_policy_spec(value: &Resource<TrafficPolicySpec>) -> Result<(
 fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigError> {
     let kind = value.kind.as_str();
     let name = value.metadata.name.as_str();
-    if !matches!(value.spec.platform.as_str(), "any" | "linux" | "windows") {
+    if !matches!(
+        value.spec.platform.as_str(),
+        "any" | "linux" | "windows" | "freebsd"
+    ) {
         return Err(invalid_spec(
             kind,
             name,
-            "platform must be any, linux, or windows",
+            "platform must be any, linux, windows, or freebsd",
         ));
     }
+    validate_listener_kind_for_platform(value, &value.spec.platform)?;
     match value.spec.kind {
         ListenerKind::Tun => {
             if value.spec.interface.as_deref().is_none_or(str::is_empty)
@@ -1617,6 +1622,22 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
             kind,
             name,
             "processMetadata must request executable, user, or group",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_listener_kind_for_platform(
+    value: &Resource<ListenerSpec>,
+    platform: &str,
+) -> Result<(), ConfigError> {
+    if platform == "freebsd"
+        && !matches!(value.spec.kind, ListenerKind::Http | ListenerKind::Socks5)
+    {
+        return Err(invalid_spec(
+            &value.kind,
+            &value.metadata.name,
+            "freebsd listeners support http and socks5 only",
         ));
     }
     Ok(())
@@ -2265,6 +2286,146 @@ spec:
         assert!(error.contains("empty match"));
     }
 
+    fn platform_listener_yaml(kind: &str, platform: &str, fields: &str) -> String {
+        format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: Listener\nmetadata:\n  name: platform-listener\nspec:\n  type: {kind}\n  platform: {platform}\n{fields}"
+        )
+    }
+
+    #[test]
+    fn accepts_freebsd_http_and_socks5_listener_specs() {
+        for (kind, protocols) in [("http", "[tcp]"), ("socks5", "[tcp, udp]")] {
+            let input = platform_listener_yaml(
+                kind,
+                "freebsd",
+                &format!("  bind: 127.0.0.1:1080\n  protocols: {protocols}\n"),
+            );
+            let config = KubeConfig::from_yaml(&input).expect("FreeBSD listener spec");
+            let listener = config
+                .resources
+                .iter()
+                .find_map(|resource| match resource {
+                    KubeResource::Listener(value) if value.metadata.name == "platform-listener" => {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .expect("FreeBSD listener resource");
+            assert_eq!(listener.spec.platform, "freebsd");
+            assert_eq!(
+                listener.spec.kind,
+                if kind == "http" {
+                    ListenerKind::Http
+                } else {
+                    ListenerKind::Socks5
+                }
+            );
+            if cfg!(target_os = "freebsd") {
+                let policy = config.into_policy_config().expect("native FreeBSD policy");
+                let listener = policy
+                    .listeners
+                    .iter()
+                    .find(|listener| listener.id.as_str() == "platform-listener")
+                    .expect("FreeBSD listener");
+                assert_eq!(listener.platform, "freebsd");
+                assert_eq!(
+                    listener.protocols.contains(&FlowProtocol::Udp),
+                    kind == "socks5"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_freebsd_transparent_and_tun_listener_specs() {
+        for (kind, fields) in [
+            (
+                "tproxy",
+                "  bind: 127.0.0.1:15000\n  mark: 1\n  routeTable: 100\n",
+            ),
+            ("redirect", "  bind: 127.0.0.1:15000\n"),
+            ("tun", "  interface: PathChord\n  address: 198.18.0.1/30\n"),
+        ] {
+            let input = platform_listener_yaml(kind, "freebsd", fields);
+            let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("freebsd listeners support http and socks5 only"),
+                "{kind}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_foreign_listener_platform_when_building_policy() {
+        for platform in ["linux", "windows", "freebsd"] {
+            if platform == std::env::consts::OS {
+                continue;
+            }
+            let input = platform_listener_yaml("http", platform, "  bind: 127.0.0.1:1080\n");
+            let error = KubeConfig::from_yaml(&input)
+                .expect("recognized listener platform")
+                .into_policy_config()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!(
+                    "listener platform {platform} is not supported by this build"
+                )),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_any_http_and_socks5_listeners_on_native_platform() {
+        for (kind, protocols) in [("http", "[tcp]"), ("socks5", "[tcp, udp]")] {
+            let input = platform_listener_yaml(
+                kind,
+                "any",
+                &format!("  bind: 127.0.0.1:1080\n  protocols: {protocols}\n"),
+            );
+            let policy = KubeConfig::from_yaml(&input)
+                .expect("portable listener spec")
+                .into_policy_config()
+                .expect("native listener policy");
+            let listener = policy
+                .listeners
+                .iter()
+                .find(|listener| listener.id.as_str() == "platform-listener")
+                .expect("portable listener");
+            assert_eq!(listener.platform, "any");
+            assert_eq!(
+                listener.protocols.contains(&FlowProtocol::Udp),
+                kind == "socks5"
+            );
+        }
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn rejects_any_transparent_and_tun_listeners_on_freebsd() {
+        for (kind, fields) in [
+            (
+                "tproxy",
+                "  bind: 127.0.0.1:15000\n  mark: 1\n  routeTable: 100\n",
+            ),
+            ("redirect", "  bind: 127.0.0.1:15000\n"),
+            ("tun", "  interface: PathChord\n  address: 198.18.0.1/30\n"),
+        ] {
+            let input = platform_listener_yaml(kind, "any", fields);
+            let error = KubeConfig::from_yaml(&input)
+                .expect("platform-neutral listener spec")
+                .into_policy_config()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("freebsd listeners support http and socks5 only"),
+                "{kind}: {error}"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "freebsd"))]
     #[test]
     fn accepts_tun_listener_without_bind() {
         let input = format!(

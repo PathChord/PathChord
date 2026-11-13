@@ -19,7 +19,7 @@ Unix socket / named pipe ----------+             +--> atomic snapshots
                                                  +--> metrics registry
 ```
 
-必需的特权本地适配器在 Linux 上是 Unix domain socket，在 Windows 上是 Named Pipe。操作系统
+必需的特权本地适配器在 Linux 和 FreeBSD 上是 Unix domain socket，在 Windows 上是 Named Pipe。操作系统
 所有者/ACL 是第一道授权边界。可选 Web Gateway 默认关闭，必须与数据 Path 分离，不能通过
 Transit Proxy 或 Egress 数据 Path 访问。非 loopback 绑定还必须显式配置受保护通道、强身份
 认证、来源允许列表、限流、脱敏和管理员可见的审计记录。
@@ -216,7 +216,7 @@ schema 中相同的边界；`cache` 可以为 null。列表读模型返回这些
 
 系统代理开关是控制面运行时 mutation，不是 YAML 资源。`system_proxy.enable` 必须包含 `listener_id`，
 且该 ID 必须引用 HTTP 或 SOCKS Listener。Windows 将其应用到环境变量和操作系统代理配置；
-`system_proxy.disable` 恢复之前的值。Linux 对启用和关闭都返回 `UNSUPPORTED_OPERATION`，并继续通过
+`system_proxy.disable` 恢复之前的值。Linux 和 FreeBSD 对启用和关闭都返回 `UNSUPPORTED_OPERATION`，并继续通过
 `nodes` 和 status 展示普通 Listener。
 
 ```text
@@ -227,7 +227,7 @@ POST /api/v1/system-proxy/disable
 ```
 
 响应和 `system_proxy.changed` 事件包含 `enabled`、当前 `listener_id`（如有）、平台效果以及恢复/错误状态。
-在 Linux 上，GET 返回 `enabled: false` 和 `platform_effect: unsupported`。
+在 Linux 和 FreeBSD 上，GET 返回 `enabled: false` 和 `platform_effect: unsupported`。
 
 变更成功响应使用以下结构：
 

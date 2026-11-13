@@ -20,8 +20,8 @@ Unix socket / named pipe ----------+             +--> atomic snapshots
                                                  +--> metrics registry
 ```
 
-The required privileged local adapter is a Unix domain socket on Linux and a
-Named Pipe on Windows. The operating-system owner/ACL is the first
+The required privileged local adapter is a Unix domain socket on Linux and
+FreeBSD and a Named Pipe on Windows. The operating-system owner/ACL is the first
 authorization boundary. The optional Web Gateway is a separate process/task
 boundary, disabled by default, and MUST NOT be reachable through a Transit
 Proxy or Egress data Path. A non-loopback bind additionally requires explicit
@@ -240,8 +240,8 @@ The system-proxy switch is a runtime control-plane mutation, not a YAML
 resource. `system_proxy.enable` MUST include `listener_id`, which MUST resolve
 to an HTTP or SOCKS Listener. Windows applies that listener to environment and
 operating-system proxy settings; `system_proxy.disable` restores the previous
-values. Linux returns `UNSUPPORTED_OPERATION` for both activation and disable
-and continues to expose ordinary listeners through `nodes` and status.
+values. Linux and FreeBSD return `UNSUPPORTED_OPERATION` for both activation
+and disable and continue to expose ordinary listeners through `nodes` and status.
 
 ```text
 GET  /api/v1/system-proxy
@@ -252,7 +252,7 @@ POST /api/v1/system-proxy/disable
 
 The response and `system_proxy.changed` event include `enabled`, the selected
 `listener_id` when present, platform effect, and restoration/error state. On
-Linux, `GET` returns `enabled: false` with `platform_effect: unsupported`.
+Linux and FreeBSD, `GET` returns `enabled: false` with `platform_effect: unsupported`.
 
 Mutation success responses use this shape:
 

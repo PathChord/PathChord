@@ -27,9 +27,11 @@ smoltcp.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "macros", "time"] }
-tun-rs.workspace = true
 url.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(not(target_os = "freebsd"))'.dependencies]
+tun-rs.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 interprocess.workspace = true

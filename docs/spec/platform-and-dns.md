@@ -6,22 +6,25 @@ This document defines the platform-specific `Listener` and `DNSPolicy` object
 contracts referenced by the [configuration schema](configuration-schema.md).
 Each object uses `apiVersion: pathchord.io/v1`, `kind`, `metadata.name`, and
 `spec`; runtime health is a read-only `status` field.
-Platform adapters expose the same policy context and failure classes on Linux
-and Windows; they do not change the PathChord Session or wire protocol.
+Platform adapters expose the same policy context and failure classes on Linux,
+Windows, and FreeBSD; they do not change the PathChord Session or wire protocol.
 
 ## Platform matrix
 
-| Listener type | Linux | Windows | Address semantics |
-|---|---|---|---|
-| `http` | MUST | MUST | explicit HTTP host or address |
-| `socks5` | MUST | MUST | explicit SOCKS5 host or address |
-| `tproxy` | MUST | MUST NOT | transparent TCP/UDP IP flow |
-| `redirect` | MUST | MUST NOT | transparent TCP flow |
-| `tun` | MAY | MUST | IP packets through a TUN adapter |
+| Listener type | Linux | Windows | FreeBSD | Address semantics |
+|---|---|---|---|---|
+| `http` | MUST | MUST | MUST | explicit HTTP host or address |
+| `socks5` | MUST | MUST | MUST | explicit SOCKS5 host or address |
+| `tproxy` | MUST | MUST NOT | MUST NOT | transparent TCP/UDP IP flow |
+| `redirect` | MUST | MUST NOT | MUST NOT | transparent TCP flow |
+| `tun` | MAY | MUST | MUST NOT | IP packets through a TUN adapter |
 
 An unsupported type/platform combination is a configuration error. A platform
 adapter MUST report an unavailable listener as a typed local failure and MUST
-not silently replace it with another listener type.
+NOT silently replace it with another listener type.
+The HTTP/SOCKS requirements include HTTP CONNECT, SOCKS5 CONNECT, and SOCKS5
+UDP ASSOCIATE on all three platforms. FreeBSD v1 supports only the explicit
+`http` and `socks5` listener types.
 
 ## Common listener schema
 
@@ -48,7 +51,9 @@ spec:
 ```
 
 `metadata.name` is the unique configuration identity. `spec.type` is one of the matrix values and
-`spec.platform` is `linux`, `windows`, or `any` (default `any`). `spec.bind` is a socket
+`spec.platform` is `linux`, `windows`, `freebsd`, or `any` (default `any`). An
+explicit platform MUST match the actual host. `any` selects the actual host's
+matrix column; it MUST NOT bypass type/platform validation. `spec.bind` is a socket
 address and is required for `http`, `socks5`, `tproxy`, and `redirect`; it is
 forbidden for `tun`. System-proxy integration is controlled at runtime by the
 Windows-only control-plane switch and does not add a Listener type. `spec.allowedSources` is a list of at most
@@ -65,7 +70,8 @@ boolean `executable`, `user`, and `group` fields; an empty object is invalid.
 The selected platform provider may return only the requested facts. Missing,
 permission-denied, or unsupported process data is unknown and never implicitly
 matches a process rule. Process discovery is bounded, read-only, and never
-executes a shell command.
+executes a shell command. FreeBSD listeners use the same unknown-value semantics
+when native process discovery is unavailable.
 
 The following is a `spec.authentication` fragment; it is not a standalone
 resource object. `spec.authentication` is either the scalar `disabled` or a mapping:
@@ -193,7 +199,8 @@ POST /api/v1/system-proxy/enable
 {"listener_id":"local-http"}
 ```
 
-The control plane MUST reject the operation on Linux, and MUST reject a missing,
+The control plane MUST reject enable and disable on Linux and FreeBSD with
+`UNSUPPORTED_OPERATION`, and MUST reject a missing,
 unknown, TUN, TPROXY, REDIRECT, or otherwise incompatible listener reference on
 Windows. When disabled, no environment or operating-system proxy setting is
 changed. Windows MUST apply the referenced
@@ -213,9 +220,11 @@ is reported as a typed platform failure and is rolled back.
 The Windows local-control Named Pipe MUST reject remote clients. Its DACL MUST
 grant full access only to the creating object owner, local Administrators, and
 SYSTEM; it MUST NOT rely on the permissive default Named Pipe descriptor.
-Linux operators MUST use ordinary listener resources and control-plane queries
-to inspect available listeners; Linux MUST NOT expose a system-proxy activation
-state.
+Linux and FreeBSD operators MUST use ordinary listener resources and control-plane
+queries to inspect available listeners. Their `system_proxy.get` response MUST
+report `enabled: false` and `platform_effect: unsupported`; both platforms
+MUST NOT expose a system-proxy activation state. Local control uses a Unix
+domain socket on Linux and FreeBSD.
 
 ```yaml
 apiVersion: pathchord.io/v1

@@ -66,8 +66,9 @@ Counters are monotonic for one process where their names imply monotonicity;
 gauges may move in either direction. `snapshot_generation` and
 `observed_generation` identify the same observation snapshot in this response.
 `system_proxy.platform_effect` is `disabled`, `applied`, or `unsupported`;
-Linux MUST report `unsupported` for activation because system-proxy control is
-Windows-only.
+Linux and FreeBSD MUST report `enabled: false` and `platform_effect: unsupported`
+in system-proxy state queries because activation is Windows-only. Their enable
+and disable operations return `UNSUPPORTED_OPERATION`.
 
 Structured drill-down resources are:
 

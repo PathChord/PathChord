@@ -207,11 +207,13 @@ ordered effective Egress rules
 
 ## Listeners
 
-The complete listener schema, including mandatory HTTP/SOCKS support on both
-platforms, Linux transparent modes and optional TUN, Windows TUN and the
-control-plane system-proxy switch, authentication references, source restrictions,
-and loop prevention is defined in
+The complete listener schema, including mandatory HTTP CONNECT and SOCKS5
+CONNECT/UDP ASSOCIATE support on Linux, Windows, and FreeBSD, Linux transparent
+modes and optional TUN, Windows TUN and the control-plane system-proxy switch,
+authentication references, source restrictions, and loop prevention is defined in
 [the platform and DNS specification](platform-and-dns.md).
+`spec.platform` accepts `linux`, `windows`, `freebsd`, and `any`; `any` uses the
+actual host's platform matrix. FreeBSD rejects `tproxy`, `redirect`, and `tun`.
 
 ```yaml
 apiVersion: pathchord.io/v1

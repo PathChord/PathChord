@@ -4,7 +4,7 @@
 
 ## 1. Scope
 
-PathChord supports Linux and Windows. Both platforms MUST support HTTP/SOCKS listeners. Linux supports TPROXY and REDIRECT and MAY support TUN; Windows supports TUN and system-proxy integration through a control-plane listener selection. Both platforms share the policy, node, Noise, Session, and multipath cores.
+PathChord supports Linux, Windows, and FreeBSD. All three platforms MUST support HTTP CONNECT, SOCKS5 CONNECT, and SOCKS5 UDP ASSOCIATE listeners. Linux supports TPROXY and REDIRECT and MAY support TUN; Windows supports TUN and system-proxy integration through a control-plane listener selection. FreeBSD MUST NOT expose TPROXY, REDIRECT, or TUN listeners in the v1 platform contract. All three platforms share the policy, node, Noise, Session, and multipath cores.
 
 The system supports TCP, UDP, and independent DNS. Fake-IP, general ICMP forwarding, multicast proxying, and arbitrary IP tunneling are outside the protocol scope.
 
@@ -109,7 +109,7 @@ Local overrides take precedence over subscription annotations. Hard states such 
 
 Multiple HTTP/SOCKS listeners have unique IDs and participate in policy evaluation. Listener authentication and source-network restrictions are independent of Ingress-to-Egress Noise authentication.
 
-Windows system-proxy integration is a control-plane switch that selects one HTTP/SOCKS listener by ID. Linux does not expose a system-proxy activation mode; its listeners remain inspectable through the control plane.
+Windows system-proxy integration is a control-plane switch that selects one HTTP/SOCKS listener by ID. Linux and FreeBSD do not expose a system-proxy activation mode; their listeners and unsupported system-proxy status remain inspectable through the control plane. Local control uses Unix sockets on Linux and FreeBSD and a Named Pipe on Windows.
 
 Transparent entry does not perform domain routing. HTTP/SOCKS requests may route by domain because they carry the domain explicitly. DNS is independent and selects where a query is resolved: local, through a Transit Proxy, through the selected Egress, or blocked. No Fake-IP mapping is used.
 

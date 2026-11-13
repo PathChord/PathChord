@@ -110,10 +110,16 @@ pub trait TunPacketDeviceFactory: std::fmt::Debug + Send + Sync {
 pub struct TunRsPacketDeviceFactory;
 
 impl TunPacketDeviceFactory for TunRsPacketDeviceFactory {
+    #[cfg(not(target_os = "freebsd"))]
     fn create(&self, config: &TunDeviceConfig) -> Result<Arc<dyn PacketDevice>, String> {
         crate::TunRsPacketDevice::create(config)
             .map(|device| Arc::new(device) as Arc<dyn PacketDevice>)
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(target_os = "freebsd")]
+    fn create(&self, _config: &TunDeviceConfig) -> Result<Arc<dyn PacketDevice>, String> {
+        Err("TUN listeners are unsupported on FreeBSD".to_owned())
     }
 }
 
@@ -872,6 +878,10 @@ fn validate_listener_platforms(listeners: &[ListenerConfig]) -> Result<(), Ingre
         ) {
             return Err(unsupported(listener));
         }
+        #[cfg(target_os = "freebsd")]
+        if listener.kind == PolicyListenerKind::Tun {
+            return Err(unsupported(listener));
+        }
     }
     Ok(())
 }
@@ -1429,5 +1439,34 @@ mod tests {
             result,
             Err(IngressPlatformError::UnsupportedPlatform { .. })
         ));
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[tokio::test]
+    async fn rejects_transparent_and_tun_listeners_before_resource_creation() {
+        for kind in [
+            PolicyListenerKind::Tproxy,
+            PolicyListenerKind::Redirect,
+            PolicyListenerKind::Tun,
+        ] {
+            let path = data_dir();
+            let result = IngressPlatformRuntime::bind_with_factories(
+                IngressPlatformConfig::new(&path),
+                &[listener("unsupported", kind)],
+                tcp_opener(),
+                Arc::new(RejectUdpOpener),
+                ProtectedEndpointSet::default(),
+                IngressPlatformFactories::default(),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(IngressPlatformError::UnsupportedPlatform { .. })
+            ));
+            assert!(
+                !path.exists(),
+                "rejection must not create platform resources"
+            );
+        }
     }
 }

@@ -9,7 +9,7 @@
 | 领域 | 选择 | 原因 |
 |---|---|---|
 | 语言 | Rust | 对缓冲区、并发、平台集成和长时间运行的网络服务具有较强控制力 |
-| 异步运行时 | Tokio | 异步 I/O、定时器、取消、任务监管以及 Windows/Linux 支持成熟 |
+| 异步运行时 | Tokio | 异步 I/O、定时器、取消、任务监管以及 Linux/Windows/FreeBSD 支持成熟 |
 | 密码学 | 通过 Clatter 使用 `Noise_IK_25519_ChaChaPoly_SHA256`，配合可清零 key/cipher 容器和 Orion SHA-256/HMAC adapter | 直接支持 Noise 模式、为每个 Path 提供独立握手状态、显式 nonce 传输，并可强制清理密钥状态 |
 | 对称密码原语 | 通过 Noise 实现使用 ChaCha20-Poly1305 | 与选定的 Noise 模式匹配 |
 | 序列化 | 配置和管理 API 模型使用 `serde` | 共享强类型模型，同时不将线协议耦合到文本格式 |
@@ -42,11 +42,11 @@ pathchord-ingress    local listeners, transparent interception, process metadata
 pathchord-cli        local management API client and operational commands
 ```
 
-`pathchord-core` 不得依赖 Linux、Windows、订阅格式或监听器实现。平台适配器通过面向字节传输、本地套接字、目标拨号和进程元数据的窄 trait 进行通信。
+`pathchord-core` 不得依赖 Linux、Windows、FreeBSD、订阅格式或监听器实现。平台适配器通过面向字节传输、本地套接字、目标拨号和进程元数据的窄 trait 进行通信。
 
 ## Ingress 控制面和可观测性
 
-Ingress 拥有一个类型化 command/query service，用于节点元数据、订阅、运行时快照、连接视图和结构化事件。权威本地适配器仍然是 Linux Unix domain socket 或 Windows Named Pipe，使用协议设计中选定的带版本长度分隔 JSON 封装。
+Ingress 拥有一个类型化 command/query service，用于节点元数据、订阅、运行时快照、连接视图和结构化事件。权威本地适配器是 Linux 和 FreeBSD 上的 Unix domain socket，或 Windows 上的 Named Pipe，使用协议设计中选定的带版本长度分隔 JSON 封装。
 
 可选 Web Gateway 调用同一个 service，默认关闭，且不能通过 Transit 或数据 Path 访问。选定的内置浏览器适配器使用 REST 资源接口加 Server-Sent Events（SSE）：资源 URL 和 HTTP 状态语义适合 command/query，单向 SSE 更新适合 metric 和事件。也可以在同一个类型化 service 边界后提供 GraphQL 适配器，但必须承担额外的授权、查询成本、缓存和订阅复杂度。类型化 service 拥有内部状态模型，独立于浏览器 API 风格。内置控制台资源嵌入 Rust 二进制，生产环境不需要 Node.js runtime。
 
@@ -86,7 +86,9 @@ Egress 授权变更使用 SQLite 事务。运行中的 Egress 进程拥有数据
 
 ## 平台架构
 
-Linux 通过平台适配器集成 TPROXY、REDIRECT、进程元数据和透明路由。Windows 使用 Wintun，并通过控制面选择监听器来集成系统代理。TUN 适配器只暴露有界 IP 包；单一所有者的 `smoltcp` reactor 持有 `Interface`、`SocketSet`、TCP Listener、UDP socket、计时器和 flow 生命周期，并通过与普通 Listener 相同的 Ingress opener 连接已接受 flow。两个平台复用核心和策略 crate。
+Linux、Windows 和 FreeBSD 共享 HTTP CONNECT 和 SOCKS5 CONNECT/UDP ASSOCIATE adapter。FreeBSD 使用 Unix 本地控制，v1 平台契约禁止其暴露 TPROXY、REDIRECT 或 TUN 监听器。系统代理 mutation 仅限 Windows；Linux 和 FreeBSD 报告激活不受支持。平台无法安全获取的进程元数据保持 unknown。
+
+Linux 通过平台适配器集成 TPROXY、REDIRECT、进程元数据和透明路由。Windows 使用 Wintun，并通过控制面选择监听器来集成系统代理。TUN 适配器只暴露有界 IP 包；单一所有者的 `smoltcp` reactor 持有 `Interface`、`SocketSet`、TCP Listener、UDP socket、计时器和 flow 生命周期，并通过与普通 Listener 相同的 Ingress opener 连接已接受 flow。三个平台复用核心和策略 crate。
 
 一个 Ingress 平台运行时模块统一持有普通 Listener、透明 Listener、策略路由、UDP 适配器和 TUN
 reactor 的启动与关闭。启动时先验证所有 Listener，并以一个事务获取资源；任何失败都会回滚已持有路由并
