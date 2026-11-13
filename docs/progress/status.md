@@ -71,6 +71,13 @@ separate from `docs/design/`, which describes the intended architecture, and
   owners for one `STREAM_OPEN` exchange. They run over the record adapter,
   invoke the injected Egress opener, and are covered by a cross-crate
   FakeEgress integration test.
+- The local dispatcher now exposes typed read models for nodes, sessions,
+  connections, subscriptions, metrics, and events, and `listeners.list`
+  validates bounded pagination/filter/sort queries. Supplied configuration
+  generation preconditions are checked for system-proxy mutations.
+- The Windows control transport now has a Tokio Named Pipe implementation and
+  the Windows target compiles; Windows ACL hardening and real system-proxy OS
+  side effects still require Windows-host validation.
 - The local listener list query now validates pagination/filter/sort fields,
   returns deterministic pages, and system-proxy mutations honor supplied
   configuration generation preconditions.

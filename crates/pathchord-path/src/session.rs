@@ -84,35 +84,33 @@ where
             .send_frame(frame)
             .await
             .map_err(|error| PathSessionError::Transport(error.to_string()))?;
-        loop {
-            let Some(frame) = self
-                .transport
-                .receive_frame()
-                .await
-                .map_err(|error| PathSessionError::Transport(error.to_string()))?
-            else {
-                return Err(PathSessionError::Transport("Path transport closed".into()));
-            };
-            self.validate_identity(&frame)?;
-            let message = Message::decode(
-                frame.header().frame_type(),
-                frame.payload(),
-                self.config.limits,
-            )?;
-            match message {
-                Message::StreamOpenOk(value) if value.stream_id == request.stream_id => {
-                    return Ok(StreamOpenDecision::Opened {
-                        metadata: value.result_metadata,
-                    });
-                }
-                Message::StreamOpenErr(value) if value.stream_id == request.stream_id => {
-                    return Ok(StreamOpenDecision::Rejected {
-                        error: value.error,
-                        reason: value.reason,
-                    });
-                }
-                _ => return Err(PathSessionError::UnexpectedMessage),
+        let Some(frame) = self
+            .transport
+            .receive_frame()
+            .await
+            .map_err(|error| PathSessionError::Transport(error.to_string()))?
+        else {
+            return Err(PathSessionError::Transport("Path transport closed".into()));
+        };
+        self.validate_identity(&frame)?;
+        let message = Message::decode(
+            frame.header().frame_type(),
+            frame.payload(),
+            self.config.limits,
+        )?;
+        match message {
+            Message::StreamOpenOk(value) if value.stream_id == request.stream_id => {
+                Ok(StreamOpenDecision::Opened {
+                    metadata: value.result_metadata,
+                })
             }
+            Message::StreamOpenErr(value) if value.stream_id == request.stream_id => {
+                Ok(StreamOpenDecision::Rejected {
+                    error: value.error,
+                    reason: value.reason,
+                })
+            }
+            _ => Err(PathSessionError::UnexpectedMessage),
         }
     }
 
