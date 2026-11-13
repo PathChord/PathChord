@@ -10,6 +10,13 @@ use async_trait::async_trait;
 use pathchord_core::PathFrame;
 use thiserror::Error;
 
+mod single_path;
+
+pub use single_path::{
+    AuthorizationState, PathAuthorization, SinglePathError, SinglePathHandshakeConfig,
+    SinglePathOutcome, SinglePathReady, establish_single_path,
+};
+
 /// An asynchronous transport whose smallest delivery unit is one complete
 /// PathChord frame.
 ///
