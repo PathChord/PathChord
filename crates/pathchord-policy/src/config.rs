@@ -334,7 +334,8 @@ pub struct ListenerSpec {
     kind: ListenerKind,
     #[serde(default = "default_platform")]
     platform: String,
-    bind: BindSpec,
+    #[serde(default)]
+    bind: Option<BindSpec>,
     #[serde(default)]
     allowed_sources: Vec<String>,
     #[serde(default = "default_authentication_value")]
@@ -773,13 +774,16 @@ impl KubeConfig {
                             ),
                         });
                     }
-                    let bind = parse_bind(&value.spec.bind).map_err(|reason| {
-                        ConfigError::InvalidSpec {
-                            kind: value.kind.clone(),
-                            name: value.metadata.name.clone(),
-                            reason,
+                    let bind = match value.spec.bind.as_ref() {
+                        Some(bind) => {
+                            Some(parse_bind(bind).map_err(|reason| ConfigError::InvalidSpec {
+                                kind: value.kind.clone(),
+                                name: value.metadata.name.clone(),
+                                reason,
+                            })?)
                         }
-                    })?;
+                        None => None,
+                    };
                     let authentication = match value.spec.authentication {
                         AuthenticationValue::Mode(mode) => mode,
                         AuthenticationValue::Object(auth) => {
@@ -1280,6 +1284,21 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
             "platform must be any, linux, or windows",
         ));
     }
+    let bind_required = !matches!(value.spec.kind, ListenerKind::Tun);
+    if bind_required && value.spec.bind.is_none() {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "bind is required for this listener type",
+        ));
+    }
+    if !bind_required && value.spec.bind.is_some() {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "bind is forbidden for tun listeners",
+        ));
+    }
     if value.spec.allowed_sources.len() > MAX_MAP_ENTRIES {
         return Err(invalid_spec(
             kind,
@@ -1506,7 +1525,7 @@ items:
         assert_eq!(policy.egresses[0].id.as_str(), "jp-1");
         assert_eq!(policy.fallback, Some(FallbackAction::Reject));
         assert_eq!(policy.listeners[0].id.as_str(), "local-http");
-        assert_eq!(policy.listeners[0].bind.port, 8080);
+        assert_eq!(policy.listeners[0].bind.as_ref().expect("bind").port, 8080);
         assert_eq!(
             policy.listeners[0].authentication,
             AuthenticationMode::Required
@@ -1605,6 +1624,49 @@ spec:
         );
         let error = KubeConfig::from_yaml(&empty_match).unwrap_err().to_string();
         assert!(error.contains("empty match"));
+    }
+
+    #[test]
+    fn accepts_tun_listener_without_bind() {
+        let input = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: Listener\nmetadata:\n  name: test-tun\nspec:\n  type: tun\n  platform: any\n  interface: PathChord\n  address: 198.18.0.1/30\n  mtu: 1500\n  protocols: [tcp, udp]\n"
+        );
+        let config = KubeConfig::from_yaml(&input).expect("TUN config");
+        let policy = config.into_policy_config().expect("policy conversion");
+        let tun = policy
+            .listeners
+            .iter()
+            .find(|listener| listener.id.as_str() == "test-tun")
+            .expect("TUN listener");
+        assert_eq!(tun.kind, ListenerKind::Tun);
+        assert_eq!(tun.bind, None);
+    }
+
+    #[test]
+    fn rejects_tun_listener_with_bind() {
+        let input = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: Listener\nmetadata:\n  name: test-tun\nspec:\n  type: tun\n  platform: any\n  bind: 127.0.0.1:15000\n  interface: PathChord\n  address: 198.18.0.1/30\n"
+        );
+        let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
+        assert!(error.contains("bind is forbidden"));
+    }
+
+    #[test]
+    fn rejects_proxy_listener_without_bind() {
+        let input = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: Listener\nmetadata:\n  name: missing-bind\nspec:\n  type: http\n  authentication: disabled\n"
+        );
+        let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
+        assert!(error.contains("bind is required"));
+    }
+
+    #[test]
+    fn rejects_non_tun_listener_without_bind() {
+        let input = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: Listener\nmetadata:\n  name: missing-bind\nspec:\n  type: http\n  platform: any\n"
+        );
+        let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
+        assert!(error.contains("bind is required"));
     }
 
     #[test]

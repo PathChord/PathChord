@@ -245,7 +245,9 @@ pub enum AuthenticationMode {
 pub struct ListenerConfig {
     pub id: ListenerId,
     pub kind: ListenerKind,
-    pub bind: Endpoint,
+    /// Socket bind for socket-based listeners; TUN listeners use their
+    /// interface/address fields in the source configuration instead.
+    pub bind: Option<Endpoint>,
     pub allowed_sources: Vec<String>,
     pub authentication: AuthenticationMode,
 }
@@ -392,7 +394,9 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         }
     }
     for listener in &config.listeners {
-        validate_port("listener", listener.id.as_str(), listener.bind.port)?;
+        if let Some(bind) = &listener.bind {
+            validate_port("listener", listener.id.as_str(), bind.port)?;
+        }
     }
     for policy in &config.traffic_policies {
         if let Some(class_bps) = policy.class_replication_budget_bps
