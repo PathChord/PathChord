@@ -10,6 +10,7 @@ publish.workspace = true
 atomic-write-file.workspace = true
 aes-gcm = "0.10.3"
 aes = "0.8.4"
+chacha20poly1305 = "0.10.1"
 async-trait.workspace = true
 base64.workspace = true
 getrandom.workspace = true
@@ -42,6 +43,7 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 zeroize.workspace = true
 url.workspace = true
 uuid = "1.29.2"
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 rcgen = "0.14.10"

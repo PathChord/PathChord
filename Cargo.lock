@@ -2515,6 +2515,7 @@ dependencies = [
  "base64",
  "blake2",
  "bytes",
+ "chacha20poly1305 0.10.1",
  "crc32fast",
  "futures-util",
  "getrandom 0.4.3",
@@ -2543,6 +2544,7 @@ dependencies = [
  "url",
  "uuid",
  "x25519-dalek",
+ "x509-parser",
  "zeroize",
 ]
 
@@ -3013,8 +3015,6 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",

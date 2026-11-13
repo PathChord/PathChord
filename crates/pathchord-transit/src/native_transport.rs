@@ -68,7 +68,11 @@ impl NativeTransport {
         }
         let tls = match tls_options.as_ref() {
             Some(options) => Some((
-                crate::tls::configure(base, Some(options), Some(credential))?,
+                if base.reality_callback.is_some() {
+                    Arc::clone(&base)
+                } else {
+                    crate::tls::configure(base, Some(options), Some(credential))?
+                },
                 crate::tls::server_name(&config.endpoint.host, Some(options))?,
             )),
             None => None,
@@ -178,8 +182,10 @@ impl NativeTransport {
                     tokio_rustls::TlsConnector::from(Arc::clone(tls))
                         .connect(name.clone(), stream)
                         .await
-                        .map_err(|_| {
-                            TransitError::Connection("native proxy TLS handshake failed".into())
+                        .map_err(|error| {
+                            TransitError::Connection(format!(
+                                "native proxy TLS handshake failed: {error}"
+                            ))
                         })?,
                 );
             }

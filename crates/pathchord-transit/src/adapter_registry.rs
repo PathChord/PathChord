@@ -178,6 +178,20 @@ where
                     self.connect_timeout,
                 )?)
             }
+            "vless"
+                if config
+                    .options
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.reality.is_some()) =>
+            {
+                Arc::new(crate::reality_adapter::RealityVlessAdapter::from_config(
+                    config,
+                    credential,
+                    self.connect_timeout,
+                    Arc::clone(&self.tls),
+                )?)
+            }
             "vless" | "trojan" => {
                 Arc::new(crate::native_protocol::NativeProtocolAdapter::from_config(
                     config,

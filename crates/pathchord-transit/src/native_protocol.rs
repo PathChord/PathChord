@@ -199,7 +199,7 @@ impl TransitAdapter for NativeProtocolAdapter {
     }
 }
 
-fn vless_request(
+pub(crate) fn vless_request(
     uuid: &[u8; 16],
     destination: &Endpoint,
     udp: bool,
@@ -250,11 +250,21 @@ fn trojan_address(destination: &Endpoint) -> trojan_proto::AddressRef<'_> {
     }
 }
 
-struct VlessResponseIo {
+pub(crate) struct VlessResponseIo {
     inner: BoxedTransitConnection,
     header: [u8; 2],
     filled: usize,
     addon_remaining: Option<usize>,
+}
+impl VlessResponseIo {
+    pub(crate) fn new(inner: BoxedTransitConnection) -> Self {
+        Self {
+            inner,
+            header: [0; 2],
+            filled: 0,
+            addon_remaining: None,
+        }
+    }
 }
 impl AsyncRead for VlessResponseIo {
     fn poll_read(
@@ -321,10 +331,20 @@ impl AsyncWrite for VlessResponseIo {
     }
 }
 
-struct NativeDatagram {
+pub(crate) struct NativeDatagram {
     stream: BoxedTransitConnection,
     destination: Endpoint,
     protocol: Protocol,
+}
+pub(crate) fn vless_datagram(
+    stream: BoxedTransitConnection,
+    destination: Endpoint,
+) -> BoxedTransitDatagram {
+    Box::new(NativeDatagram {
+        stream,
+        destination,
+        protocol: Protocol::Vless,
+    })
 }
 impl std::fmt::Debug for NativeDatagram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

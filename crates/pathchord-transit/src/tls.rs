@@ -11,7 +11,13 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme
 use crate::{TransitCredential, TransitError};
 
 pub(crate) fn client_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
-    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+    client_builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+}
+
+pub(crate) fn client_builder_with_provider(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+    ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("the selected AWS-LC provider supports the default TLS versions")
 }

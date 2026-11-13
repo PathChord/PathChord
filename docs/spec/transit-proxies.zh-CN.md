@@ -17,11 +17,12 @@
 | `ss` | 使用 AEAD 和 SS2022 算法的 TCP/UDP；旧 stream 算法会被拒绝 | 内置 `obfs-local`、`v2ray-plugin` wrapper 和支持的扩展选项 |
 | `socks4`、`socks4a` | 无原生出站适配器 | CONNECT |
 | `vless` | 带类型化 TLS/传输校验的 TCP、TLS、WebSocket 和 WSS 字节传输 | 扩展传输与 flow 选项 |
-| `vmess` | 使用 AES-128-GCM 正文记录、`alter_id: 0` 的明文 TCP | TLS、WebSocket、UDP、mux 及其他扩展选项 |
+| `vmess` | TCP、TLS、WebSocket/WSS、AES-128-GCM 或 ChaCha20-Poly1305 正文记录、单目标 UDP、`alter_id: 0` | mux、旧式非 AEAD 安全方式及其他不支持的扩展选项 |
 | `trojan` | TLS 封装的 TCP、WebSocket 和 WSS 字节传输 | 扩展传输选项 |
-| `anytls` | TLS 流、认证、settings、SYN/SYNACK、PUSH/FIN 和 heartbeat 帧 | 扩展 session 与 UDP 模式 |
-| `hysteria2` | 原生 QUIC/TLS + HTTP/3 认证、TCP/UDP relay 和 Salamander obfs；Gecko obfs/端口跳转暂不支持 | 对不支持的选项返回类型化不可用诊断 |
-| `tuic` | 原生 QUIC/TLS-exporter TCP CONNECT；UDP/0-RTT 暂不支持 | 对不支持的选项返回类型化不可用诊断 |
+| `anytls` | TLS 流、认证、settings、SYN/SYNACK、PUSH/FIN、heartbeat 帧及有界 UDP-over-TCP 数据报 | 原生帧契约之外的扩展 session 选项 |
+| `hysteria2` | 原生 QUIC/TLS + HTTP/3 认证、TCP/UDP relay、Salamander 或无混淆传输及有界 server-port 跳转 | Gecko 专用混淆和其他不支持的扩展选项 |
+| `tuic` | 原生 QUIC/TLS-exporter TCP CONNECT、UDP DATAGRAM relay、heartbeat 及可选的有重放风险 0-RTT | 不支持的拥塞控制器、UDP-over-stream 及其他扩展选项 |
+| `vless` + `tls.reality` | 使用 X25519 ClientHello proof 和证书 proof 校验的原生 VLESS over REALITY TLS | Vision flow 和不支持的外层传输 |
 | `xtls`、`hysteria`、`ssh`、`shadowtls` | 原生适配器实现中 | 注册原生适配器前返回类型化不可用诊断 |
 | `wireguard` | 无原生适配器 | 完整的用户态 WireGuard endpoint 文档 |
 | `snell` | 无原生适配器 | 类型化不可用诊断 |
@@ -31,8 +32,9 @@
 参数和未实现的协议必须产生类型化、脱敏诊断。TLS 或传输配置失败时不得回退为明文或 direct。
 
 原生 VLESS 和 Trojan 适配器会在打开 socket 前拒绝不支持的 flow、multiplex、packet 和传输
-选项。原生 VMess 当前支持明文 TCP/AES-128-GCM/`alter_id: 0`；其 TLS、WebSocket、UDP 和
-mux 变体在原生实现完成前不可用。表中的协议行本身不表示包含不支持参数的节点可选。
+选项。原生 VMess 只接受 AEAD 正文密码和 `alter_id: 0`；mux 仍不可用。REALITY 需要原生
+ClientHello proof callback，不能单独启用 Vision flow。表中的协议行本身不表示包含不支持参数的
+节点可选。
 
 ## 类型化连接选项
 
