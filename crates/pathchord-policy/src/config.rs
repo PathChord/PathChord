@@ -668,6 +668,7 @@ impl KubeConfig {
                         matches: value.spec.matches.unwrap_or_default().into(),
                         egress,
                         min_usable_paths: value.spec.requirements.min_usable_paths,
+                        required_capabilities: value.spec.requirements.capabilities,
                     });
                 }
                 KubeResource::TransitRule(value) => {

@@ -173,6 +173,7 @@ pub struct EgressRule {
     pub matches: FlowMatch,
     pub egress: EgressSelection,
     pub min_usable_paths: u32,
+    pub required_capabilities: BTreeSet<FlowProtocol>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,6 +586,7 @@ mod tests {
             matches: FlowMatch::default(),
             egress: EgressSelection::Id(EgressId::new("jp-1")),
             min_usable_paths: 0,
+            required_capabilities: BTreeSet::new(),
         });
 
         assert_eq!(
@@ -673,6 +675,7 @@ mod tests {
                 capabilities: BTreeSet::from([FlowProtocol::Udp]),
             }),
             min_usable_paths: 1,
+            required_capabilities: BTreeSet::new(),
         });
 
         assert!(ValidatedPolicySnapshot::new(Generation::new(1), config).is_ok());
