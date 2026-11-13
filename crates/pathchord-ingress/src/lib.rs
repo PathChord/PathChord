@@ -51,7 +51,9 @@ pub use local_protocol::{
     MAX_ENVELOPE_BYTES, RequestEnvelope, ResponseEnvelope, decode_object, encode_object,
     read_object, write_object,
 };
-pub use local_server::{LocalControlServer, LocalServerError};
+pub use local_server::{
+    DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS, LocalControlServer, LocalServerError,
+};
 pub use runtime::{
     DEFAULT_MAX_CONNECTIONS, ListenerRuntime, ListenerRuntimeConfig, ListenerRuntimeEvent,
     ListenerRuntimeEventSender, RuntimeError, RuntimeReport,

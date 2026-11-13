@@ -523,6 +523,12 @@ impl LocalControlDispatcher {
     }
 }
 
+impl Default for LocalControlDispatcher {
+    fn default() -> Self {
+        Self::new(crate::SystemProxyPlatform::Linux)
+    }
+}
+
 fn listener_value(descriptor: &ListenerDescriptor, generation: u64) -> Value {
     json!({
         "id": descriptor.id.as_str(),

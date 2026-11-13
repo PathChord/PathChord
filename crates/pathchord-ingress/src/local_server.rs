@@ -4,11 +4,13 @@
 //! authorization, and response shaping remain in [`LocalControlDispatcher`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 use thiserror::Error;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
     LocalControlDispatcher, LocalProtocolError, RequestEnvelope, ResponseEnvelope, read_object,
@@ -24,6 +26,8 @@ pub enum LocalServerError {
     #[error("local control protocol failed: {0}")]
     Protocol(#[from] LocalProtocolError),
 }
+
+pub const DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS: usize = 64;
 
 #[cfg(unix)]
 pub struct LocalControlServer {
@@ -91,6 +95,43 @@ impl LocalControlServer {
         }
     }
 
+    /// Serves multiple local control clients concurrently with a bounded
+    /// request budget. The dispatcher lock is held only while shaping one
+    /// response; socket reads and writes do not block other clients.
+    pub async fn run_concurrent(mut self, max_concurrent: usize) -> Result<(), LocalServerError> {
+        if max_concurrent == 0 {
+            return Err(LocalServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "max concurrent control requests must be greater than zero",
+            )));
+        }
+        let dispatcher = Arc::new(Mutex::new(std::mem::take(&mut self.dispatcher)));
+        let permits = Arc::new(Semaphore::new(max_concurrent));
+        loop {
+            let (mut stream, _) = self.listener.accept().await.map_err(LocalServerError::Io)?;
+            let permit = permits.clone().acquire_owned().await.map_err(|_| {
+                LocalServerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "control request budget closed",
+                ))
+            })?;
+            let dispatcher = dispatcher.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let request: RequestEnvelope = read_object(&mut stream).await?;
+                    let response = dispatcher.lock().await.dispatch(request);
+                    write_object(&mut stream, &response).await?;
+                    Ok::<(), LocalServerError>(())
+                }
+                .await;
+                drop(permit);
+                if let Err(error) = result {
+                    let _ = error;
+                }
+            });
+        }
+    }
+
     /// Returns the dispatcher for registering listeners before serving.
     pub fn dispatcher_mut(&mut self) -> &mut LocalControlDispatcher {
         &mut self.dispatcher
@@ -131,6 +172,12 @@ impl LocalControlServer {
     }
 
     pub async fn run(self) -> Result<(), LocalServerError> {
+        Err(LocalServerError::Unsupported {
+            platform: std::env::consts::OS,
+        })
+    }
+
+    pub async fn run_concurrent(self, _max_concurrent: usize) -> Result<(), LocalServerError> {
         Err(LocalServerError::Unsupported {
             platform: std::env::consts::OS,
         })
