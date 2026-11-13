@@ -83,10 +83,10 @@ separate from `docs/design/`, which describes the intended architecture, and
   the implemented slice; v1 UDP and Path lifecycle payload codecs are present
   as protocol primitives but are not integrated into the data plane.
 
-The staged implementation sequence is tracked in
-[the implementation plan](implementation-plan.md). Phase-specific scope,
-temporary wire fixtures, and acceptance tracking are recorded in the other
-documents in this directory.
+The active implementation sequence is tracked in the
+[implementation plan](implementation-plan.md). Superseded phase scopes,
+temporary wire fixtures, reviews, and acceptance records are not maintained in
+this directory; Git history is the historical record.
 
 ## Known implementation constraints
 
@@ -101,8 +101,7 @@ documents in this directory.
   multi-document input, DNS prerequisites, rule ordering, listener shorthand,
   and conversion into immutable policy snapshots.
 - The final-state `wire-profile-v1` registry and canonical EgressID prologue
-  are defined by `docs/spec/wire-profile.md`. The Phase 1 fixture remains a
-  historical implementation record and is not the final wire contract.
+  are defined by `docs/spec/wire-profile.md`.
 - Ingress now has typed Listener inventory and a Windows-only system-proxy
   control-state boundary with idempotent transitions and events. Real Windows
   environment-variable/OS proxy mutation remains a platform adapter task.

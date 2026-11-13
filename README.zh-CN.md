@@ -21,7 +21,7 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 ## 文档
 
-设计文档只描述预期架构和长期设计决策；规范文档定义最终行为与格式契约。实现状态、实施顺序、阶段范围和验收跟踪只放在 `docs/progress/`（或上方的仓库状态摘要）中。
+设计文档只描述预期架构和长期设计决策；规范文档定义最终行为与格式契约。维护中的进度文档只描述当前实现状态和有效的实施计划；已经被替代的过程历史保留在 Git 历史中。
 设计和规范文档均同时提供英文与简体中文版本；进度文档以英文作为唯一维护源。
 
 ### 设计
@@ -44,10 +44,6 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 - [实现状态](docs/progress/status.md)
 - [实施计划](docs/progress/implementation-plan.md)
-- [设计审查记录](docs/progress/design-review.md)
-- [阶段 1 单 Path 范围](docs/progress/phase-1-single-path.md)
-- [阶段 1 临时线协议契约](docs/progress/phase-1-wire.md)
-- [阶段 1 验收跟踪](docs/progress/phase-1-acceptance.md)
 
 ## 命令界面
 

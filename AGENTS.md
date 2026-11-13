@@ -2,7 +2,7 @@
 
 ## Project structure and module organization
 
-PathChord is in initial implementation. `README.md` defines the project vocabulary and links the documentation sets. The `docs/design/` directory contains final-state architecture and design decisions, `docs/spec/` contains final-state behavioral and format contracts, and `docs/progress/` contains implementation status, sequencing, validation, and historical reviews. The root Cargo workspace contains Phase 0 protocol primitives and test fixtures under `crates/`.
+PathChord is in initial implementation. `README.md` defines the project vocabulary and links the documentation sets. The `docs/design/` directory contains final-state architecture and design decisions, `docs/spec/` contains final-state behavioral and format contracts, and `docs/progress/` contains only the current implementation status and active implementation plan. Superseded reviews, phase-specific acceptance records, temporary fixtures, and other process history belong in Git history, not in the maintained progress directory. The root Cargo workspace contains protocol primitives and test fixtures under `crates/`.
 
 The Rust layout separates `pathchord-core`, `pathchord-noise`, `pathchord-path`, `pathchord-policy`, `pathchord-transit`, `pathchord-egress`, `pathchord-ingress`, and `pathchord-cli`. Keep `pathchord-core` independent of platforms, subscription formats, and listener implementations.
 
@@ -24,13 +24,13 @@ Treat the three documentation sets as strict content boundaries:
 
 - `docs/design/` describes only the intended final-state requirements, principles, overall design, architecture, and durable design decisions.
 - `docs/spec/` describes only the intended final-state implementation contract: required behavior, state transitions, protocols, wire formats, configuration models, APIs, and other testable details.
-- `docs/progress/` contains all implementation-dependent material: current repository state, completed or missing work, phases, milestones, sequencing, acceptance tracking, temporary fixtures, deferred decisions, validation work, and historical reviews.
+- `docs/progress/` contains only implementation status and the active implementation plan. Status records current capabilities, gaps, constraints, and validation state; the plan records current sequencing and next work. Do not add historical reviews, completed acceptance reports, temporary wire fixtures, or obsolete process notes.
 
 Every Markdown document under `docs/design/` and `docs/spec/` must have both an English `name.md` and a Simplified Chinese `name.zh-CN.md` version. Put the reciprocal language switch immediately below the H1, update both versions in the same change, and preserve equivalent normative meaning, technical literals, links, and code blocks across the pair. Progress documents under `docs/progress/` use English as their single maintained source and do not require a Chinese pair unless a task explicitly requests one.
 
 Design and specification documents must not describe the current implementation, implementation progress, rollout order, milestones, temporary phase scope, deferred work, or future plans. Phrases such as “currently implemented,” “not yet implemented,” “Phase N,” “first/next/later implementation,” “planned,” and “deferred” normally indicate material that belongs in `docs/progress/`. Root `README` files and this `AGENTS.md` may summarize current repository state, but detailed status and plans belong in `docs/progress/`.
 
-When a staged implementation contract becomes durable, copy its final behavior into `docs/spec/` without carrying over phase or progress language; keep acceptance and rollout tracking in `docs/progress/`. Keep related final-state claims synchronized across `docs/design/architecture*.md`, `docs/spec/protocol*.md`, `docs/spec/configuration*.md`, and `docs/spec/state-machines*.md`.
+When a staged implementation contract becomes durable, copy its final behavior into `docs/spec/` without carrying over phase or progress language; keep the current state and active sequencing in the two maintained `docs/progress/` documents. Delete superseded process documents instead of preserving them as maintained references; Git history is the historical record. Keep related final-state claims synchronized across `docs/design/architecture*.md`, `docs/spec/protocol*.md`, `docs/spec/configuration*.md`, and `docs/spec/state-machines*.md`.
 
 ## Coding style and naming conventions
 
