@@ -14,14 +14,21 @@ use tokio::time::timeout;
 use zeroize::Zeroize;
 
 mod adapter_registry;
+// The codec is intentionally kept ready for the native AnyTLS adapter while
+// its TLS/session handshake is completed; it is not registered as a node
+// backend until an interop fixture covers the full session lifecycle.
+#[allow(dead_code)]
+mod anytls_codec;
 mod credential_provider;
 mod datagram;
 mod http_connect_adapter;
-mod outbound_engine;
+mod native_protocol;
+mod native_transport;
 mod shadowsocks_adapter;
 mod socks5_adapter;
 mod subscription;
 mod tls;
+mod vmess;
 
 pub use adapter_registry::AdapterRegistry;
 pub use credential_provider::FileTransitCredentialProvider;

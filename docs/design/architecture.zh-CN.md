@@ -74,7 +74,7 @@ Egress 状态通过现有 Path 上报。Ingress 维护每个 Ingress 到 Egress 
 
 每个存活的 Session 至少包含一条处于 `PATH_READY` 状态、双向且长连接的 Path。Session 管理器可以保留一条 Path 数量为零、正在重连的记录，但该记录不能承载业务流量。Path 是 Session 的一条物理中转链路。Ingress 创建、扩展、排空和关闭 Path；Egress 复用相同的 Path 传输返回流量。Stream 独立于 Path 标识，可以随时在 Path 之间迁移。
 
-控制消息具有独立的发送预算。业务流量采用公平调度，并可选用优先级和份额。调度器决定当前可用的哪些 Path 可以承载每个流量类别；Stream 不保留 Path 标识。Session 控制消息可以使用任何未撤销的 Path。
+控制消息具有独立的发送预算。业务流量通过有界类别队列调度：优先级只提供有界的初始偏好，份额提供加权公平服务，每个有待发送数据的类别都会取得进展。每个类别内部对 Stream 轮询，因此增加 Stream 不会放大其分配。调度器决定当前可用的哪些 Path 可以承载每个流量类别；Stream 不保留 Path 标识。Session 控制消息可以使用任何未撤销的 Path。
 
 ## 8. 动态调度
 
@@ -87,9 +87,9 @@ Ingress 通过原子运行时快照 provider 发布这些观测数据。该 prov
 订阅配额和流量倍率是可选的参考元数据。它们可以生成标签或影响权重；它们不是硬性限制，也不会直接改变 Egress 连通性。
 
 订阅文档规范化独立于节点传输支持。适配器保留类型化连接语义，并在准入前拒绝不支持参数；
-请求 TLS 的 HTTP 节点不能变成明文连接。可选外部协议引擎位于 Transit 边界之后，不拥有
-PathChord 授权或 Noise 状态。[Transit Proxy 契约](../spec/transit-proxies.zh-CN.md)定义受支持
-文档类型、私有引擎所有权、provider 展开及用量事实。
+请求 TLS 的 HTTP 节点不能变成明文连接。不支持的协议输入在对应的 PathChord 原生适配器完成前
+保持不可用，且不拥有 PathChord 授权或 Noise 状态。[Transit Proxy 契约](../spec/transit-proxies.zh-CN.md)定义受支持
+文档类型、provider 展开及用量事实。
 
 ## 9. 元数据
 

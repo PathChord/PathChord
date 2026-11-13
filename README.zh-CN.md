@@ -13,9 +13,9 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 当前工作优先完善 Linux、Windows 和 FreeBSD 上的普通 HTTP 转发、CONNECT 与 SOCKS4/4a/5。HTTP 使用消息编解码器处理流式正文、持久连接请求和 Upgrade；SOCKS5 还提供 UDP ASSOCIATE。监听器名称 `socks` 可作为规范名称 `socks5` 的别名。`type: mixed` 在一个 TCP 端口上提供 HTTP 和 SOCKS，并通过协商的 relay 端点提供 SOCKS5 UDP ASSOCIATE。FreeBSD 已有显式代理监听器的平台校验和 Unix 本地控制接口，目标编译和 CLI 链接已通过，原生主机验证仍待完成。通用监听器回归测试由现有 Rust CI 任务执行。透明流量接管与 TUN 工作安排在这组监听器的基础能力之后；平台验证、共享运行时缺口及后续适配器工作见[实施计划](docs/progress/implementation-plan.md)。
 
 节点导入支持自动识别、Clash/Mihomo provider、SIP008、URI/Base64 列表、sing-box JSON，以及
-所支持的 Surge/Quantumult X/Loon 节点行。原生传输支持类型化 TLS 设置及 direct/SOCKS5/
-Shadowsocks UDP，包括 SS2022。高级协议和传输可通过 `--outbound-engine` 显式选择
-sing-box 1.14.4 可执行文件。未支持的节点和参数具有独立诊断。精确的兼容边界见
+所支持的 Surge/Quantumult X/Loon 节点行。原生传输支持类型化 TLS 设置、VLESS/Trojan 的
+TCP/TLS/WebSocket 传输、使用 AES-128-GCM 的明文 TCP VMess，以及 direct/SOCKS5/Shadowsocks
+UDP，包括 SS2022。未支持的协议和参数在原生实现完成前保持为明确诊断。精确的兼容边界见
 [Transit Proxy 与订阅契约](docs/spec/transit-proxies.zh-CN.md)，可运行配置见
 [部署指南](docs/spec/deployment.zh-CN.md)。
 

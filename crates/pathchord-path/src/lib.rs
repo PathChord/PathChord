@@ -21,6 +21,7 @@ mod multipath;
 mod runtime;
 mod session;
 mod single_path;
+mod traffic_queue;
 mod udp;
 
 pub use admission::{
@@ -36,7 +37,8 @@ pub use runtime::{
     BoxedSessionStream, EgressSessionController, EgressSessionHandle, EgressStatusConfig,
     EgressStatusProvider, EgressStatusSample, EgressStreamFactory, EgressStreamOpenError,
     IngressSessionHandle, IngressUdpHandle, OpenStreamError, OpenUdpError, PathExclusionReason,
-    PathQualitySnapshot, SessionRuntimeError, SessionSnapshot, SessionStream, run_egress_session,
+    PathQualitySnapshot, SessionRuntimeError, SessionSnapshot, SessionStream, StreamSnapshot,
+    run_egress_session,
 };
 pub use session::{EgressPathSession, IngressPathSession, PathSessionConfig, PathSessionError};
 pub use single_path::{

@@ -59,6 +59,11 @@ impl ShadowsocksTransitAdapter {
             .ok_or_else(|| TransitError::Unsupported("Shadowsocks password is missing".into()))?;
         let method = CipherKind::from_str(cipher)
             .map_err(|_| TransitError::Unsupported("Shadowsocks cipher is unsupported".into()))?;
+        if !method.is_aead() && !method.is_aead_2022() {
+            return Err(TransitError::Unsupported(
+                "legacy non-AEAD Shadowsocks ciphers are not supported".into(),
+            ));
+        }
         let mut server = ServerConfig::new(
             (config.endpoint.host.clone(), config.endpoint.port),
             password,
@@ -178,6 +183,23 @@ mod tests {
             ("cipher".into(), "aes-256-gcm".into()),
             ("password".into(), "test-password".into()),
             ("plugin".into(), "obfs-local".into()),
+        ]));
+        assert!(matches!(
+            ShadowsocksTransitAdapter::from_subscription(
+                &config,
+                &credential,
+                Duration::from_secs(1)
+            ),
+            Err(TransitError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_non_aead_ciphers() {
+        let config = config(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8388));
+        let credential = SubscriptionCredential::new(BTreeMap::from([
+            ("cipher".into(), "aes-256-ctr".into()),
+            ("password".into(), "test-password".into()),
         ]));
         assert!(matches!(
             ShadowsocksTransitAdapter::from_subscription(

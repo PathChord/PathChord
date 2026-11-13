@@ -139,6 +139,14 @@ Ingress 负责 Path 的创建和准入。Path 状态对 Stream 和 UDP Session �
 
 重传复制受两个预算限制：Session 范围的复制预算和 OPTIONAL 的每流量类别预算。流量类别预算 MAY 进一步限制复制，但 MUST NOT 超过 Session 范围预算的剩余额度。控制消息使用默认的控制复制策略，并计入 Session 预算。
 
+### 流量类别 capability
+
+可选的 `traffic-classes` capability 由 `PATH_READY_CAPABILITIES` 表示。选中后，
+`STREAM_OPEN_CLASS` 和 `UDP_OPEN_CLASS` 会在旧的 open payload 旁携带有界类别名称、
+优先级和份额。需要类别的 flow 在 capability 缺失时必须拒绝，不能静默丢弃类别信息。
+
+对于有待发送数据的业务类别，先提供有界优先级偏好，再提供加权公平服务；每个类别内部轮询 Stream，即使另一个类别拥有更多 Stream，也会获得有界服务机会。控制消息使用独立预算。
+
 ## 8. 版本控制
 
 创建 Session 时协商 `wire-profile-v1` 及其注册能力。如果 REQUIRED 能力不匹配，则从有效规则集中排除该 Egress。 OPTIONAL 能力取交集。一个 Session 中的所有 Path 使用相同的 Session 语义。版本、能力 ID 以及拒绝行为由 [wire-profile-v1](wire-profile.zh-CN.md) 定义。

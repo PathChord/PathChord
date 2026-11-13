@@ -184,6 +184,11 @@ FAILED → APPLYING
 
 ## 调度和自动扩缩容守卫
 
+协商可选 traffic-class capability 后，每个准入的 Stream 和 UDP Association 保存不可变的类别快照。
+未协商 capability 时打开需要类别的 flow 必须拒绝。调度器先提供有界优先级偏好，再按 `share` 提供
+加权公平服务，并在同一类别的有待发送 Stream 之间轮询。Stream 只有在其排队 DATA 已发送并确认后
+才能发出 FIN；已关闭 Stream 的观测可以保留在有界的近期历史中。
+
 对于每条符合条件的 Path，调度器计算：
 
 ```text

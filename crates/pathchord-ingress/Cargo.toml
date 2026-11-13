@@ -19,6 +19,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 notify = "8.2.0"
+netsock.workspace = true
 pathchord-core = { path = "../pathchord-core" }
 pathchord-noise = { path = "../pathchord-noise" }
 pathchord-path = { path = "../pathchord-path" }

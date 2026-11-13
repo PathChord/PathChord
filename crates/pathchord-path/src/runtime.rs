@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pathchord_core::{
-    AckRange, ControlAck, ControlReceiver, ControlSender, EgressServiceState, ErrorClass,
-    FrameCodecError, FrameFlags, FrameType, Heartbeat, MAX_VARINT, Message, MessageCodecError,
-    PathClose, PathDrain, PathFrame, PathId, ProtocolLimits, ReliabilityError, RequestId,
-    SessionClose, SessionId, StatusReport, StatusReportDisposition, StreamAck, StreamData,
-    StreamFin, StreamId, StreamOpen, StreamOpenErr, StreamOpenOk, StreamReceiveBuffer, StreamRst,
-    StreamWindow, TargetEndpoint, UdpClose, UdpDatagram, UdpOpen, UdpOpenErr,
+    AckRange, CAPABILITY_TRAFFIC_CLASSES, ControlAck, ControlReceiver, ControlSender,
+    EgressServiceState, ErrorClass, FrameCodecError, FrameFlags, FrameType, Heartbeat, MAX_VARINT,
+    Message, MessageCodecError, PathClose, PathDrain, PathFrame, PathId, ProtocolLimits,
+    ReliabilityError, RequestId, SessionClose, SessionId, StatusReport, StatusReportDisposition,
+    StreamAck, StreamData, StreamFin, StreamId, StreamOpen, StreamOpenClass, StreamOpenErr,
+    StreamOpenOk, StreamReceiveBuffer, StreamRst, StreamState, StreamWindow, TargetEndpoint,
+    TrafficClassConfig, UdpClose, UdpDatagram, UdpOpen, UdpOpenClass, UdpOpenErr,
 };
 use pathchord_noise::{
     MAX_NOISE_MESSAGE_LEN, NoiseError, NoiseTransport, RECORD_ENVELOPE_HEADER_LEN,
@@ -44,6 +45,7 @@ const STREAM_FLAG_RST: u64 = 2;
 const MIN_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_RETRANSMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRANSMISSION_ATTEMPTS: u32 = 3;
+const MAX_CLASS_OPEN_ATTEMPTS: u32 = 8;
 const MAX_PENDING_CONTROL_MESSAGES: usize = 32;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(500);
@@ -224,6 +226,23 @@ impl Default for EgressStatusConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSnapshot {
+    pub stream_id: StreamId,
+    pub state: StreamState,
+    pub target: TargetEndpoint,
+    pub traffic_class: Option<TrafficClassConfig>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub bytes_acked: u64,
+    pub retransmissions: u64,
+    pub reorder_buffer_bytes: usize,
+    pub receive_window: u64,
+    pub opened_at_ms: u64,
+    pub closed_at_ms: Option<u64>,
+    pub close_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSnapshot {
     pub session_id: SessionId,
     pub path_id: PathId,
@@ -235,6 +254,7 @@ pub struct SessionSnapshot {
     pub recommended_path_count: u64,
     pub path_quality: BTreeMap<PathId, PathQualitySnapshot>,
     pub active_streams: usize,
+    pub streams: BTreeMap<StreamId, StreamSnapshot>,
     pub pending_stream_opens: usize,
     pub retained_outbound_bytes: usize,
     pub bytes_sent: u64,
@@ -329,6 +349,7 @@ impl IngressSessionHandle {
         let session_id = path.session_id();
         let path_id = path.path_id();
         let ready = path.limits().clone();
+        let capabilities = path.negotiated_capabilities();
         let records = path.into_transport();
         let buffer_limit = runtime_buffer_limit(&ready)?;
         let stream_capacity = buffer_limit.clamp(1, 64 * 1024);
@@ -344,6 +365,7 @@ impl IngressSessionHandle {
             recommended_path_count: 1,
             path_quality: BTreeMap::new(),
             active_streams: 0,
+            streams: BTreeMap::new(),
             pending_stream_opens: 0,
             retained_outbound_bytes: 0,
             bytes_sent: 0,
@@ -363,6 +385,7 @@ impl IngressSessionHandle {
                 snapshots: snapshot_tx,
                 egress_status: EgressStatusConfig::default(),
                 status_provider: None,
+                capabilities,
             },
         )?;
         let task = tokio::spawn(actor.run());
@@ -833,6 +856,7 @@ impl EgressSessionHandle {
         let session_id = path.session_id();
         let path_id = path.path_id();
         let ready = path.limits().clone();
+        let capabilities = path.negotiated_capabilities();
         let records = path.into_transport();
         let initial = SessionSnapshot {
             session_id,
@@ -845,6 +869,7 @@ impl EgressSessionHandle {
             recommended_path_count: 1,
             path_quality: BTreeMap::new(),
             active_streams: 0,
+            streams: BTreeMap::new(),
             pending_stream_opens: 0,
             retained_outbound_bytes: 0,
             bytes_sent: 0,
@@ -867,6 +892,7 @@ impl EgressSessionHandle {
                 snapshots: snapshot_tx,
                 egress_status,
                 status_provider,
+                capabilities,
             },
         )?;
         let task = tokio::spawn(actor.run());
@@ -927,6 +953,7 @@ struct SessionActorInit {
     snapshots: watch::Sender<SessionSnapshot>,
     egress_status: EgressStatusConfig,
     status_provider: Option<Arc<dyn EgressStatusProvider>>,
+    capabilities: u64,
 }
 
 enum IngressCommand {
@@ -977,6 +1004,7 @@ enum IngressCommand {
 }
 
 struct ErasedAdmittedPath {
+    capabilities: u64,
     session_id: SessionId,
     path_id: PathId,
     ready: pathchord_core::PathReady,
@@ -991,10 +1019,12 @@ impl ErasedAdmittedPath {
         let session_id = path.session_id();
         let path_id = path.path_id();
         let ready = path.limits().clone();
+        let capabilities = path.negotiated_capabilities();
         let records = path.into_transport();
         let limits = records.limits();
         let (io, noise) = records.into_parts();
         Self {
+            capabilities,
             session_id,
             path_id,
             ready,
@@ -1009,10 +1039,12 @@ impl ErasedAdmittedPath {
         let session_id = path.session_id();
         let path_id = path.path_id();
         let ready = path.limits().clone();
+        let capabilities = path.negotiated_capabilities();
         let records = path.into_transport();
         let limits = records.limits();
         let (io, noise) = records.into_parts();
         Self {
+            capabilities,
             session_id,
             path_id,
             ready,
@@ -1022,12 +1054,16 @@ impl ErasedAdmittedPath {
 }
 
 struct PendingIngressOpen {
+    retry: Option<(Message, Instant, u32)>,
+    traffic_class: Option<TrafficClassConfig>,
     io: BoxedSessionStream,
     eligible_paths: Option<BTreeMap<PathId, u32>>,
     reply: oneshot::Sender<Result<(), OpenStreamError>>,
 }
 
 struct PendingIngressUdp {
+    retry: Option<(Message, Instant, u32)>,
+    traffic_class: Option<TrafficClassConfig>,
     datagrams: mpsc::Sender<Vec<u8>>,
     eligible_paths: Option<BTreeMap<PathId, u32>>,
     reply: oneshot::Sender<Result<u64, OpenUdpError>>,
@@ -1046,6 +1082,7 @@ enum CachedOpenResult {
 }
 
 struct CachedEgressOpen {
+    traffic_class: Option<TrafficClassConfig>,
     request: StreamOpen,
     result: CachedOpenResult,
     eligible_paths: BTreeMap<PathId, u32>,
@@ -1129,11 +1166,15 @@ struct InboundPermit {
 }
 
 struct ActiveStream {
+    traffic_class: Option<TrafficClassConfig>,
+    fin_sent: bool,
+    io_finished: bool,
     commands: mpsc::Sender<StreamIoCommand>,
     task: JoinHandle<()>,
     receive: StreamReceiveBuffer,
     inbound_permits: Vec<InboundPermit>,
     next_send_offset: u64,
+    acknowledged: Vec<AckRange>,
     pending: VecDeque<OutboundChunk>,
     retained: BTreeMap<u64, RetainedChunk>,
     remote_receive_limit: u64,
@@ -1200,7 +1241,19 @@ impl PathHealth {
     }
 }
 
+struct PendingUdpSend {
+    datagram: UdpDatagram,
+    reply: Option<oneshot::Sender<Result<(), OpenUdpError>>>,
+    _permit: OwnedSemaphorePermit,
+}
+
 struct SessionActor<W> {
+    capabilities: u64,
+    traffic_queue: crate::traffic_queue::TrafficQueue,
+    stream_observations: BTreeMap<StreamId, StreamSnapshot>,
+    closed_streams: VecDeque<StreamId>,
+    udp_classes: HashMap<u64, TrafficClassConfig>,
+    pending_udp: HashMap<u64, VecDeque<PendingUdpSend>>,
     role: ActorRole,
     writer: RecordWriter<W>,
     reader_task: JoinHandle<()>,
@@ -1267,6 +1320,7 @@ where
             snapshots,
             egress_status,
             status_provider,
+            capabilities,
         } = init;
         let buffer_limit = runtime_buffer_limit(&ready)?;
         let limits = records.limits();
@@ -1319,6 +1373,12 @@ where
         let status_provider: Arc<dyn EgressStatusProvider> =
             status_provider.unwrap_or_else(|| Arc::new(StaticEgressStatusProvider(egress_status)));
         Ok(Self {
+            capabilities,
+            traffic_queue: Default::default(),
+            stream_observations: BTreeMap::new(),
+            closed_streams: VecDeque::new(),
+            udp_classes: HashMap::new(),
+            pending_udp: HashMap::new(),
             role,
             writer,
             reader_task,
@@ -1387,6 +1447,7 @@ where
         retransmission_tick.tick().await;
         loop {
             tokio::select! {
+                _ = tokio::task::yield_now(), if self.business_ready() => {},
                 command = receive_command(&mut self.commands) => {
                     match command {
                         Some(command) => {
@@ -1433,6 +1494,7 @@ where
                     }
                 }
                 _ = retransmission_tick.tick() => {
+                    self.retry_class_opens().await?;
                     self.handle_retransmission_timeouts().await?;
                     self.poll_udp_targets().await?;
                     if self.handle_path_health().await? {
@@ -1443,6 +1505,13 @@ where
                     );
                 }
             }
+            for _ in 0..STREAM_EVENT_QUEUE_CAPACITY {
+                let Ok(event) = self.stream_events.try_recv() else {
+                    break;
+                };
+                self.handle_stream_event(event).await?;
+            }
+            self.flush_business().await?;
             self.publish_snapshot(false);
         }
     }
@@ -1467,6 +1536,21 @@ where
                 multipath_config,
                 reply,
             } => {
+                let traffic_class = multipath_config
+                    .as_ref()
+                    .and_then(|config| config.traffic_class.clone());
+                if traffic_class
+                    .as_ref()
+                    .is_some_and(|class| class.validate().is_err())
+                    || (traffic_class.is_some()
+                        && self.capabilities & CAPABILITY_TRAFFIC_CLASSES == 0)
+                {
+                    let _ = reply.send(Err(OpenUdpError::Rejected {
+                        error: ErrorClass::LocalPolicy,
+                        reason: b"traffic class capability is unavailable or invalid".to_vec(),
+                    }));
+                    return Ok(false);
+                }
                 if let Some(config) = multipath_config
                     && let Err(error) = self.multipath.reconfigure(config)
                 {
@@ -1496,14 +1580,25 @@ where
                     let _ = reply.send(Err(OpenUdpError::ResourceLimit));
                     return Ok(false);
                 }
-                let open = Message::UdpOpen(UdpOpen {
+                let request = UdpOpen {
                     association_id,
                     target_flags,
                     target,
-                });
+                };
+                let open = match traffic_class.clone() {
+                    Some(traffic_class) => Message::UdpOpenClass(UdpOpenClass {
+                        open: request,
+                        traffic_class,
+                    }),
+                    None => Message::UdpOpen(request),
+                };
                 self.pending_ingress_udp.insert(
                     association_id,
                     PendingIngressUdp {
+                        retry: traffic_class
+                            .as_ref()
+                            .map(|_| (open.clone(), Instant::now(), 0)),
+                        traffic_class,
                         datagrams,
                         eligible_paths: eligible_paths.clone(),
                         reply,
@@ -1540,16 +1635,14 @@ where
                 *sequence = sequence
                     .checked_add(1)
                     .ok_or(SessionRuntimeError::FrameSequenceExhausted)?;
-                self.send_udp_message(
-                    association_id,
-                    Message::UdpDatagram(UdpDatagram {
+                self.queue_udp(
+                    UdpDatagram {
                         association_id,
                         datagram_seq,
                         payload,
-                    }),
-                )
-                .await?;
-                let _ = reply.send(Ok(()));
+                    },
+                    Some(reply),
+                );
                 Ok(false)
             }
             IngressCommand::CloseUdp {
@@ -1567,6 +1660,8 @@ where
                 .await?;
                 self.pending_ingress_udp.remove(&association_id);
                 self.ingress_udp.remove(&association_id);
+                self.pending_udp.remove(&association_id);
+                self.udp_classes.remove(&association_id);
                 self.udp_send_sequences.remove(&association_id);
                 let _ = reply.send(Ok(()));
                 Ok(false)
@@ -1670,6 +1765,21 @@ where
                 multipath_config,
                 reply,
             } => {
+                let traffic_class = multipath_config
+                    .as_ref()
+                    .and_then(|config| config.traffic_class.clone());
+                if traffic_class
+                    .as_ref()
+                    .is_some_and(|class| class.validate().is_err())
+                    || (traffic_class.is_some()
+                        && self.capabilities & CAPABILITY_TRAFFIC_CLASSES == 0)
+                {
+                    let _ = reply.send(Err(OpenStreamError::Rejected {
+                        error: ErrorClass::LocalPolicy,
+                        reason: b"traffic class capability is unavailable or invalid".to_vec(),
+                    }));
+                    return Ok(false);
+                }
                 if let Some(config) = multipath_config
                     && let Err(error) = self.multipath.reconfigure(config)
                 {
@@ -1701,14 +1811,26 @@ where
                     .next_request_id
                     .checked_add(1)
                     .ok_or(SessionRuntimeError::FrameSequenceExhausted)?;
-                let open = Message::StreamOpen(StreamOpen {
+                self.observe_open(stream_id, target.clone(), traffic_class.clone());
+                let request = StreamOpen {
                     stream_id,
                     request_id,
                     target,
-                });
+                };
+                let open = match traffic_class.clone() {
+                    Some(traffic_class) => Message::StreamOpenClass(StreamOpenClass {
+                        open: request,
+                        traffic_class,
+                    }),
+                    None => Message::StreamOpen(request),
+                };
                 self.pending_ingress.insert(
                     stream_id,
                     PendingIngressOpen {
+                        retry: traffic_class
+                            .as_ref()
+                            .map(|_| (open.clone(), Instant::now(), 0)),
+                        traffic_class,
                         io,
                         eligible_paths,
                         reply,
@@ -1741,6 +1863,11 @@ where
         path: ErasedAdmittedPath,
         observation: MultipathPathObservation,
     ) -> Result<(), SessionRuntimeError> {
+        if path.capabilities & self.capabilities & CAPABILITY_TRAFFIC_CLASSES
+            != self.capabilities & CAPABILITY_TRAFFIC_CLASSES
+        {
+            return Err(SessionRuntimeError::InvalidRuntimeLimit);
+        }
         if path.session_id != self.session_id {
             return Err(SessionRuntimeError::WrongSession);
         }
@@ -1843,6 +1970,9 @@ where
                     retained.last_path = plan.path_id;
                     retained.last_sent_at = Instant::now();
                     retained.attempts = plan.attempt;
+                    if let Some(snapshot) = self.stream_observations.get_mut(&stream_id) {
+                        snapshot.retransmissions = snapshot.retransmissions.saturating_add(1);
+                    }
                 }
             }
             reset.sort_unstable();
@@ -1914,6 +2044,9 @@ where
                 retained.last_path = plan.path_id;
                 retained.last_sent_at = now;
                 retained.attempts = plan.attempt;
+                if let Some(snapshot) = self.stream_observations.get_mut(&stream_id) {
+                    snapshot.retransmissions = snapshot.retransmissions.saturating_add(1);
+                }
             }
         }
         Ok(())
@@ -1945,6 +2078,9 @@ where
                 }
             };
             for response in responses {
+                if let Message::UdpOpenErr(error) = &response {
+                    self.udp_classes.remove(&error.association_id);
+                }
                 self.send_udp_message(udp_association_id(&response), response)
                     .await?;
             }
@@ -1961,6 +2097,9 @@ where
                             eligible_paths: pending.eligible_paths,
                         },
                     );
+                    if let Some(profile) = pending.traffic_class {
+                        self.udp_classes.insert(response.association_id, profile);
+                    }
                     self.udp_send_sequences.insert(response.association_id, 0);
                     let _ = pending.reply.send(Ok(response.association_id));
                 }
@@ -1995,6 +2134,8 @@ where
                 self.pending_ingress_udp.remove(&close.association_id);
                 self.ingress_udp.remove(&close.association_id);
                 self.egress_udp_paths.remove(&close.association_id);
+                self.pending_udp.remove(&close.association_id);
+                self.udp_classes.remove(&close.association_id);
                 self.udp_send_sequences.remove(&close.association_id);
             }
             _ => return Err(SessionRuntimeError::UnexpectedFrame(message.frame_type())),
@@ -2266,7 +2407,42 @@ where
         }
         let message = Message::decode(frame.header().frame_type(), frame.payload(), self.limits)?;
         match message {
-            Message::StreamOpen(request) => self.handle_egress_open(path_id, request).await?,
+            Message::StreamOpen(request) => self.handle_egress_open(path_id, request, None).await?,
+            Message::StreamOpenClass(request) => {
+                if self.capabilities & CAPABILITY_TRAFFIC_CLASSES == 0 {
+                    return Err(SessionRuntimeError::UnexpectedFrame(
+                        FrameType::StreamOpenClass,
+                    ));
+                }
+                self.handle_egress_open(path_id, request.open, Some(request.traffic_class))
+                    .await?;
+            }
+            Message::UdpOpenClass(request) => {
+                if self.capabilities & CAPABILITY_TRAFFIC_CLASSES == 0
+                    || !matches!(self.role, ActorRole::Egress { .. })
+                {
+                    return Err(SessionRuntimeError::UnexpectedFrame(
+                        FrameType::UdpOpenClass,
+                    ));
+                }
+                if self.udp_classes.len() >= MAX_SESSION_STREAMS
+                    && !self.udp_classes.contains_key(&request.open.association_id)
+                {
+                    return Err(SessionRuntimeError::InvalidRuntimeLimit);
+                }
+                if self
+                    .udp_classes
+                    .get(&request.open.association_id)
+                    .is_some_and(|class| class != &request.traffic_class)
+                {
+                    return Err(SessionRuntimeError::InvalidRuntimeLimit);
+                }
+                self.udp_classes
+                    .insert(request.open.association_id, request.traffic_class);
+                self.handle_udp_message(path_id, Message::UdpOpen(request.open))
+                    .await?;
+            }
+
             Message::StreamOpenOk(response) => self.handle_ingress_open_ok(response).await?,
             Message::StreamOpenErr(response) => self.handle_ingress_open_err(response),
             Message::StreamData(data) => self.handle_stream_data(path_id, data).await?,
@@ -2305,12 +2481,13 @@ where
         &mut self,
         received_path_id: PathId,
         request: StreamOpen,
+        traffic_class: Option<TrafficClassConfig>,
     ) -> Result<(), SessionRuntimeError> {
         let ActorRole::Egress { factory } = &self.role else {
             return Err(SessionRuntimeError::UnexpectedFrame(FrameType::StreamOpen));
         };
         if let Some(cached) = self.egress_requests.get_mut(&request.request_id) {
-            if cached.request != request {
+            if cached.request != request || cached.traffic_class != traffic_class {
                 return self
                     .send_open_error(
                         request.stream_id,
@@ -2352,17 +2529,23 @@ where
                 )
                 .await;
         }
+        let factory = Arc::clone(factory);
+        self.observe_open(
+            request.stream_id,
+            request.target.clone(),
+            traffic_class.clone(),
+        );
         self.egress_streams
             .insert(request.stream_id, request.request_id);
         self.egress_requests.insert(
             request.request_id,
             CachedEgressOpen {
+                traffic_class,
                 request: request.clone(),
                 result: CachedOpenResult::Pending,
                 eligible_paths: BTreeMap::from([(received_path_id, 100)]),
             },
         );
-        let factory = Arc::clone(factory);
         let result_tx = self.factory_result_tx.clone();
         let stream_id = request.stream_id;
         let request_id = request.request_id;
@@ -2396,9 +2579,15 @@ where
             return Ok(());
         }
         let eligible_paths = cached.eligible_paths.clone();
+        let traffic_class = cached.traffic_class.clone();
         match completion.result {
             Ok(io) => {
-                self.spawn_active_stream(completion.stream_id, io, Some(eligible_paths))?;
+                self.spawn_active_stream(
+                    completion.stream_id,
+                    io,
+                    Some(eligible_paths),
+                    traffic_class,
+                )?;
                 if let Some(cached) = self.egress_requests.get_mut(&completion.request_id) {
                     cached.result = CachedOpenResult::Opened {
                         metadata: Vec::new(),
@@ -2415,6 +2604,7 @@ where
                 self.send_window(completion.stream_id).await?;
             }
             Err(mut error) => {
+                self.observe_closed(completion.stream_id, "target_rejected", StreamState::Reset);
                 error.reason.truncate(self.limits.max_control_payload());
                 if let Some(cached) = self.egress_requests.get_mut(&completion.request_id) {
                     cached.result = CachedOpenResult::Rejected {
@@ -2446,7 +2636,12 @@ where
                 FrameType::StreamOpenOk,
             ));
         };
-        self.spawn_active_stream(response.stream_id, pending.io, pending.eligible_paths)?;
+        self.spawn_active_stream(
+            response.stream_id,
+            pending.io,
+            pending.eligible_paths,
+            pending.traffic_class,
+        )?;
         if let Err(error) = self.send_window(response.stream_id).await {
             let _ = pending.reply.send(Err(OpenStreamError::SessionClosed));
             return Err(error);
@@ -2456,6 +2651,7 @@ where
     }
 
     fn handle_ingress_open_err(&mut self, response: StreamOpenErr) {
+        self.observe_closed(response.stream_id, "open_rejected", StreamState::Reset);
         if let Some(pending) = self.pending_ingress.remove(&response.stream_id) {
             let _ = pending.reply.send(Err(OpenStreamError::Rejected {
                 error: response.error,
@@ -2469,7 +2665,11 @@ where
         stream_id: StreamId,
         io: BoxedSessionStream,
         eligible_paths: Option<BTreeMap<PathId, u32>>,
+        traffic_class: Option<TrafficClassConfig>,
     ) -> Result<(), SessionRuntimeError> {
+        if let Some(snapshot) = self.stream_observations.get_mut(&stream_id) {
+            snapshot.state = StreamState::Open;
+        }
         let receive = StreamReceiveBuffer::new(self.buffer_limit)?;
         let (commands, command_rx) = mpsc::channel(STREAM_COMMAND_QUEUE_CAPACITY);
         let events = self.stream_event_tx.clone();
@@ -2481,11 +2681,15 @@ where
         self.streams.insert(
             stream_id,
             ActiveStream {
+                traffic_class,
+                fin_sent: false,
+                io_finished: false,
                 commands,
                 task,
                 receive,
                 inbound_permits: Vec::new(),
                 next_send_offset: 0,
+                acknowledged: Vec::new(),
                 pending: VecDeque::new(),
                 retained: BTreeMap::new(),
                 remote_receive_limit: self.buffer_limit as u64,
@@ -2514,16 +2718,7 @@ where
                         true
                     }
                 });
-                if should_send {
-                    self.send_stream_message(
-                        stream_id,
-                        Message::StreamFin(StreamFin {
-                            stream_id,
-                            flags: STREAM_FLAG_FIN,
-                        }),
-                    )
-                    .await?;
-                }
+                let _ = should_send;
             }
             StreamEvent::IoFailed { stream_id, reason } => {
                 self.reset_stream(stream_id, true, reason.into_bytes())
@@ -2546,11 +2741,8 @@ where
                 self.send_window(stream_id).await?;
             }
             StreamEvent::Finished { stream_id } => {
-                if let Some(stream) = self.streams.remove(&stream_id) {
-                    stream
-                        .task
-                        .await
-                        .map_err(|error| SessionRuntimeError::Task(error.to_string()))?;
+                if let Some(stream) = self.streams.get_mut(&stream_id) {
+                    stream.io_finished = true;
                 }
             }
         }
@@ -2580,80 +2772,330 @@ where
             data,
             _permit: permit,
         });
-        self.flush_stream(stream_id).await
+        Ok(())
     }
 
     async fn flush_stream(&mut self, stream_id: StreamId) -> Result<(), SessionRuntimeError> {
-        loop {
-            let next = {
-                let Some(stream) = self.streams.get_mut(&stream_id) else {
-                    return Ok(());
-                };
-                let Some(front) = stream.pending.front() else {
-                    return Ok(());
-                };
-                let end = front.offset + front.data.len() as u64;
-                if end > stream.remote_receive_limit
-                    || self.session_sent_total + front.data.len() as u64 > self.remote_session_limit
-                {
-                    return Ok(());
-                }
-                stream.pending.pop_front()
-            };
-            let Some(chunk) = next else {
+        let next = {
+            let Some(stream) = self.streams.get_mut(&stream_id) else {
                 return Ok(());
             };
-            let length = chunk.data.len();
-            let data = StreamData {
-                stream_id,
-                offset: chunk.offset,
-                flags: 0,
-                data: chunk.data.clone(),
+            let Some(front) = stream.pending.front() else {
+                return Ok(());
             };
-            let eligible = self
-                .streams
-                .get(&stream_id)
-                .and_then(|stream| stream.eligible_paths.clone());
-            let path_id = match eligible.as_ref() {
-                Some(eligible) => {
-                    self.multipath
-                        .schedule_eligible(self.outbound_direction(), length, eligible)?
-                        .path_id
-                }
-                None => {
-                    self.multipath
-                        .schedule(self.outbound_direction(), length)?
-                        .path_id
-                }
-            };
-            let retain_for_retransmission = self.multipath.retransmission_replication_enabled();
-            if retain_for_retransmission {
-                self.multipath
-                    .retain_stream_data(data.clone(), "default", path_id)?;
-            }
-            let send_result = self
-                .send_message_on(path_id, Message::StreamData(data))
-                .await;
-            self.session_sent_total += length as u64;
-            self.bytes_sent += length as u64;
-            if retain_for_retransmission && let Some(stream) = self.streams.get_mut(&stream_id) {
-                stream.retained.insert(
-                    chunk.offset,
-                    RetainedChunk {
-                        data: chunk.data,
-                        _permit: chunk._permit,
-                        last_path: path_id,
-                        last_sent_at: Instant::now(),
-                        attempts: 0,
-                    },
-                );
-            }
-            if let Err(error) = send_result
-                && self.handle_path_failure(path_id).await?
+            let end = front.offset + front.data.len() as u64;
+            if end > stream.remote_receive_limit
+                || self.session_sent_total + front.data.len() as u64 > self.remote_session_limit
             {
-                return Err(error);
+                return Ok(());
+            }
+            stream.pending.pop_front()
+        };
+        let Some(chunk) = next else {
+            return Ok(());
+        };
+        let length = chunk.data.len();
+        let data = StreamData {
+            stream_id,
+            offset: chunk.offset,
+            flags: 0,
+            data: chunk.data.clone(),
+        };
+        let eligible = self
+            .streams
+            .get(&stream_id)
+            .and_then(|stream| stream.eligible_paths.clone());
+        let path_id = match eligible.as_ref() {
+            Some(eligible) => {
+                self.multipath
+                    .schedule_eligible(self.outbound_direction(), length, eligible)?
+                    .path_id
+            }
+            None => {
+                self.multipath
+                    .schedule(self.outbound_direction(), length)?
+                    .path_id
+            }
+        };
+        let traffic_class = self
+            .streams
+            .get(&stream_id)
+            .and_then(|stream| stream.traffic_class.as_ref())
+            .map_or("default", |class| class.name.as_str())
+            .to_owned();
+        let retain_for_retransmission = self.multipath.retransmission_replication_enabled();
+        if retain_for_retransmission {
+            self.multipath
+                .retain_stream_data(data.clone(), traffic_class, path_id)?;
+        }
+        let send_result = self
+            .send_message_on(path_id, Message::StreamData(data))
+            .await;
+        self.session_sent_total += length as u64;
+        self.bytes_sent += length as u64;
+        if let Some(snapshot) = self.stream_observations.get_mut(&stream_id) {
+            snapshot.bytes_sent = snapshot.bytes_sent.saturating_add(length as u64);
+        }
+        if retain_for_retransmission && let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.retained.insert(
+                chunk.offset,
+                RetainedChunk {
+                    data: chunk.data,
+                    _permit: chunk._permit,
+                    last_path: path_id,
+                    last_sent_at: Instant::now(),
+                    attempts: 0,
+                },
+            );
+        }
+        if let Err(error) = send_result
+            && self.handle_path_failure(path_id).await?
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn retry_class_opens(&mut self) -> Result<(), SessionRuntimeError> {
+        let now = Instant::now();
+        let mut retry = Vec::new();
+        let mut expired = Vec::new();
+        for (id, pending) in &mut self.pending_ingress {
+            if let Some((message, sent, attempts)) = &mut pending.retry
+                && now.duration_since(*sent)
+                    >= MIN_RETRANSMISSION_TIMEOUT
+                        .saturating_mul(1_u32 << (*attempts).min(6))
+                        .min(MAX_RETRANSMISSION_TIMEOUT)
+            {
+                if *attempts >= MAX_CLASS_OPEN_ATTEMPTS {
+                    expired.push(*id);
+                } else {
+                    *attempts += 1;
+                    *sent = now;
+                    retry.push((message.clone(), pending.eligible_paths.clone()));
+                }
             }
         }
+        for id in expired {
+            if let Some(pending) = self.pending_ingress.remove(&id) {
+                let _ = pending.reply.send(Err(OpenStreamError::Rejected {
+                    error: ErrorClass::PathFailure,
+                    reason: b"class Stream admission timed out".to_vec(),
+                }));
+                self.observe_closed(id, "open_timeout", StreamState::Reset);
+            }
+        }
+        let mut expired = Vec::new();
+        for (id, pending) in &mut self.pending_ingress_udp {
+            if let Some((message, sent, attempts)) = &mut pending.retry
+                && now.duration_since(*sent)
+                    >= MIN_RETRANSMISSION_TIMEOUT
+                        .saturating_mul(1_u32 << (*attempts).min(6))
+                        .min(MAX_RETRANSMISSION_TIMEOUT)
+            {
+                if *attempts >= MAX_CLASS_OPEN_ATTEMPTS {
+                    expired.push(*id);
+                } else {
+                    *attempts += 1;
+                    *sent = now;
+                    retry.push((message.clone(), pending.eligible_paths.clone()));
+                }
+            }
+        }
+        for id in expired {
+            if let Some(pending) = self.pending_ingress_udp.remove(&id) {
+                let _ = pending.reply.send(Err(OpenUdpError::Rejected {
+                    error: ErrorClass::PathFailure,
+                    reason: b"class UDP admission timed out".to_vec(),
+                }));
+            }
+        }
+        for (message, eligible) in retry {
+            if let Some(eligible) = eligible {
+                for id in eligible.keys() {
+                    let _ = self.send_message_on(*id, message.clone()).await;
+                }
+            } else {
+                let _ = self.send_message(message).await;
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_open(
+        &mut self,
+        id: StreamId,
+        target: TargetEndpoint,
+        traffic_class: Option<TrafficClassConfig>,
+    ) {
+        self.stream_observations
+            .entry(id)
+            .or_insert(StreamSnapshot {
+                stream_id: id,
+                state: StreamState::Opening,
+                target,
+                traffic_class,
+                bytes_sent: 0,
+                bytes_received: 0,
+                bytes_acked: 0,
+                retransmissions: 0,
+                reorder_buffer_bytes: 0,
+                receive_window: self.buffer_limit as u64,
+                opened_at_ms: wall_clock_ms(),
+                closed_at_ms: None,
+                close_reason: None,
+            });
+    }
+    fn observe_closed(&mut self, id: StreamId, reason: &str, state: StreamState) {
+        if let Some(snapshot) = self.stream_observations.get_mut(&id)
+            && snapshot.closed_at_ms.is_none()
+        {
+            snapshot.state = state;
+            snapshot.closed_at_ms = Some(wall_clock_ms());
+            snapshot.close_reason = Some(reason.to_owned());
+            self.closed_streams.push_back(id);
+        }
+        while self.closed_streams.len() > 128 {
+            if let Some(id) = self.closed_streams.pop_front() {
+                self.stream_observations.remove(&id);
+            }
+        }
+    }
+    fn queue_udp(
+        &mut self,
+        datagram: UdpDatagram,
+        reply: Option<oneshot::Sender<Result<(), OpenUdpError>>>,
+    ) {
+        let permit = Arc::clone(&self.send_budget)
+            .try_acquire_many_owned(datagram.payload.len().max(1) as u32);
+        let queue = self.pending_udp.entry(datagram.association_id).or_default();
+        if queue.len() >= STREAM_COMMAND_QUEUE_CAPACITY || permit.is_err() {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(OpenUdpError::ResourceLimit));
+            }
+            return;
+        }
+        queue.push_back(PendingUdpSend {
+            datagram,
+            reply,
+            _permit: permit.unwrap(),
+        });
+    }
+    fn ready_business(
+        &self,
+    ) -> Vec<(
+        crate::traffic_queue::FlowKey,
+        Option<TrafficClassConfig>,
+        usize,
+    )> {
+        let mut ready = Vec::new();
+        for (id, stream) in &self.streams {
+            if let Some(front) = stream.pending.front()
+                && front.offset + front.data.len() as u64 <= stream.remote_receive_limit
+                && self.session_sent_total + front.data.len() as u64 <= self.remote_session_limit
+            {
+                ready.push((
+                    crate::traffic_queue::FlowKey::Tcp(id.get()),
+                    stream.traffic_class.clone(),
+                    front.data.len(),
+                ));
+            }
+        }
+        for (id, queue) in &self.pending_udp {
+            if let Some(front) = queue.front() {
+                ready.push((
+                    crate::traffic_queue::FlowKey::Udp(*id),
+                    self.udp_classes.get(id).cloned(),
+                    front.datagram.payload.len(),
+                ));
+            }
+        }
+        ready
+    }
+    fn business_ready(&self) -> bool {
+        !self.ready_business().is_empty()
+    }
+    async fn flush_business(&mut self) -> Result<(), SessionRuntimeError> {
+        for _ in 0..8 {
+            let ready = self.ready_business();
+            let Some(flow) = self.traffic_queue.select(&ready, self.chunk_size) else {
+                break;
+            };
+            match flow {
+                crate::traffic_queue::FlowKey::Tcp(id) => {
+                    self.flush_stream(
+                        StreamId::new(id).map_err(|_| SessionRuntimeError::InvalidRuntimeLimit)?,
+                    )
+                    .await?
+                }
+                crate::traffic_queue::FlowKey::Udp(id) => {
+                    if let Some(chunk) = self.pending_udp.get_mut(&id).and_then(VecDeque::pop_front)
+                    {
+                        let result = self
+                            .send_udp_now(id, Message::UdpDatagram(chunk.datagram))
+                            .await;
+                        if let Some(reply) = chunk.reply {
+                            let _ = reply.send(
+                                result
+                                    .as_ref()
+                                    .map(|_| ())
+                                    .map_err(|_| OpenUdpError::SessionClosed),
+                            );
+                        }
+                        result?;
+                    }
+                }
+            }
+        }
+        let finished: Vec<_> = self
+            .streams
+            .iter()
+            .filter_map(|(id, stream)| {
+                (stream.local_fin
+                    && !stream.fin_sent
+                    && stream.pending.is_empty()
+                    && stream.retained.is_empty()
+                    && self
+                        .stream_observations
+                        .get(id)
+                        .is_none_or(|snapshot| snapshot.bytes_acked >= snapshot.bytes_sent))
+                .then_some(*id)
+            })
+            .collect();
+        for id in finished {
+            self.send_stream_message(
+                id,
+                Message::StreamFin(StreamFin {
+                    stream_id: id,
+                    flags: STREAM_FLAG_FIN,
+                }),
+            )
+            .await?;
+            if let Some(stream) = self.streams.get_mut(&id) {
+                stream.fin_sent = true;
+            }
+        }
+        let complete: Vec<_> = self
+            .streams
+            .iter()
+            .filter_map(|(id, stream)| {
+                (stream.io_finished
+                    && stream.fin_sent
+                    && stream.pending.is_empty()
+                    && stream.retained.is_empty())
+                .then_some(*id)
+            })
+            .collect();
+        for id in complete {
+            self.observe_closed(id, "finished", StreamState::Closed);
+            if let Some(stream) = self.streams.remove(&id) {
+                stream
+                    .task
+                    .await
+                    .map_err(|error| SessionRuntimeError::Task(error.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     async fn handle_stream_data(
@@ -2734,6 +3176,11 @@ where
         stream.inbound_permits = remaining;
         let commands = stream.commands.clone();
         let delivered = result.delivered;
+        if let Some(snapshot) = self.stream_observations.get_mut(&data.stream_id) {
+            snapshot.bytes_received = snapshot
+                .bytes_received
+                .saturating_add(delivered.len() as u64);
+        }
         if result.duplicate {
             self.session_received_total += delivered.len() as u64;
             self.bytes_received += delivered.len() as u64;
@@ -2783,13 +3230,44 @@ where
         let Some(stream) = self.streams.get_mut(&ack.stream_id) else {
             return Ok(());
         };
+        let sent = self
+            .stream_observations
+            .get(&ack.stream_id)
+            .map_or(0, |snapshot| snapshot.bytes_sent);
+        for range in &ack.ranges {
+            if sent > 0 && range.start < sent {
+                stream.acknowledged.push(AckRange {
+                    start: range.start,
+                    end: range.end.min(sent - 1),
+                });
+            }
+        }
+        stream.acknowledged.sort_by_key(|range| range.start);
+        let mut merged: Vec<AckRange> = Vec::new();
+        for range in std::mem::take(&mut stream.acknowledged) {
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end.saturating_add(1)
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        if merged.len() > ProtocolLimits::HARD_MAX_ACK_RANGES {
+            return Err(SessionRuntimeError::InvalidRuntimeLimit);
+        }
+        let acked = merged.iter().map(|range| range.end - range.start + 1).sum();
+        stream.acknowledged = merged;
         stream.retained.retain(|offset, chunk| {
             let end = *offset + chunk.data.len() as u64 - 1;
             !ack.ranges
                 .iter()
                 .any(|range| range.contains(*offset) && range.contains(end))
         });
-        self.flush_stream(ack.stream_id).await
+        if let Some(snapshot) = self.stream_observations.get_mut(&ack.stream_id) {
+            snapshot.bytes_acked = acked;
+        }
+        Ok(())
     }
 
     async fn handle_stream_window(
@@ -2812,7 +3290,7 @@ where
         }
         stream.remote_receive_limit = window.stream_limit;
         self.remote_session_limit = self.remote_session_limit.max(window.session_limit);
-        self.flush_stream(window.stream_id).await
+        Ok(())
     }
 
     async fn handle_stream_fin(&mut self, fin: StreamFin) -> Result<(), SessionRuntimeError> {
@@ -2849,6 +3327,7 @@ where
         mut reason: Vec<u8>,
     ) -> Result<(), SessionRuntimeError> {
         reason.truncate(self.limits.max_control_payload());
+        self.observe_closed(stream_id, "reset", StreamState::Reset);
         if notify_peer {
             self.send_stream_message(
                 stream_id,
@@ -2922,6 +3401,19 @@ where
     }
 
     async fn send_udp_message(
+        &mut self,
+        association_id: u64,
+        message: Message,
+    ) -> Result<(), SessionRuntimeError> {
+        if let Message::UdpDatagram(datagram) = message {
+            self.queue_udp(datagram, None);
+            Ok(())
+        } else {
+            self.send_udp_now(association_id, message).await
+        }
+    }
+
+    async fn send_udp_now(
         &mut self,
         association_id: u64,
         message: Message,
@@ -3055,6 +3547,30 @@ where
             egress_aggregate_capacity_bps: self.egress_aggregate_capacity_bps,
             recommended_path_count: self.recommended_path_count,
             path_quality,
+            streams: self
+                .stream_observations
+                .iter()
+                .map(|(id, snapshot)| {
+                    let mut snapshot = snapshot.clone();
+                    if let Some(stream) = self.streams.get(id) {
+                        snapshot.reorder_buffer_bytes = stream.receive.buffered_bytes();
+                        snapshot.receive_window = stream
+                            .remote_receive_limit
+                            .saturating_sub(stream.next_send_offset);
+                        snapshot.state = match (stream.local_fin, stream.remote_fin, &self.role) {
+                            (true, true, _) => StreamState::Closed,
+                            (true, false, ActorRole::Ingress)
+                            | (false, true, ActorRole::Egress { .. }) => {
+                                StreamState::IngressHalfClosed
+                            }
+                            (true, false, ActorRole::Egress { .. })
+                            | (false, true, ActorRole::Ingress) => StreamState::EgressHalfClosed,
+                            _ => StreamState::Open,
+                        };
+                    }
+                    (*id, snapshot)
+                })
+                .collect(),
             active_streams: self.streams.len(),
             pending_stream_opens: self.pending_ingress.len() + self.opening_tasks.len(),
             retained_outbound_bytes: self.retained_outbound_bytes(),
@@ -3069,6 +3585,10 @@ where
     }
 
     async fn cleanup(&mut self) {
+        for id in self.stream_observations.keys().copied().collect::<Vec<_>>() {
+            self.observe_closed(id, "session_closed", StreamState::Closed);
+        }
+        self.pending_udp.clear();
         for (_, pending) in self.pending_ingress.drain() {
             let _ = pending.reply.send(Err(OpenStreamError::SessionClosed));
         }
@@ -3113,6 +3633,14 @@ impl<W> Drop for SessionActor<W> {
             path.reader_task.abort();
         }
     }
+}
+
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_millis().min(u128::from(u64::MAX)) as u64
+        })
 }
 
 async fn receive_command(
@@ -3423,6 +3951,7 @@ async fn stream_read_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CompleteFrameTransport;
     use crate::{
         AuthorizationState, EgressPathAdmissionConfig, IngressPathAdmissionConfig,
         PathAdmissionOutcome, PathAuthorization, accept_path, dial_path,
@@ -3482,9 +4011,21 @@ mod tests {
         IngressAdmittedPath<DuplexStream>,
         EgressAdmittedPath<DuplexStream>,
     ) {
+        admitted_pair_with_classes(false).await
+    }
+    async fn admitted_pair_with_classes(
+        classes: bool,
+    ) -> (
+        IngressAdmittedPath<DuplexStream>,
+        EgressAdmittedPath<DuplexStream>,
+    ) {
         let (ingress_key, egress_key) = keys();
-        let ingress_config = ingress_config();
-        let egress_config = egress_config();
+        let mut ingress_config = ingress_config();
+        let mut egress_config = egress_config();
+        if classes {
+            ingress_config.offered_capabilities |= CAPABILITY_TRAFFIC_CLASSES;
+            egress_config.supported_capabilities |= CAPABILITY_TRAFFIC_CLASSES;
+        }
         let authorization = authorization(&ingress_key);
         let (ingress_io, egress_io) = duplex(512 * 1024);
         let (ingress, egress) = tokio::join!(
@@ -4180,5 +4721,343 @@ mod tests {
         ingress.shutdown().await.unwrap();
         egress.wait().await.unwrap();
         factory.join().await;
+    }
+    async fn class_pair_dropping_first_business_frame(
+        drop_next: Arc<AtomicBool>,
+    ) -> (
+        IngressAdmittedPath<DropNextWrite<DuplexStream>>,
+        EgressAdmittedPath<DuplexStream>,
+    ) {
+        let (ingress_key, egress_key) = keys();
+        let mut ingress = ingress_config();
+        let mut egress = egress_config();
+        ingress.offered_capabilities |= CAPABILITY_TRAFFIC_CLASSES;
+        egress.supported_capabilities |= CAPABILITY_TRAFFIC_CLASSES;
+        let authorization = authorization(&ingress_key);
+        let (a, b) = duplex(512 * 1024);
+        let (i, e) = tokio::join!(
+            dial_path(
+                DropNextWrite {
+                    inner: a,
+                    drop_next
+                },
+                ingress_key.private(),
+                egress_key.public(),
+                &ingress
+            ),
+            accept_path(b, egress_key.private(), &egress, &authorization)
+        );
+        let PathAdmissionOutcome::Ready(i) = i.unwrap() else {
+            panic!("Ingress")
+        };
+        let PathAdmissionOutcome::Ready(e) = e.unwrap() else {
+            panic!("Egress")
+        };
+        (i, e)
+    }
+
+    #[tokio::test]
+    async fn class_open_retries_a_lost_request_and_preserves_single_target_open() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let (i, e) = class_pair_dropping_first_business_frame(dropped.clone()).await;
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e, factory.clone()).unwrap();
+            let ingress = IngressSessionHandle::start(i).unwrap();
+            dropped.store(true, Ordering::Release);
+            let mut stream = ingress
+                .open_tcp_routed_with_config(
+                    target("retry-class.test"),
+                    Default::default(),
+                    MultipathConfig {
+                        traffic_class: Some(class("priority", 10, 2)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            stream.write_all(b"retry").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"retry");
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    fn class(name: &str, priority: u8, share: u32) -> TrafficClassConfig {
+        TrafficClassConfig {
+            name: name.to_owned(),
+            priority,
+            share,
+        }
+    }
+
+    #[tokio::test]
+    async fn class_admission_is_negotiated_and_missing_capability_refuses_the_flow() {
+        let (ingress_path, egress_path) = admitted_pair().await;
+        let factory = EchoFactory::default();
+        let egress = EgressSessionHandle::start(egress_path, factory.clone()).unwrap();
+        let ingress = IngressSessionHandle::start(ingress_path).unwrap();
+        let result = ingress
+            .open_tcp_routed_with_config(
+                target("refused.test"),
+                BTreeMap::new(),
+                MultipathConfig {
+                    traffic_class: Some(class("interactive", 20, 3)),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(OpenStreamError::Rejected {
+                error: ErrorClass::LocalPolicy,
+                ..
+            })
+        ));
+        ingress.shutdown().await.unwrap();
+        egress.wait().await.unwrap();
+        factory.join().await;
+    }
+
+    #[tokio::test]
+    async fn negotiated_classes_preserve_echo_fin_and_export_both_sides_stream_state() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ingress_path, egress_path) = admitted_pair_with_classes(true).await;
+            assert_ne!(
+                ingress_path.negotiated_capabilities() & CAPABILITY_TRAFFIC_CLASSES,
+                0
+            );
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(egress_path, factory.clone()).unwrap();
+            let ingress = IngressSessionHandle::start(ingress_path).unwrap();
+            let profile = class("interactive", 200, 3);
+            let mut stream = ingress
+                .open_tcp_routed_with_config(
+                    target("class.test"),
+                    BTreeMap::new(),
+                    MultipathConfig {
+                        traffic_class: Some(profile.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let payload = vec![0x7a; 48 * 1024];
+            stream.write_all(&payload).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut echoed = Vec::new();
+            stream.read_to_end(&mut echoed).await.unwrap();
+            assert_eq!(echoed, payload);
+            for _ in 0..30 {
+                if ingress
+                    .snapshot()
+                    .streams
+                    .values()
+                    .any(|stream| stream.closed_at_ms.is_some())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let observed = ingress.snapshot().streams.values().next().unwrap().clone();
+            assert_eq!(observed.traffic_class, Some(profile.clone()));
+            assert_eq!(observed.bytes_sent, payload.len() as u64);
+            assert_eq!(observed.bytes_received, payload.len() as u64);
+            assert_eq!(observed.target.hostname, b"class.test");
+            assert!(observed.opened_at_ms > 0);
+            assert_eq!(
+                egress
+                    .controller()
+                    .snapshot()
+                    .streams
+                    .values()
+                    .next()
+                    .unwrap()
+                    .traffic_class,
+                Some(profile)
+            );
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actual_pending_streams_are_arbitrated_by_class_share_not_flow_count() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ingress_path, mut peer) = admitted_pair_with_classes(true).await;
+            let id = ingress_path.session_id();
+            let path = ingress_path.path_id();
+            let ready = ingress_path.limits().clone();
+            let initial = SessionSnapshot {
+                session_id: id,
+                path_id: path,
+                ready_paths: 1,
+                ready_path_ids: vec![path],
+                degraded_paths: 0,
+                effective_capacity_bps: 0,
+                egress_aggregate_capacity_bps: 0,
+                recommended_path_count: 1,
+                path_quality: Default::default(),
+                active_streams: 0,
+                streams: Default::default(),
+                pending_stream_opens: 0,
+                retained_outbound_bytes: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
+                closed: false,
+            };
+            let (snapshots, _) = watch::channel(initial);
+            let mut actor = SessionActor::new(
+                ingress_path.into_transport(),
+                SessionActorInit {
+                    role: ActorRole::Ingress,
+                    udp_factory: None,
+                    session_id: id,
+                    path_id: path,
+                    ready,
+                    commands: None,
+                    snapshots,
+                    egress_status: Default::default(),
+                    status_provider: None,
+                    capabilities: CAPABILITY_TRAFFIC_CLASSES,
+                },
+            )
+            .unwrap();
+            actor.chunk_size = 128;
+            let mut peers = Vec::new();
+            for index in 1..=4 {
+                let stream_id = StreamId::new(index).unwrap();
+                let (io, peer) = duplex(1024);
+                peers.push(peer);
+                let profile = if index == 1 {
+                    class("high", 255, 3)
+                } else {
+                    class("low", 0, 1)
+                };
+                actor.observe_open(stream_id, target("queued.test"), Some(profile.clone()));
+                actor
+                    .spawn_active_stream(stream_id, Box::new(io), None, Some(profile))
+                    .unwrap();
+                let count = if index == 1 { 192 } else { 64 };
+                for _ in 0..count {
+                    let permit = actor
+                        .send_budget
+                        .clone()
+                        .try_acquire_many_owned(128)
+                        .unwrap();
+                    actor
+                        .queue_stream_data(stream_id, vec![index as u8; 128], permit)
+                        .await
+                        .unwrap();
+                }
+            }
+            let mut counts = [0; 4];
+            for _ in 0..12 {
+                actor.flush_business().await.unwrap();
+                for _ in 0..8 {
+                    let frame = peer.transport_mut().receive_frame().await.unwrap().unwrap();
+                    let message = Message::decode(
+                        frame.header().frame_type(),
+                        frame.payload(),
+                        ProtocolLimits::default(),
+                    )
+                    .unwrap();
+                    let Message::StreamData(data) = message else {
+                        panic!("business arbitration emits DATA");
+                    };
+                    counts[data.stream_id.get() as usize - 1] += 1;
+                }
+            }
+            assert!((70..=74).contains(&counts[0]), "{counts:?}");
+            for low in &counts[1..] {
+                assert!((7..=9).contains(low), "{counts:?}");
+            }
+            actor
+                .send_message(Message::Heartbeat(Heartbeat { control_seq: 0 }))
+                .await
+                .unwrap();
+            let frame = peer.transport_mut().receive_frame().await.unwrap().unwrap();
+            assert_eq!(frame.header().frame_type(), FrameType::Heartbeat);
+            actor.cleanup().await;
+            drop(peers);
+        })
+        .await
+        .unwrap();
+    }
+    #[derive(Clone)]
+    struct EchoUdpFactory;
+    struct EchoUdpSocket {
+        pending: VecDeque<Vec<u8>>,
+    }
+    #[async_trait]
+    impl crate::UdpTargetSocket for EchoUdpSocket {
+        fn target_visible_port(&self) -> u16 {
+            5353
+        }
+        async fn send_datagram(&mut self, payload: &[u8]) -> Result<(), crate::UdpTargetError> {
+            self.pending.push_back(payload.to_vec());
+            Ok(())
+        }
+        async fn receive_datagram(
+            &mut self,
+            _maximum: usize,
+        ) -> Result<Vec<u8>, crate::UdpTargetError> {
+            match self.pending.pop_front() {
+                Some(payload) => Ok(payload),
+                None => pending().await,
+            }
+        }
+    }
+    #[async_trait]
+    impl UdpTargetFactory for EchoUdpFactory {
+        async fn open(
+            &self,
+            _target: TargetEndpoint,
+        ) -> Result<crate::BoxedUdpTargetSocket, crate::UdpTargetError> {
+            Ok(Box::new(EchoUdpSocket {
+                pending: VecDeque::new(),
+            }))
+        }
+    }
+    #[tokio::test]
+    async fn negotiated_udp_classes_round_trip_without_using_tcp_stream_budget() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (i, e) = admitted_pair_with_classes(true).await;
+            let factory = EchoFactory::default();
+            let egress =
+                EgressSessionHandle::start_with_udp(e, factory.clone(), EchoUdpFactory).unwrap();
+            let ingress = IngressSessionHandle::start(i).unwrap();
+            let mut udp = ingress
+                .open_udp_routed_with_config(
+                    target("udp-class.test"),
+                    BTreeMap::new(),
+                    MultipathConfig {
+                        traffic_class: Some(class("dns", 220, 2)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            udp.send(b"first".to_vec()).await.unwrap();
+            assert_eq!(udp.receive().await, Some(b"first".to_vec()));
+            udp.send(b"second".to_vec()).await.unwrap();
+            assert_eq!(udp.receive().await, Some(b"second".to_vec()));
+            udp.close().await.unwrap();
+            assert_eq!(ingress.snapshot().active_streams, 0);
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
     }
 }

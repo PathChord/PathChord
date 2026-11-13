@@ -9,27 +9,27 @@
 
 ## 适配器选择与失败
 
-| 节点协议 | 原生传输 | 可选 sing-box 1.14.4 引擎 |
+| 节点协议 | 原生传输 | 当前处理 |
 | --- | --- | --- |
 | `direct` | TCP 和 UDP | 扩展拨号选项 |
 | `http`、`https` | HTTP/1 CONNECT、Basic 认证、经过验证的额外头；HTTPS 使用 TLS | 支持的扩展节点选项 |
 | `socks5` | CONNECT、用户名密码、UDP ASSOCIATE；TCP 可选 TLS | 支持的扩展节点选项 |
-| `ss` | TCP/UDP；启用的经典 AEAD、旧 stream、扩展 AEAD 及 SS2022 算法 | 内置 `obfs-local`、`v2ray-plugin` wrapper 和支持的扩展选项 |
+| `ss` | 使用 AEAD 和 SS2022 算法的 TCP/UDP；旧 stream 算法会被拒绝 | 内置 `obfs-local`、`v2ray-plugin` wrapper 和支持的扩展选项 |
 | `socks4`、`socks4a` | 无原生出站适配器 | CONNECT |
-| `vless`、`vmess`、`xtls`、`trojan`、`hysteria`、`hysteria2`、`tuic`、`ssh`、`shadowtls`、`anytls` | 无原生适配器 | 必须通过引擎 schema 与传输验证 |
+| `vless` | 带类型化 TLS/传输校验的 TCP、TLS、WebSocket 和 WSS 字节传输 | 扩展传输与 flow 选项 |
+| `vmess` | 使用 AES-128-GCM 正文记录、`alter_id: 0` 的明文 TCP | TLS、WebSocket、UDP、mux 及其他扩展选项 |
+| `trojan` | TLS 封装的 TCP、WebSocket 和 WSS 字节传输 | 扩展传输选项 |
+| `xtls`、`hysteria`、`hysteria2`、`tuic`、`ssh`、`shadowtls`、`anytls` | 原生适配器实现中 | 注册原生适配器前返回类型化不可用诊断 |
 | `wireguard` | 无原生适配器 | 完整的用户态 WireGuard endpoint 文档 |
-| `snell` | 无原生适配器 | 引擎支持的版本 4 和 6 |
-| `ssr` 及未注册协议 | 不可用 | 未注册对应适配器时必须明确不可用 |
+| `snell` | 无原生适配器 | 类型化不可用诊断 |
+| `ssr` 及未注册协议 | 不可用 | 明确不可用 |
 
-引擎是显式配置的本地可执行程序，固定为 sing-box 1.14.4。仅凭协议名不得将节点标为可用。
-原生适配器必须校验消费的参数；引擎节点在发布到运行时之前，必须通过有界的版本与配置检查。
-不支持的参数和缺失的引擎支持必须产生类型化、脱敏诊断。TLS 或传输配置失败时不得回退为
-明文或 direct。
+仅凭协议名不得将节点标为可用。原生适配器必须在发布到运行时之前校验消费的参数。不支持的
+参数和未实现的协议必须产生类型化、脱敏诊断。TLS 或传输配置失败时不得回退为明文或 direct。
 
-可选引擎持有一个采用随机认证的私有 loopback SOCKS 端点。节点配置通过 stdin 提供，不得
-放入凭据命令参数或其他用户可读的文件。引擎输出不得泄露秘密。启动与就绪等待必须有界。
-节点连接共享对应引擎进程；连接仍持有它时进程保持存活，最后一个所有者释放后必须终止并
-回收进程。引擎状态目录必须为私有目录。
+原生 VLESS 和 Trojan 适配器会在打开 socket 前拒绝不支持的 flow、multiplex、packet 和传输
+选项。原生 VMess 当前支持明文 TCP/AES-128-GCM/`alter_id: 0`；其 TLS、WebSocket、UDP 和
+mux 变体在原生实现完成前不可用。表中的协议行本身不表示包含不支持参数的节点可选。
 
 ## 类型化连接选项
 
@@ -53,19 +53,19 @@ TLS 布尔值默认 `false`；证书和 ALPN 列表默认空列表。`https` 隐
 身份。原生 HTTPS CONNECT 允许 HTTP/1.1 ALPN。证书值是内联 PEM；客户端私钥只能从
 `clientKeyField` 指定的 opaque credential 文档字段读取。除整个对象均为默认值外，禁用 TLS
 时指定 TLS 设置无效。Reality 使用 `publicKey` 和 `shortId`；fingerprint/Reality 需要兼容的
-引擎。`insecure` 是显式证书验证选项，不得在验证失败后自动采用。
+原生 Reality 适配器。`insecure` 是显式证书验证选项，不得在验证失败后自动采用。
 
 传输 `type` 为 `tcp`、`ws`、`grpc`、`http`、`httpupgrade`、`quic` 或 `xhttp`；模型接受该值
-不表示选定引擎支持它。普通 TCP 不接受 HTTP 传输参数。WebSocket Host 覆盖映射为传输的
+不表示原生适配器支持它。普通 TCP 不接受 HTTP 传输参数。WebSocket Host 覆盖映射为传输的
 `Host` 头。冲突的别名或 Host 值必须拒绝。Multiplex 布尔值默认 `false`；协议为 `smux`、
 `yamux` 或 `h2mux`。不支持的组合必须验证失败。
 
 原生适配器凭据字段按协议区分。HTTP/SOCKS 使用 `username` 和 `password`；SS 使用 `cipher`
-和 `password`，plugin 字段只能由兼容引擎路径处理。额外凭据键不得静默丢弃。敏感头、私钥、
-密码、UUID 和完整引擎文档必须保留在私有凭据中，不能成为管理员 label 或公共节点诊断。
+和 `password`，plugin 字段只能由已注册的原生 plugin 路径处理。额外凭据键不得静默丢弃。敏感头、私钥、
+密码、UUID 和完整导入文档必须保留在私有凭据中，不能成为管理员 label 或公共节点诊断。
 
-类型化引擎节点使用以下私有凭据字段；不在对应行中的字段必须拒绝，不得猜测或丢弃。
-选定引擎执行最终协议和版本验证。
+类型化协议节点使用以下私有凭据字段；不在对应行中的字段必须拒绝，不得猜测或丢弃。
+原生适配器执行最终协议验证。
 
 | 协议 | 私有凭据字段 |
 | --- | --- |
@@ -79,13 +79,10 @@ TLS 布尔值默认 `false`；证书和 ALPN 列表默认空列表。`https` 隐
 | `shadowtls` | `password`、`version` |
 | `snell` | `psk` 或等价 `password`、`userkey`、`version` |
 
-`clientKeyField` 将引用的私有字段加入允许集合。冲突别名无效。其他引擎字段必须使用完整
-引擎节点文档，保留其自身 schema，不得将它缩减为类型化凭据子集。
-
-凭据字段 `sing_box_outbound` 携带一份完整的引擎节点文档。它是权威源，不得与独立节点选项或
-派生凭据字段混用。其类型和端点必须与规范化节点匹配。未知引擎字段必须原样进入引擎验证器。
-导入文档不得引用本地文件、命令、外部 detour 或系统 WireGuard 接口；必须使用内联凭据和
-用户态网络。网络传输路径仍然合法。SS plugin 名称仅限已注册的内置 wrapper；执行任意 plugin
+`clientKeyField` 将引用的私有字段加入允许集合。冲突别名无效。其他协议字段在对应原生适配器
+支持前保留为不可用诊断。完整 `sing_box_outbound` 文档
+只作为导入节点的 opaque 诊断数据保留，不提供原生适配器，也不会被 PathChord 执行。导入文档
+不得触发隐式进程启动或 direct 回退。SS plugin 名称仅限已注册的内置 wrapper；执行任意 plugin
 不是节点能力。
 
 ## 订阅文档类型
@@ -96,7 +93,7 @@ TLS 布尔值默认 `false`；证书和 ALPN 列表默认空列表。`https` 隐
 | `clash` | Clash/Mihomo `proxies` 和 HTTP `proxy-providers` |
 | `sip008` | SS JSON 数组，或包含 `servers` 的版本化对象 |
 | `uri` | 明文或 Base64 编码的分享链接列表；百分号编码 URI 字段；VMess JSON 及旧版/SIP002 SS 形式 |
-| `sing_box` | 包含完整私有 outbound 参数的 sing-box 节点文档 |
+| `sing_box` | 导入的 sing-box 节点文档；保留为不可用诊断 |
 | `surge`、`quantumult`、`loon` | 支持的节点列表及 proxy section 形式 |
 | `static` | 管理员编写的节点；不进行远程订阅刷新 |
 

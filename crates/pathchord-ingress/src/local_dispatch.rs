@@ -655,6 +655,60 @@ impl LocalControlDispatcher {
             return *response;
         }
         let snapshot = self.service.observation_snapshot();
+        let mut node_health = BTreeMap::from([
+            ("unknown", 0_u64),
+            ("up", 0_u64),
+            ("degraded", 0_u64),
+            ("down", 0_u64),
+        ]);
+        for observation in snapshot.nodes.values() {
+            let key = match observation.state {
+                crate::NodeHealthState::Unknown => "unknown",
+                crate::NodeHealthState::Up => "up",
+                crate::NodeHealthState::Degraded => "degraded",
+                crate::NodeHealthState::Down => "down",
+            };
+            *node_health
+                .get_mut(key)
+                .expect("all node states are initialized") += 1;
+        }
+        let path_rtt_ms_sum: u64 = snapshot.paths.values().map(|path| path.rtt_ms).sum();
+        let path_jitter_ms_sum: u64 = snapshot.paths.values().map(|path| path.jitter_ms).sum();
+        let path_loss_ppm_sum: u64 = snapshot
+            .paths
+            .values()
+            .map(|path| u64::from(path.loss_ppm))
+            .sum();
+        let path_throughput_bps_sum: u64 = snapshot
+            .paths
+            .values()
+            .map(|path| path.throughput_bps)
+            .sum();
+        let path_reordering_events: u64 = snapshot
+            .paths
+            .values()
+            .map(|path| path.reordering_events)
+            .sum();
+        let stream_bytes_sent: u64 = snapshot
+            .streams
+            .values()
+            .map(|stream| stream.bytes_sent)
+            .sum();
+        let stream_bytes_received: u64 = snapshot
+            .streams
+            .values()
+            .map(|stream| stream.bytes_received)
+            .sum();
+        let stream_bytes_acked: u64 = snapshot
+            .streams
+            .values()
+            .map(|stream| stream.bytes_acked)
+            .sum();
+        let stream_retransmissions: u64 = snapshot
+            .streams
+            .values()
+            .map(|stream| stream.retransmissions)
+            .sum();
         self.success(
             request.request_id,
             json!({
@@ -667,6 +721,22 @@ impl LocalControlDispatcher {
                     "target_connections": snapshot.runtime.target_connections,
                 },
                 "nodes": snapshot.nodes.len(),
+                "node_health": node_health,
+                "paths": snapshot.paths.len(),
+                "path_quality": {
+                    "rtt_ms_sum": path_rtt_ms_sum,
+                    "jitter_ms_sum": path_jitter_ms_sum,
+                    "loss_ppm_sum": path_loss_ppm_sum,
+                    "throughput_bps_sum": path_throughput_bps_sum,
+                    "reordering_events": path_reordering_events,
+                },
+                "streams_observed": snapshot.streams.len(),
+                "stream_totals": {
+                    "bytes_sent": stream_bytes_sent,
+                    "bytes_received": stream_bytes_received,
+                    "bytes_acked": stream_bytes_acked,
+                    "retransmissions": stream_retransmissions,
+                },
                 "connections": snapshot.connections.len(),
             }),
         )
@@ -701,23 +771,58 @@ impl LocalControlDispatcher {
         if let Err(response) = self.require_capability(&request, "metrics:read") {
             return *response;
         }
+        let reveal_targets = request
+            .actor
+            .capabilities
+            .iter()
+            .any(|capability| capability == "targets:read");
         let snapshot = self.service.observation_snapshot();
-        let items: Vec<_> = snapshot
-            .sessions
-            .values()
-            .map(|session| {
-                json!({
-                    "session_id": session.session_id.to_string(),
-                    "egress_id": session.egress_id,
-                    "state": format!("{:?}", session.state).to_ascii_lowercase(),
-                    "ready_paths": session.ready_paths,
-                    "active_streams": session.active_streams,
-                    "retained_outbound_bytes": session.retained_outbound_bytes,
-                    "bytes_sent": session.bytes_sent,
-                    "bytes_received": session.bytes_received,
+        let items: Vec<_> = if snapshot.streams.is_empty() {
+            snapshot
+                .sessions
+                .values()
+                .map(|session| {
+                    json!({
+                        "session_id": session.session_id.to_string(),
+                        "egress_id": session.egress_id,
+                        "state": format!("{:?}", session.state).to_ascii_lowercase(),
+                        "ready_paths": session.ready_paths,
+                        "active_streams": session.active_streams,
+                        "retained_outbound_bytes": session.retained_outbound_bytes,
+                        "bytes_sent": session.bytes_sent,
+                        "bytes_received": session.bytes_received,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        } else {
+            snapshot
+                .streams
+                .values()
+                .map(|stream| {
+                    json!({
+                        "session_id": stream.session_id.to_string(),
+                        "stream_id": stream.stream_id.to_string(),
+                        "state": format!("{:?}", stream.state).to_ascii_lowercase(),
+                        "target": if reveal_targets {
+                            Some(stream.target_display.clone())
+                        } else {
+                            None
+                        },
+                        "target_redacted": !reveal_targets,
+                        "traffic_class": stream.traffic_class,
+                        "bytes_sent": stream.bytes_sent,
+                        "bytes_received": stream.bytes_received,
+                        "bytes_acked": stream.bytes_acked,
+                        "retransmissions": stream.retransmissions,
+                        "reorder_buffer_bytes": stream.reorder_buffer_bytes,
+                        "receive_window": stream.receive_window,
+                        "opened_at_ms": stream.opened_at_ms,
+                        "closed_at_ms": stream.closed_at_ms,
+                        "close_reason": stream.close_reason,
+                    })
+                })
+                .collect()
+        };
         self.success(request.request_id, json!({"items": items}))
     }
 
@@ -1615,6 +1720,40 @@ mod tests {
         assert_eq!(stream["egress_id"], "egress-a");
         assert_eq!(stream["ready_paths"], 1);
         assert_eq!(stream["active_streams"], 2);
+
+        observations
+            .replace_stream_observations([crate::StreamObservation {
+                session_id,
+                stream_id: pathchord_core::StreamId::new(53).expect("stream id"),
+                state: pathchord_core::StreamState::Open,
+                target_display: "private.example:443".into(),
+                traffic_class: Some("interactive".into()),
+                bytes_sent: 10,
+                bytes_received: 11,
+                bytes_acked: 9,
+                retransmissions: 1,
+                reorder_buffer_bytes: 2,
+                receive_window: 3,
+                opened_at_ms: 4,
+                closed_at_ms: None,
+                close_reason: None,
+            }])
+            .unwrap();
+        let redacted =
+            dispatcher.dispatch(request("metrics.streams", &["metrics:read"], json!({})));
+        let redacted = &redacted.result.expect("redacted stream metrics")["items"][0];
+        assert!(redacted["target"].is_null());
+        assert_eq!(redacted["target_redacted"], true);
+        assert_eq!(redacted["traffic_class"], "interactive");
+        let revealed = dispatcher.dispatch(request(
+            "metrics.streams",
+            &["metrics:read", "targets:read"],
+            json!({}),
+        ));
+        assert_eq!(
+            revealed.result.expect("revealed stream metrics")["items"][0]["target"],
+            "private.example:443"
+        );
     }
 
     #[test]

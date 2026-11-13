@@ -117,6 +117,7 @@ admission_generation, created_at, last_change_at
 ready_path_count, active_streams, active_udp_associations
 control_pending, control_acked, control_retransmissions
 close_reason, reconnect_attempts
+traffic_class_name, traffic_class_priority, traffic_class_share
 ```
 
 Stream 视图暴露：
@@ -127,6 +128,7 @@ target_kind, target_port, admitted_generation
 bytes_sent, bytes_received, bytes_acked
 reorder_buffer_bytes, receive_window, retransmissions
 opened_at, closed_at, close_reason
+traffic_class_name, traffic_class_priority, traffic_class_share
 ```
 
 目标连接视图暴露稳定的本地连接 ID、SessionID 和 StreamID、生命周期状态、字节计数器、

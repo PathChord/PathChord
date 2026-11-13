@@ -485,16 +485,20 @@ mod tests {
         let (target, target_task) = echo_target().await;
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        let server = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![cert.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
-            )
-            .unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
+        )
+        .unwrap();
         let mut roots = RootCertStore::empty();
         roots.add(cert.der().clone()).unwrap();
-        let client = ClientConfig::builder()
+        let client = crate::tls::client_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -522,13 +526,17 @@ mod tests {
         let (target, target_task) = echo_target().await;
         let CertifiedKey { cert, signing_key } =
             generate_simple_self_signed(vec!["proxy.test".to_owned()]).unwrap();
-        let server = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![cert.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
-            )
-            .unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
+        )
+        .unwrap();
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = proxy.local_addr().unwrap();
         let proxy_task = tokio::spawn(async move {
@@ -555,7 +563,7 @@ mod tests {
             Some(&credential()),
             Duration::from_secs(2),
             Arc::new(
-                ClientConfig::builder()
+                crate::tls::client_builder()
                     .with_root_certificates(RootCertStore::empty())
                     .with_no_client_auth(),
             ),
@@ -582,13 +590,17 @@ mod tests {
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
             .build()
             .unwrap();
-        let server = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(
-                vec![server_cert.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
-            )
-            .unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![server_cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+        )
+        .unwrap();
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = proxy.local_addr().unwrap();
         let task = tokio::spawn(async move {

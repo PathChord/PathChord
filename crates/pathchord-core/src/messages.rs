@@ -62,6 +62,32 @@ pub struct PathReady {
     pub max_session_buffering: u64,
 }
 
+/// Negotiated optional extension; legacy message bytes remain unchanged.
+pub const CAPABILITY_TRAFFIC_CLASSES: u64 = 1 << 2;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrafficClassConfig {
+    pub name: String,
+    pub priority: u8,
+    pub share: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathReadyCapabilities {
+    pub limits: PathReady,
+    pub capabilities: u64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamOpenClass {
+    pub open: StreamOpen,
+    pub traffic_class: TrafficClassConfig,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdpOpenClass {
+    pub open: UdpOpen,
+    pub traffic_class: TrafficClassConfig,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathDrain {
     pub drain_reason: u64,
@@ -245,6 +271,9 @@ pub struct UdpClose {
 /// All v1 payloads carried by the canonical frame registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
+    PathReadyCapabilities(PathReadyCapabilities),
+    StreamOpenClass(StreamOpenClass),
+    UdpOpenClass(UdpOpenClass),
     PathHello(PathHello),
     SessionAttach(SessionAttach),
     SessionAttachOk(SessionAttachOk),
@@ -275,6 +304,9 @@ impl Message {
     #[must_use]
     pub const fn frame_type(&self) -> FrameType {
         match self {
+            Self::PathReadyCapabilities(_) => FrameType::PathReadyCapabilities,
+            Self::StreamOpenClass(_) => FrameType::StreamOpenClass,
+            Self::UdpOpenClass(_) => FrameType::UdpOpenClass,
             Self::PathHello(_) => FrameType::PathHello,
             Self::SessionAttach(_) => FrameType::SessionAttach,
             Self::SessionAttachOk(_) => FrameType::SessionAttachOk,
@@ -339,6 +371,15 @@ impl Message {
         }
         let mut reader = Reader::new(input);
         let message = match frame_type {
+            FrameType::PathReadyCapabilities => {
+                Self::PathReadyCapabilities(PathReadyCapabilities::decode(&mut reader, limits)?)
+            }
+            FrameType::StreamOpenClass => {
+                Self::StreamOpenClass(StreamOpenClass::decode(&mut reader, limits)?)
+            }
+            FrameType::UdpOpenClass => {
+                Self::UdpOpenClass(UdpOpenClass::decode(&mut reader, limits)?)
+            }
             FrameType::PathHello => Self::PathHello(PathHello::decode(&mut reader, limits)?),
             FrameType::SessionAttach => {
                 Self::SessionAttach(SessionAttach::decode(&mut reader, limits)?)
@@ -386,6 +427,9 @@ impl Message {
         limits: ProtocolLimits,
     ) -> Result<(), MessageCodecError> {
         match self {
+            Self::PathReadyCapabilities(value) => value.encode(output, limits),
+            Self::StreamOpenClass(value) => value.encode(output, limits),
+            Self::UdpOpenClass(value) => value.encode(output, limits),
             Self::PathHello(value) => value.encode(output, limits),
             Self::SessionAttach(value) => value.encode(output, limits),
             Self::SessionAttachOk(value) => value.encode(output),
@@ -1526,6 +1570,102 @@ impl UdpClose {
     }
 }
 
+impl TrafficClassConfig {
+    pub fn validate(&self) -> Result<(), MessageCodecError> {
+        if self.name.is_empty()
+            || self.name.len() > 256
+            || !self
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-:".contains(&byte))
+            || !(1..=1_000_000).contains(&self.share)
+        {
+            return Err(MessageCodecError::InvalidField {
+                field: "traffic_class",
+            });
+        }
+        Ok(())
+    }
+    fn encode(&self, output: &mut Vec<u8>) -> Result<(), MessageCodecError> {
+        self.validate()?;
+        put_bytes(self.name.as_bytes(), 256, "traffic_class", output)?;
+        put_varint(u64::from(self.priority), output)?;
+        put_varint(u64::from(self.share), output)
+    }
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, MessageCodecError> {
+        let name = String::from_utf8(reader.bytes(256, "traffic_class")?).map_err(|_| {
+            MessageCodecError::InvalidField {
+                field: "traffic_class",
+            }
+        })?;
+        let priority = u8::try_from(reader.varint("class_priority")?).map_err(|_| {
+            MessageCodecError::InvalidField {
+                field: "class_priority",
+            }
+        })?;
+        let share = u32::try_from(reader.varint("class_share")?).map_err(|_| {
+            MessageCodecError::InvalidField {
+                field: "class_share",
+            }
+        })?;
+        let value = Self {
+            name,
+            priority,
+            share,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+impl PathReadyCapabilities {
+    fn encode(
+        &self,
+        output: &mut Vec<u8>,
+        _limits: ProtocolLimits,
+    ) -> Result<(), MessageCodecError> {
+        self.limits.encode(output)?;
+        put_varint(self.capabilities, output)
+    }
+    fn decode(reader: &mut Reader<'_>, _limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
+        Ok(Self {
+            limits: PathReady::decode(reader)?,
+            capabilities: reader.varint("capabilities")?,
+        })
+    }
+}
+impl StreamOpenClass {
+    fn encode(
+        &self,
+        output: &mut Vec<u8>,
+        limits: ProtocolLimits,
+    ) -> Result<(), MessageCodecError> {
+        self.open.encode(output, limits)?;
+        self.traffic_class.encode(output)
+    }
+    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
+        Ok(Self {
+            open: StreamOpen::decode(reader, limits)?,
+            traffic_class: TrafficClassConfig::decode(reader)?,
+        })
+    }
+}
+impl UdpOpenClass {
+    fn encode(
+        &self,
+        output: &mut Vec<u8>,
+        limits: ProtocolLimits,
+    ) -> Result<(), MessageCodecError> {
+        self.open.encode(output, limits)?;
+        self.traffic_class.encode(output)
+    }
+    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
+        Ok(Self {
+            open: UdpOpen::decode(reader, limits)?,
+            traffic_class: TrafficClassConfig::decode(reader)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1649,6 +1789,68 @@ mod tests {
             StatusReportDisposition::Expired
         );
         assert_eq!(tracker.latest().expect("latest").report_seqno, 2);
+    }
+
+    #[test]
+    fn negotiated_class_extensions_round_trip_and_enforce_bounds() {
+        let profile = TrafficClassConfig {
+            name: "gaming:interactive".into(),
+            priority: 255,
+            share: 3,
+        };
+        let limits = ProtocolLimits::default();
+        let messages = [
+            Message::PathReadyCapabilities(PathReadyCapabilities {
+                limits: PathReady {
+                    max_frame_payload: 1024,
+                    max_control_payload: 512,
+                    max_session_buffering: 4096,
+                },
+                capabilities: 7,
+            }),
+            Message::StreamOpenClass(StreamOpenClass {
+                open: StreamOpen {
+                    stream_id: StreamId::new(1).unwrap(),
+                    request_id: RequestId::new(2),
+                    target: endpoint(),
+                },
+                traffic_class: profile.clone(),
+            }),
+            Message::UdpOpenClass(UdpOpenClass {
+                open: UdpOpen {
+                    association_id: 1,
+                    target_flags: 3,
+                    target: endpoint(),
+                },
+                traffic_class: profile.clone(),
+            }),
+        ];
+        for message in messages {
+            let encoded = message.encode(limits).unwrap();
+            assert_eq!(
+                Message::decode(message.frame_type(), &encoded, limits).unwrap(),
+                message
+            );
+            let mut trailing = encoded.clone();
+            trailing.push(0);
+            assert!(Message::decode(message.frame_type(), &trailing, limits).is_err());
+        }
+        for bad in [
+            TrafficClassConfig {
+                share: 0,
+                ..profile.clone()
+            },
+            TrafficClassConfig {
+                name: "bad class".into(),
+                ..profile.clone()
+            },
+            TrafficClassConfig {
+                name: "x".repeat(257),
+                ..profile.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err());
+        }
     }
 
     #[test]

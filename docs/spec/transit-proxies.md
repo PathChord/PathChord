@@ -10,31 +10,31 @@ NOT be interpreted as support for the same outbound node protocol.
 
 ## Adapter selection and failure
 
-| Node protocol | Native transport | Optional sing-box 1.14.4 engine |
+| Node protocol | Native transport | Current handling |
 | --- | --- | --- |
 | `direct` | TCP and UDP | Extended dialer options |
 | `http`, `https` | HTTP/1 CONNECT, Basic authentication, validated extra headers; HTTPS uses TLS | Supported extended node options |
 | `socks5` | CONNECT, username/password, UDP ASSOCIATE; optional TLS for TCP | Supported extended node options |
-| `ss` | TCP/UDP; enabled classic AEAD, legacy stream, extra AEAD, and SS2022 ciphers | Built-in `obfs-local` and `v2ray-plugin` wrappers and supported extended options |
+| `ss` | TCP/UDP with AEAD and SS2022 ciphers; legacy stream ciphers are rejected | Built-in `obfs-local` and `v2ray-plugin` wrappers and supported extended options |
 | `socks4`, `socks4a` | No native outbound adapter | CONNECT |
-| `vless`, `vmess`, `xtls`, `trojan`, `hysteria`, `hysteria2`, `tuic`, `ssh`, `shadowtls`, `anytls` | No native adapter | Engine schema and transport validation are required |
+| `vless` | TCP, TLS, WebSocket, and WSS byte transports with typed TLS/transport validation | Extended transport and flow options |
+| `vmess` | Plain TCP with AES-128-GCM body records and `alter_id: 0` | TLS, WebSocket, UDP, mux, and other extended options |
+| `trojan` | TLS-wrapped TCP, WebSocket, and WSS byte transports | Extended transport options |
+| `xtls`, `hysteria`, `hysteria2`, `tuic`, `ssh`, `shadowtls`, `anytls` | Native adapter under implementation | Typed unavailable diagnostic until the native adapter is registered |
 | `wireguard` | No native adapter | Complete userspace WireGuard endpoint document |
-| `snell` | No native adapter | Engine-supported versions 4 and 6 |
-| `ssr` and unregistered protocols | Unavailable | Explicitly unavailable unless a matching adapter is registered |
+| `snell` | No native adapter | Typed unavailable diagnostic |
+| `ssr` and unregistered protocols | Unavailable | Explicitly unavailable |
 
-The engine is an explicitly configured local executable, pinned to sing-box
-1.14.4. Protocol names alone MUST NOT mark a node usable. Native adapters
-validate consumed parameters; engine nodes MUST pass bounded version and
-configuration checks before runtime publication. Unsupported parameters and
-missing engine support MUST produce typed, redacted diagnostics. A failed
-TLS or transport configuration MUST NOT fall back to plaintext or direct.
+Protocol names alone MUST NOT mark a node usable. Native adapters validate
+consumed parameters before runtime publication. Unsupported parameters and
+unimplemented protocols MUST produce typed, redacted diagnostics. A failed TLS
+or transport configuration MUST NOT fall back to plaintext or direct.
 
-The optional engine owns a private loopback SOCKS endpoint with random
-authentication. Node configuration is provided over stdin, not credential
-arguments or a world-readable file. Engine output MUST NOT expose secrets.
-Startup and readiness are bounded. The engine process is shared by its node's
-connections, remains alive while those connections own it, and is killed and
-reaped after its last owner disappears. Engine state directories are private.
+Native VLESS and Trojan adapters reject unsupported flow, multiplex, packet,
+and transport options before opening a socket. Native VMess currently covers
+plain TCP/AES-128-GCM/`alter_id: 0`; its TLS, WebSocket, UDP, and mux variants
+remain unavailable until implemented natively. A protocol row in this table
+never makes an unsupported parameter set selectable.
 
 ## Typed connection options
 
@@ -61,27 +61,27 @@ of the connection address. Native HTTPS CONNECT permits HTTP/1.1 ALPN.
 Certificate values are inline PEM; client private keys are resolved only from
 the opaque credential document field named by `clientKeyField`. TLS settings
 with disabled TLS are invalid unless the object is entirely default-valued.
-Reality uses `publicKey` and `shortId`; fingerprint/Reality options require a
-compatible engine. `insecure` is an explicit certificate-verification option,
+Reality uses `publicKey` and `shortId`; fingerprint/Reality options require the
+native Reality adapter. `insecure` is an explicit certificate-verification option,
 never a fallback after validation failure.
 
 Transport `type` is `tcp`, `ws`, `grpc`, `http`, `httpupgrade`, `quic`, or
-`xhttp`; accepting the type in the model does not imply the chosen engine
-supports it. Plain TCP cannot carry HTTP transport parameters. WebSocket Host
+`xhttp`; accepting the type in the model does not imply native support. Plain
+TCP cannot carry HTTP transport parameters. WebSocket Host
 overrides map to the transport's `Host` header. Conflicting aliases or Host
 values are rejected. Multiplex booleans default to `false`; its protocol is
 `smux`, `yamux`, or `h2mux`. Unsupported combinations fail validation.
 
 Native adapter credential fields are protocol-specific. HTTP/SOCKS use
 `username` and `password`; SS uses `cipher` and `password`, with plugin fields
-only on a compatible engine path. Extra credential keys MUST NOT be silently
+only on a registered native plugin path. Extra credential keys MUST NOT be silently
 discarded. Sensitive headers, private keys, passwords, UUIDs, and complete
-engine documents remain private credential data, never administrator labels
+imported documents remain private credential data, never administrator labels
 or public node diagnostics.
 
-Typed engine nodes use these private credential fields; fields absent from a
-row are rejected instead of being guessed or discarded. The selected engine
-performs final protocol/version validation.
+Typed protocol nodes use these private credential fields; fields absent from a
+row are rejected instead of being guessed or discarded. The native adapter
+performs final protocol validation.
 
 | Protocol | Private credential fields |
 | --- | --- |
@@ -96,19 +96,14 @@ performs final protocol/version validation.
 | `snell` | `psk` or equivalent `password`, `userkey`, `version` |
 
 `clientKeyField` adds its referenced private field to the permitted set.
-Conflicting aliases are invalid. Further engine fields require a complete
-engine node document, which preserves its own schema without reducing it to
-the typed credential subset.
+Conflicting aliases are invalid. Further protocol fields remain unavailable
+until the corresponding native adapter supports them.
 
-The credential field `sing_box_outbound` carries one complete engine node
-document. It is authoritative and MUST NOT be combined with separate node
-options or derived credential fields. Its type and endpoint must match the
-normalized node. Unknown engine fields reach the engine validator unchanged.
-Imported documents cannot reference local files, commands, external detours,
-or a system WireGuard interface; inline credentials and userspace networking
-are required. Network transport paths remain valid. SS plugin names are
-limited to the registered built-in wrappers; arbitrary plugin execution is
-not a node capability.
+The credential field `sing_box_outbound` is retained as an imported opaque
+document for diagnostics, but it has no native adapter and is not executable
+by PathChord. Imported documents cannot become an implicit process launch or
+direct fallback. SS plugin names are limited to the registered built-in
+wrappers; arbitrary plugin execution is not a node capability.
 
 ## Subscription document families
 

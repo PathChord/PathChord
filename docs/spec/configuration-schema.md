@@ -233,7 +233,7 @@ optional capability set. The first rule whose match, selector, capability, and
 current Egress usability all pass wins. `TransitRule` objects are evaluated after an
 Egress is selected; `egressRef` is an Egress name, `require` and `reject` are
 selectors, `weight` defaults to `100`, and `trafficPolicyRef` is required when
-more than one admitted relationship can carry the flow. A rule with no admitted
+more than one admitted relationship can carry the flow. `trafficClassRef` optionally selects a key in the selected TrafficPolicy class map; an unknown key is invalid. A rule with no admitted
 Transit Proxy causes the next Egress rule to be considered; it does not silently
 fall through to an arbitrary Proxy.
 
@@ -269,6 +269,8 @@ is `0..=255` and a `share` is `1..=1_000_000`. The Session budget is the hard
 upper bound; control traffic is accounted against it. The scheduler applies
 relationship weight first and then effective capacity, congestion window, RTT,
 jitter, and loss. A policy cannot grant a Path more than its advertised flow
+`TransitRule.spec.trafficClassRef` optionally assigns admitted flows to one key in the selected `TrafficPolicy.classes` map. Unknown class references are validation errors. A missing reference uses the default class.
+
 control limit.
 
 ## Listener

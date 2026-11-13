@@ -8,9 +8,9 @@ architecture and behavioral contracts remain under `docs/design/` and
 
 ## Current focus
 
-Active work prioritizes HTTP forwarding/CONNECT, SOCKS4/4a/5 CONNECT, and
-SOCKS5 UDP ASSOCIATE on
-Linux, Windows, and FreeBSD. FreeBSD explicit-listener configuration, platform
+Active work prioritizes HTTP forwarding/CONNECT, SOCKS4/4a/5 CONNECT, SOCKS5
+UDP ASSOCIATE, and same-port Mixed listeners on Linux, Windows, and FreeBSD.
+FreeBSD explicit-listener configuration, native process metadata, platform
 identity, and Unix local control are integrated. FreeBSD x86_64 target
 compilation and CLI linking pass; native host tests remain outstanding.
 Portable listener regressions run in the existing Rust CI job.
@@ -68,11 +68,25 @@ in the current scope.
 - `IngressDataPlane` compiles/evaluates ordered policy, creates authenticated
   Egress Sessions through Transit adapters, exposes TCP/UDP openers, maintains
   Path slots, applies selected TrafficPolicy replication/retransmission
-  budgets, exports path-quality/session/stream observations, and publishes DNS
-  protected endpoints.
+  budgets, exports path-quality/session/individual Stream observations, and
+  publishes DNS protected endpoints. TrafficPolicy class priority/share
+  scheduling is negotiated in both directions with bounded priority, weighted
+  fairness, and class-aware TCP/UDP queues.
+- Static policy reload prepares every changed Transit adapter before a
+  transactional runtime/control-plane commit. Failed preparation or durable
+  control reconciliation retains the previous generation; changed Paths drain
+  under a bounded retirement task while existing Streams continue.
+- Explicit NodeProbePolicy configuration performs bounded TCP connect probes
+  only to its configured target. Observations expose adapter readiness, state,
+  latency, jitter, loss, and typed failures without fabricating throughput or
+  capacity. Probing is disabled by default.
 - Egress has a real TCP Path listener, authorization-backed admission, target
   Stream/UDP forwarding, multiple Path attachment, global status inputs,
   authorization reconciliation, cleanup barriers, and bounded supervision.
+- Ingress and Egress consume the same file/directory resource bundle. Egress
+  selects one EgressService resource, resolves relative paths from its source,
+  and applies command-line, environment, then account-default precedence while
+  retaining complete legacy CLI-only startup when the default bundle is absent.
 - Policy parsing preserves subscriptions, DNSPolicy, opaque credential
   references, listener platform/protocol/process fields, and flow tags.
   `CompiledPolicy` evaluates Egress, Transit, ordinary Proxy, and fallback
@@ -84,15 +98,21 @@ in the current scope.
   credentials/options are rejected instead of ignored; TLS options cannot
   silently become plaintext. Credential files retain bounded, private,
   symlink/TOCTOU-checked, redacted handling.
-- The optional sing-box 1.14.4 backend carries advanced protocols and
-  transports through a supervised, private authenticated endpoint. Schema and
-  version checks run before publication; secret configuration travels on stdin.
-  VLESS, WebSocket VLESS, and TLS Trojan have local interoperability evidence.
-  Complete private engine documents preserve parameters and reject local-file,
-  command, external detour, and system-interface references.
+- Native Rust VLESS and Trojan adapters support TCP, TLS, WebSocket, and WSS
+  combinations with real protocol-peer TCP and UDP interoperability
+  coverage. Native VMess supports plain TCP with AES-128-GCM and `alter_id: 0`
+  with a real protocol interoperability fixture; VMess extended transports,
+  Hysteria2, TUIC, Reality, and SSR remain unimplemented or explicitly
+  unavailable.
+- AnyTLS has a bounded pure-Rust frame and password-authentication codec, but
+  remains unregistered until its TLS/session lifecycle and independent
+  interoperability fixture are complete.
+- Imported complete sing-box documents are retained as opaque unavailable-node
+  diagnostics. PathChord does not start or embed a compatibility process.
 - Subscription refresh supports automatic detection, Clash/Mihomo, SIP008
   arrays and object wrappers, URI/Base64 lists, sing-box outbounds/endpoints,
-  and supported Surge/Quantumult X/Loon node lines. HTTP provider references
+  and supported Surge/Quantumult X/Loon node lines. Complete external-engine
+  documents remain unavailable diagnostics. HTTP provider references
   are bounded by depth/count/aggregate bytes and propagate bearer credentials
   only to the same origin. Individual invalid nodes retain sanitized
   diagnostics; malformed documents and failed providers retain applicable
@@ -101,9 +121,10 @@ in the current scope.
   `PathChord-Traffic-Multiplier` extension supplies billing metadata. Cache,
   node queries, the console, and Path economics consume the metadata. Unknown
   statistics stay unknown; expiry is not a quota reset timestamp.
-- `/metrics` exposes bounded aggregate Prometheus gauges through the optional
-  Web Gateway's existing authentication, Origin, and capability checks. JSON
-  metric queries and SSE remain available.
+- `/metrics` exposes bounded aggregate Prometheus gauges for runtime, node
+  health, Path quality, and observed Stream byte/retransmission totals through
+  the optional Web Gateway's existing authentication, Origin, and capability
+  checks. JSON metric queries and SSE remain available.
 - DNSRuntime supports local, Transit, Egress, and blocked routes, Hickory
   parsing, same-upstream TCP fallback for truncated UDP replies, positive and
   negative TTL cache, inflight/size/time limits, protected endpoint output,
@@ -150,24 +171,23 @@ in the current scope.
   validation. A cross-compiled target check is distinct from executing the
   workspace tests on FreeBSD; native FreeBSD execution remains a separate host
   validation item.
-- Process metadata is best-effort: Linux has a procfs provider; other platforms
-  currently report unknown. Windows and FreeBSD native process discovery is
-  an additional capability, not a prerequisite for explicit listeners.
+- Process metadata is best-effort: Linux uses bounded procfs reads and Windows
+  and FreeBSD use the safe `netsock` native IP Helper/libprocstat provider.
+  Process IDs and executable names are returned where permissions allow;
+  user/group identifiers remain unknown when the platform API does not expose
+  them.
 - Long-running failure/restart tests and real subscription refresh soak tests
   remain to be exercised through the explicit listeners.
 
 ## Shared implementation gaps
 
-- TrafficPolicy replication budgets and retransmission mode are applied by the
-  Session runtime. Class priority/share fields are parsed into the policy
-  model but are not consumed by runtime class scheduling. Complete class
-  scheduling needs explicit flow classification and negotiated bidirectional
-  class metadata; the v1 wire contract has not been changed for that feature.
 - Native Windows/FreeBSD runtime matrices, provider soak tests, external
   monitoring deployment, and a broad real-provider protocol/parameter matrix
-  remain validation work. SSR and unregistered protocols are explicitly
-  unavailable. Third-party policy groups, rules, and scripts are not imported
-  as PathChord policy.
+  remain validation work. Hysteria2, TUIC, Reality, SSR, and other unregistered
+  protocols stay explicitly
+  unavailable until native wire and interoperability evidence exists.
+  Third-party policy groups, rules, and scripts are not imported as PathChord
+  policy.
 
 ## Deferred work
 
@@ -201,9 +221,12 @@ subscription normalization, and fault/retransmission cases. The dependency
 graph excludes the previously unmaintained `paste` path from the TUN adapter
 feature set.
 
-The Linux workspace run with the pinned backend available passes 465 tests,
-including the two normally ignored engine interoperability tests. The portable explicit-listener
-integration test binds listeners for the actual host platform and checks HTTP
+The Linux workspace run passes every non-ignored workspace test. The Transit
+unit set reports 75 passed and 2 ignored without an external proxy executable.
+The ignored tests use independent reference peers when explicitly requested.
+The portable
+explicit-listener integration
+test binds listeners for the actual host platform and checks HTTP
 CONNECT, SOCKS5 CONNECT, SOCKS5 UDP ASSOCIATE, TCP half-close, and cancellation
 with an open UDP control connection.
 
@@ -224,10 +247,10 @@ Ingress and Egress CLI processes, an HTTP Transit, HTTP forwarding, and Session
 UDP. Transit coverage includes TLS CA/SNI and mutual authentication, classic
 and 2022 SS TCP/UDP, native SOCKS5 UDP/control lifetime, provider expansion and
 credential boundaries, strict import diagnostics, usage/cache restoration,
-engine schema/process cleanup, node queries, and authenticated Prometheus
-export. Engine tests run explicitly with `PATHCHORD_TEST_SING_BOX` pointing to
-sing-box 1.14.4 and `--include-ignored`; the normal Rust CI does not require an
-installed backend executable.
+strict protocol-parameter validation, node queries, and authenticated Prometheus
+export. Reference-peer interoperability tests are run explicitly when their
+peer fixture is available; the normal Rust CI does not require an external
+proxy executable.
 
 Configuration-source coverage includes recursive split-resource loading,
 cross-file references, duplicate rejection, account defaults and override

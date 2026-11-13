@@ -220,6 +220,14 @@ effect, and error or restoration state.
 
 ## Scheduler and autoscaling guards
 
+When the optional traffic-class capability is negotiated, each admitted Stream
+and UDP Association stores an immutable class snapshot. Opening a class flow
+without the negotiated capability is rejected. The scheduler gives bounded
+priority preference, then weighted fair service by `share`, and rotates among
+backlogged Streams inside each class. A Stream's FIN is emitted only after its
+queued DATA is sent and acknowledged; a closed Stream observation may remain in
+the bounded recent history.
+
 For each eligible Path, the scheduler computes:
 
 ```text

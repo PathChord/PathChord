@@ -395,6 +395,25 @@ pub struct SessionObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamObservation {
+    pub session_id: SessionId,
+    pub stream_id: StreamId,
+    pub state: pathchord_core::StreamState,
+    /// Hostname and port only; credentials and payloads are never represented.
+    pub target_display: String,
+    pub traffic_class: Option<String>,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub bytes_acked: u64,
+    pub retransmissions: u64,
+    pub reorder_buffer_bytes: usize,
+    pub receive_window: u64,
+    pub opened_at_ms: u64,
+    pub closed_at_ms: Option<u64>,
+    pub close_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathObservation {
     pub path_id: PathId,
     pub session_id: SessionId,
@@ -419,6 +438,7 @@ pub struct ObservationSnapshot {
     pub active_listener_count: usize,
     pub nodes: BTreeMap<NodeId, NodeObservation>,
     pub sessions: BTreeMap<SessionId, SessionObservation>,
+    pub streams: BTreeMap<(SessionId, StreamId), StreamObservation>,
     pub paths: BTreeMap<PathId, PathObservation>,
     pub connections: BTreeMap<String, ConnectionObservation>,
 }
@@ -438,6 +458,7 @@ struct SharedObservationState {
     active_listeners: BTreeSet<ListenerId>,
     nodes: BTreeMap<NodeId, NodeObservation>,
     sessions: BTreeMap<SessionId, SessionObservation>,
+    streams: BTreeMap<(SessionId, StreamId), StreamObservation>,
     paths: BTreeMap<PathId, PathObservation>,
     connections: BTreeMap<String, ConnectionObservation>,
     connection_listeners: BTreeMap<String, ListenerId>,
@@ -493,6 +514,28 @@ impl IngressObservationHandle {
         state.paths = paths;
         state.last_updated_ms = Some(now_ms());
         state.generation = state.generation.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn replace_stream_observations(
+        &self,
+        streams: impl IntoIterator<Item = StreamObservation>,
+    ) -> Result<(), ControlError> {
+        let streams: BTreeMap<_, _> = streams
+            .into_iter()
+            .map(|stream| ((stream.session_id, stream.stream_id), stream))
+            .collect();
+        if streams.len() > MAX_CONNECTION_OBSERVATIONS {
+            return Err(ControlError::ResourceLimit {
+                resource: "stream observations",
+            });
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ControlError::ObservationUnavailable)?;
+        state.streams = streams;
+        touch_observations(&mut state);
         Ok(())
     }
 
@@ -1160,6 +1203,7 @@ impl IngressControlService {
             active_listener_count: observations.active_listeners.len(),
             nodes: observations.nodes.clone(),
             sessions: observations.sessions.clone(),
+            streams: observations.streams.clone(),
             paths: observations.paths.clone(),
             connections: observations.connections.clone(),
         }

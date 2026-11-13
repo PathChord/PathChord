@@ -41,10 +41,14 @@ fn command_json(arguments: &[&str]) -> Value {
 }
 
 fn spawn(arguments: &[&str], directory: &Path) -> Process {
-    Process(
-        Command::new(BIN)
-            .args(arguments)
-            .current_dir(directory)
+    let mut command = Command::new(BIN);
+    command
+        .args(arguments)
+        .current_dir(directory)
+        .env_remove("PATHCHORD_CONFIG")
+        .env_remove("PATHCHORD_CONFIG_DIR");
+    if arguments.contains(&"ingress") {
+        command
             .env(
                 "PATHCHORD_CONFIG",
                 directory.join("ignored-environment.yaml"),
@@ -52,7 +56,10 @@ fn spawn(arguments: &[&str], directory: &Path) -> Process {
             .env(
                 "PATHCHORD_CONFIG_DIR",
                 directory.join("ignored-environment.d"),
-            )
+            );
+    }
+    Process(
+        command
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

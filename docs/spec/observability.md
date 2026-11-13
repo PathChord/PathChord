@@ -127,6 +127,7 @@ admission_generation, created_at, last_change_at
 ready_path_count, active_streams, active_udp_associations
 control_pending, control_acked, control_retransmissions
 close_reason, reconnect_attempts
+traffic_class_name, traffic_class_priority, traffic_class_share
 ```
 
 Stream views expose:
@@ -137,6 +138,7 @@ target_kind, target_port, admitted_generation
 bytes_sent, bytes_received, bytes_acked
 reorder_buffer_bytes, receive_window, retransmissions
 opened_at, closed_at, close_reason
+traffic_class_name, traffic_class_priority, traffic_class_share
 ```
 
 Target connection views expose a stable local connection ID, SessionID and

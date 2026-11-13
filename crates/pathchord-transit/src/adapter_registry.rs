@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +16,6 @@ pub struct AdapterRegistry<P> {
     credentials: Arc<P>,
     connect_timeout: Duration,
     tls: Arc<ClientConfig>,
-    engine: Option<Arc<crate::outbound_engine::OutboundEngine>>,
 }
 
 impl<P> std::fmt::Debug for AdapterRegistry<P> {
@@ -39,31 +37,16 @@ where
             credentials,
             connect_timeout,
             tls,
-            engine: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_outbound_engine(mut self, executable: PathBuf, state_dir: PathBuf) -> Self {
-        self.engine = Some(Arc::new(crate::outbound_engine::OutboundEngine::new(
-            executable, state_dir,
-        )));
-        self
     }
 
     #[must_use]
     pub fn available_protocols(&self) -> BTreeSet<String> {
-        let mut protocols: BTreeSet<_> = ["direct", "http", "https", "socks5", "ss"]
-            .map(str::to_owned)
-            .into();
-        if self.engine.is_some() {
-            protocols.insert("sing_box_outbound".to_owned());
-            protocols.extend(
-                crate::outbound_engine::PROTOCOLS
-                    .iter()
-                    .map(|value| (*value).to_owned()),
-            );
-        }
+        let protocols: BTreeSet<_> = [
+            "direct", "http", "https", "socks5", "ss", "vless", "trojan", "vmess",
+        ]
+        .map(str::to_owned)
+        .into();
         protocols
     }
 
@@ -85,7 +68,7 @@ where
                 reason: "native TLS root store is empty",
             });
         }
-        let tls = ClientConfig::builder()
+        let tls = crate::tls::client_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         Ok(Self::new(credentials, connect_timeout, Arc::new(tls)))
@@ -97,11 +80,12 @@ where
         configs: impl IntoIterator<Item = &'a TransitProxyConfig>,
     ) -> Result<Self, TransitError> {
         if configs.into_iter().any(|config| {
-            config.protocol == "https" || config.options.tls.as_ref().is_some_and(|tls| tls.enabled)
+            matches!(config.protocol.as_str(), "https" | "trojan")
+                || config.options.tls.as_ref().is_some_and(|tls| tls.enabled)
         }) {
             return Self::with_native_roots(credentials, connect_timeout);
         }
-        let tls = ClientConfig::builder()
+        let tls = crate::tls::client_builder()
             .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth();
         Ok(Self::new(credentials, connect_timeout, Arc::new(tls)))
@@ -135,34 +119,7 @@ where
         config: &TransitProxyConfig,
         credential: &TransitCredential,
     ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
-        if credential.field("sing_box_outbound").is_some() {
-            return self.engine_adapter(config, credential);
-        }
-        match self.build_native(config, credential) {
-            Ok(adapter) => Ok(adapter),
-            Err(_) if self.engine.is_some() => self.engine_adapter(config, credential),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn engine_adapter(
-        &self,
-        config: &TransitProxyConfig,
-        credential: &TransitCredential,
-    ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
-        let engine = self
-            .engine
-            .as_ref()
-            .ok_or_else(|| TransitError::AdapterUnavailable {
-                protocol: config.protocol.clone(),
-                reason: "this node requires the configured sing-box outbound engine",
-            })?;
-        Ok(Arc::new(crate::outbound_engine::EngineAdapter::new(
-            config,
-            credential,
-            Arc::clone(engine),
-            self.connect_timeout,
-        )?))
+        self.build_native(config, credential)
     }
 
     fn build_native(
@@ -211,18 +168,20 @@ where
                     self.connect_timeout,
                 )?)
             }
-            "vless" => {
-                return Err(TransitError::AdapterUnavailable {
-                    protocol: "vless".to_owned(),
-                    reason: "candidate engine requires a specified UUID/transport mapping and loopback conformance fixture",
-                });
+            "vless" | "trojan" => {
+                Arc::new(crate::native_protocol::NativeProtocolAdapter::from_config(
+                    config,
+                    credential,
+                    self.connect_timeout,
+                    Arc::clone(&self.tls),
+                )?)
             }
-            "vmess" => {
-                return Err(TransitError::AdapterUnavailable {
-                    protocol: "vmess".to_owned(),
-                    reason: "candidate engine requires BoringSSL and cross-target interoperability validation",
-                });
-            }
+            "vmess" => Arc::new(crate::vmess::VmessAdapter::from_config(
+                config,
+                credential,
+                self.connect_timeout,
+                Arc::clone(&self.tls),
+            )?),
             "xtls" => {
                 return Err(TransitError::AdapterUnavailable {
                     protocol: "xtls".to_owned(),
@@ -264,7 +223,7 @@ pub(crate) fn native_tls_roots() -> Arc<ClientConfig> {
         let _ = roots.add(certificate);
     }
     Arc::new(
-        ClientConfig::builder()
+        crate::tls::client_builder()
             .with_root_certificates(roots)
             .with_no_client_auth(),
     )
@@ -383,7 +342,7 @@ mod tests {
     }
 
     fn registry(provider: Arc<Credentials>) -> AdapterRegistry<Credentials> {
-        let tls = ClientConfig::builder()
+        let tls = crate::tls::client_builder()
             .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth();
         AdapterRegistry::new(provider, Duration::from_secs(1), Arc::new(tls))
@@ -415,22 +374,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreviewed_protocols_are_typed_unavailable() {
+    async fn unregistered_protocol_is_typed_unavailable() {
         let provider = Arc::new(Credentials {
             requested: Mutex::new(Vec::new()),
         });
         let registry = registry(provider);
         assert!(matches!(
-            registry.build(&config("vless")).await,
-            Err(TransitError::AdapterUnavailable { protocol, .. }) if protocol == "vless"
+            registry.build(&config("unregistered-protocol")).await,
+            Err(TransitError::AdapterUnavailable { protocol, .. }) if protocol == "unregistered-protocol"
         ));
-        assert!(matches!(
-            registry.build(&config("vmess")).await,
-            Err(TransitError::AdapterUnavailable { protocol, .. }) if protocol == "vmess"
-        ));
-        assert!(matches!(
-            registry.build(&config("xtls")).await,
-            Err(TransitError::AdapterUnavailable { protocol, .. }) if protocol == "xtls"
-        ));
+    }
+
+    #[test]
+    fn native_vless_and_trojan_are_available_without_an_external_engine() {
+        let provider = Arc::new(Credentials {
+            requested: Mutex::new(Vec::new()),
+        });
+        let registry = registry(provider);
+        for (protocol, key, value) in [
+            ("vless", "uuid", "6cbf3f72-3417-4922-bde6-67820d041f25"),
+            ("trojan", "password", "native-secret"),
+        ] {
+            let mut config = config(protocol);
+            config.credentials_ref = None;
+            let credentials = TransitCredential::new(BTreeMap::from([(key.into(), value.into())]));
+            let adapter = registry
+                .build_with_credential(&config, &credentials)
+                .unwrap();
+            assert!(adapter.supports_tcp());
+            assert!(adapter.supports_udp());
+            assert!(registry.available_protocols().contains(protocol));
+            config.options.udp = Some(false);
+            assert!(
+                !registry
+                    .build_with_credential(&config, &credentials)
+                    .unwrap()
+                    .supports_udp()
+            );
+        }
     }
 }

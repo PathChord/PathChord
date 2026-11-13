@@ -23,6 +23,7 @@ pub struct ReloadSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadState {
+    Pending,
     Applied,
     Rejected,
     RestartRequired,
@@ -38,6 +39,7 @@ pub struct ReloadStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadOutcome {
+    Pending { generation: u64 },
     Applied { generation: u64 },
     Rejected { active_generation: u64 },
     RestartRequired { active_generation: u64 },
@@ -63,14 +65,23 @@ pub enum ReloadError {
     Notify,
     #[error("initial configuration is invalid")]
     InvalidInitialConfiguration,
+    #[error("control-plane reload transaction was rejected")]
+    ControlCommit,
     #[error("configuration reload state lock is unavailable")]
     Lock,
 }
 
 #[derive(Clone)]
 pub struct ConfigReloadHandle {
-    active: Arc<RwLock<ReloadSnapshot>>,
-    status: Arc<RwLock<ReloadStatus>>,
+    state: Arc<RwLock<ReloadData>>,
+}
+
+struct ReloadData {
+    active: ReloadSnapshot,
+    status: ReloadStatus,
+    runtime_managed: bool,
+    next_generation: u64,
+    pending: Option<ReloadSnapshot>,
 }
 
 impl std::fmt::Debug for ConfigReloadHandle {
@@ -91,31 +102,105 @@ impl ConfigReloadHandle {
         inputs: impl IntoIterator<Item = &'a str>,
         generation: u64,
     ) -> Result<Self, ReloadError> {
-        let snapshot = compile_candidate_documents(inputs, generation)
+        let active = compile_candidate_documents(inputs, generation)
             .map_err(|_| ReloadError::InvalidInitialConfiguration)?;
         Ok(Self {
-            active: Arc::new(RwLock::new(snapshot)),
-            status: Arc::new(RwLock::new(ReloadStatus {
-                state: ReloadState::Applied,
-                active_generation: generation,
-                observed_at_ms: now_ms(),
-                reason: None,
+            state: Arc::new(RwLock::new(ReloadData {
+                active,
+                status: ReloadStatus {
+                    state: ReloadState::Applied,
+                    active_generation: generation,
+                    observed_at_ms: now_ms(),
+                    reason: None,
+                },
+                runtime_managed: false,
+                next_generation: generation,
+                pending: None,
             })),
         })
     }
 
     pub fn snapshot(&self) -> Result<ReloadSnapshot, ReloadError> {
-        self.active
+        self.state
             .read()
-            .map(|snapshot| snapshot.clone())
+            .map(|state| state.active.clone())
             .map_err(|_| ReloadError::Lock)
     }
 
     #[must_use]
     pub fn status(&self) -> ReloadStatus {
-        self.status
+        self.state
             .read()
-            .map_or_else(|_| failed_lock_status(), |status| status.clone())
+            .map_or_else(|_| failed_lock_status(), |state| state.status.clone())
+    }
+
+    /// The runtime prepares adapters before acknowledging a candidate. Enable
+    /// this before starting the filesystem watcher.
+    pub fn enable_runtime_commit(&self) -> Result<(), ReloadError> {
+        self.state
+            .write()
+            .map_err(|_| ReloadError::Lock)?
+            .runtime_managed = true;
+        Ok(())
+    }
+
+    pub fn pending_snapshot(&self) -> Result<Option<ReloadSnapshot>, ReloadError> {
+        self.state
+            .read()
+            .map(|state| state.pending.clone())
+            .map_err(|_| ReloadError::Lock)
+    }
+
+    /// Run a synchronous durable hook while the candidate identity is locked.
+    /// A superseded candidate never reaches the hook. The caller holds its
+    /// runtime publication locks, so no await can split the commit.
+    pub fn commit_runtime_candidate<F>(
+        &self,
+        generation: u64,
+        durable_commit: F,
+    ) -> Result<bool, ReloadError>
+    where
+        F: FnOnce() -> Result<(), ReloadError>,
+    {
+        let mut state = self.state.write().map_err(|_| ReloadError::Lock)?;
+        if state
+            .pending
+            .as_ref()
+            .is_none_or(|candidate| candidate.generation != generation)
+        {
+            return Ok(false);
+        }
+        durable_commit()?;
+        state.active = state.pending.take().expect("candidate checked under lock");
+        state.status = ReloadStatus {
+            state: ReloadState::Applied,
+            active_generation: generation,
+            observed_at_ms: now_ms(),
+            reason: None,
+        };
+        Ok(true)
+    }
+
+    pub fn reject_runtime_candidate(
+        &self,
+        generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<(), ReloadError> {
+        let mut state = self.state.write().map_err(|_| ReloadError::Lock)?;
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|candidate| candidate.generation == generation)
+        {
+            state.pending = None;
+            state.status = ReloadStatus {
+                state: ReloadState::Rejected,
+                active_generation: state.active.generation,
+                observed_at_ms: now_ms(),
+                reason: Some(reason.into()),
+            };
+        }
+        Ok(())
     }
 
     pub fn reload_text(&self, input: &str) -> ReloadOutcome {
@@ -123,81 +208,95 @@ impl ConfigReloadHandle {
     }
 
     pub fn reload_documents<'a>(&self, inputs: impl IntoIterator<Item = &'a str>) -> ReloadOutcome {
-        let active = match self.active.read() {
-            Ok(active) => active.clone(),
-            Err(_) => {
-                return ReloadOutcome::Rejected {
-                    active_generation: 0,
-                };
-            }
-        };
-        let Some(generation) = active.generation.checked_add(1) else {
-            self.replace_status(ReloadStatus {
-                state: ReloadState::Rejected,
-                active_generation: active.generation,
-                observed_at_ms: now_ms(),
-                reason: Some("configuration generation is exhausted".to_owned()),
-            });
+        let Ok(mut state) = self.state.write() else {
             return ReloadOutcome::Rejected {
-                active_generation: active.generation,
+                active_generation: 0,
             };
         };
+        let active_generation = state.active.generation;
+        let previous_generation = if state.runtime_managed {
+            state.next_generation
+        } else {
+            active_generation
+        };
+        let Some(generation) = previous_generation.checked_add(1) else {
+            state.pending = None;
+            state.status = ReloadStatus {
+                state: ReloadState::Rejected,
+                active_generation,
+                observed_at_ms: now_ms(),
+                reason: Some("configuration generation is exhausted".to_owned()),
+            };
+            return ReloadOutcome::Rejected { active_generation };
+        };
+        state.next_generation = generation;
         let candidate = match compile_candidate_documents(inputs, generation) {
             Ok(candidate) => candidate,
             Err(reason) => {
-                self.replace_status(ReloadStatus {
+                state.pending = None;
+                state.status = ReloadStatus {
                     state: ReloadState::Rejected,
-                    active_generation: active.generation,
+                    active_generation,
                     observed_at_ms: now_ms(),
                     reason: Some(reason.to_owned()),
-                });
-                return ReloadOutcome::Rejected {
-                    active_generation: active.generation,
                 };
+                return ReloadOutcome::Rejected { active_generation };
             }
         };
-        if candidate.config == active.config {
-            self.replace_status(ReloadStatus {
+        if candidate.config == state.active.config {
+            state.pending = None;
+            state.status = ReloadStatus {
                 state: ReloadState::Applied,
-                active_generation: active.generation,
+                active_generation,
                 observed_at_ms: now_ms(),
                 reason: None,
-            });
+            };
             return ReloadOutcome::Applied {
-                generation: active.generation,
+                generation: active_generation,
             };
         }
-        if startup_fields_changed(&active.config, &candidate.config) {
-            self.replace_status(ReloadStatus {
+        if startup_fields_changed(&state.active.config, &candidate.config) {
+            state.pending = None;
+            state.status = ReloadStatus {
                 state: ReloadState::RestartRequired,
-                active_generation: active.generation,
+                active_generation,
                 observed_at_ms: now_ms(),
-                reason: Some("static Egress/key or Listener fields changed".to_owned()),
-            });
-            return ReloadOutcome::RestartRequired {
-                active_generation: active.generation,
+                reason: Some("static Egress/key, DNS or Listener fields changed".to_owned()),
             };
+            return ReloadOutcome::RestartRequired { active_generation };
         }
-        match self.active.write() {
-            Ok(mut active) => *active = candidate,
-            Err(_) => {
-                return ReloadOutcome::Rejected {
-                    active_generation: active.generation,
+        if state.runtime_managed {
+            if let Some(pending) = &state.pending
+                && candidate.config == pending.config
+            {
+                return ReloadOutcome::Pending {
+                    generation: pending.generation,
                 };
             }
+            state.pending = Some(candidate);
+            state.status = ReloadStatus {
+                state: ReloadState::Pending,
+                active_generation,
+                observed_at_ms: now_ms(),
+                reason: None,
+            };
+            ReloadOutcome::Pending { generation }
+        } else {
+            state.active = candidate;
+            state.status = ReloadStatus {
+                state: ReloadState::Applied,
+                active_generation: generation,
+                observed_at_ms: now_ms(),
+                reason: None,
+            };
+            ReloadOutcome::Applied { generation }
         }
-        self.replace_status(ReloadStatus {
-            state: ReloadState::Applied,
-            active_generation: generation,
-            observed_at_ms: now_ms(),
-            reason: None,
-        });
-        ReloadOutcome::Applied { generation }
     }
 
     fn replace_status(&self, next: ReloadStatus) {
-        if let Ok(mut status) = self.status.write() {
-            *status = next;
+        if let Ok(mut state) = self.state.write() {
+            state.pending = None;
+            state.status = next;
         }
     }
 }
@@ -474,6 +573,59 @@ items:
             std::process::id(),
             NEXT_FILE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn managed_reload_waits_for_runtime_and_durable_commit() {
+        let handle = ConfigReloadHandle::from_yaml(VALID, 7).unwrap();
+        handle.enable_runtime_commit().unwrap();
+        let changed = VALID.replace("action: reject", "action: direct");
+        assert_eq!(
+            handle.reload_text(&changed),
+            ReloadOutcome::Pending { generation: 8 }
+        );
+        assert_eq!(handle.snapshot().unwrap().generation, 7);
+        assert_eq!(handle.status().state, ReloadState::Pending);
+        assert!(
+            handle
+                .commit_runtime_candidate(8, || Err(ReloadError::ControlCommit))
+                .is_err()
+        );
+        assert_eq!(handle.snapshot().unwrap().generation, 7);
+        assert!(handle.commit_runtime_candidate(8, || Ok(())).unwrap());
+        assert_eq!(handle.snapshot().unwrap().generation, 8);
+        assert_eq!(handle.status().state, ReloadState::Applied);
+    }
+
+    #[test]
+    fn invalid_or_superseded_candidate_cannot_commit_or_reject_newer_pending() {
+        let handle = ConfigReloadHandle::from_yaml(VALID, 1).unwrap();
+        handle.enable_runtime_commit().unwrap();
+        let changed = VALID.replace("action: reject", "action: direct");
+        handle.reload_text(&changed);
+        handle.reload_text("malformed: [");
+        assert!(
+            !handle
+                .commit_runtime_candidate(2, || panic!("stale durable hook"))
+                .unwrap()
+        );
+        assert_eq!(
+            handle.reload_text(&changed),
+            ReloadOutcome::Pending { generation: 4 }
+        );
+        handle.reject_runtime_candidate(2, "old failure").unwrap();
+        assert_eq!(handle.pending_snapshot().unwrap().unwrap().generation, 4);
+        assert!(
+            !handle
+                .commit_runtime_candidate(2, || panic!("stale durable hook"))
+                .unwrap()
+        );
+        handle
+            .reject_runtime_candidate(4, "adapter unavailable")
+            .unwrap();
+        assert!(handle.pending_snapshot().unwrap().is_none());
+        assert_eq!(handle.status().state, ReloadState::Rejected);
+        assert_eq!(handle.snapshot().unwrap().generation, 1);
     }
 
     #[test]

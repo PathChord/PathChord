@@ -29,6 +29,7 @@ hyper = { version = "1.12.0", default-features = false, features = ["client", "s
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 interprocess = { version = "2.4.8", default-features = false, features = ["tokio"] }
 nix = { version = "0.31.3", default-features = false, features = ["net", "socket", "uio"] }
+netsock = "0.8.0"
 orion = { version = "0.18.1", default-features = false, features = ["zeroize"] }
 proptest = "1.12.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
@@ -38,7 +39,7 @@ serde_json = "1.0.145"
 # Preserve the `serde_yaml` source namespace while using the maintained,
 # pure-Rust compatibility facade; keep its parser and facade lockstep-pinned.
 serde_yaml = { package = "noyalib-serde-yaml", version = "=0.0.60" }
-shadowsocks = { version = "1.25.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "aead-cipher-extra", "stream-cipher"] }
+shadowsocks = { version = "1.25.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "aead-cipher-extra"] }
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 subtle = "2.6.1"

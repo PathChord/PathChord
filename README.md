@@ -31,9 +31,11 @@ validation, shared runtime gaps, and subsequent adapter work.
 
 Node imports support automatic detection, Clash/Mihomo providers, SIP008,
 URI/Base64 lists, sing-box JSON, and supported Surge/Quantumult X/Loon node
-lines. Native transports support typed TLS settings and direct/SOCKS5/
-Shadowsocks UDP, including SS2022. Advanced protocols and transports can use
-an explicitly selected sing-box 1.14.4 executable through `--outbound-engine`.
+lines. Native transports support typed TLS settings, VLESS/Trojan TCP/TLS/
+WebSocket transports, plain TCP VMess with AES-128-GCM, and
+direct/SOCKS5/Shadowsocks UDP, including SS2022. Unsupported protocols and
+parameters remain explicit diagnostics until their native implementations are
+available.
 Unsupported nodes and parameters expose individual diagnostics. See the
 [Transit Proxy and subscription contract](docs/spec/transit-proxies.md) for
 the exact compatibility boundaries and [deployment guide](docs/spec/deployment.md)

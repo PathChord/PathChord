@@ -11,6 +11,13 @@ pub(crate) const MAX_CONFIGURATION_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_CONFIGURATION_FILES: usize = 1024;
 pub(crate) const MAX_CONFIGURATION_DEPTH: usize = 16;
 
+pub async fn load_configuration_documents(
+    path: impl Into<PathBuf>,
+) -> Result<Vec<String>, ReloadError> {
+    let source = ConfigurationSource::bind(path.into()).await?;
+    Ok(source.load().await?.documents)
+}
+
 #[derive(Debug)]
 pub(crate) struct ConfigurationSource {
     path: PathBuf,

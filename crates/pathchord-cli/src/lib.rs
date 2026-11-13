@@ -33,11 +33,12 @@ use pathchord_ingress::{
     LocalControlServer, LocalDnsAdapter, LocalProtocolError, NodeHealthState, NodeId,
     NodeObservation, PathObservation, PlatformProxyAdapter, ProtectedEndpointSet,
     RejectListenerCredentials, RequestEnvelope, ResponseEnvelope, RuntimeCounts, RuntimeError,
-    SessionObservation, StaticListenerCredentialVerifier,
+    SessionObservation, StaticListenerCredentialVerifier, StreamObservation,
     SubscriptionCacheSpec as ControlSubscriptionCacheSpec, SubscriptionId as ControlSubscriptionId,
     SubscriptionRefreshSpec as ControlSubscriptionRefreshSpec,
-    SubscriptionSpec as ControlSubscriptionSpec, SystemProxyPlatform, TcpFlowOpener, UdpFlowOpener,
-    WebBearerToken, WebGateway, WebGatewayConfig,
+    SubscriptionSpec as ControlSubscriptionSpec, SystemProxyPlatform, TcpFlowOpener,
+    TransitProbeConfig, TransitProbeState, UdpFlowOpener, WebBearerToken, WebGateway,
+    WebGatewayConfig,
 };
 #[cfg(test)]
 use pathchord_ingress::{
@@ -56,6 +57,7 @@ use pathchord_policy::{
 };
 
 mod configuration;
+mod egress_configuration;
 use pathchord_transit::{
     AdapterRegistry, DynamicNodeState, DynamicTransitSnapshot, FileTransitCredentialProvider,
     HttpSubscriptionFetcher, RefreshOutcome, SubscriptionCredentialProvider, SubscriptionManager,
@@ -132,9 +134,6 @@ pub struct IngressArgs {
     /// Directory containing private JSON credential maps named by credentialsRef.
     #[arg(long, default_value = "pathchord-secrets")]
     pub credentials_dir: PathBuf,
-    /// Optional sing-box executable for advanced outbound protocols and transports.
-    #[arg(long)]
-    pub outbound_engine: Option<PathBuf>,
     /// Optional Web Gateway bind. Omit to keep the browser adapter disabled.
     #[arg(long)]
     pub web_bind: Option<SocketAddr>,
@@ -151,33 +150,39 @@ pub struct IngressArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct EgressArgs {
+    /// Resource file or directory; overrides environment and account defaults.
+    #[arg(short = 'c', long, conflicts_with = "config_dir")]
+    pub config: Option<PathBuf>,
+    /// Configuration directory; overrides environment and account defaults.
+    #[arg(short = 'C', long, conflicts_with = "config")]
+    pub config_dir: Option<PathBuf>,
     /// Public Path listener address.
-    #[arg(long, default_value = DEFAULT_EGRESS_BIND)]
-    pub bind: SocketAddr,
+    #[arg(long)]
+    pub bind: Option<SocketAddr>,
     /// Canonical Egress identity bound into the Noise prologue.
     #[arg(long)]
-    pub egress_id: String,
+    pub egress_id: Option<String>,
     /// Versioned private identity file.
     #[arg(long)]
-    pub identity: PathBuf,
+    pub identity: Option<PathBuf>,
     /// Egress-owned SQLite authorization database.
-    #[arg(long, default_value = "pathchord-authorizations.db")]
-    pub authorization_db: PathBuf,
+    #[arg(long)]
+    pub authorization_db: Option<PathBuf>,
     /// Local authorization control socket or Named Pipe.
-    #[arg(long, default_value = DEFAULT_EGRESS_SOCKET_PATH)]
-    pub control_socket: PathBuf,
-    #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENT_PATHS)]
-    pub max_concurrent_paths: usize,
-    #[arg(long, default_value_t = 1_000_000_000)]
-    pub capacity_bps: u64,
-    #[arg(long, default_value_t = 1)]
-    pub recommended_path_count: u64,
-    #[arg(long, default_value_t = 4096)]
-    pub max_streams_per_ingress: usize,
+    #[arg(long)]
+    pub control_socket: Option<PathBuf>,
+    #[arg(long)]
+    pub max_concurrent_paths: Option<usize>,
+    #[arg(long)]
+    pub capacity_bps: Option<u64>,
+    #[arg(long)]
+    pub recommended_path_count: Option<u64>,
+    #[arg(long)]
+    pub max_streams_per_ingress: Option<usize>,
     #[arg(long)]
     pub quota_remaining: Option<u64>,
-    #[arg(long, default_value_t = 10_000)]
-    pub traffic_multiplier_basis_points: u32,
+    #[arg(long)]
+    pub traffic_multiplier_basis_points: Option<u32>,
     /// Optional authorization Web Gateway bind.
     #[arg(long)]
     pub web_bind: Option<SocketAddr>,
@@ -185,8 +190,8 @@ pub struct EgressArgs {
     pub web_token_file: Option<PathBuf>,
     #[arg(long = "web-origin")]
     pub web_origins: Vec<String>,
-    #[arg(long)]
-    pub web_protected_transport: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub web_protected_transport: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -305,6 +310,8 @@ pub enum CliError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("Egress configuration is invalid: {0}")]
+    EgressConfiguration(&'static str),
     #[error("configuration validation failed: {0}")]
     Config(#[from] pathchord_policy::ConfigError),
     #[error("local control server failed: {0}")]
@@ -629,6 +636,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
             source: error,
         })?;
     let reload_handle = reloader.handle();
+    reload_handle.enable_runtime_commit()?;
     let policy_config = (*reload_handle.snapshot()?.config).clone();
     let policy =
         pathchord_policy::ValidatedPolicySnapshot::new(Generation::new(1), policy_config.clone())
@@ -644,24 +652,16 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         identity,
         policy,
     ))?);
+    data_plane
+        .configure_node_probe(node_probe_config(policy_config.node_probe.as_ref()))
+        .await?;
     std::fs::create_dir_all(&args.data_dir)?;
     let credentials = Arc::new(FileTransitCredentialProvider::new(&args.credentials_dir)?);
-    let adapter_registry = if policy_config.subscriptions.is_empty() {
-        AdapterRegistry::for_configs(
-            Arc::clone(&credentials),
-            pathchord_ingress::DEFAULT_PATH_CONNECT_TIMEOUT,
-            &policy_config.transit_proxies,
-        )?
-    } else {
-        AdapterRegistry::with_native_roots(
-            Arc::clone(&credentials),
-            pathchord_ingress::DEFAULT_PATH_CONNECT_TIMEOUT,
-        )?
-    };
-    let adapter_registry = Arc::new(match args.outbound_engine {
-        Some(path) => adapter_registry.with_outbound_engine(path, args.data_dir.join("outbounds")),
-        None => adapter_registry,
-    });
+    let adapter_registry = AdapterRegistry::with_native_roots(
+        Arc::clone(&credentials),
+        pathchord_ingress::DEFAULT_PATH_CONNECT_TIMEOUT,
+    )?;
+    let adapter_registry = Arc::new(adapter_registry);
     for proxy in &policy_config.transit_proxies {
         let adapter = adapter_registry.build(proxy).await?;
         adapter.prepare().await?;
@@ -782,6 +782,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     runtime.set_listener_event_sender(runtime_events);
     let server = LocalControlServer::bind(socket.to_owned(), dispatcher)?;
     let control_dispatcher = server.shared_dispatcher();
+    let node_control = Arc::clone(&control_dispatcher);
     sync_control_nodes(
         &control_dispatcher,
         data_plane.as_ref(),
@@ -906,6 +907,34 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                     observation_handle
                         .replace_session_observations(sessions, paths)
                         .map_err(|error| CliError::Observation(error.to_string()))?;
+                    let streams = session_snapshots.iter().flat_map(|entry| {
+                        let session_id = entry.session.session_id;
+                        entry.session.streams.values().map(move |stream| {
+                            let hostname = String::from_utf8_lossy(&stream.target.hostname);
+                            StreamObservation {
+                                session_id,
+                                stream_id: stream.stream_id,
+                                state: stream.state,
+                                target_display: format!("{hostname}:{}", stream.target.port),
+                                traffic_class: stream
+                                    .traffic_class
+                                    .as_ref()
+                                    .map(|class| class.name.clone()),
+                                bytes_sent: stream.bytes_sent,
+                                bytes_received: stream.bytes_received,
+                                bytes_acked: stream.bytes_acked,
+                                retransmissions: stream.retransmissions,
+                                reorder_buffer_bytes: stream.reorder_buffer_bytes,
+                                receive_window: stream.receive_window,
+                                opened_at_ms: stream.opened_at_ms,
+                                closed_at_ms: stream.closed_at_ms,
+                                close_reason: stream.close_reason.clone(),
+                            }
+                        })
+                    });
+                    observation_handle
+                        .replace_stream_observations(streams)
+                        .map_err(|error| CliError::Observation(error.to_string()))?;
                     observation_handle
                         .set_runtime_counts(RuntimeCounts {
                             sessions: snapshot.sessions as u64,
@@ -914,6 +943,38 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                             target_connections: snapshot.streams as u64,
                         })
                         .map_err(|error| CliError::Observation(error.to_string()))?;
+                    let transit_observations = observation_plane.transit_observations().await;
+                    let mut node_dispatcher = node_control.lock().await;
+                    for (id, observation) in transit_observations {
+                        let node_id = NodeId::new(id.as_str())
+                            .map_err(|error| CliError::Observation(error.to_string()))?;
+                        let state = match observation.state {
+                            TransitProbeState::Up => NodeHealthState::Up,
+                            TransitProbeState::Degraded => NodeHealthState::Degraded,
+                            TransitProbeState::Down => NodeHealthState::Down,
+                            TransitProbeState::Unknown => NodeHealthState::Unknown,
+                        };
+                        node_dispatcher
+                            .service_mut()
+                            .set_node_observation(
+                                node_id,
+                                NodeObservation {
+                                    state,
+                                    rtt_ms: observation
+                                        .rtt_ms
+                                        .map(|value| value.min(u64::from(u32::MAX)) as u32),
+                                    jitter_ms: observation
+                                        .jitter_ms
+                                        .map(|value| value.min(u64::from(u32::MAX)) as u32),
+                                    loss_ppm: observation.loss_ppm,
+                                    throughput_bps: observation.throughput_bps,
+                                    effective_capacity_bps: observation.effective_capacity_bps,
+                                    diagnostic: None,
+                                    usage: None,
+                                },
+                            )
+                            .map_err(|error| CliError::Observation(error.to_string()))?;
+                    }
                 }
             }
         }
@@ -934,13 +995,20 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         dynamic_snapshot: Arc::clone(&dynamic_snapshot),
     }
     .run(shutdown.subscribe());
-    let maintenance_future =
-        run_data_plane_maintenance(Arc::clone(&data_plane), shutdown.subscribe());
+    let maintenance_future = run_data_plane_maintenance(
+        Arc::clone(&data_plane),
+        policy_config
+            .node_probe
+            .as_ref()
+            .map(|policy| Duration::from_secs(policy.interval_seconds)),
+        shutdown.subscribe(),
+    );
     let reload_future = reloader.run_until_shutdown(wait_for_shutdown(shutdown.subscribe()));
     let reload_apply_future = apply_reloaded_policies(
         reload_handle,
         Arc::clone(&data_plane),
         control_dispatcher,
+        Arc::clone(&adapter_registry),
         protected_endpoints.clone(),
         dns_runtime.clone(),
         Arc::clone(&dynamic_snapshot),
@@ -976,6 +1044,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
 }
 
 async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
+    let args = egress_configuration::resolve(args).await?;
     let identity = Arc::new(load_identity(&args.identity)?);
     let authorizations = Arc::new(AuthorizationStore::open(
         &args.authorization_db,
@@ -996,7 +1065,7 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
                     max_session_buffering: ProtocolLimits::HARD_MAX_SESSION_BUFFERING as u64,
                 },
                 required_capabilities: 1,
-                supported_capabilities: 0b11,
+                supported_capabilities: 0b11 | pathchord_core::CAPABILITY_TRAFFIC_CLASSES,
                 max_concurrent_paths: args.max_concurrent_paths,
                 capacity_bps: args.capacity_bps,
                 recommended_path_count: args.recommended_path_count,
@@ -1397,9 +1466,12 @@ fn refresh_result(outcome: RefreshOutcome) -> (bool, Option<String>) {
 
 async fn run_data_plane_maintenance(
     data_plane: Arc<IngressDataPlane>,
+    probe_interval: Option<Duration>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), CliError> {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut probe_tick =
+        tokio::time::interval(probe_interval.unwrap_or(Duration::from_secs(86_400)));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -1413,14 +1485,19 @@ async fn run_data_plane_maintenance(
                     return Ok(());
                 }
             },
+            _ = probe_tick.tick(), if probe_interval.is_some() => {
+                data_plane.probe_transits().await;
+            },
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_reloaded_policies(
     handle: ConfigReloadHandle,
     data_plane: Arc<IngressDataPlane>,
     control: Arc<tokio::sync::Mutex<LocalControlDispatcher>>,
+    adapter_registry: Arc<AdapterRegistry<FileTransitCredentialProvider>>,
     protected_endpoints: ProtectedEndpointSet,
     dns_runtime: Option<Arc<DnsRuntime>>,
     dynamic_snapshot: Arc<tokio::sync::RwLock<DynamicTransitSnapshot>>,
@@ -1437,29 +1514,64 @@ async fn apply_reloaded_policies(
                 }
             }
             _ = interval.tick() => {
-                let snapshot = handle.snapshot()?;
-                if snapshot.generation > applied_generation {
-                    data_plane
-                        .replace_compiled_policy((*snapshot.compiled).clone())
-                        .await;
-                    let (nodes, subscriptions) = declarative_control_resources(&snapshot.config)?;
-                    control
-                        .lock()
-                        .await
-                        .service_mut()
-                        .reconcile_declarative_resources(
-                            snapshot.generation,
-                            nodes,
-                            subscriptions,
-                        )?;
-                    let dynamic = dynamic_snapshot.read().await.clone();
-                    let endpoints = cancellable_ingress_work(shutdown.clone(),
-                        collect_protected_endpoints(&snapshot.config, dns_runtime.as_deref(), Some(&dynamic)),
-                    ).await;
-                    let Some(endpoints) = endpoints else { return Ok(()); };
-                    protected_endpoints.replace(endpoints);
-                    applied_generation = snapshot.generation;
-                }
+                let Some(snapshot) = handle.pending_snapshot()? else { continue; };
+                if snapshot.generation <= applied_generation { continue; }
+                let validated = pathchord_policy::ValidatedPolicySnapshot::new(
+                    Generation::new(snapshot.generation),
+                    (*snapshot.config).clone(),
+                ).map_err(pathchord_policy::ConfigError::from)?;
+                let prepared = match cancellable_ingress_work(
+                    shutdown.clone(),
+                    data_plane.prepare_static_snapshot(&validated, adapter_registry.as_ref()),
+                ).await {
+                    Some(Ok(prepared)) => prepared,
+                    Some(Err(error)) => {
+                        handle.reject_runtime_candidate(snapshot.generation, error.to_string())?;
+                        continue;
+                    }
+                    None => return Ok(()),
+                };
+                let (nodes, subscriptions) = declarative_control_resources(&snapshot.config)?;
+                let mut dispatcher = control.lock().await;
+                let handle_for_commit = handle.clone();
+                let outcome = data_plane.commit_static_snapshot(prepared, move || {
+                    let committed = handle_for_commit
+                        .commit_runtime_candidate(snapshot.generation, || {
+                            dispatcher
+                                .service_mut()
+                                .reconcile_declarative_resources(
+                                    snapshot.generation,
+                                    nodes,
+                                    subscriptions,
+                                )
+                                .map_err(|_| pathchord_ingress::ReloadError::ControlCommit)
+                        })
+                        .map_err(|_| pathchord_ingress::DataPlaneError::ControlCommitRejected)?;
+                    if committed {
+                        Ok(())
+                    } else {
+                        Err(pathchord_ingress::DataPlaneError::ControlCommitRejected)
+                    }
+                }).await;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(pathchord_ingress::DataPlaneError::ControlCommitRejected) => continue,
+                    Err(error) => {
+                        let _ = handle.reject_runtime_candidate(snapshot.generation, error.to_string());
+                        continue;
+                    }
+                };
+                data_plane
+                    .configure_node_probe(node_probe_config(snapshot.config.node_probe.as_ref()))
+                    .await?;
+                let dynamic = dynamic_snapshot.read().await.clone();
+                let endpoints = cancellable_ingress_work(
+                    shutdown.clone(),
+                    collect_protected_endpoints(&snapshot.config, dns_runtime.as_deref(), Some(&dynamic)),
+                ).await;
+                let Some(endpoints) = endpoints else { return Ok(()); };
+                protected_endpoints.replace(endpoints);
+                applied_generation = outcome.generation;
             }
         }
     }
@@ -1701,6 +1813,22 @@ fn adapter_capabilities(
         capabilities.insert(FlowProtocol::Udp);
     }
     capabilities
+}
+
+fn node_probe_config(
+    spec: Option<&pathchord_policy::NodeProbePolicySpec>,
+) -> Option<TransitProbeConfig> {
+    spec.map(|spec| {
+        let mut config = TransitProbeConfig::new(pathchord_transit::Endpoint {
+            host: spec.target.host.clone(),
+            port: spec.target.port,
+        });
+        config.timeout = Duration::from_secs(spec.timeout_seconds);
+        config.max_concurrency = spec.max_concurrency;
+        config.window_size = spec.window_size;
+        config.max_nodes_per_batch = spec.max_nodes_per_batch;
+        config
+    })
 }
 
 fn run_keygen(args: KeygenArgs) -> Result<(), CliError> {
@@ -2509,7 +2637,7 @@ mod tests {
         assert!(matches!(
             egress.command,
             Command::Egress(EgressArgs { egress_id, bind, .. })
-                if egress_id == "egress-a" && bind == "127.0.0.1:7443".parse().unwrap()
+                if egress_id.as_deref() == Some("egress-a") && bind == Some("127.0.0.1:7443".parse().unwrap())
         ));
     }
 

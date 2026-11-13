@@ -108,6 +108,7 @@ pub struct EgressRouteCandidate {
     pub egress_id: EgressId,
     pub transit_rule_id: RuleId,
     pub traffic_policy_id: TrafficPolicyId,
+    pub traffic_class: Option<String>,
     pub transit_proxies: Vec<TransitCandidate>,
 }
 
@@ -441,6 +442,7 @@ impl CompiledPolicy {
             egress_id: egress.id.clone(),
             transit_rule_id: compiled.rule.id.clone(),
             traffic_policy_id: compiled.rule.traffic_policy.clone(),
+            traffic_class: compiled.rule.traffic_class.clone(),
             transit_proxies,
         })
     }
@@ -759,6 +761,7 @@ mod tests {
             reject_tags: BTreeSet::new(),
             weight: 100,
             traffic_policy: TrafficPolicyId::new("default"),
+            traffic_class: None,
         }
     }
 
@@ -827,6 +830,7 @@ mod tests {
             traffic_policies: vec![traffic_policy("default")],
             listeners: Vec::new(),
             dns_policy: None,
+            node_probe: None,
             fallback: Some(FallbackAction::Reject),
         });
         let mut runtime = RuntimeCatalog::default();
@@ -908,6 +912,7 @@ mod tests {
             traffic_policies: vec![traffic_policy("default")],
             listeners: Vec::new(),
             dns_policy: None,
+            node_probe: None,
             fallback: Some(FallbackAction::Reject),
         });
         let mut status = ready_egress(1);
@@ -960,6 +965,7 @@ mod tests {
             traffic_policies: vec![traffic_policy("default")],
             listeners: Vec::new(),
             dns_policy: None,
+            node_probe: None,
             fallback: Some(FallbackAction::Reject),
         });
         let mut runtime = RuntimeCatalog::default();
@@ -1109,6 +1115,7 @@ mod tests {
             traffic_policies: vec![traffic_policy("default")],
             listeners: Vec::new(),
             dns_policy: None,
+            node_probe: None,
             fallback: Some(FallbackAction::Reject),
         });
         let mut runtime = RuntimeCatalog::default();

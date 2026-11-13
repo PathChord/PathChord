@@ -8,9 +8,18 @@ publish.workspace = true
 
 [dependencies]
 atomic-write-file.workspace = true
+aes-gcm = "0.10.3"
+aes = "0.8.4"
 async-trait.workspace = true
 base64.workspace = true
 getrandom.workspace = true
+bytes.workspace = true
+trojan-proto = "=0.18.0"
+sha2 = "0.10.9"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+hmac = "0.12.1"
+crc32fast = "1.5.5"
+md-5 = "0.10.6"
 pathchord-policy = { path = "../pathchord-policy" }
 reqwest.workspace = true
 serde.workspace = true
@@ -22,8 +31,10 @@ rustls-native-certs = "0.8.5"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
 tokio-rustls = "0.26.6"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 zeroize.workspace = true
 url.workspace = true
+uuid = "1.29.2"
 
 [dev-dependencies]
 rcgen = "0.14.10"

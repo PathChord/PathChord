@@ -74,7 +74,7 @@ One Session exists for each active Ingress-to-Egress relationship and has a stri
 
 Each live Session contains at least one `PATH_READY` bidirectional, long-lived Path. The Session manager may retain a reconnecting record with zero Paths, but that record cannot carry business traffic. A Path is one physical transit link for the Session. Ingress creates, expands, drains, and closes Paths; Egress reuses the same Paths for return traffic. Streams are independent of Path identity and may migrate between Paths at any time.
 
-Control messages have an independent sending budget. Business traffic is fairly scheduled, with optional priority and shares. The scheduler decides which currently usable Paths may carry each traffic class; Streams do not retain Path identity. Session control can use any non-revoked Path.
+Control messages have an independent sending budget. Business traffic is scheduled by bounded class queues: priority gives a bounded initial preference, shares provide weighted fair service, and every backlogged class makes progress. Each class uses round-robin service among its Streams, so adding Streams does not multiply its allocation. The scheduler decides which currently usable Paths may carry each traffic class; Streams do not retain Path identity. Session control can use any non-revoked Path.
 
 ## 8. Dynamic scheduling
 
@@ -95,8 +95,8 @@ Subscription quota and traffic multiplier are optional reference metadata. They 
 Subscription document normalization is independent of node transport support.
 Adapters preserve typed connection semantics and reject unsupported parameters
 before admission; an HTTP node that requests TLS cannot become a plaintext
-connection. Optional external protocol engines remain behind the Transit
-boundary and do not own PathChord authorization or Noise state. The
+connection. Unsupported protocol inputs remain unavailable until a native
+PathChord adapter is implemented and do not own PathChord authorization or Noise state. The
 [Transit Proxy contract](../spec/transit-proxies.md) defines supported document
 families, private engine ownership, provider expansion, and accounting facts.
 

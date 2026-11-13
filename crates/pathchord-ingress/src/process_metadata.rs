@@ -384,7 +384,108 @@ pub use linux::LinuxProcessMetadataProvider;
 pub type SystemProcessMetadataProvider = LinuxProcessMetadataProvider;
 
 #[cfg(not(target_os = "linux"))]
-pub type SystemProcessMetadataProvider = UnavailableProcessMetadataProvider;
+mod native_platform {
+    use std::collections::BTreeMap;
+    use std::net::IpAddr;
+
+    use async_trait::async_trait;
+    use netsock::family::AddressFamilyFlags;
+    use netsock::protocol::ProtocolFlags;
+    use netsock::socket::ProtocolSocketInfo;
+    use pathchord_policy::{ProcessMetadata, ProcessMetadataRequest};
+
+    use super::{ProcessMetadataProvider, ProcessSocketTuple};
+
+    const MAX_PROCESS_NAME_BYTES: usize = 4096;
+
+    /// Windows and FreeBSD provider backed by `netsock`'s native IP Helper and
+    /// libprocstat integrations. It never invokes a shell or parses command
+    /// output; user/group identifiers remain unknown when the platform API
+    /// does not expose them to an unprivileged process.
+    #[derive(Debug, Default)]
+    pub struct NativeProcessMetadataProvider;
+
+    #[async_trait]
+    impl ProcessMetadataProvider for NativeProcessMetadataProvider {
+        async fn lookup(
+            &self,
+            socket: ProcessSocketTuple,
+            request: ProcessMetadataRequest,
+        ) -> Option<ProcessMetadata> {
+            if request.is_empty() {
+                return None;
+            }
+            tokio::task::spawn_blocking(move || lookup(socket, request))
+                .await
+                .ok()
+                .flatten()
+        }
+    }
+
+    fn lookup(
+        socket: ProcessSocketTuple,
+        request: ProcessMetadataRequest,
+    ) -> Option<ProcessMetadata> {
+        let sockets = netsock::iter_sockets(
+            AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6,
+            ProtocolFlags::TCP | ProtocolFlags::UDP,
+        )
+        .ok()?;
+        let mut owners = BTreeMap::new();
+        for info in sockets.flatten() {
+            let matches = match &info.protocol_socket_info {
+                ProtocolSocketInfo::Tcp(tcp) => {
+                    addresses_equal(tcp.local_addr, socket.local.ip())
+                        && tcp.local_port == socket.local.port()
+                        && addresses_equal(tcp.remote_addr, socket.source.ip())
+                        && tcp.remote_port == socket.source.port()
+                }
+                // A UDP socket has no peer in the native table. Only use it
+                // when the local endpoint is unique; otherwise report unknown.
+                ProtocolSocketInfo::Udp(udp) => {
+                    addresses_equal(udp.local_addr, socket.local.ip())
+                        && udp.local_port == socket.local.port()
+                }
+            };
+            if matches {
+                for process in info.processes {
+                    owners.entry(process.pid).or_insert(process.name);
+                }
+            }
+        }
+        let (process_id, executable) = match owners.into_iter().collect::<Vec<_>>().as_slice() {
+            [(pid, name)] => (
+                Some(*pid),
+                request.executable.then(|| {
+                    name.chars()
+                        .take(MAX_PROCESS_NAME_BYTES)
+                        .collect::<String>()
+                }),
+            ),
+            _ => (None, None),
+        };
+        process_id.map(|process_id| ProcessMetadata {
+            process_id: Some(process_id),
+            executable,
+            user_id: None,
+            group_id: None,
+        })
+    }
+
+    fn addresses_equal(left: IpAddr, right: IpAddr) -> bool {
+        if right.is_unspecified() {
+            left.is_ipv4() == right.is_ipv4()
+        } else {
+            left == right
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub use native_platform::NativeProcessMetadataProvider;
+
+#[cfg(not(target_os = "linux"))]
+pub type SystemProcessMetadataProvider = NativeProcessMetadataProvider;
 
 #[cfg(test)]
 mod tests {

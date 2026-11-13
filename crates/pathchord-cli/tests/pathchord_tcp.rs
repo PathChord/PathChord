@@ -245,6 +245,7 @@ fn policy(
                 reject_tags: BTreeSet::new(),
                 weight: 100,
                 traffic_policy: traffic_policy_id.clone(),
+                traffic_class: None,
             }],
             traffic_policies: vec![TrafficPolicy {
                 id: traffic_policy_id,

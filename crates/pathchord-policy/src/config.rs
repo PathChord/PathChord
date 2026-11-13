@@ -275,6 +275,8 @@ pub struct TransitRuleSpec {
     weight: u32,
     traffic_policy_ref: Option<String>,
     #[serde(default)]
+    traffic_class_ref: Option<String>,
+    #[serde(default)]
     catch_all: bool,
 }
 
@@ -479,6 +481,8 @@ fn default_enabled() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KubeResource {
+    EgressService(Resource<crate::EgressServiceSpec>),
+    NodeProbePolicy(Resource<crate::NodeProbePolicySpec>),
     Egress(Resource<EgressSpec>),
     TransitProxy(Resource<TransitProxySpec>),
     Subscription(Resource<SubscriptionSpec>),
@@ -494,6 +498,12 @@ pub enum KubeResource {
 impl KubeResource {
     fn key(&self) -> (&str, &str, &str) {
         match self {
+            Self::EgressService(value) => {
+                (&value.metadata.namespace, &value.kind, &value.metadata.name)
+            }
+            Self::NodeProbePolicy(value) => {
+                (&value.metadata.namespace, &value.kind, &value.metadata.name)
+            }
             Self::Egress(value) => (&value.metadata.namespace, &value.kind, &value.metadata.name),
             Self::TransitProxy(value) => {
                 (&value.metadata.namespace, &value.kind, &value.metadata.name)
@@ -525,6 +535,8 @@ impl KubeResource {
 
     fn metadata(&self) -> &ObjectMeta {
         match self {
+            Self::EgressService(value) => &value.metadata,
+            Self::NodeProbePolicy(value) => &value.metadata,
             Self::Egress(value) => &value.metadata,
             Self::TransitProxy(value) => &value.metadata,
             Self::Subscription(value) => &value.metadata,
@@ -535,6 +547,13 @@ impl KubeResource {
             Self::Listener(value) => &value.metadata,
             Self::DnsPolicy(value) => &value.metadata,
             Self::FallbackPolicy(value) => &value.metadata,
+        }
+    }
+
+    pub fn egress_service(&self) -> Option<(&ObjectMeta, &crate::EgressServiceSpec)> {
+        match self {
+            Self::EgressService(value) => Some((&value.metadata, &value.spec)),
+            _ => None,
         }
     }
 }
@@ -579,6 +598,19 @@ impl KubeConfig {
     pub fn from_documents<'a>(
         inputs: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, ConfigError> {
+        Self::parse_documents(inputs, true)
+    }
+
+    pub fn from_service_documents<'a>(
+        inputs: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, ConfigError> {
+        Self::parse_documents(inputs, false)
+    }
+
+    fn parse_documents<'a>(
+        inputs: impl IntoIterator<Item = &'a str>,
+        require_ingress: bool,
+    ) -> Result<Self, ConfigError> {
         let mut values = Vec::new();
         for input in inputs {
             for value in serde_yaml::from_str_multi::<Value>(input)? {
@@ -613,7 +645,7 @@ impl KubeConfig {
             resources.push(resource);
         }
         resources.sort_by(|left, right| left.key().cmp(&right.key()));
-        validate_resource_set(&resources)?;
+        validate_resource_set(&resources, require_ingress)?;
         Ok(Self { resources })
     }
 
@@ -724,6 +756,7 @@ impl KubeConfig {
                             reject_tags: value.spec.reject.tags,
                             weight: value.spec.weight,
                             traffic_policy: TrafficPolicyId::new(policy),
+                            traffic_class: value.spec.traffic_class_ref,
                         },
                     ));
                 }
@@ -1008,6 +1041,8 @@ impl KubeConfig {
                     });
                 }
                 KubeResource::FallbackPolicy(value) => config.fallback = Some(value.spec.action),
+                KubeResource::EgressService(_) => {}
+                KubeResource::NodeProbePolicy(value) => config.node_probe = Some(value.spec),
             }
         }
         if default_policy
@@ -1107,6 +1142,8 @@ fn parse_resource(value: Value) -> Result<KubeResource, ConfigError> {
         }};
     }
     match kind.as_str() {
+        "EgressService" => parse!(crate::EgressServiceSpec, EgressService),
+        "NodeProbePolicy" => parse!(crate::NodeProbePolicySpec, NodeProbePolicy),
         "Egress" => parse!(EgressSpec, Egress),
         "TransitProxy" => parse!(TransitProxySpec, TransitProxy),
         "Subscription" => parse!(SubscriptionSpec, Subscription),
@@ -1121,7 +1158,10 @@ fn parse_resource(value: Value) -> Result<KubeResource, ConfigError> {
     }
 }
 
-fn validate_resource_set(resources: &[KubeResource]) -> Result<(), ConfigError> {
+fn validate_resource_set(
+    resources: &[KubeResource],
+    require_ingress: bool,
+) -> Result<(), ConfigError> {
     let dns = resources
         .iter()
         .filter(|resource| matches!(resource, KubeResource::DnsPolicy(_)))
@@ -1130,20 +1170,38 @@ fn validate_resource_set(resources: &[KubeResource]) -> Result<(), ConfigError> 
         .iter()
         .filter(|resource| matches!(resource, KubeResource::FallbackPolicy(_)))
         .count();
-    if dns != 1 {
+    if require_ingress && dns != 1 {
         return Err(ConfigError::InvalidEnvelope(
             "exactly one DNSPolicy is required".into(),
         ));
     }
-    if fallback != 1 {
+    if require_ingress && fallback != 1 {
         return Err(ConfigError::InvalidEnvelope(
             "exactly one FallbackPolicy is required".into(),
         ));
     }
     let mut rule_orders = HashSet::new();
+    if resources
+        .iter()
+        .filter(|resource| matches!(resource, KubeResource::NodeProbePolicy(_)))
+        .count()
+        > 1
+    {
+        return Err(ConfigError::InvalidEnvelope(
+            "at most one NodeProbePolicy is permitted".to_owned(),
+        ));
+    }
     for resource in resources {
         validate_metadata(resource.metadata())?;
         match resource {
+            KubeResource::EgressService(value) => value
+                .spec
+                .validate()
+                .map_err(|reason| invalid_spec(&value.kind, &value.metadata.name, reason))?,
+            KubeResource::NodeProbePolicy(value) => value
+                .spec
+                .validate()
+                .map_err(|reason| invalid_spec(&value.kind, &value.metadata.name, reason))?,
             KubeResource::Egress(value) => {
                 validate_egress_spec(value)?;
             }
@@ -1416,7 +1474,6 @@ fn validate_transit_proxy_spec(value: &Resource<TransitProxySpec>) -> Result<(),
         "shadowtls",
         "anytls",
         "snell",
-        "ssr",
     ];
     if !PROTOCOLS.contains(&value.spec.protocol.as_str()) {
         return Err(invalid_spec(
@@ -2317,6 +2374,41 @@ spec:
             "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: EgressRule\nmetadata:\n  name: r1\nspec:\n  match: {{flowTags: [x]}}\n  egressRef: jp-1\n"
         );
         assert!(KubeConfig::from_yaml(&input).is_err());
+    }
+
+    #[test]
+    fn traffic_class_references_select_existing_policy_classes() {
+        let input = format!(
+            r#"{VALID}
+---
+apiVersion: pathchord.io/v1
+kind: TrafficPolicy
+metadata: {{name: gaming}}
+spec:
+  classes:
+    interactive: {{priority: 200, share: 3}}
+---
+apiVersion: pathchord.io/v1
+kind: TransitRule
+metadata: {{name: classified}}
+spec: {{order: 99, catchAll: true, egressRef: jp-1, trafficPolicyRef: gaming, trafficClassRef: interactive}}
+"#
+        );
+        let parsed = KubeConfig::from_yaml(&input)
+            .unwrap()
+            .into_validated_snapshot(Generation::new(1))
+            .unwrap();
+        assert_eq!(
+            parsed.config().transit_rules[0].traffic_class.as_deref(),
+            Some("interactive")
+        );
+        let invalid = input.replace("trafficClassRef: interactive", "trafficClassRef: absent");
+        assert!(
+            KubeConfig::from_yaml(&invalid)
+                .unwrap()
+                .into_validated_snapshot(Generation::new(1))
+                .is_err()
+        );
     }
 
     #[test]
