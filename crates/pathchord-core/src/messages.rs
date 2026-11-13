@@ -91,6 +91,52 @@ pub struct StatusReport {
     pub expires_after_ms: u64,
 }
 
+/// Result of applying one Egress status report to a monotonic observation
+/// tracker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusReportDisposition {
+    Accepted,
+    Duplicate,
+    Stale,
+    Expired,
+}
+
+/// Tracks report ordering and freshness independently of wire decoding.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StatusReportTracker {
+    latest: Option<StatusReport>,
+}
+
+impl StatusReportTracker {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { latest: None }
+    }
+
+    #[must_use]
+    pub fn latest(&self) -> Option<&StatusReport> {
+        self.latest.as_ref()
+    }
+
+    /// Applies a report only when it is newer and within its advertised
+    /// freshness window. Stale/duplicate reports do not replace current state.
+    pub fn apply(&mut self, report: StatusReport) -> StatusReportDisposition {
+        if report.sample_age_ms > report.expires_after_ms {
+            return StatusReportDisposition::Expired;
+        }
+        if let Some(previous) = &self.latest {
+            if report.report_seqno == previous.report_seqno {
+                return StatusReportDisposition::Duplicate;
+            }
+            if report.report_seqno < previous.report_seqno {
+                return StatusReportDisposition::Stale;
+            }
+        }
+        self.latest = Some(report);
+        StatusReportDisposition::Accepted
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Heartbeat {
     pub control_seq: u64,
@@ -1569,6 +1615,40 @@ mod tests {
                 field: "ingress_id"
             })
         );
+    }
+
+    #[test]
+    fn status_reports_are_monotonic_and_freshness_bounded() {
+        let report = |sequence, age| StatusReport {
+            connected: true,
+            service_state: EgressServiceState::Up,
+            load_basis_points: 0,
+            connection_utilization_basis_points: 0,
+            bandwidth_utilization_basis_points: 0,
+            active_sessions: 0,
+            active_streams: 0,
+            active_target_connections: 0,
+            capacity_bps: 1,
+            recommended_path_count: 1,
+            report_seqno: sequence,
+            sample_age_ms: age,
+            expires_after_ms: 100,
+        };
+        let mut tracker = StatusReportTracker::new();
+        assert_eq!(
+            tracker.apply(report(2, 10)),
+            StatusReportDisposition::Accepted
+        );
+        assert_eq!(
+            tracker.apply(report(2, 10)),
+            StatusReportDisposition::Duplicate
+        );
+        assert_eq!(tracker.apply(report(1, 10)), StatusReportDisposition::Stale);
+        assert_eq!(
+            tracker.apply(report(3, 101)),
+            StatusReportDisposition::Expired
+        );
+        assert_eq!(tracker.latest().expect("latest").report_seqno, 2);
     }
 
     #[test]

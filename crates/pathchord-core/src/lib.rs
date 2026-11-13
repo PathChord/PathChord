@@ -22,9 +22,10 @@ pub use id::{IdError, PathId, RequestId, SessionId, StreamId};
 pub use limits::{LimitsError, ProtocolLimits};
 pub use messages::{
     ControlAck, Heartbeat, Message, MessageCodecError, PathClose, PathDrain, PathHello, PathReady,
-    SessionAttach, SessionAttachOk, SessionAttachReject, SessionClose, StatusReport, StreamAck,
-    StreamData, StreamFin, StreamOpen, StreamOpenErr, StreamOpenOk, StreamRst, StreamWindow,
-    TargetEndpoint, UdpClose, UdpDatagram, UdpOpen, UdpOpenErr, UdpOpenOk,
+    SessionAttach, SessionAttachOk, SessionAttachReject, SessionClose, StatusReport,
+    StatusReportDisposition, StatusReportTracker, StreamAck, StreamData, StreamFin, StreamOpen,
+    StreamOpenErr, StreamOpenOk, StreamRst, StreamWindow, TargetEndpoint, UdpClose, UdpDatagram,
+    UdpOpen, UdpOpenErr, UdpOpenOk,
 };
 pub use reliability::{
     AckRange, ControlReceiver, ControlSender, ReliabilityError, StreamInsertResult,
