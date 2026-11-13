@@ -70,7 +70,13 @@ impl LocalControlDispatcher {
 
         match request.operation.as_str() {
             "status.get" => self.dispatch_status(request),
+            "nodes.list" => self.dispatch_nodes_list(request),
+            "sessions.list" => self.dispatch_empty_list(request, "sessions", "status:read"),
+            "connections.list" => self.dispatch_connections_list(request),
             "listeners.list" => self.dispatch_listeners(request),
+            "subscriptions.list" => self.dispatch_subscriptions_list(request),
+            "metrics.snapshot" => self.dispatch_metrics_snapshot(request),
+            "events.subscribe" => self.dispatch_events(request),
             "system_proxy.get" => self.dispatch_system_proxy_get(request),
             "system_proxy.enable" => self.dispatch_system_proxy_enable(request),
             "system_proxy.disable" => self.dispatch_system_proxy_disable(request),
@@ -148,6 +154,137 @@ impl LocalControlDispatcher {
         self.success(
             request.request_id,
             json!({"items": items, "next_page_token": next_page_token}),
+        )
+    }
+
+    fn dispatch_nodes_list(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "nodes:read") {
+            return *response;
+        }
+        let snapshot = self.service.snapshot();
+        let items: Vec<_> = snapshot
+            .nodes
+            .iter()
+            .map(|(id, state)| {
+                json!({
+                    "id": id.as_str(),
+                    "admin": {"labels": state.labels, "tags": state.tags},
+                    "generation": snapshot.generation,
+                })
+            })
+            .collect();
+        self.success(
+            request.request_id,
+            json!({"items": items, "next_page_token": Value::Null}),
+        )
+    }
+
+    fn dispatch_subscriptions_list(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "status:read") {
+            return *response;
+        }
+        let snapshot = self.service.snapshot();
+        let items: Vec<_> = snapshot
+            .subscriptions
+            .values()
+            .map(|subscription| {
+                json!({
+                    "id": subscription.spec.id.as_str(),
+                    "source_type": subscription.spec.source_type,
+                    "enabled": subscription.spec.enabled,
+                    "revision": subscription.revision,
+                    "state": format!("{:?}", subscription.refresh_state).to_ascii_lowercase(),
+                    "last_error": subscription.last_error,
+                })
+            })
+            .collect();
+        self.success(
+            request.request_id,
+            json!({"items": items, "next_page_token": Value::Null}),
+        )
+    }
+
+    fn dispatch_connections_list(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "metrics:read") {
+            return *response;
+        }
+        let snapshot = self.service.observation_snapshot();
+        let items: Vec<_> = snapshot
+            .connections
+            .values()
+            .map(|connection| {
+                json!({
+                    "connection_id": connection.connection_id,
+                    "session_id": connection.session_id.to_string(),
+                    "stream_id": connection.stream_id.map(|id| id.get()),
+                    "state": format!("{:?}", connection.state).to_ascii_lowercase(),
+                    "bytes_sent": connection.bytes_sent,
+                    "bytes_received": connection.bytes_received,
+                    "target": connection.target_display,
+                })
+            })
+            .collect();
+        self.success(
+            request.request_id,
+            json!({"items": items, "next_page_token": Value::Null}),
+        )
+    }
+
+    fn dispatch_metrics_snapshot(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "metrics:read") {
+            return *response;
+        }
+        let snapshot = self.service.observation_snapshot();
+        self.success(
+            request.request_id,
+            json!({
+                "captured_at_ms": snapshot.captured_at_ms,
+                "generation": snapshot.generation,
+                "runtime": {
+                    "sessions": snapshot.runtime.sessions,
+                    "ready_paths": snapshot.runtime.ready_paths,
+                    "streams": snapshot.runtime.streams,
+                    "target_connections": snapshot.runtime.target_connections,
+                },
+                "nodes": snapshot.nodes.len(),
+                "connections": snapshot.connections.len(),
+            }),
+        )
+    }
+
+    fn dispatch_events(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "metrics:read") {
+            return *response;
+        }
+        let last_event_id = request.body.get("last_event_id").and_then(Value::as_u64);
+        let events: Vec<_> = self
+            .service
+            .events_since(last_event_id)
+            .into_iter()
+            .map(|event| {
+                json!({
+                    "id": event.id,
+                    "generation": event.generation,
+                    "type": format!("{:?}", event.kind).to_ascii_lowercase(),
+                    "resource_id": event.resource_id,
+                })
+            })
+            .collect();
+        self.success(request.request_id, json!({"items": events}))
+    }
+
+    fn dispatch_empty_list(
+        &self,
+        request: RequestEnvelope,
+        _resource: &str,
+        capability: &str,
+    ) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, capability) {
+            return *response;
+        }
+        self.success(
+            request.request_id,
+            json!({"items": [], "next_page_token": Value::Null}),
         )
     }
 
