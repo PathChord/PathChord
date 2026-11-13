@@ -27,6 +27,8 @@ mod native_protocol;
 mod native_transport;
 #[allow(dead_code)]
 mod reality_codec;
+#[allow(dead_code)]
+mod reality_tls;
 mod shadowsocks_adapter;
 mod socks5_adapter;
 mod subscription;
