@@ -19,7 +19,8 @@
 | `vless` | 带类型化 TLS/传输校验的 TCP、TLS、WebSocket 和 WSS 字节传输 | 扩展传输与 flow 选项 |
 | `vmess` | 使用 AES-128-GCM 正文记录、`alter_id: 0` 的明文 TCP | TLS、WebSocket、UDP、mux 及其他扩展选项 |
 | `trojan` | TLS 封装的 TCP、WebSocket 和 WSS 字节传输 | 扩展传输选项 |
-| `xtls`、`hysteria`、`hysteria2`、`tuic`、`ssh`、`shadowtls`、`anytls` | 原生适配器实现中 | 注册原生适配器前返回类型化不可用诊断 |
+| `anytls` | TLS 流、认证、settings、SYN/SYNACK、PUSH/FIN 和 heartbeat 帧 | 扩展 session 与 UDP 模式 |
+| `xtls`、`hysteria`、`hysteria2`、`tuic`、`ssh`、`shadowtls` | 原生适配器实现中 | 注册原生适配器前返回类型化不可用诊断 |
 | `wireguard` | 无原生适配器 | 完整的用户态 WireGuard endpoint 文档 |
 | `snell` | 无原生适配器 | 类型化不可用诊断 |
 | `ssr` 及未注册协议 | 不可用 | 明确不可用 |

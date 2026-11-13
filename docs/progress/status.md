@@ -104,9 +104,9 @@ in the current scope.
   with a real protocol interoperability fixture; VMess extended transports,
   Hysteria2, TUIC, Reality, and SSR remain unimplemented or explicitly
   unavailable.
-- AnyTLS has a bounded pure-Rust frame and password-authentication codec, but
-  remains unregistered until its TLS/session lifecycle and independent
-  interoperability fixture are complete.
+- AnyTLS has a native TLS/session adapter with bounded frame/authentication
+  codec, settings, SYN/SYNACK, PUSH/FIN, heartbeat handling, and a sing-box
+  protocol-peer interoperability fixture.
 - Hysteria2 and Reality now have bounded pure-Rust wire/crypto codecs with
   unit vectors, but no native adapters are registered until QUIC/TLS session
   ownership and independent peer interoperability are complete.
