@@ -175,27 +175,23 @@ pub fn decode_packet(mut input: &[u8]) -> Result<TuicPacket, TuicCodecError> {
     if input.get_u8() != COMMAND_PACKET {
         return Err(TuicCodecError::InvalidCommand);
     }
+    let association_id = input.get_u16();
+    let packet_id = input.get_u16();
+    let fragment_total = input.get_u8();
+    let fragment_id = input.get_u8();
+    let payload_len = input.get_u16() as usize;
+    let endpoint = decode_address(&mut input)?;
     let packet = TuicPacket {
-        association_id: input.get_u16(),
-        packet_id: input.get_u16(),
-        fragment_total: input.get_u8(),
-        fragment_id: input.get_u8(),
-        endpoint: {
-            let size = input.get_u16() as usize;
-            let endpoint = decode_address(&mut input)?;
-            if input.len() != size + input.len() {
-                // The payload size is checked below after the address.
-            }
-            endpoint
-        },
+        association_id,
+        packet_id,
+        fragment_total,
+        fragment_id,
+        endpoint,
         payload: Bytes::new(),
     };
     if packet.fragment_total == 0 || packet.fragment_id >= packet.fragment_total {
         return Err(TuicCodecError::InvalidPayload);
     }
-    // Re-read the fixed payload length without relying on address size.
-    let payload_len_offset = 8;
-    let payload_len = u16::from_be_bytes([input_at(input, payload_len_offset)?, input_at(input, payload_len_offset + 1)?]) as usize;
     if input.len() != payload_len {
         return Err(TuicCodecError::InvalidPayload);
     }
@@ -211,7 +207,10 @@ fn encode_address(endpoint: &TuicEndpoint, output: &mut BytesMut) -> Result<(), 
     match &endpoint.address {
         TuicAddress::None => output.put_u8(0xff),
         TuicAddress::Domain(domain) => {
-            if domain.is_empty() || domain.len() > MAX_DOMAIN_BYTES || domain.bytes().any(|b| b.is_ascii_control()) {
+            if domain.is_empty()
+                || domain.len() > MAX_DOMAIN_BYTES
+                || domain.bytes().any(|b| b.is_ascii_control())
+            {
                 return Err(TuicCodecError::InvalidAddress);
             }
             output.put_u8(0);
@@ -237,34 +236,48 @@ fn decode_address(input: &mut &[u8]) -> Result<TuicEndpoint, TuicCodecError> {
     let kind = input.first().copied().ok_or(TuicCodecError::Truncated)?;
     *input = &input[1..];
     let address = match kind {
-        0xff => return Ok(TuicEndpoint { address: TuicAddress::None, port: 0 }),
+        0xff => {
+            return Ok(TuicEndpoint {
+                address: TuicAddress::None,
+                port: 0,
+            });
+        }
         0 => {
             let length = input.first().copied().ok_or(TuicCodecError::Truncated)? as usize;
             *input = &input[1..];
             if length == 0 || input.len() < length {
                 return Err(TuicCodecError::InvalidAddress);
             }
-            let domain = std::str::from_utf8(&input[..length]).map_err(|_| TuicCodecError::InvalidAddress)?.to_owned();
+            let domain = std::str::from_utf8(&input[..length])
+                .map_err(|_| TuicCodecError::InvalidAddress)?
+                .to_owned();
             *input = &input[length..];
             TuicAddress::Domain(domain)
         }
         1 => {
-            if input.len() < 4 { return Err(TuicCodecError::Truncated); }
-            let value: [u8; 4] = input[..4].try_into().unwrap(); *input = &input[4..]; TuicAddress::Ipv4(value)
+            if input.len() < 4 {
+                return Err(TuicCodecError::Truncated);
+            }
+            let value: [u8; 4] = input[..4].try_into().unwrap();
+            *input = &input[4..];
+            TuicAddress::Ipv4(value)
         }
         2 => {
-            if input.len() < 16 { return Err(TuicCodecError::Truncated); }
-            let value: [u8; 16] = input[..16].try_into().unwrap(); *input = &input[16..]; TuicAddress::Ipv6(value)
+            if input.len() < 16 {
+                return Err(TuicCodecError::Truncated);
+            }
+            let value: [u8; 16] = input[..16].try_into().unwrap();
+            *input = &input[16..];
+            TuicAddress::Ipv6(value)
         }
         _ => return Err(TuicCodecError::InvalidAddress),
     };
-    if input.len() < 2 { return Err(TuicCodecError::Truncated); }
-    let port = u16::from_be_bytes([input[0], input[1]]); *input = &input[2..];
+    if input.len() < 2 {
+        return Err(TuicCodecError::Truncated);
+    }
+    let port = u16::from_be_bytes([input[0], input[1]]);
+    *input = &input[2..];
     Ok(TuicEndpoint { address, port })
-}
-
-fn input_at(input: &[u8], index: usize) -> Result<u8, TuicCodecError> {
-    input.get(index).copied().ok_or(TuicCodecError::Truncated)
 }
 
 #[cfg(test)]
@@ -273,33 +286,90 @@ mod tests {
 
     #[test]
     fn quic_varints_round_trip_boundaries() {
-        for value in [0, 63, 64, 16_383, 16_384, 1_073_741_823, 1_073_741_824, (1_u64 << 62) - 1] {
-            let mut encoded = BytesMut::new(); encode_quic_varint(value, &mut encoded).unwrap();
-            let mut slice = encoded.as_ref(); assert_eq!(decode_quic_varint(&mut slice).unwrap(), value); assert!(slice.is_empty());
+        for value in [
+            0,
+            63,
+            64,
+            16_383,
+            16_384,
+            1_073_741_823,
+            1_073_741_824,
+            (1_u64 << 62) - 1,
+        ] {
+            let mut encoded = BytesMut::new();
+            encode_quic_varint(value, &mut encoded).unwrap();
+            let mut slice = encoded.as_ref();
+            assert_eq!(decode_quic_varint(&mut slice).unwrap(), value);
+            assert!(slice.is_empty());
         }
-        assert!(matches!(encode_quic_varint(1_u64 << 62, &mut BytesMut::new()), Err(TuicCodecError::VarIntOverflow)));
+        assert!(matches!(
+            encode_quic_varint(1_u64 << 62, &mut BytesMut::new()),
+            Err(TuicCodecError::VarIntOverflow)
+        ));
     }
 
     #[test]
     fn auth_connect_and_address_commands_encode() {
-        let credentials = TuicCredentials::parse("6cbf3f72-3417-4922-bde6-67820d041f25", "secret").unwrap();
-        let auth = encode_authenticate(&credentials); assert_eq!(&auth[..2], &[5, 0]); assert_eq!(auth.len(), 50);
-        let connect = encode_connect(&TuicEndpoint { address: TuicAddress::Domain("example.test".into()), port: 443 }).unwrap();
-        assert_eq!(&connect[..2], &[5, 1]); assert!(connect.ends_with(&443_u16.to_be_bytes()));
+        let credentials =
+            TuicCredentials::parse("6cbf3f72-3417-4922-bde6-67820d041f25", "secret").unwrap();
+        let auth = encode_authenticate(&credentials);
+        assert_eq!(&auth[..2], &[5, 0]);
+        assert_eq!(auth.len(), 50);
+        let connect = encode_connect(&TuicEndpoint {
+            address: TuicAddress::Domain("example.test".into()),
+            port: 443,
+        })
+        .unwrap();
+        assert_eq!(&connect[..2], &[5, 1]);
+        assert!(connect.ends_with(&443_u16.to_be_bytes()));
     }
 
     #[test]
     fn packet_round_trip_supports_domain_and_none_fragment_address() {
-        let packet = TuicPacket { association_id: 1, packet_id: 2, fragment_total: 1, fragment_id: 0, endpoint: TuicEndpoint { address: TuicAddress::Ipv4([192, 0, 2, 1]), port: 53 }, payload: Bytes::from_static(b"dns") };
-        let encoded = encode_packet(&packet).unwrap(); assert_eq!(decode_packet(&encoded).unwrap(), packet);
-        let tail = TuicPacket { association_id: 1, packet_id: 2, fragment_total: 2, fragment_id: 1, endpoint: TuicEndpoint { address: TuicAddress::None, port: 0 }, payload: Bytes::from_static(b"tail") };
+        let packet = TuicPacket {
+            association_id: 1,
+            packet_id: 2,
+            fragment_total: 1,
+            fragment_id: 0,
+            endpoint: TuicEndpoint {
+                address: TuicAddress::Ipv4([192, 0, 2, 1]),
+                port: 53,
+            },
+            payload: Bytes::from_static(b"dns"),
+        };
+        let encoded = encode_packet(&packet).unwrap();
+        assert_eq!(decode_packet(&encoded).unwrap(), packet);
+        let tail = TuicPacket {
+            association_id: 1,
+            packet_id: 2,
+            fragment_total: 2,
+            fragment_id: 1,
+            endpoint: TuicEndpoint {
+                address: TuicAddress::None,
+                port: 0,
+            },
+            payload: Bytes::from_static(b"tail"),
+        };
         assert!(encode_packet(&tail).is_ok());
     }
 
     #[test]
     fn packet_rejects_bad_fragments_and_bounds() {
-        let bad = TuicPacket { association_id: 1, packet_id: 1, fragment_total: 1, fragment_id: 1, endpoint: TuicEndpoint { address: TuicAddress::None, port: 0 }, payload: Bytes::new() };
-        assert!(matches!(encode_packet(&bad), Err(TuicCodecError::InvalidPayload)));
+        let bad = TuicPacket {
+            association_id: 1,
+            packet_id: 1,
+            fragment_total: 1,
+            fragment_id: 1,
+            endpoint: TuicEndpoint {
+                address: TuicAddress::None,
+                port: 0,
+            },
+            payload: Bytes::new(),
+        };
+        assert!(matches!(
+            encode_packet(&bad),
+            Err(TuicCodecError::InvalidPayload)
+        ));
         assert!(TuicCredentials::parse("bad", "secret").is_err());
     }
 }
