@@ -101,19 +101,15 @@ in the current scope.
 - Native Rust VLESS and Trojan adapters support TCP, TLS, WebSocket, and WSS
   combinations with real protocol-peer TCP and UDP interoperability
   coverage. Native VMess supports plain TCP with AES-128-GCM and `alter_id: 0`
-  with a real protocol interoperability fixture; VMess extended transports,
-  Hysteria2, TUIC, Reality, and SSR remain unimplemented or explicitly
-  unavailable.
+  with a real protocol interoperability fixture. Native Hysteria2 now covers
+  QUIC/TLS, HTTP/3 authentication, and TCP relay with a real peer fixture;
+  UDP, obfs, and port hopping remain unimplemented. TUIC, Reality, and SSR
+  remain unimplemented or explicitly unavailable.
 - AnyTLS has a native TLS/session adapter with bounded frame/authentication
   codec, settings, SYN/SYNACK, PUSH/FIN, heartbeat handling, and a sing-box
   protocol-peer interoperability fixture.
-- Hysteria2 and Reality now have bounded pure-Rust wire/crypto codecs with
-  unit vectors, but no native adapters are registered until QUIC/TLS session
-  ownership and independent peer interoperability are complete.
-- Hysteria2 has a bounded pure-Rust wire layer for QUIC varints, TCP/UDP relay
-  records, authentication fields, and Salamander obfuscation. It remains
-  unregistered until the native QUIC/HTTP3 session driver and independent
-  interoperability fixture are complete.
+- Reality has a bounded pure-Rust wire/crypto codec with unit vectors; its
+  custom TLS ClientHello and native handshake seam remain unregistered.
 - Imported complete sing-box documents are retained as opaque unavailable-node
   diagnostics. PathChord does not start or embed a compatibility process.
 - Subscription refresh supports automatic detection, Clash/Mihomo, SIP008

@@ -20,6 +20,7 @@ mod anytls_codec;
 mod credential_provider;
 mod datagram;
 mod http_connect_adapter;
+mod hysteria2_adapter;
 #[allow(dead_code)]
 mod hysteria2_codec;
 mod native_protocol;

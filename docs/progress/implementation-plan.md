@@ -34,7 +34,8 @@ interoperability path rather than crate names alone.
 | --- | --- | --- |
 | `trojan-proto` 0.18.0 | Apache/MIT-compatible Trojan wire parser/encoder; only `bytes`-scale protocol dependency and public request/UDP codecs; crate source is at [crates.io](https://crates.io/crates/trojan-proto/0.18.0) | Adopted for the native Trojan adapter; existing rustls/Tokio transport owns TLS and lifecycle. |
 | Native VMess codec | The VMess AEAD header, KDF, FNV checksum, AES-128-GCM record framing, and response framing use pure Rust dependencies; behavior was cross-checked against shoes/meow-rs tests and an independent protocol fixture. | Adopted for plain TCP plus AES-128-GCM and `alter_id: 0`; TLS, WebSocket, mux, and UDP remain to be implemented natively. |
-| `rsteria2` 0.1.1 | MIT, async Tokio/Quinn Hysteria2 client; public `connect`, `HysteriaClient::tcp_connect`, and UDP session APIs; [source](https://github.com/trustrusty/rsteria2/tree/9d5f582ac0ba6eb7f8e7aa417b4221d22596c3e2) | Candidate for the next native Hysteria2 adapter; requires a QUIC feature boundary and live server fixtures. |
+| Native Hysteria2 driver | Pure Rust Quinn 0.11 + h3 0.0.8 primitives; QUIC/TLS, HTTP/3 `/auth`, TCP bidi relay, and bounded response-header parsing; independent sing-box peer fixture passes. | Adopted for native TCP relay. UDP DATAGRAM, Salamander/Gecko obfs, and port hopping remain follow-up native work. |
+| `rsteria2` 0.1.1 | MIT, async Tokio/Quinn Hysteria2 client; public `connect`, `HysteriaClient::tcp_connect`, and UDP session APIs; [source](https://github.com/trustrusty/rsteria2/tree/9d5f582ac0ba6eb7f8e7aa417b4221d22596c3e2) | Reference only; no full backend is embedded. |
 | `anytls` 0.5.4 | MIT, public async `Client`, `create_stream`, and runtime session APIs; [source](https://github.com/ssrlive/anytls-rs/tree/bdc27d093bc32f52ddf5bba73147e226b156075d) | Reference only; PathChord uses its own native AnyTLS frame/session implementation and does not embed the crate. |
 | `ssr-client-rs` 0.1.1 | GPL-3-or-later, public `SsrClient`/`SsrSession`, TCP and UDP relay modules; [source](https://github.com/liangzhaoyuan12/ssr-client-rs/tree/9a04b30493d074719a9f2d2672ef6748fb4e4f39) | Rejected for the supported protocol set; SSR is intentionally retired as an outdated protocol. |
 | `eggress-outbound` 1.0.12 | MIT/Apache-2.0, explicit listener-free `OutboundConnector`, TCP and optional UDP; [source](https://github.com/eggstack/eggress/tree/ba64e166474ede7caeba736a885322323d965911) | Not adopted; it is a complete outbound backend and includes retired SSR support. |
@@ -74,12 +75,11 @@ until its wire and obfuscation implementation is complete.
    The native AnyTLS frame/session layer is registered after TLS/session
    handshake and peer interoperability coverage; padding updates and UDP
    remain follow-up protocol work.
-   Hysteria2 and Reality wire/crypto codecs follow the same rule: codec tests
-   alone do not register a transport adapter; QUIC/TLS ownership and peer
-   interoperability must be proven first.
-   Hysteria2 now has an unregistered pure-Rust wire layer for QUIC varints,
-   TCP/UDP relay messages, auth bounds, and Salamander obfuscation; the QUIC
-   and HTTP/3 session driver remains to be implemented natively.
+   Reality wire/crypto codecs follow the same rule: codec tests alone do not
+   register a transport adapter; custom TLS ownership and peer interoperability
+   must be proven first. Hysteria2 now has a native QUIC/TLS + HTTP/3 TCP
+   driver; its UDP, obfs, and port-hopping modes remain codec-only follow-up
+   work.
 5. Connect the Prometheus endpoint and structured observations to deployed
    monitoring, alerts, and dashboards. Keep live gauges distinct from
    historical counters, and measure production probe/autoscaler constants.
