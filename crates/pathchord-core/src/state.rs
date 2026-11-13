@@ -81,7 +81,7 @@ impl SessionState {
     }
 
     pub const fn can_open_stream(self) -> bool {
-        matches!(self, Self::Active)
+        matches!(self, Self::Active | Self::Degraded)
     }
 }
 
@@ -347,6 +347,7 @@ mod tests {
     #[test]
     fn closed_session_never_opens_new_streams() {
         assert!(!SessionState::Closed.can_open_stream());
+        assert!(SessionState::Degraded.can_open_stream());
         assert_eq!(
             SessionState::Closed.transition(SessionState::Active, 0),
             Err(StateTransitionError::InvalidSession {

@@ -94,8 +94,8 @@ impl LocalControlDispatcher {
             json!({
                 "ingress": {"state": "running"},
                 "control_plane": {"state": "running"},
-                "runtime_snapshot": {"state": "fresh", "generation": snapshot.generation},
-                "data_path_summary": "connected",
+                "runtime_snapshot": {"state": "unavailable", "generation": snapshot.generation},
+                "data_path_summary": "down",
                 "configuration_generation": self.service.snapshot().generation,
                 "observation_generation": snapshot.generation,
                 "sessions": snapshot.runtime.sessions,
@@ -266,6 +266,20 @@ impl LocalControlDispatcher {
     }
 
     fn system_proxy_value(&self) -> Value {
+        // Linux exposes ordinary listener inventory but has no system-proxy
+        // activation state. Keep this response distinct from Windows'
+        // disabled state so clients cannot mistake unsupported for restored.
+        if self.platform == SystemProxyPlatform::Linux {
+            return json!({
+                "enabled": false,
+                "listener_id": Value::Null,
+                "platform_effect": "unsupported",
+                "environment_applied": false,
+                "operating_system_applied": false,
+                "restoration_state": "not_required",
+                "error": Value::Null,
+            });
+        }
         let status = self.service.system_proxy_status();
         json!({
             "enabled": status.enabled,
@@ -378,6 +392,10 @@ mod tests {
         let status = dispatcher.dispatch(request("status.get", &["status:read"], json!({})));
         assert!(status.ok);
         assert_eq!(status.result.unwrap()["control_plane"]["state"], "running");
+        let status = dispatcher.dispatch(request("status.get", &["status:read"], json!({})));
+        let result = status.result.unwrap();
+        assert_eq!(result["data_path_summary"], "down");
+        assert_eq!(result["runtime_snapshot"]["state"], "unavailable");
         let listeners =
             dispatcher.dispatch(request("listeners.list", &["listeners:read"], json!({})));
         assert!(listeners.ok);
@@ -416,6 +434,13 @@ mod tests {
             response.error.unwrap().code,
             ErrorCode::UnsupportedOperation
         );
+
+        let status = linux.dispatch(request("system_proxy.get", &["status:read"], json!({})));
+        assert!(status.ok);
+        let resource = status.result.expect("Linux system proxy status");
+        assert_eq!(resource["enabled"], false);
+        assert_eq!(resource["platform_effect"], "unsupported");
+        assert_eq!(resource["restoration_state"], "not_required");
     }
 
     #[test]
