@@ -13,7 +13,8 @@ use pathchord_ingress::{
     SystemProxyPlatform, TargetAddress, TargetHost, read_object, write_object,
 };
 use pathchord_policy::{
-    AuthenticationMode, KubeConfig, ListenerConfig, ListenerKind as PolicyListenerKind,
+    AuthenticationMode, FallbackAction, KubeConfig, ListenerConfig,
+    ListenerKind as PolicyListenerKind, PolicyConfig,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -215,17 +216,14 @@ async fn run_ingress(
     } else {
         SystemProxyPlatform::Linux
     };
+    let dialer = TcpIngressDialer::new(&policy);
     let descriptors = policy
         .listeners
         .into_iter()
         .map(listener_descriptor)
         .collect::<Result<Vec<_>, _>>()?;
-    let runtime = ListenerRuntime::bind_descriptors(
-        TcpIngressDialer::new(),
-        Default::default(),
-        descriptors.clone(),
-    )
-    .await?;
+    let runtime =
+        ListenerRuntime::bind_descriptors(dialer, Default::default(), descriptors.clone()).await?;
     let mut dispatcher = LocalControlDispatcher::new(platform);
     for descriptor in descriptors {
         dispatcher.service_mut().register_listener(descriptor);
@@ -296,15 +294,34 @@ fn parse_bind(host: &str, port: u16) -> Option<std::net::SocketAddr> {
 
 /// Adapts the concrete Egress TCP connector to the transport-neutral local
 /// flow bridge used by listener runtimes.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct TcpIngressDialer {
     connector: TcpTargetConnector,
+    policy: BootstrapPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapPolicy {
+    Direct,
+    Reject,
+    UnsupportedRules,
 }
 
 impl TcpIngressDialer {
-    const fn new() -> Self {
+    fn new(config: &PolicyConfig) -> Self {
+        let policy = if !config.egress_rules.is_empty()
+            || !config.transit_rules.is_empty()
+            || !config.proxy_rules.is_empty()
+        {
+            BootstrapPolicy::UnsupportedRules
+        } else if config.fallback == Some(FallbackAction::Direct) {
+            BootstrapPolicy::Direct
+        } else {
+            BootstrapPolicy::Reject
+        };
         Self {
             connector: TcpTargetConnector::new(),
+            policy,
         }
     }
 }
@@ -315,6 +332,19 @@ impl IngressTargetDialer for TcpIngressDialer {
         &self,
         target: TargetAddress,
     ) -> Result<BoxedLocalConnection, FlowBridgeError> {
+        match self.policy {
+            BootstrapPolicy::Direct => {}
+            BootstrapPolicy::Reject => {
+                return Err(FlowBridgeError::Dial(
+                    "local policy fallback rejects direct traffic".to_owned(),
+                ));
+            }
+            BootstrapPolicy::UnsupportedRules => {
+                return Err(FlowBridgeError::Dial(
+                    "configured policy rules require a Session/Transit runtime".to_owned(),
+                ));
+            }
+        }
         let request = target_request(target);
         self.connector
             .connect_tcp(request)
@@ -404,7 +434,10 @@ mod tests {
         tokio::task::JoinHandle<pathchord_ingress::RuntimeReport>,
         mpsc::UnboundedReceiver<pathchord_ingress::ListenerRuntimeEvent>,
     ) {
-        let mut runtime = ListenerRuntime::new(TcpIngressDialer::new());
+        let mut runtime = ListenerRuntime::new(TcpIngressDialer::new(&PolicyConfig {
+            fallback: Some(FallbackAction::Direct),
+            ..PolicyConfig::default()
+        }));
         let address = listener.local_addr().expect("proxy address");
         runtime.add_listener(listener).expect("runtime listener");
         let (events, receiver) = mpsc::unbounded_channel();
