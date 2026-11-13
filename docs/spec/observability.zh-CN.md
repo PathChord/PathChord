@@ -58,8 +58,9 @@ Ingress 可观测性是本地控制平面的结构化查询和事件接口。日
 相应 Egress 观测必须标记为 `stale`，不能当作当前零负载。名称表示单调性的计数器在单个
 进程生命周期内必须单调；仪表值可以双向变化。本响应中的 `snapshot_generation` 与
 `observed_generation` 标识同一个观测快照。
-`system_proxy.platform_effect` 的值为 `disabled`、`applied` 或 `unsupported`；Linux 的系统代理控制
-仅限 Windows，因此必须报告 `unsupported`。
+`system_proxy.platform_effect` 的值为 `disabled`、`applied` 或 `unsupported`；系统代理激活仅限 Windows，
+因此 Linux 和 FreeBSD 的系统代理状态查询必须返回 `enabled: false` 和 `platform_effect: unsupported`。
+其启用和关闭操作返回 `UNSUPPORTED_OPERATION`。
 
 结构化下钻资源如下：
 

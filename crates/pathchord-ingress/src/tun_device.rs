@@ -80,11 +80,13 @@ pub trait PacketFlowEngine: std::fmt::Debug + Send + Sync {
     async fn ingest_packet(&self, packet: Vec<u8>) -> Result<Vec<Vec<u8>>, PacketDeviceError>;
 }
 
+#[cfg(not(target_os = "freebsd"))]
 pub struct TunRsPacketDevice {
     device: tun_rs::AsyncDevice,
     mtu: usize,
 }
 
+#[cfg(not(target_os = "freebsd"))]
 impl std::fmt::Debug for TunRsPacketDevice {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -94,6 +96,7 @@ impl std::fmt::Debug for TunRsPacketDevice {
     }
 }
 
+#[cfg(not(target_os = "freebsd"))]
 impl TunRsPacketDevice {
     pub fn create(config: &TunDeviceConfig) -> Result<Self, PacketDeviceError> {
         let mut builder = tun_rs::DeviceBuilder::new()
@@ -113,6 +116,7 @@ impl TunRsPacketDevice {
     }
 }
 
+#[cfg(not(target_os = "freebsd"))]
 #[async_trait]
 impl PacketDevice for TunRsPacketDevice {
     fn mtu(&self) -> usize {

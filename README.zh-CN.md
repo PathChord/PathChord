@@ -10,7 +10,7 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 本仓库包含设计基线、`wire-profile-v1` 协议契约、Kubernetes 风格配置契约，以及可运行的 Rust 实现。Ingress 可以绑定 HTTP、SOCKS5、Linux 透明模式和 TUN 监听器，维护持久化控制状态，刷新由订阅提供的 Transit Proxy，并通过经过认证的 Session/Path 运行时承载 TCP/UDP 流量。Egress 提供经过认证的 Path 监听器和授权控制面；可选的 REST/SSE Web Gateway 由两个控制面共享。
 
-当前工作优先完善 Linux 和 Windows 上的 HTTP CONNECT 与 SOCKS5，并评估 FreeBSD 对同一组显式代理监听器及 Unix 本地控制接口的支持。FreeBSD 尚无目标平台构建或原生主机验证记录。透明流量接管与 TUN 工作安排在这组监听器的基础能力之后；平台验证、共享运行时缺口及后续适配器工作见[实施计划](docs/progress/implementation-plan.md)。
+当前工作优先完善 Linux、Windows 和 FreeBSD 上的 HTTP CONNECT 与 SOCKS5。FreeBSD 已有显式代理监听器的平台校验和 Unix 本地控制接口，目标编译和 CLI 链接已通过，原生主机验证仍待完成。通用监听器回归测试由现有 Rust CI 任务执行。透明流量接管与 TUN 工作安排在这组监听器的基础能力之后；平台验证、共享运行时缺口及后续适配器工作见[实施计划](docs/progress/implementation-plan.md)。
 
 ## 术语
 

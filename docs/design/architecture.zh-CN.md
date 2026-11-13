@@ -4,7 +4,7 @@
 
 ## 1. 范围
 
-PathChord 支持 Linux 和 Windows。两个平台都必须支持 HTTP/SOCKS 监听器。Linux 支持 TPROXY、REDIRECT，可以支持 TUN；Windows 通过控制面选择监听器来提供 TUN 和系统代理集成。两个平台共享策略、节点、Noise、Session 和多路径核心。
+PathChord 支持 Linux、Windows 和 FreeBSD。三个平台都必须支持 HTTP CONNECT、SOCKS5 CONNECT 和 SOCKS5 UDP ASSOCIATE 监听器。Linux 支持 TPROXY、REDIRECT，可以支持 TUN；Windows 通过控制面选择监听器来提供 TUN 和系统代理集成。v1 平台契约禁止 FreeBSD 暴露 TPROXY、REDIRECT 或 TUN 监听器。三个平台共享策略、节点、Noise、Session 和多路径核心。
 
 系统支持 TCP、UDP 和独立 DNS。Fake-IP、通用 ICMP 转发、组播代理和任意 IP 隧道不在协议范围内。
 
@@ -103,7 +103,7 @@ Ingress 通过原子运行时快照 provider 发布这些观测数据。该 prov
 
 多个 HTTP/SOCKS 监听器各自具有唯一 ID，并参与策略评估。监听器认证和来源网络限制独立于 Ingress 到 Egress 的 Noise 认证。
 
-Windows 系统代理集成是控制面开关，按 ID 选择一个 HTTP/SOCKS 监听器。Linux 不暴露系统代理激活模式；其监听器仍可通过控制面查看。
+Windows 系统代理集成是控制面开关，按 ID 选择一个 HTTP/SOCKS 监听器。Linux 和 FreeBSD 不暴露系统代理激活模式；其监听器及系统代理不受支持的状态仍可通过控制面查看。Linux 和 FreeBSD 的本地控制使用 Unix socket，Windows 使用 Named Pipe。
 
 透明入口不执行域名路由。HTTP/SOCKS 请求显式携带域名，因此可以按域名路由。DNS 独立运行，并选择查询的解析位置：本地、通过 Transit Proxy、通过选定的 Egress，或阻止查询。不使用 Fake-IP 映射。
 

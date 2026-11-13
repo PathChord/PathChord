@@ -3,21 +3,23 @@
 [English](platform-and-dns.md) | **简体中文**
 
 本文档定义平台专用监听器契约以及[配置 schema](configuration-schema.zh-CN.md)引用的独立 DNS
-策略。平台适配器在 Linux 和 Windows 上暴露相同的策略上下文和失败类别，不改变 PathChord
+策略。平台适配器在 Linux、Windows 和 FreeBSD 上暴露相同的策略上下文和失败类别，不改变 PathChord
 Session 或线协议。
 
 ## 平台矩阵
 
-| 监听器类型 | Linux | Windows | 地址语义 |
-|---|---|---|---|
-| `http` | 必须支持 | 必须支持 | 显式 HTTP 主机名或地址 |
-| `socks5` | 必须支持 | 必须支持 | 显式 SOCKS5 主机名或地址 |
-| `tproxy` | 必须支持 | 必须不支持 | 透明 TCP/UDP IP 流 |
-| `redirect` | 必须支持 | 必须不支持 | 透明 TCP 流 |
-| `tun` | 可以支持 | 必须支持 | 通过 TUN 适配器传输的 IP 包 |
+| 监听器类型 | Linux | Windows | FreeBSD | 地址语义 |
+|---|---|---|---|---|
+| `http` | 必须支持 | 必须支持 | 必须支持 | 显式 HTTP 主机名或地址 |
+| `socks5` | 必须支持 | 必须支持 | 必须支持 | 显式 SOCKS5 主机名或地址 |
+| `tproxy` | 必须支持 | 必须不支持 | 必须不支持 | 透明 TCP/UDP IP 流 |
+| `redirect` | 必须支持 | 必须不支持 | 必须不支持 | 透明 TCP 流 |
+| `tun` | 可以支持 | 必须支持 | 必须不支持 | 通过 TUN 适配器传输的 IP 包 |
 
 不支持的类型/平台组合属于配置错误。平台适配器必须将不可用监听器报告为类型化本地失败，
 不得静默替换为另一种监听器类型。
+HTTP/SOCKS 要求包括三个平台上的 HTTP CONNECT、SOCKS5 CONNECT 和 SOCKS5 UDP ASSOCIATE。
+FreeBSD v1 只支持显式 `http` 和 `socks5` 监听器类型。
 
 ## 通用监听器 schema
 
@@ -43,8 +45,9 @@ spec:
     credentialsRef: lan-socks-users
 ```
 
-`metadata.name` 是唯一资源名。`spec.type` 为矩阵中的一种类型，`spec.platform` 为 `linux`、`windows` 或 `any`
-（默认 `any`）。`bind` 是套接字地址，对 `http`、`socks5`、`tproxy` 和 `redirect` 必填；对 `tun`
+`metadata.name` 是唯一资源名。`spec.type` 为矩阵中的一种类型，`spec.platform` 为 `linux`、`windows`、`freebsd` 或 `any`
+（默认 `any`）。显式平台必须与实际主机匹配。`any` 选择实际主机对应的矩阵列，不得绕过类型/平台验证。
+`bind` 是套接字地址，对 `http`、`socks5`、`tproxy` 和 `redirect` 必填；对 `tun`
 禁止。系统代理集成由仅限 Windows 的控制面开关管理，不增加 Listener 类型。`spec.allowedSources` 是最多 256 个 CIDR 的列表；回环绑定默认只允许本机，
 显式非回环监听器的空列表表示“所有来源地址”。非回环绑定应当使用显式列表。
 
@@ -53,7 +56,7 @@ TCP 或 UDP flow，并可用于 `FlowMatch.flowTags`；它们不会从协议头�
 每个 tag 使用其他配置 tag 相同的标识符语法。`spec.processMetadata` 是可选对象，字段
 `executable`、`user` 和 `group` 均为布尔值；空对象无效。所选平台 provider 可能只返回被请求的
 事实。缺失、权限不足或平台不支持的进程数据表示 unknown，绝不会隐式匹配进程规则。进程发现必须
-有界、只读，且不得执行 shell 命令。
+有界、只读，且不得执行 shell 命令。FreeBSD 监听器在原生进程发现不可用时遵循同样的 unknown 值语义。
 
 以下是 `spec.authentication` 片段，不是独立资源对象。认证可以是标量 `disabled`，也可以是映射：
 
@@ -155,11 +158,11 @@ POST /api/v1/system-proxy/enable
 {"listener_id":"local-http"}
 ```
 
-Linux 调用该操作必须返回平台不支持。Windows 必须拒绝缺失、未知、TUN、TPROXY、REDIRECT 或其他
+Linux 和 FreeBSD 对启用和关闭都必须返回 `UNSUPPORTED_OPERATION`。Windows 必须拒绝缺失、未知、TUN、TPROXY、REDIRECT 或其他
 不兼容的 Listener 引用。关闭时不得修改环境变量或操作系统代理设置。Windows 必须将引用的 Listener
 应用到 `HTTP_PROXY`、`HTTPS_PROXY` 和 `ALL_PROXY` 环境变量（在支持时也设置对应的小写别名）以及 Windows
 操作系统代理配置，并在关闭或退出时恢复之前的精确值。所选 Listener 和当前效果必须
-可通过控制面 status 和结构化事件查看。Linux 用户应通过普通 Listener 资源和控制面查询查看可用监听器；
+可通过控制面 status 和结构化事件查看。Linux 和 FreeBSD 用户必须通过普通 Listener 资源和控制面查询查看可用监听器；
 在修改任何值之前，适配器必须以原子方式持久化恢复 journal，记录旧值是否存在、注册表类型和原始字节。
 正常关闭只有在所有值恢复完成后才能删除 journal。启动时必须先恢复遗留 journal，之后才能接受下一次
 系统代理修改，从而避免进程在应用与关闭之间退出时永久改变代理状态。
@@ -167,7 +170,8 @@ Linux 调用该操作必须返回平台不支持。Windows 必须拒绝缺失、
 类型化平台失败并回滚修改。
 Windows 本地控制 Named Pipe 必须拒绝远程客户端。其 DACL 只能向创建对象的所有者、本机
 Administrators 和 SYSTEM 授予完全访问权限；不得依赖权限过宽的默认 Named Pipe 安全描述符。
-Linux 不暴露系统代理激活状态。
+Linux 和 FreeBSD 的 `system_proxy.get` 响应必须返回 `enabled: false` 和 `platform_effect: unsupported`，
+两个平台均不得暴露系统代理激活状态。Linux 和 FreeBSD 的本地控制使用 Unix domain socket。
 
 ```yaml
 apiVersion: pathchord.io/v1

@@ -205,8 +205,10 @@ SOCKS Listener on Windows. Enabling the already-selected listener is idempotent
 and MUST return the current applied state without rewriting saved values.
 `APPLIED` MUST record the exact previous environment and operating-system proxy
 values. Disable MUST restore those values; a restore failure enters `FAILED`,
-retains the saved values, and MUST NOT report `DISABLED`. Linux MUST reject
+retains the saved values, and MUST NOT report `DISABLED`. Linux and FreeBSD MUST reject
 enable/disable as `UNSUPPORTED_OPERATION` and MUST NOT enter this state machine.
+Their `system_proxy.get` response MUST report `enabled: false` and
+`platform_effect: unsupported`.
 Every transition emits `system_proxy.changed` with the listener ID, platform
 effect, and error or restoration state.
 

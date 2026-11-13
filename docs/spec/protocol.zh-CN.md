@@ -335,14 +335,17 @@ Ingress 拥有一个类型化 command/query service，用于节点元数据、�
 ```text
 Linux   Unix domain socket
 Windows named pipe
+FreeBSD Unix domain socket
 ```
 
 `pathchord` CLI 是受支持的本地管理客户端。API 通过操作系统对套接字或管道的所有权和权限模型来授权调用方。它不通过 Transit Proxy 或 Egress 数据 Path 暴露。
 
 管理消息使用带长度前缀的 UTF-8 JSON 封装结构。该封装包含 API 版本、操作名称、请求 ID，以及具有类型的请求或响应正文。Command 还携带 actor、 OPTIONAL 的期望代次和幂等请求 ID。JSON 仅用于管理适配器；data Path 继续使用专用二进制帧编解码器。
 
-Ingress 变更包括管理员节点 tag/label 修改、订阅创建/删除、手动订阅刷新、监听器清单查询以及
-Windows 专用的 `system_proxy.get`、`system_proxy.enable` 和 `system_proxy.disable` 操作。完整的操作、
+Ingress 控制操作包括管理员节点 tag/label 修改、订阅创建/删除、手动订阅刷新、监听器清单查询以及
+`system_proxy.get`、`system_proxy.enable` 和 `system_proxy.disable`。get 是所有平台上的结构化状态查询。
+enable 和 disable 只在 Windows 上修改代理设置；Linux 和 FreeBSD 对这两个 mutation MUST 返回
+`UNSUPPORTED_OPERATION`，而 get 返回 `enabled: false` 和 `platform_effect: unsupported`。完整的操作、
 资源、响应、错误、分页和事件注册表由[Ingress 控制面规范](ingress-control-plane.zh-CN.md)定义；该文档
 具有权威性，本节不得被解释为更小的子集。mutation 原子发布动态快照，使用代次检查处理并发更新；
 刷新失败时保留最近一次成功的订阅快照，并产生结构化审计事件。`observed.*` 和运行时拥有的 quota

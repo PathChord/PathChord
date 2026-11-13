@@ -956,10 +956,10 @@ impl LocalControlDispatcher {
     }
 
     fn system_proxy_value(&self) -> Value {
-        // Linux exposes ordinary listener inventory but has no system-proxy
+        // Unix platforms expose ordinary listener inventory but have no system-proxy
         // activation state. Keep this response distinct from Windows'
         // disabled state so clients cannot mistake unsupported for restored.
-        if self.platform == SystemProxyPlatform::Linux {
+        if self.platform != SystemProxyPlatform::Windows {
             return json!({
                 "enabled": false,
                 "listener_id": Value::Null,
@@ -1008,7 +1008,9 @@ impl LocalControlDispatcher {
 
 fn default_platform_adapter(platform: SystemProxyPlatform) -> Arc<dyn PlatformProxyAdapter> {
     match platform {
-        SystemProxyPlatform::Linux => Arc::new(crate::UnsupportedPlatformProxyAdapter),
+        SystemProxyPlatform::Linux | SystemProxyPlatform::FreeBsd => {
+            Arc::new(crate::UnsupportedPlatformProxyAdapter)
+        }
         SystemProxyPlatform::Windows => default_windows_platform_adapter(),
     }
 }
@@ -1025,7 +1027,7 @@ fn default_windows_platform_adapter() -> Arc<dyn PlatformProxyAdapter> {
 
 impl Default for LocalControlDispatcher {
     fn default() -> Self {
-        Self::new(crate::SystemProxyPlatform::Linux)
+        Self::new(SystemProxyPlatform::current())
     }
 }
 
@@ -1690,6 +1692,30 @@ mod tests {
         assert!(status.ok);
         let resource = status.result.expect("Linux system proxy status");
         assert_eq!(resource["enabled"], false);
+        assert_eq!(resource["platform_effect"], "unsupported");
+        assert_eq!(resource["restoration_state"], "not_required");
+    }
+
+    #[test]
+    fn freebsd_system_proxy_operations_are_unsupported() {
+        let mut dispatcher = dispatcher(SystemProxyPlatform::FreeBsd);
+        let generation = dispatcher.service().snapshot().generation;
+        for (operation, params) in [
+            ("system_proxy.enable", json!({"listener_id": "local-http"})),
+            ("system_proxy.disable", json!({})),
+        ] {
+            let response = dispatcher.dispatch(request(operation, &["system_proxy:write"], params));
+            assert!(!response.ok);
+            let error = response.error.expect("unsupported system-proxy operation");
+            assert_eq!(error.code, ErrorCode::UnsupportedOperation);
+            assert_eq!(dispatcher.service().snapshot().generation, generation);
+        }
+        let response =
+            dispatcher.dispatch(request("system_proxy.get", &["status:read"], json!({})));
+        assert!(response.ok);
+        let resource = response.result.expect("FreeBSD system-proxy status");
+        assert_eq!(resource["enabled"], false);
+        assert_eq!(resource["listener_id"], Value::Null);
         assert_eq!(resource["platform_effect"], "unsupported");
         assert_eq!(resource["restoration_state"], "not_required");
     }

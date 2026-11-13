@@ -616,11 +616,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         None if policy_config.egresses.is_empty() => generate_static_keypair()?,
         None => return Err(CliError::MissingIdentity),
     };
-    let platform = if cfg!(target_os = "windows") {
-        SystemProxyPlatform::Windows
-    } else {
-        SystemProxyPlatform::Linux
-    };
+    let platform = SystemProxyPlatform::current();
     let data_plane = Arc::new(IngressDataPlane::new(IngressDataPlaneConfig::new(
         args.ingress_id,
         identity,

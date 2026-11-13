@@ -387,6 +387,7 @@ The authoritative local management API is local-only:
 ```text
 Linux   Unix domain socket
 Windows named pipe
+FreeBSD Unix domain socket
 ```
 
 The `pathchord` CLI is the supported local management client. The API
@@ -400,11 +401,14 @@ response body. Commands carry an actor, OPTIONAL expected generation, and
 idempotency request ID. JSON is limited to management adapters; the data Path
 continues to use the dedicated binary frame codec.
 
-Ingress mutations include administrator node tag/label edits, subscription
-creation/deletion, explicit subscription refresh, listener inventory queries,
-and the Windows-only `system_proxy.get`, `system_proxy.enable`, and
-`system_proxy.disable` operations. The complete operation, resource, response,
-error, pagination, and event registry is defined by the
+Ingress control operations include administrator node tag/label edits,
+subscription creation/deletion, explicit subscription refresh, listener inventory
+queries, and `system_proxy.get`, `system_proxy.enable`, and
+`system_proxy.disable`. The get operation is a structured state query on every
+platform. Enable and disable affect proxy settings only on Windows; Linux and
+FreeBSD MUST return `UNSUPPORTED_OPERATION` for both mutations, while get
+reports `enabled: false` and `platform_effect: unsupported`. The complete
+operation, resource, response, error, pagination, and event registry is defined by the
 [Ingress control-plane specification](ingress-control-plane.md); that document
 is authoritative and this section MUST NOT be interpreted as a smaller subset.
 Mutations publish dynamic snapshots atomically, require generation checks for

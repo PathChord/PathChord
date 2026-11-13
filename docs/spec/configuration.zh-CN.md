@@ -194,9 +194,12 @@ ordered effective Egress rules
 
 ## 监听器
 
-完整监听器 schema（包括两个平台都必须支持的 HTTP/SOCKS、Linux 透明模式和可选 TUN、Windows TUN
+完整监听器 schema（包括 Linux、Windows 和 FreeBSD 都必须支持的 HTTP CONNECT 与 SOCKS5
+CONNECT/UDP ASSOCIATE、Linux 透明模式和可选 TUN、Windows TUN
 及 Windows 控制面的 system-proxy 开关、认证引用、来源限制
 以及环路防护）见[平台与 DNS 规范](platform-and-dns.zh-CN.md)。
+`spec.platform` 接受 `linux`、`windows`、`freebsd` 和 `any`；`any` 使用实际主机的平台矩阵。
+FreeBSD 拒绝 `tproxy`、`redirect` 和 `tun`。
 
 ```yaml
 apiVersion: pathchord.io/v1

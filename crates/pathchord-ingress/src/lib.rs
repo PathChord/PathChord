@@ -145,9 +145,11 @@ pub use runtime::{
 pub use socks5::Socks5Listener;
 pub use socks5_udp::{Socks5Runtime, Socks5RuntimeConfig, Socks5RuntimeError, Socks5RuntimeReport};
 pub use store::{IngressControlStore, IngressControlStoreError};
+#[cfg(not(target_os = "freebsd"))]
+pub use tun_device::TunRsPacketDevice;
 pub use tun_device::{
     FakePacketDevice, PacketDevice, PacketDeviceError, PacketFlowEngine, TunDeviceConfig,
-    TunRsPacketDevice, run_packet_device,
+    run_packet_device,
 };
 pub use tun_netstack::{
     TunFlowRuntime, TunFlowRuntimeConfig, TunFlowRuntimeError, TunFlowRuntimeReport,

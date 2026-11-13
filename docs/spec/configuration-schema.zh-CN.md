@@ -178,9 +178,11 @@ Session 预算是硬上限且包含控制流量；调度器应用关系权重、
 ## Listener
 
 Listener 的完整字段见[平台和 DNS 规范](platform-and-dns.zh-CN.md)。Listener 由 metadata.name 标识，
-spec 包含 type、platform（默认 any）和 authentication（默认 disabled），还可以包含最多 256 个合法 tag
+spec 包含 type、platform（`linux`、`windows`、`freebsd` 或默认值 `any`）和 authentication（默认 disabled），还可以包含最多 256 个合法 tag
 组成的 `flowTags`，以及带布尔字段 `executable`、`user`、`group` 的 `processMetadata` 请求。静态 flow
-tags 会复制到每个接收的 flow；平台无法安全获取的进程事实表示 unknown。不支持的平台/type 组合必须拒绝。
+tags 会复制到每个接收的 flow；平台无法安全获取的进程事实表示 unknown。显式平台必须与实际主机匹配，
+`any` 使用实际主机的平台矩阵。FreeBSD 允许 `http` 和 `socks5`，拒绝 `tproxy`、`redirect` 和 `tun`。
+不支持的平台/type 组合必须在验证期间拒绝，不得忽略。
 
 ## DNSPolicy 和 FallbackPolicy
 
