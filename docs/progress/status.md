@@ -102,9 +102,10 @@ in the current scope.
   combinations with real protocol-peer TCP and UDP interoperability
   coverage. Native VMess supports plain TCP with AES-128-GCM and `alter_id: 0`
   with a real protocol interoperability fixture. Native Hysteria2 now covers
-  QUIC/TLS, HTTP/3 authentication, and TCP relay with a real peer fixture;
-  UDP, obfs, and port hopping remain unimplemented. TUIC, Reality, and SSR
-  remain unimplemented or explicitly unavailable.
+  QUIC/TLS, HTTP/3 authentication, TCP relay, and UDP relay with a real peer
+  fixture; Salamander/Gecko obfs and port hopping remain unimplemented. Native
+  TUIC now covers QUIC/TLS-exporter TCP CONNECT with a peer fixture; UDP/0-RTT,
+  Reality, and SSR remain unimplemented or explicitly unavailable.
 - AnyTLS has a native TLS/session adapter with bounded frame/authentication
   codec, settings, SYN/SYNACK, PUSH/FIN, heartbeat handling, and a sing-box
   protocol-peer interoperability fixture.

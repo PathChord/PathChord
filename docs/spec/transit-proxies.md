@@ -21,8 +21,9 @@ NOT be interpreted as support for the same outbound node protocol.
 | `vmess` | Plain TCP with AES-128-GCM body records and `alter_id: 0` | TLS, WebSocket, UDP, mux, and other extended options |
 | `trojan` | TLS-wrapped TCP, WebSocket, and WSS byte transports | Extended transport options |
 | `anytls` | TLS stream, authentication, settings, SYN/SYNACK, PUSH/FIN, and heartbeat frames | Extended session and UDP modes |
-| `hysteria2` | Native QUIC/TLS + HTTP/3 authentication and TCP relay; UDP/obfs/port hopping are not yet supported | Typed unavailable diagnostics for unsupported options |
-| `xtls`, `hysteria`, `tuic`, `ssh`, `shadowtls` | Native adapter under implementation | Typed unavailable diagnostic until the native adapter is registered |
+| `hysteria2` | Native QUIC/TLS + HTTP/3 authentication, TCP relay, and UDP relay; obfs/port hopping are not yet supported | Typed unavailable diagnostics for unsupported options |
+| `tuic` | Native QUIC/TLS-exporter TCP CONNECT; UDP/0-RTT are not yet supported | Typed unavailable diagnostics for unsupported options |
+| `xtls`, `hysteria`, `ssh`, `shadowtls` | Native adapter under implementation | Typed unavailable diagnostic until the native adapter is registered |
 | `wireguard` | No native adapter | Complete userspace WireGuard endpoint document |
 | `snell` | No native adapter | Typed unavailable diagnostic |
 | `ssr` and unregistered protocols | Unavailable | Explicitly unavailable |
