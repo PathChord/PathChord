@@ -77,7 +77,8 @@ until its wire and obfuscation implementation is complete.
    remain follow-up protocol work.
    Reality wire/crypto codecs follow the same rule: codec tests alone do not
    register a transport adapter; custom TLS ownership and peer interoperability
-   must be proven first. Hysteria2 now has a native QUIC/TLS + HTTP/3 TCP
+   must be proven first. The rustls X25519 provider seam is isolated for
+   Reality, but its custom ClientHello proof hook is still required. Hysteria2 now has a native QUIC/TLS + HTTP/3 TCP
    driver; its UDP, obfs, and port-hopping modes remain codec-only follow-up
    work.
 5. Connect the Prometheus endpoint and structured observations to deployed

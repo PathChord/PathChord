@@ -109,7 +109,8 @@ in the current scope.
   codec, settings, SYN/SYNACK, PUSH/FIN, heartbeat handling, and a sing-box
   protocol-peer interoperability fixture.
 - Reality has a bounded pure-Rust wire/crypto codec with unit vectors; its
-  custom TLS ClientHello and native handshake seam remain unregistered.
+  custom TLS ClientHello and native handshake seam remain unregistered. The
+  rustls X25519 provider seam is now isolated for that future handshake.
 - Imported complete sing-box documents are retained as opaque unavailable-node
   diagnostics. PathChord does not start or embed a compatibility process.
 - Subscription refresh supports automatic detection, Clash/Mihomo, SIP008
