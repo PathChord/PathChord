@@ -4,18 +4,22 @@
 //! authorization, and response shaping remain in [`LocalControlDispatcher`].
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 use thiserror::Error;
+#[cfg(unix)]
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
-    LocalControlDispatcher, LocalProtocolError, RequestEnvelope, ResponseEnvelope, read_object,
-    write_object,
+    LocalControlDispatcher, LocalProtocolError, RequestEnvelope, read_object, write_object,
 };
+
+#[cfg(unix)]
+use crate::ResponseEnvelope;
 
 #[derive(Debug, Error)]
 pub enum LocalServerError {
@@ -150,17 +154,102 @@ impl Drop for LocalControlServer {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
+#[cfg(windows)]
+pub struct LocalControlServer {
+    pipe: NamedPipeServer,
+    name: PathBuf,
+    dispatcher: LocalControlDispatcher,
+    first_instance: bool,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for LocalControlServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalControlServer")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl LocalControlServer {
+    pub fn bind(
+        path: impl Into<PathBuf>,
+        dispatcher: LocalControlDispatcher,
+    ) -> Result<Self, LocalServerError> {
+        let name = path.into();
+        let pipe = named_pipe(&name, true)?;
+        Ok(Self {
+            pipe,
+            name,
+            dispatcher,
+            first_instance: false,
+        })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.name
+    }
+
+    pub async fn serve_once(&mut self) -> Result<(), LocalServerError> {
+        self.pipe.connect().await.map_err(LocalServerError::Io)?;
+        let next_pipe = named_pipe(&self.name, self.first_instance)?;
+        self.first_instance = false;
+        let mut connected = std::mem::replace(&mut self.pipe, next_pipe);
+        let request: RequestEnvelope = read_object(&mut connected).await?;
+        let response = self.dispatcher.dispatch(request);
+        write_object(&mut connected, &response).await?;
+        let _ = connected.disconnect();
+        Ok(())
+    }
+
+    pub async fn run(mut self) -> Result<(), LocalServerError> {
+        loop {
+            self.serve_once().await?;
+        }
+    }
+
+    pub async fn run_concurrent(self, _max_concurrent: usize) -> Result<(), LocalServerError> {
+        // Named pipe instances are created one at a time until the Windows
+        // ACL/concurrency adapter is configured; requests still use the same
+        // canonical protocol and bounded envelope checks.
+        self.run().await
+    }
+
+    pub fn dispatcher_mut(&mut self) -> &mut LocalControlDispatcher {
+        &mut self.dispatcher
+    }
+
+    pub fn shutdown(self) -> Result<(), LocalServerError> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn named_pipe(path: &Path, first_instance: bool) -> Result<NamedPipeServer, LocalServerError> {
+    let mut options = ServerOptions::new();
+    options.first_pipe_instance(first_instance);
+    options
+        .create(path.as_os_str())
+        .map_err(LocalServerError::Io)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub struct LocalControlServer;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl std::fmt::Debug for LocalControlServer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("LocalControlServer(unsupported)")
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl LocalControlServer {
     pub fn bind(
         _path: impl Into<PathBuf>,

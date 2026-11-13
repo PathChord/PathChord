@@ -11,8 +11,10 @@ use pathchord_ingress::{
     FlowBridgeError, IngressTargetDialer, LOCAL_API_VERSION, ListenerDescriptor, ListenerKind,
     ListenerRuntime, LocalControlDispatcher, LocalControlServer, LocalProtocolError,
     RequestEnvelope, ResponseEnvelope, RuntimeError, SystemProxyPlatform, TargetAddress,
-    TargetHost, read_object, write_object,
+    TargetHost,
 };
+#[cfg(unix)]
+use pathchord_ingress::{read_object, write_object};
 use pathchord_policy::{
     AuthenticationMode, FallbackAction, KubeConfig, ListenerConfig,
     ListenerKind as PolicyListenerKind, PolicyConfig,
@@ -20,8 +22,12 @@ use pathchord_policy::{
 use serde_json::Value;
 use thiserror::Error;
 
-/// Default local control endpoint on Unix hosts.
+/// Default local control endpoint.
+#[cfg(not(windows))]
 pub const DEFAULT_SOCKET_PATH: &str = "/run/pathchord/ingress.sock";
+
+#[cfg(windows)]
+pub const DEFAULT_SOCKET_PATH: &str = r"\\.\pipe\pathchord-ingress";
 
 #[derive(Debug, Parser)]
 #[command(name = "pathchord", version, about = "PathChord management client")]
