@@ -25,6 +25,9 @@ mod hysteria2_adapter;
 mod hysteria2_codec;
 mod native_protocol;
 mod native_transport;
+mod reality_adapter;
+#[allow(dead_code)]
+mod reality_client_hello;
 #[allow(dead_code)]
 mod reality_codec;
 #[allow(dead_code)]

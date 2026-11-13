@@ -33,6 +33,7 @@ pub(crate) struct AnyTlsAdapter {
     metadata: TransitMetadata,
     password: Zeroizing<String>,
     transport: NativeTransport,
+    udp_enabled: bool,
     timeout: Duration,
 }
 
@@ -64,7 +65,16 @@ impl AnyTlsAdapter {
         {
             return Err(unsupported("native AnyTLS requires TLS"));
         }
-        crate::adapter_registry::validate_credentials(Some(credential), &["password"])?;
+        let mut allowed = vec!["password"];
+        if let Some(field) = config
+            .options
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_key_field.as_deref())
+        {
+            allowed.push(field);
+        }
+        crate::adapter_registry::validate_credentials(Some(credential), &allowed)?;
         let password = credential
             .field("password")
             .filter(|value| !value.is_empty())
@@ -80,11 +90,16 @@ impl AnyTlsAdapter {
             },
             password: Zeroizing::new(password.to_owned()),
             transport,
+            udp_enabled: config.options.udp != Some(false),
             timeout,
         })
     }
 
-    async fn open(&self, destination: &Endpoint) -> Result<BoxedTransitConnection, TransitError> {
+    async fn open(
+        &self,
+        destination: &Endpoint,
+        eager_payload: Option<bytes::Bytes>,
+    ) -> Result<BoxedTransitConnection, TransitError> {
         let destination = anytls_address(destination)?;
         timeout(self.timeout, async {
             let mut stream = self.transport.connect().await?;
@@ -121,6 +136,15 @@ impl AnyTlsAdapter {
             }
             .encode(&mut initial)
             .map_err(protocol)?;
+            if let Some(payload) = eager_payload {
+                AnyTlsFrame {
+                    command: AnyTlsCommand::Push,
+                    stream_id: STREAM_ID,
+                    payload,
+                }
+                .encode(&mut initial)
+                .map_err(protocol)?;
+            }
             stream.write_all(&initial).await.map_err(io_failure)?;
             stream.flush().await.map_err(io_failure)?;
             wait_synack(&mut stream).await?;
@@ -138,19 +162,87 @@ impl TransitAdapter for AnyTlsAdapter {
     }
 
     fn supports_udp(&self) -> bool {
-        false
+        self.udp_enabled
     }
 
     async fn connect(
         &self,
         request: ConnectRequest,
     ) -> Result<BoxedTransitConnection, TransitError> {
-        self.open(&request.destination).await
+        self.open(&request.destination, None).await
+    }
+
+    async fn connect_udp(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<crate::BoxedTransitDatagram, TransitError> {
+        if !self.udp_enabled {
+            return Err(unsupported("AnyTLS UDP is disabled"));
+        }
+        let target = anytls_address(&request.destination)?;
+        let mut request_payload = BytesMut::new();
+        request_payload.extend_from_slice(&[1]);
+        target.encode(&mut request_payload).map_err(protocol)?;
+        let stream = self
+            .open(
+                &Endpoint {
+                    host: "sp.v2.udp-over-tcp.arpa".into(),
+                    port: 0,
+                },
+                Some(request_payload.freeze()),
+            )
+            .await?;
+        Ok(Box::new(AnyTlsDatagram { stream }))
+    }
+}
+
+struct AnyTlsDatagram {
+    stream: BoxedTransitConnection,
+}
+
+impl std::fmt::Debug for AnyTlsDatagram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AnyTlsDatagram(..)")
+    }
+}
+
+#[async_trait]
+impl crate::TransitDatagram for AnyTlsDatagram {
+    async fn send(&mut self, payload: &[u8]) -> Result<(), TransitError> {
+        if payload.len() > u16::MAX as usize {
+            return Err(unsupported("AnyTLS UDP payload exceeds u16 length"));
+        }
+        self.stream
+            .write_all(&(payload.len() as u16).to_be_bytes())
+            .await
+            .map_err(io_failure)?;
+        self.stream.write_all(payload).await.map_err(io_failure)?;
+        self.stream.flush().await.map_err(io_failure)
+    }
+
+    async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
+        let mut length = [0_u8; 2];
+        self.stream
+            .read_exact(&mut length)
+            .await
+            .map_err(io_failure)?;
+        let mut payload = vec![0_u8; u16::from_be_bytes(length) as usize];
+        self.stream
+            .read_exact(&mut payload)
+            .await
+            .map_err(io_failure)?;
+        Ok(payload)
+    }
+
+    async fn close(mut self: Box<Self>) -> Result<(), TransitError> {
+        self.stream.shutdown().await.map_err(io_failure)
     }
 }
 
 fn anytls_address(endpoint: &Endpoint) -> Result<AnyTlsAddress, TransitError> {
-    if endpoint.port == 0 || endpoint.host.is_empty() {
+    if endpoint.host.is_empty()
+        || (endpoint.port == 0 && endpoint.host != "sp.v2.udp-over-tcp.arpa")
+    {
         return Err(unsupported("AnyTLS destination is invalid"));
     }
     if let Ok(address) = endpoint.host.parse::<IpAddr>() {
@@ -289,6 +381,7 @@ fn io_failure(error: std::io::Error) -> TransitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TransitDatagram;
     use pathchord_policy::{Endpoint as PolicyEndpoint, TransitOptions, TransitProxyId};
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -299,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
-    async fn native_anytls_tcp_interoperates_with_sing_box() {
+    async fn native_anytls_tcp_and_udp_interoperate_with_sing_box() {
         let binary =
             PathBuf::from(std::env::var_os("PATHCHORD_TEST_SING_BOX").expect("reference peer"));
         let password = "pathchord-anytls-password";
@@ -316,6 +409,7 @@ mod tests {
                 "listen": "127.0.0.1",
                 "listen_port": port,
                 "users": [{"name": "pathchord", "password": password}],
+                "udp_timeout": "5m",
                 "tls": {"enabled": true, "certificate": cert.pem(), "key": signing_key.serialize_pem()}
             }],
             "outbounds": [{"type": "direct", "tag": "direct"}],
@@ -402,7 +496,51 @@ mod tests {
         stream.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"anytls!");
         target_task.await.unwrap();
+        let udp_target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_address = udp_target.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut payload = [0_u8; 256];
+            let (length, peer) = udp_target.recv_from(&mut payload).await.unwrap();
+            udp_target.send_to(&payload[..length], peer).await.unwrap();
+        });
+        let mut datagram = adapter
+            .connect_udp(ConnectRequest {
+                destination: Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: udp_address.port(),
+                },
+            })
+            .await
+            .unwrap();
+        datagram.send(b"anytls-udp").await.unwrap();
+        assert_eq!(datagram.receive().await.unwrap(), b"anytls-udp");
+        datagram.close().await.unwrap();
+        udp_task.await.unwrap();
         peer.kill().await.unwrap();
         peer.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anytls_udp_over_tcp_uses_bounded_length_frames() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        let mut datagram = AnyTlsDatagram {
+            stream: Box::new(client),
+        };
+        datagram.send(b"request").await.unwrap();
+        let mut header = [0_u8; 2];
+        peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(u16::from_be_bytes(header), 7);
+        let mut request = [0_u8; 7];
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+        peer.write_all(&5_u16.to_be_bytes()).await.unwrap();
+        peer.write_all(b"reply").await.unwrap();
+        assert_eq!(datagram.receive().await.unwrap(), b"reply");
+        assert!(
+            datagram
+                .send(&vec![0_u8; u16::MAX as usize + 1])
+                .await
+                .is_err()
+        );
     }
 }

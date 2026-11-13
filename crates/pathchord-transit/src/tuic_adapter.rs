@@ -1,8 +1,8 @@
 //! Narrow native TUIC v5 TCP adapter over Quinn.
 //!
-//! This owns the TUIC TLS-exporter authentication and TCP CONNECT stream. UDP
-//! relay and 0-RTT remain explicit follow-up work; no external proxy process
-//! is involved.
+//! This owns the TUIC TLS-exporter authentication, TCP CONNECT, UDP DATAGRAM,
+//! heartbeat, and optional replay-sensitive 0-RTT session setup. No external
+//! proxy process is involved.
 
 use std::io;
 use std::pin::Pin;
@@ -32,6 +32,8 @@ pub(crate) struct TuicAdapter {
     credentials: TuicCredentials,
     tls: Arc<rustls::ClientConfig>,
     server_name: String,
+    zero_rtt: bool,
+    heartbeat: Option<Duration>,
     timeout: Duration,
 }
 
@@ -55,6 +57,24 @@ impl TuicAdapter {
             return Err(unsupported("TUIC adapter requires protocol tuic"));
         }
         crate::adapter_registry::validate_native_options(config, true, false, false)?;
+        let mut allowed = vec![
+            "uuid",
+            "password",
+            "congestion_control",
+            "udp_relay_mode",
+            "heartbeat",
+            "zero_rtt_handshake",
+            "udp_over_stream",
+        ];
+        if let Some(field) = config
+            .options
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_key_field.as_deref())
+        {
+            allowed.push(field);
+        }
+        crate::adapter_registry::validate_credentials(Some(credential), &allowed)?;
         let uuid = credential
             .field("uuid")
             .ok_or_else(|| unsupported("TUIC UUID is missing"))?;
@@ -63,6 +83,32 @@ impl TuicAdapter {
             .ok_or_else(|| unsupported("TUIC password is missing"))?;
         let credentials = TuicCredentials::parse(uuid, password)
             .map_err(|error| unsupported(error.to_string()))?;
+        if credential
+            .field("congestion_control")
+            .is_some_and(|value| !value.is_empty() && value != "cubic")
+        {
+            return Err(unsupported(
+                "native TUIC supports congestion_control cubic only",
+            ));
+        }
+        if credential
+            .field("udp_relay_mode")
+            .is_some_and(|value| !value.is_empty() && value != "quic")
+        {
+            return Err(unsupported("native TUIC supports quic UDP relay only"));
+        }
+        if credential.field("udp_over_stream").is_some_and(|value| {
+            matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+        }) {
+            return Err(unsupported("TUIC udp_over_stream is unsupported"));
+        }
+        let zero_rtt = credential.field("zero_rtt_handshake").is_some_and(|value| {
+            matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+        });
+        let heartbeat = credential
+            .field("heartbeat")
+            .map(parse_duration)
+            .transpose()?;
         let tls_options = config
             .options
             .tls
@@ -76,6 +122,8 @@ impl TuicAdapter {
             return Err(unsupported("TUIC requires TLS"));
         }
         let tls = crate::tls::configure(base_tls, Some(&tls_options), Some(credential))?;
+        let mut tls = tls;
+        Arc::make_mut(&mut tls).enable_early_data = zero_rtt;
         let server_name = tls_options
             .server_name
             .clone()
@@ -95,6 +143,8 @@ impl TuicAdapter {
             credentials,
             tls,
             server_name,
+            zero_rtt,
+            heartbeat,
             timeout,
         })
     }
@@ -128,15 +178,51 @@ impl TuicAdapter {
         )
         .map_err(|_| TransitError::Connection("TUIC QUIC endpoint failed".into()))?;
         endpoint.set_default_client_config(quic);
-        let connection = timeout(
-            self.timeout,
-            endpoint
-                .connect(address, &self.server_name)
-                .map_err(|_| TransitError::Connection("TUIC QUIC connect failed".into()))?,
-        )
-        .await
-        .map_err(|_| TransitError::Connection("TUIC handshake timed out".into()))?
-        .map_err(|error| TransitError::Connection(format!("TUIC handshake failed: {error}")))?;
+        let connecting = endpoint
+            .connect(address, &self.server_name)
+            .map_err(|_| TransitError::Connection("TUIC QUIC connect failed".into()))?;
+        let connection = if self.zero_rtt {
+            match connecting.into_0rtt() {
+                Ok((connection, accepted)) => {
+                    tokio::spawn(async move {
+                        let _ = accepted.await;
+                    });
+                    connection
+                }
+                Err(connecting) => timeout(self.timeout, connecting)
+                    .await
+                    .map_err(|_| TransitError::Connection("TUIC handshake timed out".into()))?
+                    .map_err(|error| {
+                        TransitError::Connection(format!("TUIC handshake failed: {error}"))
+                    })?,
+            }
+        } else {
+            timeout(self.timeout, connecting)
+                .await
+                .map_err(|_| TransitError::Connection("TUIC handshake timed out".into()))?
+                .map_err(|error| {
+                    TransitError::Connection(format!("TUIC handshake failed: {error}"))
+                })?
+        };
+        if let Some(interval) = self.heartbeat {
+            let heartbeat = connection.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let Ok(mut stream) = heartbeat.open_uni().await else {
+                        break;
+                    };
+                    if stream
+                        .write_all(&crate::tuic_codec::encode_heartbeat())
+                        .await
+                        .is_err()
+                        || stream.finish().is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
         let keepalive = connection.clone();
         tokio::spawn(async move {
             keepalive.closed().await;
@@ -339,6 +425,26 @@ impl AsyncWrite for TuicStream {
 
 fn unsupported(message: impl Into<String>) -> TransitError {
     TransitError::Unsupported(message.into())
+}
+
+fn parse_duration(value: &str) -> Result<Duration, TransitError> {
+    let value = value.trim();
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1_u64)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1_000_u64)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60_000_u64)
+    } else {
+        (value, 1_000_u64)
+    };
+    let millis = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|number| number.checked_mul(multiplier))
+        .filter(|millis| (1..=86_400_000).contains(millis))
+        .ok_or_else(|| unsupported("TUIC heartbeat duration is invalid"))?;
+    Ok(Duration::from_millis(millis))
 }
 
 #[cfg(test)]

@@ -100,19 +100,22 @@ in the current scope.
   symlink/TOCTOU-checked, redacted handling.
 - Native Rust VLESS and Trojan adapters support TCP, TLS, WebSocket, and WSS
   combinations with real protocol-peer TCP and UDP interoperability
-  coverage. Native VMess supports plain TCP with AES-128-GCM and `alter_id: 0`
-  with a real protocol interoperability fixture. Native Hysteria2 now covers
-  QUIC/TLS, HTTP/3 authentication, TCP relay, and UDP relay with a real peer
-  fixture; Salamander is supported, while Gecko obfs and port hopping remain
-  unimplemented. Native
-  TUIC now covers QUIC/TLS-exporter TCP CONNECT with a peer fixture; UDP/0-RTT,
-  Reality, and SSR remain unimplemented or explicitly unavailable.
+  coverage. VLESS + REALITY uses the local rustls ClientHello callback, X25519
+  proof, and certificate proof verifier. Native VMess supports TCP, TLS,
+  WebSocket/WSS, AES-128-GCM or ChaCha20-Poly1305 body records, single-target
+  UDP, and `alter_id: 0`; plain TCP and TLS/WebSocket AES paths have real peer
+  fixtures. Native Hysteria2 covers QUIC/TLS, HTTP/3 authentication, TCP/UDP
+  relay, Salamander, and bounded server-port rotation with a real peer fixture.
+  Native TUIC covers QUIC/TLS-exporter TCP CONNECT, UDP DATAGRAM relay,
+  heartbeat, and optional 0-RTT setup with a real TCP/UDP peer fixture.
 - AnyTLS has a native TLS/session adapter with bounded frame/authentication
-  codec, settings, SYN/SYNACK, PUSH/FIN, heartbeat handling, and a sing-box
-  protocol-peer interoperability fixture.
-- Reality has a bounded pure-Rust wire/crypto codec with unit vectors; its
-  custom TLS ClientHello and native handshake seam remain unregistered. The
-  rustls X25519 provider seam is now isolated for that future handshake.
+  codec, settings, SYN/SYNACK, PUSH/FIN, heartbeat handling, bounded
+  UDP-over-TCP framing, and a sing-box TCP/UDP protocol-peer interoperability
+  fixture.
+- Reality has a bounded pure-Rust wire/crypto codec and a local rustls patch
+  for the ClientHello proof callback and X25519 secret seam. The VLESS +
+  REALITY adapter is registered; construction/proof tests and a local decoy
+  sing-box Reality/VLESS peer fixture pass.
 - Imported complete sing-box documents are retained as opaque unavailable-node
   diagnostics. PathChord does not start or embed a compatibility process.
 - Subscription refresh supports automatic detection, Clash/Mihomo, SIP008
@@ -189,9 +192,9 @@ in the current scope.
 
 - Native Windows/FreeBSD runtime matrices, provider soak tests, external
   monitoring deployment, and a broad real-provider protocol/parameter matrix
-  remain validation work. Hysteria2, TUIC, Reality, SSR, and other unregistered
-  protocols stay explicitly
-  unavailable until native wire and interoperability evidence exists.
+  remain validation work. SSR and other unregistered protocols stay explicitly
+  unavailable. Cross-machine Reality and long-running protocol soak evidence
+  remain validation work.
   Third-party policy groups, rules, and scripts are not imported as PathChord
   policy.
 

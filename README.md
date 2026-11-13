@@ -32,10 +32,12 @@ validation, shared runtime gaps, and subsequent adapter work.
 Node imports support automatic detection, Clash/Mihomo providers, SIP008,
 URI/Base64 lists, sing-box JSON, and supported Surge/Quantumult X/Loon node
 lines. Native transports support typed TLS settings, VLESS/Trojan TCP/TLS/
-WebSocket transports, plain TCP VMess with AES-128-GCM, and
-direct/SOCKS5/Shadowsocks UDP, including SS2022. Unsupported protocols and
-parameters remain explicit diagnostics until their native implementations are
-available.
+WebSocket transports, VLESS + REALITY, VMess TCP/TLS/WebSocket with AEAD body
+records and single-target UDP, AnyTLS TCP plus UDP-over-TCP framing, native
+Hysteria2 TCP/UDP with Salamander and port hopping, and TUIC TCP/UDP with
+heartbeats and optional 0-RTT. Direct/SOCKS5/Shadowsocks UDP, including SS2022,
+remain available. Unsupported protocols and parameters remain explicit
+diagnostics.
 Unsupported nodes and parameters expose individual diagnostics. See the
 [Transit Proxy and subscription contract](docs/spec/transit-proxies.md) for
 the exact compatibility boundaries and [deployment guide](docs/spec/deployment.md)

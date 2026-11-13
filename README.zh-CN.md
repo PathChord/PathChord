@@ -14,8 +14,10 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 节点导入支持自动识别、Clash/Mihomo provider、SIP008、URI/Base64 列表、sing-box JSON，以及
 所支持的 Surge/Quantumult X/Loon 节点行。原生传输支持类型化 TLS 设置、VLESS/Trojan 的
-TCP/TLS/WebSocket 传输、使用 AES-128-GCM 的明文 TCP VMess，以及 direct/SOCKS5/Shadowsocks
-UDP，包括 SS2022。未支持的协议和参数在原生实现完成前保持为明确诊断。精确的兼容边界见
+TCP/TLS/WebSocket 传输、VLESS + REALITY、带 AEAD 正文记录和单目标 UDP 的 VMess TCP/TLS/
+WebSocket、AnyTLS TCP 与 UDP-over-TCP、带 Salamander 和端口跳转的原生 Hysteria2 TCP/UDP，
+以及带 heartbeat 和可选 0-RTT 的 TUIC TCP/UDP。direct/SOCKS5/Shadowsocks UDP（包括 SS2022）
+仍可用。未支持的协议和参数保持为明确诊断。精确的兼容边界见
 [Transit Proxy 与订阅契约](docs/spec/transit-proxies.zh-CN.md)，可运行配置见
 [部署指南](docs/spec/deployment.zh-CN.md)。
 

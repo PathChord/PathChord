@@ -5,7 +5,8 @@
 //! independent peer fixtures cover those lifecycles.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use std::{
     io,
     io::IoSliceMut,
@@ -36,6 +37,8 @@ pub(crate) struct Hysteria2Adapter {
     endpoint: TransitEndpoint,
     password: String,
     obfs_password: Option<String>,
+    hop_ports: Option<Vec<u16>>,
+    hop_interval: Option<Duration>,
     tls: Arc<rustls::ClientConfig>,
     connect_timeout: Duration,
     udp_enabled: bool,
@@ -53,15 +56,110 @@ impl std::fmt::Debug for Hysteria2Adapter {
 #[derive(Debug)]
 struct SalamanderSocket {
     inner: Arc<dyn AsyncUdpSocket>,
-    password: Vec<u8>,
+    password: Option<Vec<u8>>,
+    canonical: std::net::SocketAddr,
+    hop_ports: Vec<u16>,
+    hop_interval: Option<Duration>,
+    hop_state: Mutex<(usize, Instant)>,
+}
+
+fn parse_hop_ports(value: &str) -> Result<Vec<u16>, TransitError> {
+    let mut ports = Vec::new();
+    for part in value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if let Some((start, end)) = part.split_once('-') {
+            let start = start.parse::<u16>().map_err(|_| {
+                TransitError::Unsupported("Hysteria2 server_ports is invalid".into())
+            })?;
+            let end = end.parse::<u16>().map_err(|_| {
+                TransitError::Unsupported("Hysteria2 server_ports is invalid".into())
+            })?;
+            if start == 0 || end == 0 || start > end || usize::from(end - start) > 256 {
+                return Err(TransitError::Unsupported(
+                    "Hysteria2 server_ports is invalid".into(),
+                ));
+            }
+            ports.extend(start..=end);
+        } else {
+            let port = part.parse::<u16>().map_err(|_| {
+                TransitError::Unsupported("Hysteria2 server_ports is invalid".into())
+            })?;
+            if port == 0 {
+                return Err(TransitError::Unsupported(
+                    "Hysteria2 server_ports is invalid".into(),
+                ));
+            }
+            ports.push(port);
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.is_empty() || ports.len() > 256 {
+        return Err(TransitError::Unsupported(
+            "Hysteria2 server_ports is invalid".into(),
+        ));
+    }
+    Ok(ports)
+}
+
+fn parse_hop_interval(value: &str) -> Result<Duration, TransitError> {
+    let value = value.trim();
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1_u64)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1_000_u64)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60_000_u64)
+    } else {
+        (value, 1_000_u64)
+    };
+    let millis = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|number| number.checked_mul(multiplier))
+        .filter(|millis| (1..=86_400_000).contains(millis))
+        .ok_or_else(|| TransitError::Unsupported("Hysteria2 hop_interval is invalid".into()))?;
+    Ok(Duration::from_millis(millis))
 }
 
 impl SalamanderSocket {
-    fn new(inner: Arc<dyn AsyncUdpSocket>, password: &str) -> Self {
+    fn new(
+        inner: Arc<dyn AsyncUdpSocket>,
+        password: Option<&str>,
+        canonical: std::net::SocketAddr,
+        hop_ports: Vec<u16>,
+        hop_interval: Option<Duration>,
+    ) -> Self {
         Self {
             inner,
-            password: password.as_bytes().to_vec(),
+            password: password.map(|value| value.as_bytes().to_vec()),
+            canonical,
+            hop_ports,
+            hop_interval,
+            hop_state: Mutex::new((0, Instant::now())),
         }
+    }
+
+    fn destination(&self, original: std::net::SocketAddr) -> std::net::SocketAddr {
+        if self.hop_ports.is_empty() {
+            return original;
+        }
+        let Ok(mut state) = self.hop_state.lock() else {
+            return original;
+        };
+        if self
+            .hop_interval
+            .is_some_and(|interval| state.1.elapsed() < interval)
+        {
+            return std::net::SocketAddr::new(original.ip(), self.hop_ports[state.0]);
+        }
+        let index = state.0 % self.hop_ports.len();
+        state.0 = (index + 1) % self.hop_ports.len();
+        state.1 = Instant::now();
+        std::net::SocketAddr::new(original.ip(), self.hop_ports[index])
     }
 }
 
@@ -80,10 +178,14 @@ impl AsyncUdpSocket for SalamanderSocket {
         let mut salt = [0_u8; 8];
         getrandom::fill(&mut salt)
             .map_err(|_| io::Error::other("Hysteria2 Salamander salt generation failed"))?;
-        let encrypted =
-            crate::hysteria2_codec::salamander_encode(&self.password, transmit.contents, salt);
+        let encrypted = match &self.password {
+            Some(password) => {
+                crate::hysteria2_codec::salamander_encode(password, transmit.contents, salt)
+            }
+            None => transmit.contents.to_vec(),
+        };
         let transformed = Transmit {
-            destination: transmit.destination,
+            destination: self.destination(transmit.destination),
             ecn: transmit.ecn,
             contents: &encrypted,
             segment_size: None,
@@ -116,18 +218,28 @@ impl AsyncUdpSocket for SalamanderSocket {
         for (index, metadata) in scratch_meta.iter().enumerate().take(received) {
             let raw_start = index * MAX_DATAGRAM;
             let raw_end = raw_start.saturating_add(metadata.len).min(storage.len());
-            let Some(plain) = crate::hysteria2_codec::salamander_decode(
-                &self.password,
-                &storage[raw_start..raw_end],
-            ) else {
-                continue;
+            let plain = match &self.password {
+                Some(password) => {
+                    let Some(value) = crate::hysteria2_codec::salamander_decode(
+                        password,
+                        &storage[raw_start..raw_end],
+                    ) else {
+                        continue;
+                    };
+                    value
+                }
+                None => storage[raw_start..raw_end].to_vec(),
             };
             if plain.len() > bufs[output].len() {
                 continue;
             }
             bufs[output][..plain.len()].copy_from_slice(&plain);
             meta[output] = RecvMeta {
-                addr: metadata.addr,
+                addr: if self.hop_ports.is_empty() {
+                    metadata.addr
+                } else {
+                    self.canonical
+                },
                 len: plain.len(),
                 stride: plain.len(),
                 ecn: metadata.ecn,
@@ -167,6 +279,25 @@ impl Hysteria2Adapter {
                 "Hysteria2 adapter requires protocol hysteria2".into(),
             ));
         }
+        let mut allowed = vec![
+            "password",
+            "auth",
+            "obfs",
+            "obfs_password",
+            "server_ports",
+            "hop_interval",
+            "up_mbps",
+            "down_mbps",
+        ];
+        if let Some(field) = config
+            .options
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_key_field.as_deref())
+        {
+            allowed.push(field);
+        }
+        crate::adapter_registry::validate_credentials(Some(credential), &allowed)?;
         crate::adapter_registry::validate_native_options(config, true, false, false)?;
         let password = credential
             .field("password")
@@ -191,6 +322,20 @@ impl Hysteria2Adapter {
         {
             return Err(TransitError::Unsupported(
                 "Hysteria2 Salamander password is too short".into(),
+            ));
+        }
+        let hop_ports = credential
+            .field("server_ports")
+            .map(parse_hop_ports)
+            .transpose()?;
+        let hop_interval = credential
+            .field("hop_interval")
+            .map(parse_hop_interval)
+            .transpose()?
+            .or_else(|| hop_ports.as_ref().map(|_| Duration::from_secs(30)));
+        if hop_interval.is_some() && hop_ports.is_none() {
+            return Err(TransitError::Unsupported(
+                "Hysteria2 hop_interval requires server_ports".into(),
             ));
         }
         let tls_options = config
@@ -220,6 +365,8 @@ impl Hysteria2Adapter {
             },
             password: password.to_owned(),
             obfs_password,
+            hop_ports,
+            hop_interval,
             tls,
             connect_timeout: timeout,
             udp_enabled: config.options.udp != Some(false),
@@ -262,9 +409,29 @@ impl Hysteria2Adapter {
         let inner = runtime
             .wrap_udp_socket(std_socket)
             .map_err(|_| TransitError::Connection("Hysteria2 QUIC socket failed".into()))?;
-        let socket: Arc<dyn AsyncUdpSocket> = match &self.obfs_password {
-            Some(password) => Arc::new(SalamanderSocket::new(inner, password)),
-            None => inner,
+        let socket: Arc<dyn AsyncUdpSocket> = match (&self.obfs_password, &self.hop_ports) {
+            (Some(password), Some(ports)) => Arc::new(SalamanderSocket::new(
+                inner,
+                Some(password),
+                address,
+                ports.clone(),
+                self.hop_interval,
+            )),
+            (Some(password), None) => Arc::new(SalamanderSocket::new(
+                inner,
+                Some(password),
+                address,
+                Vec::new(),
+                None,
+            )),
+            (None, Some(ports)) => Arc::new(SalamanderSocket::new(
+                inner,
+                None,
+                address,
+                ports.clone(),
+                self.hop_interval,
+            )),
+            (None, None) => inner,
         };
         let mut endpoint =
             Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
@@ -553,6 +720,23 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UdpSocket;
     use tokio::process::Command;
+
+    #[test]
+    fn server_port_ranges_are_bounded_and_normalized() {
+        assert_eq!(parse_hop_ports("443,8443,8443").unwrap(), vec![443, 8443]);
+        assert_eq!(
+            parse_hop_ports("1000-1002").unwrap(),
+            vec![1000, 1001, 1002]
+        );
+        assert!(parse_hop_ports("0").is_err());
+        assert!(parse_hop_ports("1002-1000").is_err());
+        assert_eq!(parse_hop_interval("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(
+            parse_hop_interval("500ms").unwrap(),
+            Duration::from_millis(500)
+        );
+        assert!(parse_hop_interval("0s").is_err());
+    }
 
     #[tokio::test]
     #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]

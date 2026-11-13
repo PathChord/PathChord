@@ -49,6 +49,12 @@ impl fmt::Debug for RealityActiveX25519 {
 }
 
 impl ActiveKeyExchange for RealityActiveX25519 {
+    fn extract_reality_key(&self, server_pub_key: &[u8]) -> Option<Vec<u8>> {
+        let server_pub_key: [u8; 32] = server_pub_key.try_into().ok()?;
+        let shared = self.secret.diffie_hellman(&PublicKey::from(server_pub_key));
+        (!shared.as_bytes().iter().all(|byte| *byte == 0)).then(|| shared.as_bytes().to_vec())
+    }
+
     fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
         let peer_pub_key: [u8; 32] = peer_pub_key
             .try_into()
@@ -71,17 +77,7 @@ impl ActiveKeyExchange for RealityActiveX25519 {
 
 pub(crate) fn provider_with_reality_x25519() -> CryptoProvider {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    provider.kx_groups = provider
-        .kx_groups
-        .into_iter()
-        .map(|group| {
-            if group.name() == NamedGroup::X25519 {
-                &REALITY_X25519_GROUP as &'static dyn SupportedKxGroup
-            } else {
-                group
-            }
-        })
-        .collect();
+    provider.kx_groups = vec![&REALITY_X25519_GROUP as &'static dyn SupportedKxGroup];
     provider
 }
 

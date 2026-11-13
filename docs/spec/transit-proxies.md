@@ -18,11 +18,12 @@ NOT be interpreted as support for the same outbound node protocol.
 | `ss` | TCP/UDP with AEAD and SS2022 ciphers; legacy stream ciphers are rejected | Built-in `obfs-local` and `v2ray-plugin` wrappers and supported extended options |
 | `socks4`, `socks4a` | No native outbound adapter | CONNECT |
 | `vless` | TCP, TLS, WebSocket, and WSS byte transports with typed TLS/transport validation | Extended transport and flow options |
-| `vmess` | Plain TCP with AES-128-GCM body records and `alter_id: 0` | TLS, WebSocket, UDP, mux, and other extended options |
+| `vmess` | TCP, TLS, WebSocket/WSS, AES-128-GCM or ChaCha20-Poly1305 body records, single-target UDP, `alter_id: 0` | mux, legacy non-AEAD security, and other unsupported extended options |
 | `trojan` | TLS-wrapped TCP, WebSocket, and WSS byte transports | Extended transport options |
-| `anytls` | TLS stream, authentication, settings, SYN/SYNACK, PUSH/FIN, and heartbeat frames | Extended session and UDP modes |
-| `hysteria2` | Native QUIC/TLS + HTTP/3 authentication, TCP/UDP relay, and Salamander obfs; Gecko obfs/port hopping are not yet supported | Typed unavailable diagnostics for unsupported options |
-| `tuic` | Native QUIC/TLS-exporter TCP CONNECT; UDP/0-RTT are not yet supported | Typed unavailable diagnostics for unsupported options |
+| `anytls` | TLS stream, authentication, settings, SYN/SYNACK, PUSH/FIN, heartbeat frames, and bounded UDP-over-TCP datagrams | Multiplexed session options outside the native frame contract |
+| `hysteria2` | Native QUIC/TLS + HTTP/3 authentication, TCP/UDP relay, Salamander or un-obfuscated transport, and bounded server-port hopping | Gecko-specific obfuscation and unsupported extended options |
+| `tuic` | Native QUIC/TLS-exporter TCP CONNECT, UDP DATAGRAM relay, heartbeat, and optional replay-sensitive 0-RTT | Unsupported congestion controllers, UDP-over-stream, and other extended options |
+| `vless` + `tls.reality` | Native VLESS over REALITY TLS with X25519 ClientHello proof and certificate proof validation | Vision flow and unsupported outer transports |
 | `xtls`, `hysteria`, `ssh`, `shadowtls` | Native adapter under implementation | Typed unavailable diagnostic until the native adapter is registered |
 | `wireguard` | No native adapter | Complete userspace WireGuard endpoint document |
 | `snell` | No native adapter | Typed unavailable diagnostic |
@@ -34,10 +35,10 @@ unimplemented protocols MUST produce typed, redacted diagnostics. A failed TLS
 or transport configuration MUST NOT fall back to plaintext or direct.
 
 Native VLESS and Trojan adapters reject unsupported flow, multiplex, packet,
-and transport options before opening a socket. Native VMess currently covers
-plain TCP/AES-128-GCM/`alter_id: 0`; its TLS, WebSocket, UDP, and mux variants
-remain unavailable until implemented natively. A protocol row in this table
-never makes an unsupported parameter set selectable.
+and transport options before opening a socket. Native VMess accepts only
+AEAD body ciphers and `alter_id: 0`; mux remains unavailable. REALITY requires
+the native ClientHello proof callback and does not enable Vision flow by itself.
+A protocol row in this table never makes an unsupported parameter set selectable.
 
 ## Typed connection options
 
