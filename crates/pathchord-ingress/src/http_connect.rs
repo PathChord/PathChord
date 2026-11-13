@@ -89,6 +89,9 @@ impl HttpConnectListener {
                 "HTTP CONNECT adapter requires an HTTP ListenerDescriptor".to_owned(),
             ));
         }
+        if !descriptor.allows_source(source.ip()) {
+            return Err(reject(stream, "source address is not allowed").await);
+        }
         if descriptor.authentication_required && authentication_identity.is_none() {
             return Err(reject(stream, "HTTP listener authentication is required").await);
         }
@@ -361,6 +364,30 @@ mod tests {
         request.extend(std::iter::repeat_n(b'x', MAX_HEADER_BYTES));
         request.extend_from_slice(b"\r\n\r\n");
         client.write_all(&request).await.unwrap();
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_disallowed_source_before_connect_response() {
+        let mut descriptor = descriptor(false);
+        descriptor.allowed_sources = vec!["192.0.2.0/24".to_owned()];
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            HttpConnectListener::accept_stream(
+                &descriptor,
+                server,
+                "127.0.0.1:12345".parse().unwrap(),
+                None,
+            )
+            .await
+        });
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 400"));
         assert!(task.await.unwrap().is_err());
     }
 

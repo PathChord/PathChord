@@ -72,6 +72,9 @@ impl Socks5Listener {
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         Self::validate_descriptor(descriptor)?;
+        if !descriptor.allows_source(source.ip()) {
+            return Err(error("source address is not allowed"));
+        }
         let mut stream = stream;
         let identity = negotiate(&mut stream, descriptor.authentication_required).await?;
         let target = read_connect(&mut stream).await?;
@@ -420,5 +423,19 @@ mod tests {
             .unwrap();
         assert_eq!(read_exact(&mut client, 10).await[1], 7);
         assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_disallowed_source_before_socks_negotiation() {
+        let mut descriptor = descriptor(false);
+        descriptor.allowed_sources = vec!["192.0.2.0/24".to_owned()];
+        let (_client, server) = duplex(1024);
+        let result = Socks5Listener::accept_stream(
+            server,
+            SocketAddr::from_str("127.0.0.1:1234").unwrap(),
+            &descriptor,
+        )
+        .await;
+        assert!(matches!(result, Err(ListenerError::Protocol(_))));
     }
 }
