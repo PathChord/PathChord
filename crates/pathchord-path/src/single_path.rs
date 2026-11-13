@@ -5,9 +5,12 @@
 //! records without duplicating admission rules. It does not own sockets,
 //! scheduling, or target Streams.
 
+use std::collections::HashMap;
+
+use async_trait::async_trait;
 use pathchord_core::{
     ErrorClass, FrameCodecError, FrameFlags, Message, MessageCodecError, PathFrame, PathHello,
-    PathId, PathReady, ProtocolLimits, SessionAttach, SessionId,
+    PathId, PathReady, ProtocolLimits, RequestId, SessionAttach, SessionId, StreamId, StreamOpen,
 };
 use pathchord_noise::{
     InitiatorHandshake, NoiseError, NoiseTransport, ResponderHandshake, STATIC_KEY_LEN,
@@ -60,9 +63,20 @@ pub struct SinglePathHandshakeConfig {
 pub struct SinglePathReady {
     initiator_transport: NoiseTransport,
     responder_transport: NoiseTransport,
+    session_id: SessionId,
+    path_id: PathId,
+    local_limits: ProtocolLimits,
     negotiated_capabilities: u64,
     authorization_generation: u64,
     limits: PathReady,
+    stream_requests: HashMap<RequestId, CachedStreamOpen>,
+    stream_ids: HashMap<StreamId, RequestId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CachedStreamOpen {
+    request: StreamOpen,
+    decision: StreamOpenDecision,
 }
 
 impl std::fmt::Debug for SinglePathReady {
@@ -97,6 +111,135 @@ impl SinglePathReady {
     pub fn into_transports(self) -> (NoiseTransport, NoiseTransport) {
         (self.initiator_transport, self.responder_transport)
     }
+
+    /// Opens one Session Stream through an injected Egress-side opener.
+    ///
+    /// The request is carried over the authenticated Path only after
+    /// `PATH_READY`. RequestID and StreamID ownership is retained by this
+    /// harness so an identical retry is replayed locally, while conflicting
+    /// reuse is rejected before invoking the opener a second time.
+    pub async fn open_stream<O>(
+        &mut self,
+        opener: &mut O,
+        request: StreamOpen,
+    ) -> Result<StreamOpenDecision, SinglePathError>
+    where
+        O: StreamOpener,
+    {
+        if let Some(cached) = self.stream_requests.get(&request.request_id) {
+            if cached.request == request {
+                return Ok(cached.decision.clone());
+            }
+            return Err(SinglePathError::ConflictingRequestId {
+                request_id: request.request_id,
+            });
+        }
+        if let Some(existing) = self.stream_ids.get(&request.stream_id)
+            && *existing != request.request_id
+        {
+            return Err(SinglePathError::StreamAlreadyOpen {
+                stream_id: request.stream_id,
+            });
+        }
+
+        let frame_seq = self
+            .initiator_transport
+            .next_send_nonce()
+            .ok_or(NoiseError::NonceExhausted)?;
+        let frame = make_frame(
+            Message::StreamOpen(request.clone()),
+            self.session_id,
+            self.path_id,
+            frame_seq,
+            self.local_limits,
+        )?;
+        let sealed = self
+            .initiator_transport
+            .seal_frame(&frame, self.local_limits)?;
+        let received = self
+            .responder_transport
+            .open_frame(&sealed, self.local_limits)?;
+        validate_frame_ids_raw(&received, self.session_id, self.path_id)?;
+        let received_request = match decode_message(&received, self.local_limits)? {
+            Message::StreamOpen(value) if value == request => value,
+            _ => {
+                return Err(SinglePathError::Message(MessageCodecError::InvalidField {
+                    field: "stream_open",
+                }));
+            }
+        };
+
+        let decision = opener
+            .open_stream(received_request)
+            .await
+            .map_err(|error| SinglePathError::StreamOpener(error.to_string()))?;
+        let response_seq = self
+            .responder_transport
+            .next_send_nonce()
+            .ok_or(NoiseError::NonceExhausted)?;
+        let response = match &decision {
+            StreamOpenDecision::Opened { metadata } => {
+                Message::StreamOpenOk(pathchord_core::StreamOpenOk {
+                    stream_id: request.stream_id,
+                    result_metadata: metadata.clone(),
+                })
+            }
+            StreamOpenDecision::Rejected { error, reason } => {
+                Message::StreamOpenErr(pathchord_core::StreamOpenErr {
+                    stream_id: request.stream_id,
+                    error: *error,
+                    reason: reason.clone(),
+                })
+            }
+        };
+        let response_frame = make_frame(
+            response,
+            self.session_id,
+            self.path_id,
+            response_seq,
+            self.local_limits,
+        )?;
+        let sealed_response = self
+            .responder_transport
+            .seal_frame(&response_frame, self.local_limits)?;
+        let received_response = self
+            .initiator_transport
+            .open_frame(&sealed_response, self.local_limits)?;
+        validate_frame_ids_raw(&received_response, self.session_id, self.path_id)?;
+        validate_stream_open_response(
+            &received_response,
+            request.stream_id,
+            &decision,
+            self.local_limits,
+        )?;
+
+        self.stream_ids
+            .insert(request.stream_id, request.request_id);
+        self.stream_requests.insert(
+            request.request_id,
+            CachedStreamOpen {
+                request,
+                decision: decision.clone(),
+            },
+        );
+        Ok(decision)
+    }
+}
+
+/// Result selected by an Egress-side Stream opener.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamOpenDecision {
+    Opened { metadata: Vec<u8> },
+    Rejected { error: ErrorClass, reason: Vec<u8> },
+}
+
+/// Injected boundary for opening one target Stream after Path admission.
+#[async_trait]
+pub trait StreamOpener: Send {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn open_stream(&mut self, request: StreamOpen)
+    -> Result<StreamOpenDecision, Self::Error>;
 }
 
 /// Admission result. Policy failures are protocol-level rejects; malformed
@@ -121,6 +264,14 @@ pub enum SinglePathError {
     InvalidIdentity,
     #[error("PATH_READY limits exceed the local negotiated limits")]
     ReadyLimitsExceedLocal,
+    #[error("Stream opener failed: {0}")]
+    StreamOpener(String),
+    #[error("RequestID {request_id} was reused with different Stream fields")]
+    ConflictingRequestId { request_id: RequestId },
+    #[error("StreamID {stream_id} is already bound to another RequestID")]
+    StreamAlreadyOpen { stream_id: StreamId },
+    #[error("Stream opener returned an invalid response")]
+    InvalidStreamOpenResponse,
 }
 
 /// Runs one deterministic, in-memory Path admission exchange.
@@ -283,9 +434,14 @@ pub fn establish_single_path(
     Ok(SinglePathOutcome::Ready(Box::new(SinglePathReady {
         initiator_transport,
         responder_transport,
+        session_id: config.session_id,
+        path_id: config.path_id,
+        local_limits: config.local_limits,
         negotiated_capabilities,
         authorization_generation: authorization.generation,
         limits: ready,
+        stream_requests: HashMap::new(),
+        stream_ids: HashMap::new(),
     })))
 }
 
@@ -361,14 +517,42 @@ fn validate_frame_ids(
     frame: &PathFrame,
     config: &SinglePathHandshakeConfig,
 ) -> Result<(), SinglePathError> {
-    if frame.header().session_id() != config.session_id
-        || frame.header().path_id() != config.path_id
-    {
+    validate_frame_ids_raw(frame, config.session_id, config.path_id)
+}
+
+fn validate_frame_ids_raw(
+    frame: &PathFrame,
+    session_id: SessionId,
+    path_id: PathId,
+) -> Result<(), SinglePathError> {
+    if frame.header().session_id() != session_id || frame.header().path_id() != path_id {
         return Err(SinglePathError::Message(MessageCodecError::InvalidField {
             field: "path_or_session_id",
         }));
     }
     Ok(())
+}
+
+fn validate_stream_open_response(
+    frame: &PathFrame,
+    stream_id: StreamId,
+    expected: &StreamOpenDecision,
+    limits: ProtocolLimits,
+) -> Result<(), SinglePathError> {
+    let valid = match (decode_message(frame, limits)?, expected) {
+        (Message::StreamOpenOk(value), StreamOpenDecision::Opened { metadata }) => {
+            value.stream_id == stream_id && value.result_metadata == *metadata
+        }
+        (Message::StreamOpenErr(value), StreamOpenDecision::Rejected { error, reason }) => {
+            value.stream_id == stream_id && value.error == *error && value.reason == *reason
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(SinglePathError::InvalidStreamOpenResponse)
+    }
 }
 
 fn validate_attach(
@@ -497,6 +681,63 @@ mod tests {
             public_key: *key.public(),
             state: AuthorizationState::Enabled,
             generation: 9,
+        }
+    }
+
+    fn ready_path() -> SinglePathReady {
+        let (initiator, responder) = keys();
+        let result = establish_single_path(
+            initiator.private(),
+            responder.private(),
+            responder.public(),
+            &config(),
+            &authorization(&initiator),
+        )
+        .expect("handshake");
+        let SinglePathOutcome::Ready(ready) = result else {
+            panic!("expected ready path");
+        };
+        *ready
+    }
+
+    #[derive(Debug)]
+    struct TestOpenerError;
+
+    impl std::fmt::Display for TestOpenerError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("test opener failed")
+        }
+    }
+
+    impl std::error::Error for TestOpenerError {}
+
+    struct TestOpener {
+        calls: usize,
+        decision: StreamOpenDecision,
+    }
+
+    #[async_trait]
+    impl StreamOpener for TestOpener {
+        type Error = TestOpenerError;
+
+        async fn open_stream(
+            &mut self,
+            _request: StreamOpen,
+        ) -> Result<StreamOpenDecision, Self::Error> {
+            self.calls += 1;
+            Ok(self.decision.clone())
+        }
+    }
+
+    fn stream_request(request_id: u128, stream_id: u64) -> StreamOpen {
+        StreamOpen {
+            request_id: RequestId::new(request_id),
+            stream_id: StreamId::new(stream_id).expect("stream ID"),
+            target: pathchord_core::TargetEndpoint {
+                hostname: b"example.test".to_vec(),
+                port: 443,
+                resolved_addresses: Vec::new(),
+            },
         }
     }
 
@@ -632,5 +873,58 @@ mod tests {
             ),
             Err(SinglePathError::Noise(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn opens_stream_after_ready_and_replays_identical_request() {
+        let mut ready = ready_path();
+        let request = stream_request(11, 1);
+        let mut opener = TestOpener {
+            calls: 0,
+            decision: StreamOpenDecision::Opened {
+                metadata: b"target-open".to_vec(),
+            },
+        };
+
+        let first = ready
+            .open_stream(&mut opener, request.clone())
+            .await
+            .expect("stream open");
+        let replay = ready
+            .open_stream(&mut opener, request)
+            .await
+            .expect("replayed stream open");
+        assert_eq!(first, replay);
+        assert_eq!(opener.calls, 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_conflicting_request_or_stream_id_reuse() {
+        let mut ready = ready_path();
+        let request = stream_request(12, 2);
+        let mut opener = TestOpener {
+            calls: 0,
+            decision: StreamOpenDecision::Rejected {
+                error: ErrorClass::TargetFailure,
+                reason: b"target unavailable".to_vec(),
+            },
+        };
+        ready
+            .open_stream(&mut opener, request.clone())
+            .await
+            .expect("rejected open is a protocol result");
+
+        let conflicting_request = stream_request(12, 3);
+        assert!(matches!(
+            ready.open_stream(&mut opener, conflicting_request).await,
+            Err(SinglePathError::ConflictingRequestId { .. })
+        ));
+
+        let reused_stream = stream_request(13, 2);
+        assert!(matches!(
+            ready.open_stream(&mut opener, reused_stream).await,
+            Err(SinglePathError::StreamAlreadyOpen { .. })
+        ));
+        assert_eq!(opener.calls, 1);
     }
 }
