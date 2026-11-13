@@ -5,11 +5,13 @@
 //! including strict object envelopes and the conversion into that domain model.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use thiserror::Error;
+use url::Url;
 
 use crate::{
     AuthenticationMode, Capabilities, EgressConfig, EgressId, EgressRule, EgressSelection,
@@ -20,6 +22,11 @@ use crate::{
 };
 
 pub const API_VERSION: &str = "pathchord.io/v1";
+
+const MAX_MAP_ENTRIES: usize = 256;
+const MAX_MAP_KEY_BYTES: usize = 64;
+const MAX_MAP_VALUE_BYTES: usize = 256;
+const MAX_WEIGHT: u32 = 1_000_000;
 
 fn default_namespace() -> String {
     "default".to_owned()
@@ -391,14 +398,34 @@ struct DnsLocalSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DnsPolicySpec {
+    #[serde(default = "default_dns_route")]
     default_route: String,
     local: Option<DnsLocalSpec>,
     transit: Option<DnsSelectorSpec>,
     egress: Option<DnsSelectorSpec>,
+    #[serde(default = "default_blocked_response")]
     blocked_response: Option<String>,
+    #[serde(default = "default_dns_timeout")]
     timeout_seconds: Option<u64>,
+    #[serde(default = "default_dns_max_inflight")]
     max_inflight: Option<u64>,
     cache: Option<DnsCacheSpec>,
+}
+
+fn default_dns_route() -> String {
+    "local".to_owned()
+}
+
+fn default_blocked_response() -> Option<String> {
+    Some("refused".to_owned())
+}
+
+fn default_dns_timeout() -> Option<u64> {
+    Some(5)
+}
+
+fn default_dns_max_inflight() -> Option<u64> {
+    Some(1024)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -480,6 +507,21 @@ impl KubeResource {
             Self::FallbackPolicy(value) => {
                 (&value.metadata.namespace, &value.kind, &value.metadata.name)
             }
+        }
+    }
+
+    fn metadata(&self) -> &ObjectMeta {
+        match self {
+            Self::Egress(value) => &value.metadata,
+            Self::TransitProxy(value) => &value.metadata,
+            Self::Subscription(value) => &value.metadata,
+            Self::EgressRule(value) => &value.metadata,
+            Self::TransitRule(value) => &value.metadata,
+            Self::ProxyRule(value) => &value.metadata,
+            Self::TrafficPolicy(value) => &value.metadata,
+            Self::Listener(value) => &value.metadata,
+            Self::DnsPolicy(value) => &value.metadata,
+            Self::FallbackPolicy(value) => &value.metadata,
         }
     }
 }
@@ -655,6 +697,13 @@ impl KubeConfig {
                             kind: value.kind,
                             name: value.metadata.name,
                             reason: "duplicate rule order".into(),
+                        });
+                    }
+                    if value.spec.proxy.is_some() && value.spec.select.is_some() {
+                        return Err(ConfigError::InvalidSpec {
+                            kind: value.kind,
+                            name: value.metadata.name,
+                            reason: "proxy and select are mutually exclusive".into(),
                         });
                     }
                     if value
@@ -883,9 +932,17 @@ fn validate_resource_set(resources: &[KubeResource]) -> Result<(), ConfigError> 
     }
     let mut rule_orders = HashSet::new();
     for resource in resources {
-        let (namespace, _, name) = resource.key();
-        validate_metadata(namespace, name)?;
+        validate_metadata(resource.metadata())?;
         match resource {
+            KubeResource::Egress(value) => {
+                validate_egress_spec(value)?;
+            }
+            KubeResource::TransitProxy(value) => {
+                validate_transit_proxy_spec(value)?;
+            }
+            KubeResource::Subscription(value) => {
+                validate_subscription_spec(value)?;
+            }
             KubeResource::EgressRule(value) => {
                 validate_rule_spec(
                     value.kind.as_str(),
@@ -913,6 +970,12 @@ fn validate_resource_set(resources: &[KubeResource]) -> Result<(), ConfigError> 
                     value.spec.catch_all,
                 )?;
             }
+            KubeResource::TrafficPolicy(value) => {
+                validate_traffic_policy_spec(value)?;
+            }
+            KubeResource::Listener(value) => {
+                validate_listener_spec(value)?;
+            }
             _ => {}
         }
         let order = match resource {
@@ -930,31 +993,8 @@ fn validate_resource_set(resources: &[KubeResource]) -> Result<(), ConfigError> 
                 reason: "duplicate rule order".into(),
             });
         }
-        if let KubeResource::DnsPolicy(value) = resource
-            && value.spec.default_route == "local"
-            && value
-                .spec
-                .local
-                .as_ref()
-                .is_none_or(|local| local.servers.is_empty())
-        {
-            return Err(ConfigError::InvalidSpec {
-                kind: value.kind.clone(),
-                name: value.metadata.name.clone(),
-                reason: "local.servers is required for local DNS route".into(),
-            });
-        }
-        if let KubeResource::DnsPolicy(value) = resource
-            && !matches!(
-                value.spec.default_route.as_str(),
-                "local" | "transit" | "egress" | "blocked"
-            )
-        {
-            return Err(ConfigError::InvalidSpec {
-                kind: value.kind.clone(),
-                name: value.metadata.name.clone(),
-                reason: "defaultRoute must be local, transit, egress, or blocked".into(),
-            });
+        if let KubeResource::DnsPolicy(value) = resource {
+            validate_dns_policy_spec(value)?;
         }
         if let KubeResource::TransitProxy(value) = resource
             && let Some(source) = &value.spec.source
@@ -971,10 +1011,41 @@ fn validate_resource_set(resources: &[KubeResource]) -> Result<(), ConfigError> 
     Ok(())
 }
 
-fn validate_metadata(namespace: &str, name: &str) -> Result<(), ConfigError> {
-    let bytes = name.as_bytes();
-    let valid = !bytes.is_empty()
-        && name.len() <= 63
+fn validate_metadata(metadata: &ObjectMeta) -> Result<(), ConfigError> {
+    let name = &metadata.name;
+    let namespace = &metadata.namespace;
+    let valid_name = valid_resource_name(name);
+    if namespace.is_empty() || contains_control(namespace) {
+        return Err(ConfigError::InvalidEnvelope(format!(
+            "invalid metadata name or namespace: {namespace}/{name}"
+        )));
+    }
+    if !valid_name {
+        return Err(ConfigError::InvalidEnvelope(format!(
+            "invalid metadata name or namespace: {namespace}/{name}"
+        )));
+    }
+    validate_string_map("metadata.labels", &metadata.labels).map_err(|reason| {
+        ConfigError::InvalidSpec {
+            kind: "metadata".into(),
+            name: name.clone(),
+            reason,
+        }
+    })?;
+    validate_string_map("metadata.annotations", &metadata.annotations).map_err(|reason| {
+        ConfigError::InvalidSpec {
+            kind: "metadata".into(),
+            name: name.clone(),
+            reason,
+        }
+    })?;
+    Ok(())
+}
+
+fn valid_resource_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && value.len() <= 63
         && bytes
             .first()
             .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
@@ -983,11 +1054,360 @@ fn validate_metadata(namespace: &str, name: &str) -> Result<(), ConfigError> {
             .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
         && bytes
             .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
-    if namespace.is_empty() || !valid {
-        return Err(ConfigError::InvalidEnvelope(format!(
-            "invalid metadata name or namespace: {namespace}/{name}"
-        )));
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn validate_string_map(field: &str, values: &BTreeMap<String, String>) -> Result<(), String> {
+    if values.len() > MAX_MAP_ENTRIES {
+        return Err(format!("{field} has too many entries"));
+    }
+    for (key, value) in values {
+        if key.is_empty() || key.len() > MAX_MAP_KEY_BYTES {
+            return Err(format!("{field} key length is invalid"));
+        }
+        if value.len() > MAX_MAP_VALUE_BYTES {
+            return Err(format!("{field}.{key} value is too long"));
+        }
+        if contains_control(key) || contains_control(value) {
+            return Err(format!("{field}.{key} contains a control character"));
+        }
+    }
+    Ok(())
+}
+
+fn contains_control(value: &str) -> bool {
+    value.chars().any(char::is_control)
+}
+
+fn invalid_spec(resource: &str, name: &str, reason: impl Into<String>) -> ConfigError {
+    ConfigError::InvalidSpec {
+        kind: resource.to_owned(),
+        name: name.to_owned(),
+        reason: reason.into(),
+    }
+}
+
+fn validate_host(field: &str, host: &str) -> Result<(), String> {
+    if host.is_empty() || host.len() > 255 || contains_control(host) {
+        return Err(format!(
+            "{field} must be a non-empty hostname or IP literal"
+        ));
+    }
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    for label in host.trim_end_matches('.').split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(format!("{field} is not a valid DNS hostname"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_key(key: &str) -> Result<(), String> {
+    if key.contains('=') {
+        return Err("publicKey must be unpadded base64url".into());
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key)
+        .map_err(|_| "publicKey must be unpadded base64url".to_owned())?;
+    if decoded.len() != 32 {
+        return Err("publicKey must decode to exactly 32 bytes".into());
+    }
+    Ok(())
+}
+
+fn validate_egress_spec(value: &Resource<EgressSpec>) -> Result<(), ConfigError> {
+    let kind = value.kind.as_str();
+    let name = value.metadata.name.as_str();
+    validate_host("address", &value.spec.address)
+        .map_err(|reason| invalid_spec(kind, name, reason))?;
+    validate_public_key(&value.spec.public_key)
+        .map_err(|reason| invalid_spec(kind, name, reason))?;
+    if !value.spec.capabilities.tcp && !value.spec.capabilities.udp {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "at least one Egress capability must be enabled",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transit_proxy_spec(value: &Resource<TransitProxySpec>) -> Result<(), ConfigError> {
+    let kind = value.kind.as_str();
+    let name = value.metadata.name.as_str();
+    const PROTOCOLS: [&str; 7] = [
+        "direct", "http", "https", "socks5", "vless", "vmess", "xtls",
+    ];
+    if !PROTOCOLS.contains(&value.spec.protocol.as_str()) {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "protocol is not a registered adapter",
+        ));
+    }
+    if !(1..=MAX_WEIGHT).contains(&value.spec.weight) {
+        return Err(invalid_spec(kind, name, "weight must be in 1..=1000000"));
+    }
+    if let Some(source) = &value.spec.source {
+        if !["static", "clash", "sip008"].contains(&source.source_type.as_str()) {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "source.type must be static, clash, or sip008",
+            ));
+        }
+        if source.source_type != "static"
+            && source.subscription_ref.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "subscriptionRef is required for non-static source",
+            ));
+        }
+    }
+    if value.spec.protocol != "direct" {
+        let address = value.spec.address.as_deref().unwrap_or_default();
+        validate_host("address", address).map_err(|reason| invalid_spec(kind, name, reason))?;
+        if value.spec.port.is_none_or(|port| port == 0) {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "port is required and must be non-zero",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_subscription_spec(value: &Resource<SubscriptionSpec>) -> Result<(), ConfigError> {
+    let kind = value.kind.as_str();
+    let name = value.metadata.name.as_str();
+    let source = value
+        .spec
+        .source
+        .as_ref()
+        .ok_or_else(|| invalid_spec(kind, name, "source is required"))?;
+    if !["static", "clash", "sip008"].contains(&source.source_type.as_str()) {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "source.type must be static, clash, or sip008",
+        ));
+    }
+    let parsed = Url::parse(&source.url)
+        .map_err(|_| invalid_spec(kind, name, "source.url must be a valid URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "source.url must use http or https",
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "source.url must not contain credentials",
+        ));
+    }
+    if let Some(refresh) = &value.spec.refresh
+        && (!(60..=604_800).contains(&refresh.interval_seconds)
+            || !(1..=300).contains(&refresh.timeout_seconds)
+            || !(1..=10).contains(&refresh.max_attempts)
+            || !(1..=3600).contains(&refresh.backoff_seconds))
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "refresh values are outside their allowed ranges",
+        ));
+    }
+    if let Some(cache) = &value.spec.cache
+        && (cache.path.is_empty()
+            || contains_control(&cache.path)
+            || cache.max_age_seconds < 60
+            || cache.max_age_seconds > 2_592_000)
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "cache values are outside their allowed ranges",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_traffic_policy_spec(value: &Resource<TrafficPolicySpec>) -> Result<(), ConfigError> {
+    let kind = value.kind.as_str();
+    let name = value.metadata.name.as_str();
+    if value.spec.session_replication_budget_bps > 1_000_000_000_000
+        || value
+            .spec
+            .class_replication_budget_bps
+            .is_some_and(|budget| budget > 1_000_000_000_000)
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "replication budgets must not exceed 10^12",
+        ));
+    }
+    if value.spec.classes.len() > MAX_MAP_ENTRIES
+        || value.spec.classes.values().any(|class| class.share == 0)
+    {
+        return Err(invalid_spec(kind, name, "classes contain an invalid share"));
+    }
+    Ok(())
+}
+
+fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigError> {
+    let kind = value.kind.as_str();
+    let name = value.metadata.name.as_str();
+    if !matches!(value.spec.platform.as_str(), "any" | "linux" | "windows") {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "platform must be any, linux, or windows",
+        ));
+    }
+    if value.spec.allowed_sources.len() > MAX_MAP_ENTRIES {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "allowedSources has too many entries",
+        ));
+    }
+    for source in &value.spec.allowed_sources {
+        if source.is_empty() || contains_control(source) {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "allowedSources contains an invalid CIDR",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), ConfigError> {
+    let kind = value.kind.as_str();
+    let name = value.metadata.name.as_str();
+    if !matches!(
+        value.spec.default_route.as_str(),
+        "local" | "transit" | "egress" | "blocked"
+    ) {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "defaultRoute must be local, transit, egress, or blocked",
+        ));
+    }
+    if value.spec.default_route == "local" {
+        let servers = value.spec.local.as_ref().map(|local| &local.servers);
+        if servers.is_none_or(Vec::is_empty) {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "local.servers is required for local DNS route",
+            ));
+        }
+        for server in servers.expect("checked above") {
+            validate_dns_server(server).map_err(|reason| invalid_spec(kind, name, reason))?;
+        }
+    }
+    if value.spec.default_route == "transit"
+        && value
+            .spec
+            .transit
+            .as_ref()
+            .is_none_or(|selector| selector.proxy_selector.is_none())
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "transit.proxySelector is required for transit route",
+        ));
+    }
+    if value.spec.default_route == "egress"
+        && value
+            .spec
+            .egress
+            .as_ref()
+            .is_none_or(|selector| selector.egress_selector.is_none())
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "egress.egressSelector is required for egress route",
+        ));
+    }
+    if value
+        .spec
+        .blocked_response
+        .as_deref()
+        .is_some_and(|response| !matches!(response, "nxdomain" | "refused" | "servfail"))
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "blockedResponse must be nxdomain, refused, or servfail",
+        ));
+    }
+    if value
+        .spec
+        .timeout_seconds
+        .is_none_or(|seconds| !(1..=60).contains(&seconds))
+        || value
+            .spec
+            .max_inflight
+            .is_none_or(|count| !(1..=100_000).contains(&count))
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "DNS limits are outside their allowed ranges",
+        ));
+    }
+    if let Some(cache) = &value.spec.cache
+        && (cache.max_entries.is_some_and(|count| count > 1_000_000)
+            || cache
+                .max_ttl_seconds
+                .is_some_and(|seconds| !(1..=604_800).contains(&seconds)))
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "DNS cache limits are outside their allowed ranges",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dns_server(server: &str) -> Result<(), String> {
+    if let Ok(address) = server.parse::<SocketAddr>() {
+        return (address.port() != 0)
+            .then_some(())
+            .ok_or_else(|| "DNS server port must be non-zero".to_owned());
+    }
+    let (host, port) = server
+        .rsplit_once(':')
+        .ok_or_else(|| "DNS server must be host:port".to_owned())?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "DNS server port is invalid".to_owned())?;
+    validate_host("DNS server host", host.trim_matches(['[', ']']))?;
+    if port == 0 {
+        return Err("DNS server port must be non-zero".to_owned());
     }
     Ok(())
 }
@@ -999,11 +1419,18 @@ fn validate_rule_spec(
     matches: Option<&FlowMatchSpec>,
     catch_all: bool,
 ) -> Result<(), ConfigError> {
-    if matches.is_some_and(|value| value == &FlowMatchSpec::default()) && !catch_all {
+    if matches.is_some_and(|value| value == &FlowMatchSpec::default()) {
         return Err(ConfigError::InvalidSpec {
             kind: kind.into(),
             name: name.into(),
-            reason: "empty match requires catchAll:true".into(),
+            reason: "empty match is not allowed; omit match for catchAll:true".into(),
+        });
+    }
+    if catch_all && matches.is_some() {
+        return Err(ConfigError::InvalidSpec {
+            kind: kind.into(),
+            name: name.into(),
+            reason: "catchAll:true cannot be combined with match".into(),
         });
     }
     if matches.is_none() && !catch_all {
@@ -1044,7 +1471,7 @@ items:
     spec:
       address: egress.example.net
       port: 443
-      publicKey: test-key
+      publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
       capabilities: {tcp: true, udp: true}
   - apiVersion: pathchord.io/v1
     kind: DNSPolicy
@@ -1100,7 +1527,7 @@ items:
             "spec:\n      unknown: true\n      address",
         );
         assert!(KubeConfig::from_yaml(&unknown).is_err());
-        let duplicate = VALID.replace("  - apiVersion: pathchord.io/v1\n    kind: DNSPolicy", "  - apiVersion: pathchord.io/v1\n    kind: Egress\n    metadata:\n      name: jp-1\n    spec:\n      address: egress2.example.net\n      port: 443\n      publicKey: test-key\n      capabilities: {tcp: true, udp: true}\n  - apiVersion: pathchord.io/v1\n    kind: DNSPolicy");
+        let duplicate = VALID.replace("  - apiVersion: pathchord.io/v1\n    kind: DNSPolicy", "  - apiVersion: pathchord.io/v1\n    kind: Egress\n    metadata:\n      name: jp-1\n    spec:\n      address: egress2.example.net\n      port: 443\n      publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n      capabilities: {tcp: true, udp: true}\n  - apiVersion: pathchord.io/v1\n    kind: DNSPolicy");
         assert!(KubeConfig::from_yaml(&duplicate).is_err());
     }
 
@@ -1122,7 +1549,7 @@ metadata:
 spec:
   address: egress.example.net
   port: 443
-  publicKey: test-key
+  publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
   capabilities: {tcp: true, udp: true}
 ---
 apiVersion: pathchord.io/v1
@@ -1143,5 +1570,53 @@ spec:
 "#;
         let config = KubeConfig::from_yaml(input).expect("multi-document config");
         assert_eq!(config.resources.len(), 3);
+    }
+
+    #[test]
+    fn rejects_invalid_egress_key_and_capabilities() {
+        let invalid_key = VALID.replace(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "not-a-public-key",
+        );
+        let error = KubeConfig::from_yaml(&invalid_key).unwrap_err().to_string();
+        assert!(error.contains("publicKey"));
+
+        let no_capabilities = VALID.replace(
+            "capabilities: {tcp: true, udp: true}",
+            "capabilities: {tcp: false, udp: false}",
+        );
+        let error = KubeConfig::from_yaml(&no_capabilities)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("capability"));
+    }
+
+    #[test]
+    fn rejects_invalid_dns_limits_and_empty_match() {
+        let invalid_dns = VALID.replace(
+            "defaultRoute: local",
+            "defaultRoute: local\n      timeoutSeconds: 0",
+        );
+        let error = KubeConfig::from_yaml(&invalid_dns).unwrap_err().to_string();
+        assert!(error.contains("DNS limits"));
+
+        let empty_match = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: ProxyRule\nmetadata:\n  name: empty-match\nspec:\n  order: 40\n  match: {{}}\n  catchAll: true\n"
+        );
+        let error = KubeConfig::from_yaml(&empty_match).unwrap_err().to_string();
+        assert!(error.contains("empty match"));
+    }
+
+    #[test]
+    fn rejects_proxy_and_select_together() {
+        let input = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: ProxyRule\nmetadata:\n  name: conflicting-action\nspec:\n  order: 40\n  match:\n    flowTags: [web]\n  proxy: direct\n  select: any\n"
+        );
+        let error = KubeConfig::from_yaml(&input)
+            .expect("parse configuration")
+            .into_policy_config()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mutually exclusive"));
     }
 }
