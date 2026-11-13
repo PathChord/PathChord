@@ -17,11 +17,13 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
 
 use crate::tuic_codec::{
-    TuicAddress, TuicCredentials, TuicEndpoint, encode_authenticate_token, encode_connect,
+    TuicAddress, TuicCredentials, TuicEndpoint, TuicPacket, decode_packet,
+    encode_authenticate_token, encode_connect, encode_dissociate, encode_packet,
 };
 use crate::{
-    AdapterKind, BoxedTransitConnection, ConnectRequest, Endpoint as TransitEndpoint,
-    TransitAdapter, TransitCredential, TransitError, TransitMetadata,
+    AdapterKind, BoxedTransitConnection, BoxedTransitDatagram, ConnectRequest,
+    Endpoint as TransitEndpoint, TransitAdapter, TransitCredential, TransitDatagram, TransitError,
+    TransitMetadata,
 };
 
 pub(crate) struct TuicAdapter {
@@ -150,7 +152,7 @@ impl TransitAdapter for TuicAdapter {
         &self.metadata
     }
     fn supports_udp(&self) -> bool {
-        false
+        true
     }
 
     async fn connect(
@@ -190,6 +192,46 @@ impl TransitAdapter for TuicAdapter {
             .map_err(|_| TransitError::Connection("TUIC connect command failed".into()))?;
         Ok(Box::new(TuicStream { send, recv }))
     }
+
+    async fn connect_udp(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<BoxedTransitDatagram, TransitError> {
+        crate::validate_destination(&request.destination)?;
+        let connection = self.connect_session().await?;
+        let mut token = [0_u8; 32];
+        connection
+            .export_keying_material(
+                &mut token,
+                &self.credentials.uuid,
+                self.credentials.password.as_bytes(),
+            )
+            .map_err(|_| TransitError::Protocol("TUIC TLS exporter failed".into()))?;
+        let mut auth = connection
+            .open_uni()
+            .await
+            .map_err(|_| TransitError::Connection("TUIC auth stream failed".into()))?;
+        auth.write_all(&encode_authenticate_token(&self.credentials.uuid, &token))
+            .await
+            .map_err(|_| TransitError::Connection("TUIC auth write failed".into()))?;
+        auth.finish()
+            .map_err(|_| TransitError::Connection("TUIC auth finish failed".into()))?;
+        let endpoint = TuicEndpoint {
+            address: tuic_address(&request.destination)?,
+            port: request.destination.port,
+        };
+        let mut association = [0_u8; 2];
+        getrandom::fill(&mut association).map_err(|_| {
+            TransitError::Connection("TUIC association ID generation failed".into())
+        })?;
+        let association_id = u16::from_be_bytes(association).max(1);
+        Ok(Box::new(TuicDatagram {
+            connection,
+            endpoint,
+            association_id,
+            packet_id: 0,
+        }))
+    }
 }
 
 fn tuic_address(endpoint: &TransitEndpoint) -> Result<TuicAddress, TransitError> {
@@ -208,6 +250,65 @@ fn tuic_address(endpoint: &TransitEndpoint) -> Result<TuicAddress, TransitError>
 struct TuicStream {
     send: SendStream,
     recv: RecvStream,
+}
+
+#[derive(Debug)]
+struct TuicDatagram {
+    connection: quinn::Connection,
+    endpoint: TuicEndpoint,
+    association_id: u16,
+    packet_id: u16,
+}
+
+#[async_trait]
+impl TransitDatagram for TuicDatagram {
+    async fn send(&mut self, payload: &[u8]) -> Result<(), TransitError> {
+        let packet = encode_packet(&TuicPacket {
+            association_id: self.association_id,
+            packet_id: self.packet_id,
+            fragment_total: 1,
+            fragment_id: 0,
+            endpoint: self.endpoint.clone(),
+            payload: bytes::Bytes::copy_from_slice(payload),
+        })
+        .map_err(|error| unsupported(error.to_string()))?;
+        self.packet_id = self.packet_id.wrapping_add(1);
+        self.connection
+            .send_datagram(packet)
+            .map_err(|_| TransitError::Connection("TUIC UDP datagram send failed".into()))
+    }
+
+    async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
+        let packet = self
+            .connection
+            .read_datagram()
+            .await
+            .map_err(|_| TransitError::Connection("TUIC UDP datagram receive failed".into()))?;
+        let packet = decode_packet(&packet).map_err(|error| unsupported(error.to_string()))?;
+        if packet.association_id != self.association_id {
+            return Err(TransitError::Protocol(
+                "TUIC UDP association ID mismatch".into(),
+            ));
+        }
+        Ok(packet.payload.to_vec())
+    }
+
+    async fn close(self: Box<Self>) -> Result<(), TransitError> {
+        let mut command = self
+            .connection
+            .open_uni()
+            .await
+            .map_err(|_| TransitError::Connection("TUIC dissociate stream failed".into()))?;
+        command
+            .write_all(&encode_dissociate(self.association_id))
+            .await
+            .map_err(|_| TransitError::Connection("TUIC dissociate write failed".into()))?;
+        command
+            .finish()
+            .map_err(|_| TransitError::Connection("TUIC dissociate finish failed".into()))?;
+        self.connection.close(0u32.into(), b"closed");
+        Ok(())
+    }
 }
 impl AsyncRead for TuicStream {
     fn poll_read(
@@ -251,6 +352,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Stdio;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UdpSocket;
     use tokio::process::Command;
 
     #[tokio::test]
@@ -332,6 +434,7 @@ mod tests {
             crate::adapter_registry::native_tls_roots(),
         )
         .unwrap();
+        assert_eq!(adapter.tls.alpn_protocols, vec![b"h3".to_vec()]);
         let mut stream = adapter
             .connect(ConnectRequest {
                 destination: TransitEndpoint {
@@ -347,6 +450,30 @@ mod tests {
         stream.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"tuic!!");
         target_task.await.unwrap();
+        let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_address = udp_target.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut packet = [0_u8; 256];
+            let (length, peer) = udp_target.recv_from(&mut packet).await.unwrap();
+            udp_target.send_to(&packet[..length], peer).await.unwrap();
+        });
+        let mut datagram = adapter
+            .connect_udp(ConnectRequest {
+                destination: TransitEndpoint {
+                    host: "127.0.0.1".into(),
+                    port: udp_address.port(),
+                },
+            })
+            .await
+            .unwrap();
+        datagram.send(b"udp-tuic").await.unwrap();
+        let received = timeout(Duration::from_secs(5), datagram.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, b"udp-tuic");
+        datagram.close().await.unwrap();
+        udp_task.await.unwrap();
         peer.kill().await.unwrap();
         peer.wait().await.unwrap();
     }
