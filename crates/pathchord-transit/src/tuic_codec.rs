@@ -116,12 +116,15 @@ pub fn decode_quic_varint(input: &mut &[u8]) -> Result<u64, TuicCodecError> {
 }
 
 pub fn encode_authenticate(credentials: &TuicCredentials) -> Bytes {
+    encode_authenticate_token(&credentials.uuid, &[0; 32])
+}
+
+pub fn encode_authenticate_token(uuid: &[u8; 16], token: &[u8; 32]) -> Bytes {
     let mut output = BytesMut::with_capacity(50);
     output.put_u8(TUIC_VERSION);
     output.put_u8(COMMAND_AUTHENTICATE);
-    output.extend_from_slice(&credentials.uuid);
-    // The TLS exporter token is supplied by the QUIC/TLS owner.
-    output.resize(output.len() + 32, 0);
+    output.extend_from_slice(uuid);
+    output.extend_from_slice(token);
     output.freeze()
 }
 
