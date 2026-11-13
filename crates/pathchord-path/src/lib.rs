@@ -8,7 +8,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use async_trait::async_trait;
 use pathchord_core::PathFrame;
+use pathchord_noise::{
+    MAX_NOISE_MESSAGE_LEN, NoiseError, NoiseTransport, RECORD_ENVELOPE_HEADER_LEN,
+    TRANSPORT_TAG_LEN,
+};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod single_path;
 
@@ -32,6 +37,112 @@ pub trait CompleteFrameTransport: Send {
 
     /// Receives one complete frame, or `None` when none is currently available.
     async fn receive_frame(&mut self) -> Result<Option<PathFrame>, Self::Error>;
+}
+
+/// Errors from the byte-stream record adapter.
+#[derive(Debug, Error)]
+pub enum NoiseRecordStreamError {
+    #[error("Path byte stream I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Noise record failed: {0}")]
+    Noise(#[from] NoiseError),
+    #[error("Noise record ciphertext length {actual} is outside {minimum}..={maximum}")]
+    InvalidCiphertextLength {
+        actual: usize,
+        minimum: usize,
+        maximum: usize,
+    },
+}
+
+/// A real byte-stream adapter for one already-authenticated Path.
+///
+/// Handshake orchestration and Session ownership remain above this type. The
+/// adapter owns record segmentation, bounded allocation, Noise authentication,
+/// and complete-frame delivery.
+pub struct NoiseRecordStream<S> {
+    io: S,
+    transport: NoiseTransport,
+    limits: pathchord_core::ProtocolLimits,
+}
+
+impl<S> std::fmt::Debug for NoiseRecordStream<S>
+where
+    S: std::fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NoiseRecordStream")
+            .field("io", &self.io)
+            .field("transport", &self.transport)
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
+impl<S> NoiseRecordStream<S>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    #[must_use]
+    pub fn new(io: S, transport: NoiseTransport, limits: pathchord_core::ProtocolLimits) -> Self {
+        Self {
+            io,
+            transport,
+            limits,
+        }
+    }
+
+    pub fn into_parts(self) -> (S, NoiseTransport) {
+        (self.io, self.transport)
+    }
+
+    async fn send_record(&mut self, frame: PathFrame) -> Result<(), NoiseRecordStreamError> {
+        let record = self.transport.seal_frame(&frame, self.limits)?;
+        self.io.write_all(&record.encode()).await?;
+        self.io.flush().await?;
+        Ok(())
+    }
+
+    async fn receive_record(&mut self) -> Result<Option<PathFrame>, NoiseRecordStreamError> {
+        let mut header = [0_u8; RECORD_ENVELOPE_HEADER_LEN];
+        let first = self.io.read(&mut header[..1]).await?;
+        if first == 0 {
+            return Ok(None);
+        }
+        self.io.read_exact(&mut header[1..]).await?;
+        let ciphertext_len = usize::from(u16::from_be_bytes([header[8], header[9]]));
+        if !(TRANSPORT_TAG_LEN..=MAX_NOISE_MESSAGE_LEN).contains(&ciphertext_len) {
+            return Err(NoiseRecordStreamError::InvalidCiphertextLength {
+                actual: ciphertext_len,
+                minimum: TRANSPORT_TAG_LEN,
+                maximum: MAX_NOISE_MESSAGE_LEN,
+            });
+        }
+        let mut encoded = Vec::with_capacity(RECORD_ENVELOPE_HEADER_LEN + ciphertext_len);
+        encoded.extend_from_slice(&header);
+        let mut ciphertext = vec![0_u8; ciphertext_len];
+        self.io.read_exact(&mut ciphertext).await?;
+        encoded.extend_from_slice(&ciphertext);
+        Ok(Some(
+            self.transport.open_encoded_frame(&encoded, self.limits)?,
+        ))
+    }
+}
+
+#[async_trait]
+impl<S> CompleteFrameTransport for NoiseRecordStream<S>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    type Error = NoiseRecordStreamError;
+
+    async fn send_frame(&mut self, frame: PathFrame) -> Result<(), Self::Error> {
+        self.send_record(frame).await
+    }
+
+    async fn receive_frame(&mut self) -> Result<Option<PathFrame>, Self::Error> {
+        self.receive_record().await
+    }
 }
 
 /// Fault applied to a particular zero-based send ordinal.

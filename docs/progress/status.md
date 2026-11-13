@@ -63,6 +63,13 @@ separate from `docs/design/`, which describes the intended architecture, and
 - The single-Path harness now carries `STREAM_OPEN` over the authenticated Path
   to an injected opener, validates `STREAM_OPEN_OK`/`STREAM_OPEN_ERR`, and
   preserves RequestID/StreamID idempotency and conflict rules.
+- `pathchord-path` now also has a bounded `NoiseRecordStream` byte adapter;
+  it segments the wire-profile record envelope, authenticates complete frames,
+  and has a duplex integration test. `pathchord-transit` provides a bounded
+  direct TCP adapter at the byte-transport boundary.
+- The local listener list query now validates pagination/filter/sort fields,
+  returns deterministic pages, and system-proxy mutations honor supplied
+  configuration generation preconditions.
 
 ## Missing operational integration
 
@@ -77,6 +84,8 @@ separate from `docs/design/`, which describes the intended architecture, and
   loop or Session manager; its Stream opener is still an injected
   transport-neutral boundary. A cross-crate test now routes `STREAM_OPEN`
   through `FakeEgress` and verifies target-dial idempotency.
+- The direct Transit and record adapters are not yet owned by a live Session
+  manager; CLI ingress still uses the bootstrap direct target bridge.
 - The Session/Path end-to-end proxy data plane is not operational.
 - Named Pipe transport, persistent authorization and metadata stores,
   subscription worker, REST/SSE Web Gateway, and frontend are not integrated.
