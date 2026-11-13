@@ -15,8 +15,10 @@ use pathchord_noise::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod session;
 mod single_path;
 
+pub use session::{EgressPathSession, IngressPathSession, PathSessionConfig, PathSessionError};
 pub use single_path::{
     AuthorizationState, PathAuthorization, SinglePathError, SinglePathHandshakeConfig,
     SinglePathOutcome, SinglePathReady, StreamOpenDecision, StreamOpener, establish_single_path,
