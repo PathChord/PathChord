@@ -256,20 +256,31 @@ fn listener_descriptor(listener: ListenerConfig) -> Result<ListenerDescriptor, C
         PolicyListenerKind::Redirect => ListenerKind::Redirect,
         PolicyListenerKind::Tun => ListenerKind::Tun,
     };
-    let bind = listener
+    let bind_endpoint = listener
         .bind
         .ok_or_else(|| CliError::UnsupportedListenerKind {
             listener_id: listener.id.as_str().to_owned(),
             kind: format!("{kind:?}"),
         })?;
-    let bind = parse_bind(&bind.host, bind.port).ok_or_else(|| CliError::InvalidListenerBind {
-        listener_id: listener.id.as_str().to_owned(),
-        bind: format!("{}:{}", bind.host, bind.port),
+    let bind = parse_bind(&bind_endpoint.host, bind_endpoint.port).ok_or_else(|| {
+        CliError::InvalidListenerBind {
+            listener_id: listener.id.as_str().to_owned(),
+            bind: format!("{}:{}", bind_endpoint.host, bind_endpoint.port),
+        }
     })?;
+    let mut allowed_sources = listener.allowed_sources;
+    if allowed_sources.is_empty() && bind.ip().is_loopback() {
+        let prefix = match bind.ip() {
+            std::net::IpAddr::V4(_) => 32,
+            std::net::IpAddr::V6(_) => 128,
+        };
+        allowed_sources.push(format!("{}/{}", bind.ip(), prefix));
+    }
     Ok(ListenerDescriptor {
         id: listener.id,
         kind,
         bind,
+        allowed_sources,
         authentication_required: matches!(listener.authentication, AuthenticationMode::Required),
     })
 }
@@ -451,6 +462,7 @@ mod tests {
         let descriptor = listener_descriptor(listener).expect("descriptor");
         assert_eq!(descriptor.kind, ListenerKind::Http);
         assert_eq!(descriptor.bind.port(), 8080);
+        assert_eq!(descriptor.allowed_sources, vec!["127.0.0.1/32"]);
         assert!(descriptor.authentication_required);
     }
 
@@ -484,6 +496,7 @@ mod tests {
             id: pathchord_ingress::ListenerId::new("http-e2e"),
             kind: ListenerKind::Http,
             bind: "127.0.0.1:0".parse().expect("proxy bind"),
+            allowed_sources: Vec::new(),
             authentication_required: false,
         };
         let listener = pathchord_ingress::HttpConnectListener::bind(descriptor)
@@ -538,6 +551,7 @@ mod tests {
             id: pathchord_ingress::ListenerId::new("socks-e2e"),
             kind: ListenerKind::Socks5,
             bind: "127.0.0.1:0".parse().expect("proxy bind"),
+            allowed_sources: Vec::new(),
             authentication_required: false,
         };
         let listener = pathchord_ingress::Socks5Listener::bind(descriptor)

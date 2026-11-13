@@ -23,6 +23,7 @@ pub struct ListenerView {
     pub id: ListenerId,
     pub kind: ListenerKind,
     pub bind: SocketAddr,
+    pub allowed_sources: Vec<String>,
     pub authentication_required: bool,
     pub state: ListenerViewState,
     pub generation: u64,
@@ -36,6 +37,7 @@ impl ListenerView {
             id: descriptor.id.clone(),
             kind: descriptor.kind,
             bind: descriptor.bind,
+            allowed_sources: descriptor.allowed_sources.clone(),
             authentication_required: descriptor.authentication_required,
             state: ListenerViewState::Available,
             generation,
@@ -155,6 +157,7 @@ mod tests {
             id: ListenerId::new(id),
             kind,
             bind: SocketAddr::from_str("127.0.0.1:8080").expect("socket address"),
+            allowed_sources: vec!["127.0.0.1/32".to_owned()],
             authentication_required: false,
         }
     }
@@ -169,6 +172,7 @@ mod tests {
             .get(&ListenerId::new("local-http"))
             .expect("listener");
         assert_eq!(view.kind, ListenerKind::Http);
+        assert_eq!(view.allowed_sources, vec!["127.0.0.1/32"]);
         assert_eq!(view.state, ListenerViewState::Available);
         assert!(view.supports_system_proxy());
     }

@@ -8,7 +8,7 @@
 //! The transport-neutral [`IngressControlService`] is the shared foundation
 //! for the local management protocol and future REST/SSE or GraphQL adapters.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use async_trait::async_trait;
 use getrandom::fill;
@@ -78,7 +78,54 @@ pub struct ListenerDescriptor {
     pub id: ListenerId,
     pub kind: ListenerKind,
     pub bind: SocketAddr,
+    /// Allowed source CIDRs. An empty list means all source addresses.
+    pub allowed_sources: Vec<String>,
     pub authentication_required: bool,
+}
+
+impl ListenerDescriptor {
+    /// Returns whether a source address is admitted by this listener's CIDRs.
+    /// Configuration parsing validates CIDR syntax; malformed values supplied
+    /// by an embedding caller fail closed here.
+    #[must_use]
+    pub fn allows_source(&self, source: IpAddr) -> bool {
+        self.allowed_sources.is_empty()
+            || self
+                .allowed_sources
+                .iter()
+                .any(|cidr| ip_in_cidr(source, cidr))
+    }
+}
+
+fn ip_in_cidr(source: IpAddr, cidr: &str) -> bool {
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(network) = network.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match (source, network) {
+        (IpAddr::V4(source), IpAddr::V4(network)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(source) & mask) == (u32::from(network) & mask)
+        }
+        (IpAddr::V6(source), IpAddr::V6(network)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(source) & mask) == (u128::from(network) & mask)
+        }
+        _ => false,
+    }
 }
 
 pub type TargetAddress = TargetEndpoint;
@@ -146,6 +193,7 @@ pub enum SessionSlotPhase {
     Configured,
     Connecting,
     Active,
+    Degraded,
     Draining,
     WaitingForEgress,
     AuthorizationBlocked,
@@ -297,8 +345,45 @@ where
         Ok(())
     }
 
-    pub fn add_ready_path(&mut self) -> Result<usize, SessionSlotError> {
+    /// Marks a live Session degraded while retaining at least one ready Path.
+    /// Degraded Sessions continue to admit business Streams, but callers may
+    /// use the phase to reduce scheduling or trigger Path recovery.
+    pub fn mark_degraded(&mut self) -> Result<(), SessionSlotError> {
         if self.phase != SessionSlotPhase::Active {
+            return Err(SessionSlotError::InvalidManagerTransition {
+                from: self.phase,
+                to: SessionSlotPhase::Degraded,
+            });
+        }
+        let live = self.live.as_mut().ok_or(SessionSlotError::NoLiveSession)?;
+        live.state = live
+            .state
+            .transition(SessionState::Degraded, live.ready_paths)?;
+        self.phase = SessionSlotPhase::Degraded;
+        Ok(())
+    }
+
+    /// Restores an admitted degraded Session after Path quality recovers.
+    pub fn mark_active(&mut self) -> Result<(), SessionSlotError> {
+        if self.phase != SessionSlotPhase::Degraded {
+            return Err(SessionSlotError::InvalidManagerTransition {
+                from: self.phase,
+                to: SessionSlotPhase::Active,
+            });
+        }
+        let live = self.live.as_mut().ok_or(SessionSlotError::NoLiveSession)?;
+        live.state = live
+            .state
+            .transition(SessionState::Active, live.ready_paths)?;
+        self.phase = SessionSlotPhase::Active;
+        Ok(())
+    }
+
+    pub fn add_ready_path(&mut self) -> Result<usize, SessionSlotError> {
+        if !matches!(
+            self.phase,
+            SessionSlotPhase::Active | SessionSlotPhase::Degraded
+        ) {
             return Err(SessionSlotError::PathAdmissionClosed { phase: self.phase });
         }
         let live = self.live.as_mut().ok_or(SessionSlotError::NoLiveSession)?;
@@ -554,6 +639,17 @@ mod tests {
     }
 
     #[test]
+    fn degraded_session_keeps_stream_and_path_admission_open() {
+        let mut slot = connecting_slot(1);
+        slot.attach(1).expect("live Session");
+        slot.mark_degraded().expect("degrade Session");
+        assert_eq!(slot.phase(), SessionSlotPhase::Degraded);
+        assert_eq!(slot.add_ready_path(), Ok(2));
+        slot.mark_active().expect("recover Session");
+        assert_eq!(slot.phase(), SessionSlotPhase::Active);
+    }
+
+    #[test]
     fn draining_session_does_not_admit_a_new_path() {
         let mut slot = connecting_slot(1);
         slot.attach(1).expect("live Session");
@@ -655,6 +751,7 @@ mod tests {
                 id: ListenerId::new("local-http"),
                 kind: ListenerKind::Http,
                 bind: SocketAddr::from_str("127.0.0.1:8080").expect("socket address"),
+                allowed_sources: Vec::new(),
                 authentication_required: false,
             },
         };

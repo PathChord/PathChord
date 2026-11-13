@@ -1307,13 +1307,33 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
         ));
     }
     for source in &value.spec.allowed_sources {
-        if source.is_empty() || contains_control(source) {
+        if validate_cidr(source).is_err() {
             return Err(invalid_spec(
                 kind,
                 name,
                 "allowedSources contains an invalid CIDR",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_cidr(value: &str) -> Result<(), String> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| "CIDR must contain an address and prefix length".to_owned())?;
+    let address = address
+        .parse::<IpAddr>()
+        .map_err(|_| "CIDR address is invalid".to_owned())?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| "CIDR prefix length is invalid".to_owned())?;
+    let maximum = match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > maximum {
+        return Err("CIDR prefix length is outside the address family".to_owned());
     }
     Ok(())
 }
@@ -1667,6 +1687,16 @@ spec:
         );
         let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
         assert!(error.contains("bind is required"));
+    }
+
+    #[test]
+    fn rejects_invalid_allowed_source_cidr() {
+        let input = VALID.replace(
+            "      bind: 127.0.0.1:8080\n",
+            "      bind: 127.0.0.1:8080\n      allowedSources: [192.0.2.0/not-a-prefix]\n",
+        );
+        let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
+        assert!(error.contains("allowedSources"));
     }
 
     #[test]

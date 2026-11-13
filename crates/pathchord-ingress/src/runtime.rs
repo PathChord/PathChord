@@ -57,6 +57,10 @@ pub enum ListenerRuntimeEvent {
         listener_id: ListenerId,
         reason: String,
     },
+    PolicyRejected {
+        listener_id: ListenerId,
+        reason: String,
+    },
     ConnectionAccepted {
         listener_id: ListenerId,
     },
@@ -84,6 +88,7 @@ pub struct RuntimeReport {
     pub listener_count: usize,
     pub accepted_connections: u64,
     pub protocol_rejections: u64,
+    pub policy_rejections: u64,
     pub completed_connections: u64,
     pub failed_connections: u64,
     pub local_to_target_bytes: u64,
@@ -377,6 +382,7 @@ impl RuntimeCancellation {
 struct RuntimeCounters {
     accepted_connections: AtomicU64,
     protocol_rejections: AtomicU64,
+    policy_rejections: AtomicU64,
     completed_connections: AtomicU64,
     failed_connections: AtomicU64,
     local_to_target_bytes: AtomicU64,
@@ -389,6 +395,7 @@ impl RuntimeCounters {
             listener_count,
             accepted_connections: self.accepted_connections.load(Ordering::Relaxed),
             protocol_rejections: self.protocol_rejections.load(Ordering::Relaxed),
+            policy_rejections: self.policy_rejections.load(Ordering::Relaxed),
             completed_connections: self.completed_connections.load(Ordering::Relaxed),
             failed_connections: self.failed_connections.load(Ordering::Relaxed),
             local_to_target_bytes: self.local_to_target_bytes.load(Ordering::Relaxed),
@@ -430,6 +437,22 @@ where
 
         match accepted {
             Ok(connection) => {
+                if !listener
+                    .descriptor()
+                    .allows_source(connection.context.source.ip())
+                {
+                    drop(connection);
+                    drop(permit);
+                    counters.policy_rejections.fetch_add(1, Ordering::Relaxed);
+                    emit(
+                        &events,
+                        ListenerRuntimeEvent::PolicyRejected {
+                            listener_id: listener_id.clone(),
+                            reason: "source address is not allowed".to_owned(),
+                        },
+                    );
+                    continue;
+                }
                 counters
                     .accepted_connections
                     .fetch_add(1, Ordering::Relaxed);
@@ -573,6 +596,7 @@ fn emit(events: &Option<ListenerRuntimeEventSender>, event: ListenerRuntimeEvent
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
@@ -600,6 +624,7 @@ mod tests {
                     id: ListenerId::new(id),
                     kind: ListenerKind::Http,
                     bind: "127.0.0.1:0".parse().expect("bind"),
+                    allowed_sources: Vec::new(),
                     authentication_required: false,
                 },
                 queue: Mutex::new(queue.into_iter().collect()),
@@ -675,12 +700,14 @@ mod tests {
                 id: ListenerId::new("http"),
                 kind: ListenerKind::Http,
                 bind: "127.0.0.1:0".parse().expect("HTTP bind"),
+                allowed_sources: Vec::new(),
                 authentication_required: false,
             },
             ListenerDescriptor {
                 id: ListenerId::new("socks"),
                 kind: ListenerKind::Socks5,
                 bind: "127.0.0.1:0".parse().expect("SOCKS bind"),
+                allowed_sources: Vec::new(),
                 authentication_required: false,
             },
         ];
@@ -709,6 +736,7 @@ mod tests {
                 id: ListenerId::new("tun"),
                 kind: ListenerKind::Tun,
                 bind: "127.0.0.1:15000".parse().expect("TUN bind"),
+                allowed_sources: Vec::new(),
                 authentication_required: false,
             }],
         )
@@ -728,6 +756,7 @@ mod tests {
             id: ListenerId::new("duplicate"),
             kind: ListenerKind::Http,
             bind: "127.0.0.1:0".parse().expect("HTTP bind"),
+            allowed_sources: Vec::new(),
             authentication_required: false,
         };
         let result = ListenerRuntime::bind_descriptors(
@@ -775,6 +804,40 @@ mod tests {
         shutdown.send(()).expect("shutdown receiver");
         let report = task.await.expect("runtime task").expect("runtime result");
         assert_eq!(report.protocol_rejections, 1);
+    }
+
+    #[tokio::test]
+    async fn disallowed_source_is_rejected_before_target_dial() {
+        let mut listener = ScriptedListener::new("restricted", [Ok(accepted(duplex(128).1))]);
+        listener.descriptor.allowed_sources = vec!["192.0.2.0/24".to_owned()];
+        let dial_calls = Arc::new(AtomicUsize::new(0));
+        let dial_calls_for_dialer = Arc::clone(&dial_calls);
+        let mut runtime = ListenerRuntime::new(FixedTargetDialer::new(move |_| {
+            dial_calls_for_dialer.fetch_add(1, AtomicOrdering::Relaxed);
+            Err::<DuplexStream, _>(FlowBridgeError::Dial("must not dial".to_owned()))
+        }));
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        runtime.set_event_sender(events);
+        runtime.add_listener(listener).expect("listener");
+        let (shutdown, signal) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            runtime
+                .run_until_shutdown(async move {
+                    let _ = signal.await;
+                })
+                .await
+        });
+        loop {
+            match receiver.recv().await {
+                Some(ListenerRuntimeEvent::PolicyRejected { .. }) => break,
+                Some(_) => {}
+                None => panic!("runtime event channel closed before policy rejection"),
+            }
+        }
+        shutdown.send(()).expect("shutdown receiver");
+        let report = task.await.expect("runtime task").expect("runtime result");
+        assert_eq!(report.policy_rejections, 1);
+        assert_eq!(dial_calls.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[tokio::test]

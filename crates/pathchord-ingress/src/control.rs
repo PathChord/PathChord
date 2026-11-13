@@ -1003,6 +1003,7 @@ mod tests {
             id: pathchord_policy::ListenerId::new(id),
             kind,
             bind: "127.0.0.1:8080".parse().expect("listener address"),
+            allowed_sources: Vec::new(),
             authentication_required: false,
         }
     }
