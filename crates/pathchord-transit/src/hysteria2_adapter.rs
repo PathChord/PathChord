@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{
     io,
+    io::IoSliceMut,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -16,7 +17,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::Request;
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, TransportConfig};
+use quinn::udp::{RecvMeta, Transmit};
+use quinn::{
+    AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, RecvStream, Runtime, SendStream,
+    TokioRuntime, TransportConfig, UdpPoller,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
 
@@ -30,6 +35,7 @@ pub(crate) struct Hysteria2Adapter {
     metadata: TransitMetadata,
     endpoint: TransitEndpoint,
     password: String,
+    obfs_password: Option<String>,
     tls: Arc<rustls::ClientConfig>,
     connect_timeout: Duration,
     udp_enabled: bool,
@@ -41,6 +47,111 @@ impl std::fmt::Debug for Hysteria2Adapter {
             .debug_struct("Hysteria2Adapter")
             .field("metadata", &self.metadata)
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct SalamanderSocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+    password: Vec<u8>,
+}
+
+impl SalamanderSocket {
+    fn new(inner: Arc<dyn AsyncUdpSocket>, password: &str) -> Self {
+        Self {
+            inner,
+            password: password.as_bytes().to_vec(),
+        }
+    }
+}
+
+impl AsyncUdpSocket for SalamanderSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        self.inner.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
+        if transmit.segment_size.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Hysteria2 Salamander does not support UDP segmentation",
+            ));
+        }
+        let mut salt = [0_u8; 8];
+        getrandom::fill(&mut salt)
+            .map_err(|_| io::Error::other("Hysteria2 Salamander salt generation failed"))?;
+        let encrypted =
+            crate::hysteria2_codec::salamander_encode(&self.password, transmit.contents, salt);
+        let transformed = Transmit {
+            destination: transmit.destination,
+            ecn: transmit.ecn,
+            contents: &encrypted,
+            segment_size: None,
+            src_ip: transmit.src_ip,
+        };
+        self.inner.try_send(&transformed)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        const MAX_DATAGRAM: usize = 64 * 1024;
+        let count = bufs.len().min(meta.len());
+        let mut storage = vec![0_u8; count * MAX_DATAGRAM];
+        let mut scratch = storage
+            .chunks_mut(MAX_DATAGRAM)
+            .map(IoSliceMut::new)
+            .collect::<Vec<_>>();
+        let mut scratch_meta = vec![RecvMeta::default(); count];
+        let received = match self.inner.poll_recv(cx, &mut scratch, &mut scratch_meta) {
+            Poll::Ready(Ok(value)) => value,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        };
+        drop(scratch);
+        let mut output = 0;
+        for (index, metadata) in scratch_meta.iter().enumerate().take(received) {
+            let raw_start = index * MAX_DATAGRAM;
+            let raw_end = raw_start.saturating_add(metadata.len).min(storage.len());
+            let Some(plain) = crate::hysteria2_codec::salamander_decode(
+                &self.password,
+                &storage[raw_start..raw_end],
+            ) else {
+                continue;
+            };
+            if plain.len() > bufs[output].len() {
+                continue;
+            }
+            bufs[output][..plain.len()].copy_from_slice(&plain);
+            meta[output] = RecvMeta {
+                addr: metadata.addr,
+                len: plain.len(),
+                stride: plain.len(),
+                ecn: metadata.ecn,
+                dst_ip: metadata.dst_ip,
+            };
+            output += 1;
+        }
+        Poll::Ready(Ok(output))
+    }
+
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    fn may_fragment(&self) -> bool {
+        false
     }
 }
 
@@ -64,6 +175,22 @@ impl Hysteria2Adapter {
         if password.is_empty() || password.len() > 1024 {
             return Err(TransitError::Unsupported(
                 "Hysteria2 password is invalid".into(),
+            ));
+        }
+        let obfs_password = credential.field("obfs_password").map(str::to_owned);
+        if let Some(obfs) = credential.field("obfs")
+            && obfs != "salamander"
+        {
+            return Err(TransitError::Unsupported(
+                "Hysteria2 only supports Salamander obfuscation".into(),
+            ));
+        }
+        if obfs_password
+            .as_deref()
+            .is_some_and(|value| value.len() < 4)
+        {
+            return Err(TransitError::Unsupported(
+                "Hysteria2 Salamander password is too short".into(),
             ));
         }
         let tls_options = config
@@ -92,6 +219,7 @@ impl Hysteria2Adapter {
                 port: config.endpoint.port,
             },
             password: password.to_owned(),
+            obfs_password,
             tls,
             connect_timeout: timeout,
             udp_enabled: config.options.udp != Some(false),
@@ -125,11 +253,22 @@ impl Hysteria2Adapter {
         } else {
             "0.0.0.0:0"
         };
-        let mut endpoint =
-            Endpoint::client(bind.parse().map_err(|_| {
+        let runtime: Arc<dyn Runtime> = Arc::new(TokioRuntime);
+        let std_socket =
+            std::net::UdpSocket::bind(bind.parse::<std::net::SocketAddr>().map_err(|_| {
                 TransitError::Connection("Hysteria2 local QUIC bind failed".into())
             })?)
-            .map_err(|_| TransitError::Connection("Hysteria2 QUIC endpoint failed".into()))?;
+            .map_err(|_| TransitError::Connection("Hysteria2 QUIC socket failed".into()))?;
+        let inner = runtime
+            .wrap_udp_socket(std_socket)
+            .map_err(|_| TransitError::Connection("Hysteria2 QUIC socket failed".into()))?;
+        let socket: Arc<dyn AsyncUdpSocket> = match &self.obfs_password {
+            Some(password) => Arc::new(SalamanderSocket::new(inner, password)),
+            None => inner,
+        };
+        let mut endpoint =
+            Endpoint::new_with_abstract_socket(EndpointConfig::default(), None, socket, runtime)
+                .map_err(|_| TransitError::Connection("Hysteria2 QUIC endpoint failed".into()))?;
         endpoint.set_default_client_config(config);
         let connection = timeout(
             self.connect_timeout,
@@ -432,6 +571,7 @@ mod tests {
                 "listen": "127.0.0.1",
                 "listen_port": port,
                 "users": [{"password": "pathchord-hysteria-password"}],
+                "obfs": {"type": "salamander", "password": "pathchord-salamander"},
                 "tls": {
                     "enabled": true,
                     "server_name": "hysteria.test",
@@ -490,10 +630,11 @@ mod tests {
             insecure: true,
             ..Default::default()
         });
-        let credentials = TransitCredential::new(BTreeMap::from([(
-            "password".into(),
-            "pathchord-hysteria-password".into(),
-        )]));
+        let credentials = TransitCredential::new(BTreeMap::from([
+            ("password".into(), "pathchord-hysteria-password".into()),
+            ("obfs".into(), "salamander".into()),
+            ("obfs_password".into(), "pathchord-salamander".into()),
+        ]));
         let adapter = Hysteria2Adapter::from_config(
             &config,
             &credentials,
