@@ -107,6 +107,13 @@ in the current scope.
 - AnyTLS has a bounded pure-Rust frame and password-authentication codec, but
   remains unregistered until its TLS/session lifecycle and independent
   interoperability fixture are complete.
+- Hysteria2 and Reality now have bounded pure-Rust wire/crypto codecs with
+  unit vectors, but no native adapters are registered until QUIC/TLS session
+  ownership and independent peer interoperability are complete.
+- Hysteria2 has a bounded pure-Rust wire layer for QUIC varints, TCP/UDP relay
+  records, authentication fields, and Salamander obfuscation. It remains
+  unregistered until the native QUIC/HTTP3 session driver and independent
+  interoperability fixture are complete.
 - Imported complete sing-box documents are retained as opaque unavailable-node
   diagnostics. PathChord does not start or embed a compatibility process.
 - Subscription refresh supports automatic detection, Clash/Mihomo, SIP008

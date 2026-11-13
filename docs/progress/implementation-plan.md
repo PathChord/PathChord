@@ -74,6 +74,12 @@ until its wire and obfuscation implementation is complete.
    A pure-Rust AnyTLS frame/authentication codec now exists as an unregistered
    protocol layer; it must gain TLS/session handshake, SYN/SYNACK, settings,
    padding lifecycle, and sing-box interoperability before registration.
+   Hysteria2 and Reality wire/crypto codecs follow the same rule: codec tests
+   alone do not register a transport adapter; QUIC/TLS ownership and peer
+   interoperability must be proven first.
+   Hysteria2 now has an unregistered pure-Rust wire layer for QUIC varints,
+   TCP/UDP relay messages, auth bounds, and Salamander obfuscation; the QUIC
+   and HTTP/3 session driver remains to be implemented natively.
 5. Connect the Prometheus endpoint and structured observations to deployed
    monitoring, alerts, and dashboards. Keep live gauges distinct from
    historical counters, and measure production probe/autoscaler constants.

@@ -31,7 +31,7 @@ pub(crate) fn configure(
     }
     if options.fingerprint.is_some() || options.reality.is_some() {
         return Err(TransitError::Unsupported(
-            "TLS fingerprint and Reality require the configured outbound engine".into(),
+            "TLS fingerprint and Reality require a native Reality adapter".into(),
         ));
     }
     let mut config = if options.certificate.is_empty()
