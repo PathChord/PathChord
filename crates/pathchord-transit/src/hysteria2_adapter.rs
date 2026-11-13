@@ -13,6 +13,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use http::Request;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, TransportConfig};
@@ -31,6 +32,7 @@ pub(crate) struct Hysteria2Adapter {
     password: String,
     tls: Arc<rustls::ClientConfig>,
     connect_timeout: Duration,
+    udp_enabled: bool,
 }
 
 impl std::fmt::Debug for Hysteria2Adapter {
@@ -92,6 +94,7 @@ impl Hysteria2Adapter {
             password: password.to_owned(),
             tls,
             connect_timeout: timeout,
+            udp_enabled: config.options.udp != Some(false),
         })
     }
 
@@ -146,20 +149,8 @@ impl Hysteria2Adapter {
         });
         Ok(connection)
     }
-}
 
-#[async_trait]
-impl TransitAdapter for Hysteria2Adapter {
-    fn metadata(&self) -> &TransitMetadata {
-        &self.metadata
-    }
-
-    async fn connect(
-        &self,
-        request: ConnectRequest,
-    ) -> Result<BoxedTransitConnection, TransitError> {
-        crate::validate_destination(&request.destination)?;
-        let connection = self.connect_session().await?;
+    async fn authenticate(&self, connection: &quinn::Connection) -> Result<bool, TransitError> {
         let h3_connection = h3_quinn::Connection::new(connection.clone());
         let (_driver, mut sender) = h3::client::new(h3_connection)
             .await
@@ -172,7 +163,6 @@ impl TransitAdapter for Hysteria2Adapter {
         let fields = auth
             .fields()
             .map_err(|message| TransitError::Unsupported(message.into()))?;
-        let destination = format!("{}:{}", request.destination.host, request.destination.port);
         let http_request = Request::builder()
             .method("POST")
             .uri("https://hysteria/auth")
@@ -198,6 +188,28 @@ impl TransitAdapter for Hysteria2Adapter {
                 "Hysteria2 authentication rejected".into(),
             ));
         }
+        Ok(response
+            .headers()
+            .get("hysteria-udp")
+            .and_then(|value| value.to_str().ok())
+            == Some("true"))
+    }
+}
+
+#[async_trait]
+impl TransitAdapter for Hysteria2Adapter {
+    fn metadata(&self) -> &TransitMetadata {
+        &self.metadata
+    }
+
+    async fn connect(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<BoxedTransitConnection, TransitError> {
+        crate::validate_destination(&request.destination)?;
+        let connection = self.connect_session().await?;
+        self.authenticate(&connection).await?;
+        let destination = format!("{}:{}", request.destination.host, request.destination.port);
         let (mut send, recv) = connection
             .open_bi()
             .await
@@ -217,6 +229,38 @@ impl TransitAdapter for Hysteria2Adapter {
             leftover_pos: 0,
         }))
     }
+
+    fn supports_udp(&self) -> bool {
+        self.udp_enabled
+    }
+
+    async fn connect_udp(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<crate::BoxedTransitDatagram, TransitError> {
+        if !self.udp_enabled {
+            return Err(TransitError::Unsupported(
+                "Hysteria2 UDP is disabled".into(),
+            ));
+        }
+        crate::validate_destination(&request.destination)?;
+        let connection = self.connect_session().await?;
+        if !self.authenticate(&connection).await? {
+            return Err(TransitError::Unsupported(
+                "Hysteria2 server did not advertise UDP relay".into(),
+            ));
+        }
+        let mut id_bytes = [0_u8; 4];
+        getrandom::fill(&mut id_bytes).map_err(|_| {
+            TransitError::Connection("Hysteria2 session id generation failed".into())
+        })?;
+        Ok(Box::new(Hysteria2Datagram {
+            connection,
+            session_id: u32::from_be_bytes(id_bytes),
+            packet_id: 0,
+            destination: format!("{}:{}", request.destination.host, request.destination.port),
+        }))
+    }
 }
 
 struct Hysteria2Stream {
@@ -226,6 +270,64 @@ struct Hysteria2Stream {
     response_buffer: Vec<u8>,
     leftover: Vec<u8>,
     leftover_pos: usize,
+}
+
+struct Hysteria2Datagram {
+    connection: quinn::Connection,
+    session_id: u32,
+    packet_id: u16,
+    destination: String,
+}
+
+impl std::fmt::Debug for Hysteria2Datagram {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Hysteria2Datagram")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl crate::TransitDatagram for Hysteria2Datagram {
+    async fn send(&mut self, payload: &[u8]) -> Result<(), TransitError> {
+        let packet = crate::hysteria2_codec::UdpMessage {
+            session_id: self.session_id,
+            packet_id: self.packet_id,
+            fragment_id: 0,
+            fragment_count: 1,
+            address: self.destination.clone(),
+            payload: payload.to_vec(),
+        };
+        self.packet_id = self.packet_id.wrapping_add(1);
+        let encoded = crate::hysteria2_codec::encode_udp_message(&packet)
+            .map_err(|message| TransitError::Unsupported(message.into()))?;
+        self.connection
+            .send_datagram(Bytes::from(encoded))
+            .map_err(|_| TransitError::Connection("Hysteria2 UDP datagram send failed".into()))
+    }
+
+    async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
+        let encoded = self.connection.read_datagram().await.map_err(|_| {
+            TransitError::Connection("Hysteria2 UDP datagram receive failed".into())
+        })?;
+        let packet = crate::hysteria2_codec::decode_udp_message(&encoded)
+            .map_err(|message| TransitError::Protocol(message.into()))?;
+        if packet.session_id != self.session_id
+            || packet.fragment_count != 1
+            || packet.fragment_id != 0
+        {
+            return Err(TransitError::Protocol(
+                "Hysteria2 UDP fragment is unsupported".into(),
+            ));
+        }
+        Ok(packet.payload)
+    }
+
+    async fn close(self: Box<Self>) -> Result<(), TransitError> {
+        self.connection.close(0u32.into(), b"closed");
+        Ok(())
+    }
 }
 
 impl AsyncRead for Hysteria2Stream {
