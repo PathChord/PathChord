@@ -22,8 +22,12 @@ mod anytls_codec;
 mod credential_provider;
 mod datagram;
 mod http_connect_adapter;
+#[allow(dead_code)]
+mod hysteria2_codec;
 mod native_protocol;
 mod native_transport;
+#[allow(dead_code)]
+mod reality_codec;
 mod shadowsocks_adapter;
 mod socks5_adapter;
 mod subscription;
@@ -194,7 +198,7 @@ pub trait TransitAdapter: Send + Sync {
         true
     }
 
-    /// Validates an optional external backend before publishing this adapter.
+    /// Validates the native adapter before publishing it to runtime.
     async fn prepare(&self) -> Result<(), TransitError> {
         Ok(())
     }
