@@ -14,7 +14,8 @@ use pathchord_egress::{
 };
 use pathchord_noise::{WIRE_PROFILE_V1_PROLOGUE_PREFIX, generate_static_keypair};
 use pathchord_path::{
-    AuthorizationState, PathAuthorization, SinglePathHandshakeConfig, SinglePathOutcome,
+    AuthorizationState, EgressPathSession, IngressPathSession, NoiseRecordStream,
+    PathAuthorization, PathSessionConfig, SinglePathHandshakeConfig, SinglePathOutcome,
     StreamOpenDecision, StreamOpener, establish_single_path,
 };
 
@@ -177,4 +178,48 @@ async fn routes_stream_open_to_fake_egress_and_replays_without_redial() {
     );
     assert_eq!(connector.calls(), 1);
     assert_eq!(opener.egress.active_connection_count(), 1);
+}
+
+#[tokio::test]
+async fn runs_stream_open_through_both_async_path_session_owners() {
+    let ready = admitted_path();
+    let config = handshake_config();
+    let (initiator_transport, responder_transport) = ready.into_transports();
+    let (left, right) = tokio::io::duplex(16 * 1024);
+    let limits = config.local_limits;
+    let session_config = PathSessionConfig {
+        session_id: config.session_id,
+        path_id: config.path_id,
+        limits,
+    };
+    let mut ingress = IngressPathSession::new(
+        NoiseRecordStream::new(left, initiator_transport, limits),
+        session_config,
+        2,
+    );
+    let connector = CountingConnector::default();
+    let mut opener = FakeEgressOpener {
+        egress: FakeEgress::new(connector.clone()),
+        session_id: config.session_id,
+    };
+    opener.egress.register_session(config.session_id);
+    let mut egress = EgressPathSession::new(
+        NoiseRecordStream::new(right, responder_transport, limits),
+        opener,
+        session_config,
+        2,
+    );
+    let request = request();
+    let server = tokio::spawn(async move { egress.serve_once().await });
+    let decision = ingress
+        .open_stream(request)
+        .await
+        .expect("ingress Stream open");
+    let served = server
+        .await
+        .expect("egress task")
+        .expect("egress Stream open")
+        .expect("frame received");
+    assert_eq!(decision, served);
+    assert_eq!(connector.calls(), 1);
 }

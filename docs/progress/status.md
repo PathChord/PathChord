@@ -67,6 +67,10 @@ separate from `docs/design/`, which describes the intended architecture, and
   it segments the wire-profile record envelope, authenticates complete frames,
   and has a duplex integration test. `pathchord-transit` provides a bounded
   direct TCP adapter at the byte-transport boundary.
+- `pathchord-path` now provides transport-neutral Ingress/Egress Path session
+  owners for one `STREAM_OPEN` exchange. They run over the record adapter,
+  invoke the injected Egress opener, and are covered by a cross-crate
+  FakeEgress integration test.
 - The local listener list query now validates pagination/filter/sort fields,
   returns deterministic pages, and system-proxy mutations honor supplied
   configuration generation preconditions.
@@ -84,7 +88,8 @@ separate from `docs/design/`, which describes the intended architecture, and
   loop or Session manager; its Stream opener is still an injected
   transport-neutral boundary. A cross-crate test now routes `STREAM_OPEN`
   through `FakeEgress` and verifies target-dial idempotency.
-- The direct Transit and record adapters are not yet owned by a live Session
+- The direct Transit, record, and single-Stream session owners are not yet
+  connected to the CLI listener runtime or a reconnecting production Session
   manager; CLI ingress still uses the bootstrap direct target bridge.
 - The Session/Path end-to-end proxy data plane is not operational.
 - Named Pipe transport, persistent authorization and metadata stores,
