@@ -50,10 +50,12 @@ use pathchord_noise::{StaticKeypair, generate_static_keypair};
 #[cfg(test)]
 use pathchord_policy::FallbackAction;
 use pathchord_policy::{
-    AuthenticationMode, FlowProtocol, Generation, KubeConfig, ListenerConfig,
+    AuthenticationMode, FlowProtocol, Generation, ListenerConfig,
     ListenerKind as PolicyListenerKind, PolicyConfig, RuntimeNodeState, SubscriptionSourceType,
     TransitProxyRuntimeStatus,
 };
+
+mod configuration;
 use pathchord_transit::{
     AdapterRegistry, DynamicNodeState, DynamicTransitSnapshot, FileTransitCredentialProvider,
     HttpSubscriptionFetcher, RefreshOutcome, SubscriptionCredentialProvider, SubscriptionManager,
@@ -112,9 +114,12 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct IngressArgs {
-    /// Kubernetes-style PathChord configuration YAML.
-    #[arg(long, default_value = "pathchord.yaml")]
-    pub config: PathBuf,
+    /// Resource file or directory; overrides PATHCHORD_CONFIG and the account default.
+    #[arg(short = 'c', long, conflicts_with = "config_dir")]
+    pub config: Option<PathBuf>,
+    /// Configuration directory; overrides PATHCHORD_CONFIG_DIR and the account default.
+    #[arg(short = 'C', long, conflicts_with = "config")]
+    pub config_dir: Option<PathBuf>,
     /// Canonical Ingress identity used during Session attachment.
     #[arg(long, default_value = "local-ingress")]
     pub ingress_id: String,
@@ -276,6 +281,13 @@ impl Command {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("configuration source selection failed: {0}")]
+    ConfigurationSource(#[from] configuration::ConfigurationError),
+    #[error("configuration source {path} could not be loaded: {source}")]
+    ConfigurationLoad {
+        path: PathBuf,
+        source: pathchord_ingress::ReloadError,
+    },
     #[error("local control protocol failed: {0}")]
     LocalProtocol(#[from] LocalProtocolError),
     #[error("local control transport is unsupported on {platform}")]
@@ -605,15 +617,22 @@ async fn run_enrollment(
 }
 
 async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), CliError> {
-    let yaml = std::fs::read_to_string(&args.config).map_err(|source| CliError::ConfigRead {
-        path: args.config.clone(),
-        source,
-    })?;
-    let kube_config = KubeConfig::from_yaml(&yaml)?;
-    let policy = kube_config.into_validated_snapshot(Generation::new(1))?;
-    let policy_config = policy.config().clone();
-    let reloader = ConfigHotReloader::bind(&args.config, 1).await?;
+    let source = configuration::ConfigSelection::resolve(
+        args.config.as_deref(),
+        args.config_dir.as_deref(),
+    )?;
+    source.validate()?;
+    let reloader = ConfigHotReloader::bind(source.path.clone(), 1)
+        .await
+        .map_err(|error| CliError::ConfigurationLoad {
+            path: source.path,
+            source: error,
+        })?;
     let reload_handle = reloader.handle();
+    let policy_config = (*reload_handle.snapshot()?.config).clone();
+    let policy =
+        pathchord_policy::ValidatedPolicySnapshot::new(Generation::new(1), policy_config.clone())
+            .map_err(pathchord_policy::ConfigError::from)?;
     let identity = match args.identity {
         Some(path) => load_identity(&path)?,
         None if policy_config.egresses.is_empty() => generate_static_keypair()?,
@@ -2104,8 +2123,36 @@ mod tests {
             .expect("ingress args");
         assert!(matches!(
             cli.command,
-            Command::Ingress(IngressArgs { config, .. }) if config.as_os_str() == "config.yaml"
+            Command::Ingress(IngressArgs { config: Some(config), .. }) if config.as_os_str() == "config.yaml"
         ));
+    }
+
+    #[test]
+    fn parses_a_configuration_directory_without_an_implicit_working_directory_file() {
+        let cli = Cli::try_parse_from(["pathchord", "ingress", "--config-dir", "conf.d"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Ingress(IngressArgs { config: None, config_dir: Some(directory), .. }) if directory == std::path::Path::new("conf.d"))
+        );
+        let cli = Cli::try_parse_from(["pathchord", "ingress"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Ingress(IngressArgs {
+                config: None,
+                config_dir: None,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "pathchord",
+                "ingress",
+                "--config",
+                "a.yaml",
+                "--config-dir",
+                "conf.d"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

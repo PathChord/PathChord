@@ -2154,6 +2154,7 @@ dependencies = [
  "base64",
  "clap",
  "getrandom 0.4.3",
+ "nix",
  "pathchord-core",
  "pathchord-egress",
  "pathchord-ingress",

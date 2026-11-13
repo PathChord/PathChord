@@ -125,6 +125,11 @@ Transparent entry does not perform domain routing. HTTP/SOCKS requests may route
 
 ## 11. Configuration lifecycle
 
+A single file or directory bundle defines one resource graph. Ingress chooses
+an explicit command-line source before environment configuration and account
+defaults. Directory files are loaded deterministically, validated together,
+and published as one snapshot; failed candidates retain the prior graph.
+
 Egress topology, Egress public keys, and Ingress local private keys are static and require Ingress restart when changed. Transit Proxy lists are runtime data, refreshed from subscriptions into a disk cache and hot-reloaded. Failed refreshes keep the current list; deleted subscription Proxies drain.
 
 Static rule configuration is compiled at startup. Subscription-derived data and

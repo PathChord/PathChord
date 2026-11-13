@@ -572,20 +572,29 @@ pub enum ConfigError {
 
 impl KubeConfig {
     pub fn from_yaml(input: &str) -> Result<Self, ConfigError> {
+        Self::from_documents([input])
+    }
+
+    /// Parses independent source files before validating their combined graph.
+    pub fn from_documents<'a>(
+        inputs: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, ConfigError> {
         let mut values = Vec::new();
-        for value in serde_yaml::from_str_multi::<Value>(input)? {
-            if value == Value::Null {
-                continue;
-            }
-            if kind_of(&value)? == "List" {
-                let list: ResourceList = serde_yaml::from_value(value)?;
-                check_api_version(&list.api_version)?;
-                if list.kind != "List" {
-                    return Err(ConfigError::InvalidEnvelope("kind must be List".into()));
+        for input in inputs {
+            for value in serde_yaml::from_str_multi::<Value>(input)? {
+                if value == Value::Null {
+                    continue;
                 }
-                values.extend(list.items);
-            } else {
-                values.push(value);
+                if kind_of(&value)? == "List" {
+                    let list: ResourceList = serde_yaml::from_value(value)?;
+                    check_api_version(&list.api_version)?;
+                    if list.kind != "List" {
+                        return Err(ConfigError::InvalidEnvelope("kind must be List".into()));
+                    }
+                    values.extend(list.items);
+                } else {
+                    values.push(value);
+                }
             }
         }
 
@@ -603,6 +612,7 @@ impl KubeConfig {
             }
             resources.push(resource);
         }
+        resources.sort_by(|left, right| left.key().cmp(&right.key()));
         validate_resource_set(&resources)?;
         Ok(Self { resources })
     }
@@ -2340,6 +2350,36 @@ spec:
 "#;
         let config = KubeConfig::from_yaml(input).expect("multi-document config");
         assert_eq!(config.resources.len(), 3);
+    }
+
+    #[test]
+    fn independent_documents_form_one_validated_resource_graph() {
+        let base = include_str!("../../../examples/ingress-direct.yaml");
+        let split: Vec<_> = base.split("\n---\n").collect();
+        assert!(
+            split
+                .iter()
+                .all(|source| KubeConfig::from_yaml(source).is_err())
+        );
+        let policy = KubeConfig::from_documents(split.iter().copied())
+            .unwrap()
+            .into_validated_snapshot(Generation::new(1))
+            .unwrap();
+        assert_eq!(policy.config().listeners.len(), 1);
+        let duplicate = KubeConfig::from_documents([base, split[0]]).unwrap_err();
+        assert!(matches!(duplicate, ConfigError::DuplicateResource { .. }));
+        let forward = KubeConfig::from_documents(split.iter().copied())
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        let reversed = KubeConfig::from_documents(split.iter().rev().copied())
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(
+            forward, reversed,
+            "source filename order must not alter resource identity or restart semantics"
+        );
     }
 
     #[test]

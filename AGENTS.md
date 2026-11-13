@@ -18,6 +18,12 @@ cargo test --locked --workspace --all-targets
 
 For documentation changes, also run `git diff --check` and `rg -n '^#{1,6} ' README.md README.zh-CN.md docs AGENTS.md`.
 
+Ingress configuration source precedence is command line, then
+`PATHCHORD_CONFIG` / `PATHCHORD_CONFIG_DIR`, then the account default:
+`~/.config/pathchord` for regular users and `/etc/pathchord` for root/service
+accounts. Directory resource files form one validated graph; do not add
+last-file-wins semantics or a working-directory default fallback.
+
 ## Documentation taxonomy
 
 Treat the three documentation sets as strict content boundaries:

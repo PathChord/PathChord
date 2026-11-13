@@ -23,6 +23,13 @@ in the current scope.
 
 ## Implemented
 
+- Ingress accepts a single file or recursively loaded YAML/YML/JSON directory.
+  CLI source options override `PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`, which
+  override `~/.config/pathchord` or `/etc/pathchord` for root/service accounts.
+  Files form one validated graph with global references and duplicate checks.
+  Directory changes and atomic replacement reload the complete candidate;
+  invalid candidates retain the last good snapshot.
+
 - The eight-crate Rust workspace builds on Linux and cross-checks for Windows
   GNU and FreeBSD x86_64. Core frame/message codecs, state machines, bounded
   reliability buffers, wire vectors, and UDP/Path lifecycle payloads are
@@ -194,7 +201,7 @@ subscription normalization, and fault/retransmission cases. The dependency
 graph excludes the previously unmaintained `paste` path from the TUN adapter
 feature set.
 
-The Linux workspace run with the pinned backend available passes 450 tests,
+The Linux workspace run with the pinned backend available passes 465 tests,
 including the two normally ignored engine interoperability tests. The portable explicit-listener
 integration test binds listeners for the actual host platform and checks HTTP
 CONNECT, SOCKS5 CONNECT, SOCKS5 UDP ASSOCIATE, TCP half-close, and cancellation
@@ -221,6 +228,14 @@ engine schema/process cleanup, node queries, and authenticated Prometheus
 export. Engine tests run explicitly with `PATHCHORD_TEST_SING_BOX` pointing to
 sing-box 1.14.4 and `--include-ignored`; the normal Rust CI does not require an
 installed backend executable.
+
+Configuration-source coverage includes recursive split-resource loading,
+cross-file references, duplicate rejection, account defaults and override
+precedence, bounded discovery/reads, directory add/update/rename/remove,
+atomic file/root replacement, invalid-candidate retention, and no restart for
+unchanged resources moved between files. The CLI process smoke test uses a
+directory bundle while conflicting environment sources are present, proving
+the command-line override is effective.
 
 The FreeBSD target check and CLI build use Zig 0.17.1 C/C++ compiler and archiver
 wrappers with the official FreeBSD 15.1 SDK, including the bundled SQLite and

@@ -45,6 +45,14 @@ fn spawn(arguments: &[&str], directory: &Path) -> Process {
         Command::new(BIN)
             .args(arguments)
             .current_dir(directory)
+            .env(
+                "PATHCHORD_CONFIG",
+                directory.join("ignored-environment.yaml"),
+            )
+            .env(
+                "PATHCHORD_CONFIG_DIR",
+                directory.join("ignored-environment.d"),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -169,10 +177,13 @@ kind: FallbackPolicy
 metadata: {{name: default}}
 spec: {{action: reject}}
 "#, public = egress_public["public_key"].as_str().unwrap());
-        let config_path = directory.0.join("ingress.yaml");
-        std::fs::write(&config_path, yaml).unwrap();
+        let config_path = directory.0.join("conf.d");
+        std::fs::create_dir(&config_path).unwrap();
+        for (index, document) in yaml.split("\n---\n").enumerate() {
+            std::fs::write(config_path.join(format!("{index:02}.yaml")), document).unwrap();
+        }
         let mut ingress = spawn(&["--socket", ingress_socket.to_str().unwrap(), "ingress", "--ingress-id", "entry",
-            "--config", config_path.to_str().unwrap(), "--identity", ingress_key.to_str().unwrap()], &directory.0);
+            "--config-dir", config_path.to_str().unwrap(), "--identity", ingress_key.to_str().unwrap()], &directory.0);
         wait_for_socket(&ingress_socket, &mut ingress).await;
         assert_eq!(command_json(&["--socket", ingress_socket.to_str().unwrap(), "status"])["ok"], true);
 
