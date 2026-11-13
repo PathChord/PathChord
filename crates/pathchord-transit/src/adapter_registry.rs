@@ -43,7 +43,16 @@ where
     #[must_use]
     pub fn available_protocols(&self) -> BTreeSet<String> {
         let protocols: BTreeSet<_> = [
-            "direct", "http", "https", "socks5", "ss", "vless", "trojan", "vmess", "anytls",
+            "direct",
+            "http",
+            "https",
+            "socks5",
+            "ss",
+            "vless",
+            "trojan",
+            "vmess",
+            "anytls",
+            "hysteria2",
         ]
         .map(str::to_owned)
         .into();
@@ -183,6 +192,12 @@ where
                 Arc::clone(&self.tls),
             )?),
             "anytls" => Arc::new(crate::anytls_adapter::AnyTlsAdapter::from_config(
+                config,
+                credential,
+                self.connect_timeout,
+                Arc::clone(&self.tls),
+            )?),
+            "hysteria2" => Arc::new(crate::hysteria2_adapter::Hysteria2Adapter::from_config(
                 config,
                 credential,
                 self.connect_timeout,

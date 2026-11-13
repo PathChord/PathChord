@@ -15,6 +15,10 @@ base64.workspace = true
 getrandom.workspace = true
 bytes.workspace = true
 blake2 = "0.10.6"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
 trojan-proto = "=0.18.0"
 sha2 = "0.10.9"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
