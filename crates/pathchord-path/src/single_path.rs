@@ -169,10 +169,13 @@ impl SinglePathReady {
             }
         };
 
-        let decision = opener
-            .open_stream(received_request)
-            .await
-            .map_err(|error| SinglePathError::StreamOpener(error.to_string()))?;
+        let decision = match opener.open_stream(received_request).await {
+            Ok(decision) => decision,
+            Err(error) => StreamOpenDecision::Rejected {
+                error: ErrorClass::TargetFailure,
+                reason: error.to_string().into_bytes(),
+            },
+        };
         let response_seq = self
             .responder_transport
             .next_send_nonce()
@@ -330,20 +333,6 @@ pub fn establish_single_path(
     let received_hello = responder_transport.open_frame(&sealed_hello, config.local_limits)?;
     validate_hello(&received_hello, config)?;
 
-    let negotiated_capabilities = config.offered_capabilities & config.supported_capabilities;
-    if config.offered_capabilities & config.required_capabilities != config.required_capabilities
-        || config.supported_capabilities & config.required_capabilities
-            != config.required_capabilities
-    {
-        return reject(
-            &mut initiator_transport,
-            &mut responder_transport,
-            config,
-            ErrorClass::EgressFailure,
-            b"required capability is unavailable",
-        );
-    }
-
     let attach = Message::SessionAttach(SessionAttach {
         ingress_id: config.ingress_id.clone(),
         session_id: config.session_id,
@@ -360,6 +349,20 @@ pub fn establish_single_path(
     let sealed_attach = initiator_transport.seal_frame(&attach_frame, config.local_limits)?;
     let received_attach = responder_transport.open_frame(&sealed_attach, config.local_limits)?;
     validate_attach(&received_attach, config)?;
+
+    let negotiated_capabilities = config.offered_capabilities & config.supported_capabilities;
+    if config.offered_capabilities & config.required_capabilities != config.required_capabilities
+        || config.supported_capabilities & config.required_capabilities
+            != config.required_capabilities
+    {
+        return reject(
+            &mut initiator_transport,
+            &mut responder_transport,
+            config,
+            ErrorClass::EgressFailure,
+            b"required capability is unavailable",
+        );
+    }
 
     let authorization_error = match authorization.state {
         AuthorizationState::Enabled if authenticated_key == authorization.public_key => None,
@@ -454,6 +457,7 @@ fn validate_config(
     }
     if std::str::from_utf8(&authorization.ingress_id).is_err()
         || authorization.ingress_id.len() > ProtocolLimits::HARD_MAX_TARGET_NAME
+        || !valid_identifier(&authorization.ingress_id)
     {
         return Err(SinglePathError::InvalidIdentity);
     }
@@ -463,6 +467,8 @@ fn validate_config(
         || std::str::from_utf8(&config.egress_id).is_err()
         || config.ingress_id.len() > ProtocolLimits::HARD_MAX_TARGET_NAME
         || config.egress_id.len() > ProtocolLimits::HARD_MAX_TARGET_NAME
+        || !valid_identifier(&config.ingress_id)
+        || !valid_identifier(&config.egress_id)
     {
         return Err(SinglePathError::InvalidIdentity);
     }
@@ -472,6 +478,17 @@ fn validate_config(
         return Err(SinglePathError::InvalidIdentity);
     }
     validate_ready_limits(&config.ready_limits, config.local_limits)
+}
+
+fn valid_identifier(value: &[u8]) -> bool {
+    let Some(first) = value.first() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && value
+            .iter()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
 }
 
 fn validate_ready_limits(
