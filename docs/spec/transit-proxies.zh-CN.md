@@ -20,7 +20,7 @@
 | `vmess` | 使用 AES-128-GCM 正文记录、`alter_id: 0` 的明文 TCP | TLS、WebSocket、UDP、mux 及其他扩展选项 |
 | `trojan` | TLS 封装的 TCP、WebSocket 和 WSS 字节传输 | 扩展传输选项 |
 | `anytls` | TLS 流、认证、settings、SYN/SYNACK、PUSH/FIN 和 heartbeat 帧 | 扩展 session 与 UDP 模式 |
-| `hysteria2` | 原生 QUIC/TLS + HTTP/3 认证、TCP relay 和 UDP relay；obfs/端口跳转暂不支持 | 对不支持的选项返回类型化不可用诊断 |
+| `hysteria2` | 原生 QUIC/TLS + HTTP/3 认证、TCP/UDP relay 和 Salamander obfs；Gecko obfs/端口跳转暂不支持 | 对不支持的选项返回类型化不可用诊断 |
 | `tuic` | 原生 QUIC/TLS-exporter TCP CONNECT；UDP/0-RTT 暂不支持 | 对不支持的选项返回类型化不可用诊断 |
 | `xtls`、`hysteria`、`ssh`、`shadowtls` | 原生适配器实现中 | 注册原生适配器前返回类型化不可用诊断 |
 | `wireguard` | 无原生适配器 | 完整的用户态 WireGuard endpoint 文档 |
