@@ -18,6 +18,8 @@ mod adapter_registry;
 // its TLS/session handshake is completed; it is not registered as a node
 // backend until an interop fixture covers the full session lifecycle.
 #[allow(dead_code)]
+mod anytls_adapter;
+#[allow(dead_code)]
 mod anytls_codec;
 mod credential_provider;
 mod datagram;
