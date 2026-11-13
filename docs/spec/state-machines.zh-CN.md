@@ -170,7 +170,7 @@ APPLIED → FAILED
 FAILED → APPLYING
 ```
 
-`APPLYING` MUST 验证请求的 `listener_id` 在 Windows 上解析为 HTTP 或 SOCKS Listener。对已选择的
+`APPLYING` MUST 验证请求的 `listener_id` 在 Windows 上解析为 HTTP、SOCKS 或 Mixed Listener。对已选择的
 同一 Listener 重复启用MUST 幂等，返回当前已应用状态，MUST NOT 重新覆盖已保存值。`APPLIED` MUST 记录
 环境变量和操作系统代理的精确旧值。Disable MUST 恢复这些值；恢复失败进入 `FAILED`，保留已保存值，
 且MUST NOT 报告为 `DISABLED`。Linux 和 FreeBSD 对 enable/disable MUST 返回 `UNSUPPORTED_OPERATION`，MUST NOT 进入此状态机。

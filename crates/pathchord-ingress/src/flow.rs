@@ -1,9 +1,9 @@
 //! Transport-neutral direct TCP flow bridging.
 //!
 //! Listener adapters stop after producing an [`AcceptedConnection`]. This
-//! module owns the narrow next step: an injected target dialer supplies a
-//! target byte stream, and Tokio copies bytes in both directions. Session and
-//! Path multiplexing remain outside this direct bridge.
+//! module dispatches ordinary HTTP to message forwarding and uses an injected
+//! target opener for CONNECT, SOCKS, and raw TCP byte bridging. Session and
+//! Path multiplexing remain owned by that opener.
 
 use async_trait::async_trait;
 use pathchord_core::ErrorClass;
@@ -75,6 +75,12 @@ where
         context,
         response,
     } = accepted;
+    let response = match response {
+        ConnectionResponse::HttpForward(config) => {
+            return crate::http_forward::forward_connection(io, context, dialer, config).await;
+        }
+        other => other,
+    };
     let mut target = match dialer.connect(context).await {
         Ok(target) => {
             send_success(&mut io, response).await?;
@@ -99,8 +105,9 @@ async fn send_success(
     response: ConnectionResponse,
 ) -> Result<(), FlowBridgeError> {
     let bytes: &[u8] = match response {
-        ConnectionResponse::None => return Ok(()),
+        ConnectionResponse::None | ConnectionResponse::HttpForward(_) => return Ok(()),
         ConnectionResponse::HttpConnect => HTTP_CONNECTED,
+        ConnectionResponse::Socks4 => &[0, 90, 0, 0, 0, 0, 0, 0],
         ConnectionResponse::Socks5 => &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0],
     };
     io.write_all(bytes)
@@ -117,12 +124,13 @@ async fn send_failure(
     error: &FlowBridgeError,
 ) -> Result<(), FlowBridgeError> {
     let bytes: &[u8] = match response {
-        ConnectionResponse::None => return Ok(()),
+        ConnectionResponse::None | ConnectionResponse::HttpForward(_) => return Ok(()),
         ConnectionResponse::HttpConnect => match error {
             FlowBridgeError::PolicyRejected => HTTP_FORBIDDEN,
             FlowBridgeError::EgressRejected { .. } | FlowBridgeError::Dial(_) => HTTP_BAD_GATEWAY,
             _ => HTTP_UNAVAILABLE,
         },
+        ConnectionResponse::Socks4 => &[0, 91, 0, 0, 0, 0, 0, 0],
         ConnectionResponse::Socks5 => {
             let code = match error {
                 FlowBridgeError::PolicyRejected => 2,
@@ -152,6 +160,9 @@ impl AcceptedConnection {
     /// Completes the local proxy handshake after the remote TCP flow has opened.
     /// Runtime owners normally call this through [`bridge_connection`].
     pub async fn confirm_success(&mut self) -> Result<(), FlowBridgeError> {
+        if matches!(self.response, ConnectionResponse::HttpForward(_)) {
+            return Ok(());
+        }
         let response = std::mem::replace(&mut self.response, ConnectionResponse::None);
         send_success(&mut self.io, response).await
     }
@@ -309,6 +320,27 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn reports_policy_and_target_failures_with_a_socks4_rejection() {
+        for failure in [
+            FlowBridgeError::PolicyRejected,
+            FlowBridgeError::Dial("refused".to_owned()),
+        ] {
+            let (mut local_peer, local_stream) = duplex(1024);
+            let mut connection = accepted(local_stream);
+            connection.response = crate::ConnectionResponse::Socks4;
+            let mut failure = Some(failure);
+            let dialer = FixedTargetDialer::new(move |_| {
+                Err::<tokio::io::DuplexStream, _>(failure.take().expect("one target dial"))
+            });
+            let bridge = tokio::spawn(async move { bridge_connection(connection, &dialer).await });
+            let mut response = [0; 8];
+            local_peer.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [0, 91, 0, 0, 0, 0, 0, 0]);
+            assert!(bridge.await.unwrap().is_err());
+        }
     }
 
     #[tokio::test]

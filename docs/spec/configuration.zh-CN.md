@@ -194,12 +194,15 @@ ordered effective Egress rules
 
 ## 监听器
 
-完整监听器 schema（包括 Linux、Windows 和 FreeBSD 都必须支持的 HTTP CONNECT 与 SOCKS5
-CONNECT/UDP ASSOCIATE、Linux 透明模式和可选 TUN、Windows TUN
+完整监听器 schema（包括 Linux、Windows 和 FreeBSD 都必须支持的普通 HTTP 转发、HTTP CONNECT、
+SOCKS4/4a/5 CONNECT 和 SOCKS5 UDP ASSOCIATE、Linux 透明模式和可选 TUN、Windows TUN
 及 Windows 控制面的 system-proxy 开关、认证引用、来源限制
 以及环路防护）见[平台与 DNS 规范](platform-and-dns.zh-CN.md)。
 `spec.platform` 接受 `linux`、`windows`、`freebsd` 和 `any`；`any` 使用实际主机的平台矩阵。
 FreeBSD 拒绝 `tproxy`、`redirect` 和 `tun`。
+`spec.type: socks` 是规范名称 `socks5` 的输入别名；规范化输出使用 `socks5`，两个名称都接受
+SOCKS4/4a/5。客户端持久连接上的 HTTP 请求分别独立认证和路由。完整的请求 framing、头字段过滤、
+升级和版本专用认证契约见链接的平台规范。
 
 ```yaml
 apiVersion: pathchord.io/v1
@@ -222,6 +225,10 @@ spec:
 
 DNS 是独立策略。其 `local`、`transit`、`egress` 和 `blocked` 路由、解析器限制、缓存行为、主机名/候选地址
 处理以及 Fake-IP 禁止规则在[平台与 DNS 规范](platform-and-dns.zh-CN.md)中规范定义。
+
+`spec.type: mixed` 为前述 HTTP 和 SOCKS 契约绑定一个 TCP 端口。其 `protocols` 默认值为
+`[tcp, udp]`，且必须包含 TCP。SOCKS5 UDP 使用协商的 relay 端点。协议识别和共用认证语义见
+[mixed 分流](platform-and-dns.zh-CN.md#mixed-监听器分流)。
 
 ## 运行时快照
 

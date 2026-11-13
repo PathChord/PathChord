@@ -17,7 +17,7 @@ use tokio::task::JoinSet;
 use crate::{
     FlowBridgeError, FlowBridgeStats, HttpConnectListener, IngressListener, IngressTargetDialer,
     ListenerCredentialVerifier, ListenerDescriptor, ListenerError, ListenerId, ListenerKind,
-    NoopProcessMetadataProvider, ProcessMetadataProvider, ProcessSocketTuple,
+    MixedListener, NoopProcessMetadataProvider, ProcessMetadataProvider, ProcessSocketTuple,
     RejectListenerCredentials, Socks5Listener, TargetAddress, TargetHost, bridge_connection,
 };
 
@@ -236,6 +236,19 @@ where
                 ),
                 ListenerKind::Socks5 => Arc::new(
                     Socks5Listener::bind(descriptor.clone())
+                        .await
+                        .map_err(|source| RuntimeError::Listener {
+                            listener_id: descriptor.id.clone(),
+                            source,
+                        })?
+                        .with_credential_verifier(
+                            credentials
+                                .remove(&descriptor.id)
+                                .unwrap_or_else(|| Arc::new(RejectListenerCredentials)),
+                        ),
+                ),
+                ListenerKind::Mixed => Arc::new(
+                    MixedListener::bind(descriptor.clone())
                         .await
                         .map_err(|source| RuntimeError::Listener {
                             listener_id: descriptor.id.clone(),
@@ -873,17 +886,22 @@ mod tests {
                 authentication_required: false,
             },
         ];
+        let mixed = ListenerDescriptor {
+            id: ListenerId::new("mixed"),
+            kind: ListenerKind::Mixed,
+            ..descriptors[0].clone()
+        };
         let runtime = ListenerRuntime::bind_descriptors(
             FixedTargetDialer::new(|_| {
                 Err::<DuplexStream, _>(FlowBridgeError::Dial("unused".to_owned()))
             }),
             ListenerRuntimeConfig::default(),
-            descriptors,
+            descriptors.into_iter().chain([mixed]),
         )
         .await
         .expect("bind listeners");
         let addresses = runtime.listener_addresses().expect("listener addresses");
-        assert_eq!(addresses.len(), 2);
+        assert_eq!(addresses.len(), 3);
         assert!(addresses.values().all(|address| address.port() != 0));
     }
 

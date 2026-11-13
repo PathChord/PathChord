@@ -379,8 +379,10 @@ pub struct TrafficClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListenerKind {
+    #[serde(alias = "socks")]
     Socks5,
     Http,
+    Mixed,
     Tproxy,
     Redirect,
     Tun,

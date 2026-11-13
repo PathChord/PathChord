@@ -14,7 +14,8 @@ Windows, and FreeBSD; they do not change the PathChord Session or wire protocol.
 | Listener type | Linux | Windows | FreeBSD | Address semantics |
 |---|---|---|---|---|
 | `http` | MUST | MUST | MUST | explicit HTTP host or address |
-| `socks5` | MUST | MUST | MUST | explicit SOCKS5 host or address |
+| `socks5` | MUST | MUST | MUST | explicit SOCKS4/4a/5 host or address |
+| `mixed` | MUST | MUST | MUST | HTTP and SOCKS on one TCP listener |
 | `tproxy` | MUST | MUST NOT | MUST NOT | transparent TCP/UDP IP flow |
 | `redirect` | MUST | MUST NOT | MUST NOT | transparent TCP flow |
 | `tun` | MAY | MUST | MUST NOT | IP packets through a TUN adapter |
@@ -22,9 +23,11 @@ Windows, and FreeBSD; they do not change the PathChord Session or wire protocol.
 An unsupported type/platform combination is a configuration error. A platform
 adapter MUST report an unavailable listener as a typed local failure and MUST
 NOT silently replace it with another listener type.
-The HTTP/SOCKS requirements include HTTP CONNECT, SOCKS5 CONNECT, and SOCKS5
-UDP ASSOCIATE on all three platforms. FreeBSD v1 supports only the explicit
-`http` and `socks5` listener types.
+The HTTP/SOCKS requirements include ordinary HTTP forwarding, HTTP CONNECT,
+SOCKS4/4a/5 CONNECT, and SOCKS5 UDP ASSOCIATE on all three platforms. FreeBSD v1
+supports the explicit `http`, `socks5`, and `mixed` listener types. `socks` is an
+input alias for `socks5`; normalized configuration and serialization use
+`socks5`. This name does not restrict the accepted SOCKS protocol version.
 
 ## Common listener schema
 
@@ -54,7 +57,7 @@ spec:
 `spec.platform` is `linux`, `windows`, `freebsd`, or `any` (default `any`). An
 explicit platform MUST match the actual host. `any` selects the actual host's
 matrix column; it MUST NOT bypass type/platform validation. `spec.bind` is a socket
-address and is required for `http`, `socks5`, `tproxy`, and `redirect`; it is
+address and is required for `http`, `socks5`, `mixed`, `tproxy`, and `redirect`; it is
 forbidden for `tun`. System-proxy integration is controlled at runtime by the
 Windows-only control-plane switch and does not add a Listener type. `spec.allowedSources` is a list of at most
 256 CIDRs and defaults to the local host only for a loopback bind, or to an
@@ -96,27 +99,121 @@ unknown; it MUST NOT be fabricated from a log line or cause an implicit allow.
 
 HTTP and SOCKS listeners terminate the local proxy protocol and pass the
 explicit hostname, address candidates, and port to policy evaluation. They may
-route by hostname because the request carries it. A malformed request,
-unsupported command, or failed listener authentication returns the adapter's
-normal local error and MUST NOT create a Session or target connection.
+route by hostname because the request carries it. A failed protocol handshake,
+malformed request head or target, unsupported command, or failed listener
+authentication returns the adapter's normal local error and MUST NOT create a
+Session or target connection for the rejected request. Invalid body framing
+may be discovered after a target flow has opened; it MUST fail the affected
+flow and close the affected connection without requiring the complete body to
+be buffered before opening. The source identity is the accepted socket peer;
+`X-Forwarded-For` and other client-authored forwarding headers MUST NOT replace
+it.
 
-HTTP CONNECT and SOCKS5 CONNECT use the TCP Stream contract. SOCKS5 UDP
-ASSOCIATE uses the UDP Association contract and preserves datagram boundaries.
-The listener MUST preserve the original hostname even when it also resolves
-local candidates. It MUST NOT resolve a name merely to bypass a configured
-DNS route.
+HTTP forwarding, HTTP CONNECT, and SOCKS4/4a/5 CONNECT use the TCP Stream
+contract. SOCKS5 UDP ASSOCIATE uses the UDP Association contract and preserves
+datagram boundaries. The listener MUST preserve the original hostname even
+when it also resolves local candidates. It MUST NOT resolve a name merely to
+bypass a configured DNS route.
+
+### HTTP request routing and framing
+
+An HTTP listener accepts HTTP/1.0 and HTTP/1.1 requests. CONNECT uses an
+authority target with an explicit non-zero port. Ordinary forwarding requires
+an absolute-form `http://` URI with a valid hostname or IP literal; an omitted
+port means 80. The target MUST NOT contain user information or a fragment.
+Origin-form targets and absolute-form `https://` URIs are rejected; HTTPS uses
+CONNECT. The adapter MUST derive the policy target and forwarded `Host` from
+the same URI authority, convert the target to origin-form while preserving the
+path and query, and pass each ordinary request through the TCP flow opener and
+policy evaluation independently. A persistent client connection MUST NOT bind
+later requests to the first request's target, Session, or Egress.
+
+Each request header block, including its request line, is limited to 16 KiB.
+Ordinary requests accept at most 128 header fields. Invalid framing,
+conflicting `Content-Length` values, malformed targets, and exceeded
+header limits are rejected. Ordinary requests carrying both `Content-Length` and valid
+`Transfer-Encoding` use the transfer coding; the adapter MUST remove
+`Content-Length` and MUST NOT forward both fields unchanged. It MUST close the
+client connection after that response and MUST NOT accept another pipelined
+request from that connection. A maintained HTTP
+message codec parses and re-encodes request and response framing, including
+chunked bodies, instead of treating the remainder of a client connection as
+one unbounded request. Bodies are streamed with backpressure; uploads and
+responses MUST NOT require buffering the complete body. Early upstream
+responses MUST NOT deadlock an unfinished upload or turn unread request bytes
+into a subsequent request.
+
+HTTP/1.1 connections support sequential requests unless connection tokens or
+message framing require closure. HTTP/1.0 requests close after the response.
+`Proxy-Connection` tokens are recognized for client compatibility; token names
+are case-insensitive, and `close` prevents reuse. Each response completes its
+message body before another request is dispatched. Redirect responses are
+returned to the client unchanged in meaning; the proxy MUST NOT follow them.
+
+### HTTP authentication and header handling
 
 An HTTP listener with required authentication accepts exactly one
-`Proxy-Authorization: Basic` header within the bounded CONNECT header block.
-The decoded value is a non-empty `username:password` pair and is checked by the
-listener-local verifier resolved from `credentialsRef`; success publishes the
-username as the authentication identity. A missing, duplicate, malformed, or
-rejected credential returns `407 Proxy Authentication Required` with a Basic
-`Proxy-Authenticate` challenge and closes that connection. The complete HTTP
-request header block is limited to 16 KiB, including the request line. A SOCKS5
-listener with required authentication selects the username/password method and
-rejects the negotiation unless the same listener-local verifier accepts both
+`Proxy-Authorization: Basic` header per request, including each request on a
+persistent connection. The decoded value is a non-empty `username:password`
+pair and is checked by the listener-local verifier resolved from
+`credentialsRef`; success publishes the verified username as that request's
+authentication identity. A missing, duplicate, malformed, or rejected
+credential returns `407 Proxy Authentication Required` with a Basic
+`Proxy-Authenticate` challenge and closes the affected connection.
+
+Forwarded ordinary request headers and response headers MUST remove
+proxy credentials and hop-by-hop fields, including `Proxy-Authorization`,
+`Proxy-Authenticate`, `Proxy-Connection`, `Connection`, fields named by
+`Connection` tokens, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding`, and
+`Upgrade`. Message framing headers required on the next hop are generated by
+the HTTP codec. The original `Trailer` declaration MUST be replaced with a
+declaration containing only allowed trailer field names, or removed if that
+set is empty. Both trailer declarations and trailer frames MUST discard proxy
+credentials, authentication, framing, hop-by-hop, and `Connection`-nominated
+fields. Safe end-to-end trailers such as `Digest` and `X-Checksum` MUST be
+preserved. Within ordinary header blocks, end-to-end fields such as an origin
+server's `Authorization` are preserved unless explicitly named as hop-by-hop
 fields. Neither adapter logs, inventories, or returns credential values.
+
+Upgrade requests retain only the fields required for the validated upgrade
+handshake, after removing proxy credentials and other hop-by-hop fields. The
+adapter forwards the real upstream response. A client MAY offer a list of
+upgrade protocols; an upstream `101` selecting one offered protocol is valid.
+The adapter switches to a bidirectional byte tunnel only after a valid upstream
+`101 Switching Protocols`, preserving
+already-buffered bytes in both directions. A rejected upgrade remains an HTTP
+response. CONNECT similarly returns success only after the selected TCP flow
+has opened; target or policy failure MUST NOT produce a success response.
+
+Malformed requests return `400 Bad Request`; exceeded header limits MAY return
+`400 Bad Request` or `431 Request Header Fields Too Large`. Policy denial returns
+`403 Forbidden`; authentication failure returns `407 Proxy Authentication Required`;
+target/transport failure returns `502 Bad Gateway`; and unavailable routes,
+Sessions, or resource budgets return `503 Service Unavailable`. The adapter
+MUST NOT emit a second response after response headers have already been sent;
+a subsequent framing or transport failure closes the affected connection.
+
+### SOCKS versions and authentication
+
+The canonical `socks5` listener accepts SOCKS4, SOCKS4a, and SOCKS5 on its
+configured TCP socket. SOCKS4/4a support CONNECT only. SOCKS4 addresses are IPv4;
+`0.0.0.X` with non-zero `X` selects SOCKS4a and requires a following domain.
+The user ID and domain are NUL-terminated and each is limited to 255 bytes. An
+empty domain or zero target port is invalid. An unverified user ID MUST NOT
+become an authenticated identity. SOCKS4/4a carry no password and MUST be
+rejected with reply code 91 when listener authentication is required; they
+MUST NOT downgrade or bypass the configured verifier. Success uses reply code
+90 only after the selected target flow opens. BIND and other unsupported
+commands use reply code 91.
+
+SOCKS5 supports CONNECT and UDP ASSOCIATE with IPv4, IPv6, or domain targets.
+A listener with required authentication selects the username/password method
+and rejects negotiation unless the same listener-local verifier accepts both
+fields. A client with no acceptable method receives `0xff`; BIND and other
+unsupported commands receive reply code `0x07`. SOCKS5 authentication failure
+closes the connection and MUST NOT open a target flow.
+
+### SOCKS5 UDP lifecycle
 
 The SOCKS5 UDP relay accepts datagrams only from the peer IP address of the TCP
 control connection. A valid non-zero client port in the UDP ASSOCIATE request
@@ -129,8 +226,59 @@ does not reassemble SOCKS5 UDP fragments.
 The number of concurrent clients and per-client target associations, each
 target queue, and association idle lifetime are bounded. Completion or failure
 of a target UDP flow removes that target association so a later datagram may
-open a new flow to the same target. Shutdown cancels and joins the control and
-target tasks within the configured shutdown timeout.
+open a new flow to the same target. Closing the TCP control connection cancels
+its UDP associations. Shutdown cancels and joins the control and target tasks
+within the configured shutdown timeout.
+
+### Mixed listener dispatch
+
+A `mixed` listener binds one TCP endpoint and detects the protocol separately
+for each accepted connection. A first byte of `0x04` or `0x05` selects SOCKS;
+other bytes enter the HTTP parser. Detection MUST NOT consume the byte or lose
+already-buffered request or application data. The selected parser applies the
+HTTP and SOCKS contracts above. Invalid input MUST NOT fall back to a direct
+target connection. Waiting for a client's first byte or handshake MUST NOT
+block admission of other clients, and cancellation MUST close pending clients.
+
+The default `protocols` are `[tcp, udp]`. TCP is required; `[tcp]` disables
+SOCKS5 UDP ASSOCIATE. HTTP and all SOCKS versions share the configured listener
+ID, credentials, source restrictions, flow tags, and process metadata policy.
+Required authentication uses HTTP Basic or SOCKS5 username/password according
+to the detected protocol; SOCKS4/4a MUST remain rejected. The protocol choice
+MUST NOT bypass authentication or create a different listener identity.
+SOCKS5 UDP uses the relay endpoint negotiated by UDP ASSOCIATE; the TCP port
+does not accept raw UDP datagrams or perform UDP protocol detection.
+
+```yaml
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata:
+  name: local-mixed
+spec:
+  type: mixed
+  platform: any
+  bind: 127.0.0.1:7890
+  protocols: [tcp, udp]
+  authentication: disabled
+```
+
+Windows system-proxy selection MAY reference a mixed listener. It applies
+HTTP proxy settings for the shared endpoint; SOCKS clients can use the same
+TCP address explicitly.
+
+### Compatibility references
+
+The reference behavior is grounded in the stable sing-box
+[HTTP options](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/docs/configuration/inbound/http.md)
+and [SOCKS options](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/docs/configuration/inbound/socks.md),
+with its pinned sing
+[HTTP handler](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/http/handshake.go)
+and [SOCKS handler](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/socks/handshake.go).
+The requirements above own PathChord's authentication, source identity,
+framing, and failure behavior. The
+[mixed inbound](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/docs/configuration/inbound/mixed.md)
+is a reference for shared-port HTTP/SOCKS admission. TLS termination is a
+separate listener feature and does not alter this contract.
 
 ## Linux transparent listeners
 

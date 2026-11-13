@@ -21,7 +21,7 @@ This document defines the selected technologies and implementation boundaries. P
 | Linux interception | `nix`/`socket2` plus platform-specific netlink and TPROXY code | Access to socket options and routing primitives without hiding kernel behavior |
 | Linux TUN | `tun-rs` async packet device behind `PacketDevice`, with a direct `smoltcp` reactor | Safe replaceable device lifecycle and a maintained TCP/UDP state machine |
 | Windows TUN | `tun-rs` Wintun packet device behind the same interface and direct `smoltcp` reactor | Standard Windows driver integration without platform-specific TCP reconstruction |
-| HTTP/SOCKS | Internal protocol adapters | Required semantics are small and avoid unnecessary proxy-framework coupling |
+| HTTP/SOCKS | Hyper HTTP/1 message codec with internal HTTP routing and SOCKS4/4a/5 adapters | Maintained HTTP parsing, message framing, streaming backpressure, and explicit policy/authentication boundaries |
 | DNS wire handling | `hickory-proto` behind route adapters | Mature DNS parsing/encoding while keeping local, Transit, Egress, and blocked routing replaceable |
 | Testing | `cargo test`, deterministic fake transports, property tests, packet traces, and fault injection | Multipath correctness depends on reproducible loss, duplication, reordering, and restart tests |
 
@@ -109,7 +109,12 @@ SQLite transactions are used for Egress authorization changes. The running Egres
 
 ## Platform architecture
 
-Linux, Windows, and FreeBSD share the HTTP CONNECT and SOCKS5 CONNECT/UDP ASSOCIATE adapters. FreeBSD uses Unix local control and MUST NOT expose TPROXY, REDIRECT, or TUN listeners in the v1 platform contract. System-proxy mutations are Windows-only; Linux and FreeBSD report unsupported activation. Process metadata that a platform cannot safely obtain remains unknown.
+A mixed TCP listener selects HTTP or SOCKS without consuming the first byte,
+then reuses the existing protocol codecs, credential verifier, flow openers,
+and supervision. Its SOCKS5 UDP Associations retain the same bounded relay
+lifecycle as a dedicated SOCKS listener.
+
+Linux, Windows, and FreeBSD share ordinary HTTP forwarding, HTTP CONNECT, SOCKS4/4a/5 CONNECT, and SOCKS5 UDP ASSOCIATE adapters. HTTP message framing uses Hyper while each ordinary request uses the same TCP flow opener and policy engine as other local flows. The canonical `socks5` configuration name accepts `socks` as an input alias and all three SOCKS versions. The [platform and DNS specification](../spec/platform-and-dns.md#http-and-socks-listeners) owns protocol behavior. FreeBSD uses Unix local control and MUST NOT expose TPROXY, REDIRECT, or TUN listeners in the v1 platform contract. System-proxy mutations are Windows-only; Linux and FreeBSD report unsupported activation. Process metadata that a platform cannot safely obtain remains unknown.
 
 Linux integrates TPROXY, REDIRECT, process metadata, and transparent routing through platform adapters. Windows uses Wintun and system-proxy integration selected through the control plane. TUN adapters expose bounded IP packets only; one single-owner `smoltcp` reactor owns `Interface`, `SocketSet`, TCP listeners, UDP sockets, timers, and flow lifecycle and connects accepted flows through the same Ingress openers as ordinary listeners. All three platforms reuse the core and policy crates.
 

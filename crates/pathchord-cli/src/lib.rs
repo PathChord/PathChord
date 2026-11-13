@@ -1600,6 +1600,7 @@ fn listener_descriptor(listener: ListenerConfig) -> Result<ListenerDescriptor, C
     let kind = match listener.kind {
         PolicyListenerKind::Http => ListenerKind::Http,
         PolicyListenerKind::Socks5 => ListenerKind::Socks5,
+        PolicyListenerKind::Mixed => ListenerKind::Mixed,
         PolicyListenerKind::Tproxy => ListenerKind::Tproxy,
         PolicyListenerKind::Redirect => ListenerKind::Redirect,
         PolicyListenerKind::Tun => ListenerKind::Tun,
@@ -2033,33 +2034,39 @@ mod tests {
 
     #[test]
     fn maps_policy_listener_bind_and_kind() {
-        let listener = ListenerConfig {
-            id: pathchord_policy::ListenerId::new("local-http"),
-            kind: PolicyListenerKind::Http,
-            platform: "any".to_owned(),
-            bind: Some(pathchord_policy::Endpoint {
-                host: "127.0.0.1".into(),
-                port: 8080,
-            }),
-            allowed_sources: Vec::new(),
-            authentication: AuthenticationMode::Required,
-            credentials_ref: Some("listener-users".to_owned()),
-            flow_tags: std::collections::BTreeSet::new(),
-            process_metadata: pathchord_policy::ProcessMetadataRequest::default(),
-            mark: None,
-            route_table: None,
-            protocols: std::collections::BTreeSet::from([pathchord_policy::FlowProtocol::Tcp]),
-            interface: None,
-            address: None,
-            mtu: None,
-            bypass: Vec::new(),
-            proxy_ref: None,
-        };
-        let descriptor = listener_descriptor(listener).expect("descriptor");
-        assert_eq!(descriptor.kind, ListenerKind::Http);
-        assert_eq!(descriptor.bind.expect("bind").port(), 8080);
-        assert_eq!(descriptor.allowed_sources, vec!["127.0.0.1/32"]);
-        assert!(descriptor.authentication_required);
+        for (policy_kind, kind) in [
+            (PolicyListenerKind::Http, ListenerKind::Http),
+            (PolicyListenerKind::Socks5, ListenerKind::Socks5),
+            (PolicyListenerKind::Mixed, ListenerKind::Mixed),
+        ] {
+            let listener = ListenerConfig {
+                id: pathchord_policy::ListenerId::new("local-http"),
+                kind: policy_kind,
+                platform: "any".to_owned(),
+                bind: Some(pathchord_policy::Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: 8080,
+                }),
+                allowed_sources: Vec::new(),
+                authentication: AuthenticationMode::Required,
+                credentials_ref: Some("listener-users".to_owned()),
+                flow_tags: std::collections::BTreeSet::new(),
+                process_metadata: pathchord_policy::ProcessMetadataRequest::default(),
+                mark: None,
+                route_table: None,
+                protocols: std::collections::BTreeSet::from([pathchord_policy::FlowProtocol::Tcp]),
+                interface: None,
+                address: None,
+                mtu: None,
+                bypass: Vec::new(),
+                proxy_ref: None,
+            };
+            let descriptor = listener_descriptor(listener).expect("descriptor");
+            assert_eq!(descriptor.kind, kind);
+            assert_eq!(descriptor.bind.expect("bind").port(), 8080);
+            assert_eq!(descriptor.allowed_sources, vec!["127.0.0.1/32"]);
+            assert!(descriptor.authentication_required);
+        }
     }
 
     #[test]

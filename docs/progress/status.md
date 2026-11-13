@@ -8,7 +8,8 @@ architecture and behavioral contracts remain under `docs/design/` and
 
 ## Current focus
 
-Active work prioritizes HTTP CONNECT and SOCKS5 CONNECT/UDP ASSOCIATE on
+Active work prioritizes HTTP forwarding/CONNECT, SOCKS4/4a/5 CONNECT, and
+SOCKS5 UDP ASSOCIATE on
 Linux, Windows, and FreeBSD. FreeBSD explicit-listener configuration, platform
 identity, and Unix local control are integrated. FreeBSD x86_64 target
 compilation and CLI linking pass; native host tests remain outstanding.
@@ -36,10 +37,23 @@ in the current scope.
   eligible Path sets, DATA/ACK/WINDOW/FIN/RST, bounded reordering and buffers,
   Path drain/close, bounded timer retransmission, cross-Path re-framing, and
   supervised shutdown.
-- Ingress has HTTP CONNECT, SOCKS5 CONNECT and UDP ASSOCIATE, Linux REDIRECT
+- Ingress has ordinary HTTP forwarding and CONNECT, SOCKS4/4a/5 CONNECT,
+  SOCKS5 UDP ASSOCIATE, Linux REDIRECT
   and TPROXY adapters, transparent UDP, a direct smoltcp TUN reactor, process
   metadata lookup, listener flow tags, listener-local Basic/username-password
   verification, and protected endpoint replacement.
+- HTTP forwarding uses Hyper's HTTP/1 codec for bounded headers, streaming
+  bodies, request-by-request authentication and routing, hop-header and trailer
+  filtering, redirects, and validated Upgrade. Each ordinary request opens its
+  selected flow independently; HTTPS is carried through CONNECT. SOCKS4/4a are
+  refused when password authentication is required. The `socks` input alias
+  normalizes and serializes to `socks5`.
+- Mixed listeners serve HTTP and SOCKS4/4a/5 on one TCP endpoint, preserve the
+  detected first byte, and reuse listener credentials, flow context, and
+  SOCKS5 UDP relay ownership. Idle and incomplete handshakes are cancelled on
+  shutdown without waiting for the platform deadline. Mixed listeners are
+  available in configuration, inventory queries, the console, and Windows
+  system-proxy selection, where the shared endpoint uses HTTP settings.
 - `IngressPlatformRuntime` is the all-or-nothing platform owner for TCP,
   transparent UDP, TUN, route journals, cancellation, rollback, and task join.
   The CLI starts it instead of assembling only the direct bootstrap listener
@@ -74,8 +88,9 @@ in the current scope.
   Administrators / SYSTEM Named Pipe ACLs, and remote-client rejection.
   Egress enrollment and authorization mutations are transactional, durable,
   generation checked, audited, idempotent, and cleanup-aware.
-- FreeBSD listener configuration accepts HTTP CONNECT and SOCKS5 CONNECT/UDP
-  ASSOCIATE with `platform: freebsd` or host-resolved `any`. Configuration and
+- FreeBSD listener configuration accepts HTTP forwarding/CONNECT and
+  SOCKS4/4a/5 CONNECT plus SOCKS5 UDP ASSOCIATE with `platform: freebsd` or
+  host-resolved `any`. Configuration and
   runtime preflight reject FreeBSD TPROXY, REDIRECT, and TUN before resource
   creation. The CLI and default dispatcher identify FreeBSD separately from
   Linux; system-proxy mutations return `UNSUPPORTED_OPERATION`, and status
@@ -92,6 +107,9 @@ in the current scope.
 
 ## Remaining explicit-listener work
 
+- Complete reproducible deployment examples and separate CLI-process
+  validation from key generation and enrollment through configured
+  Ingress/Transit/Egress TCP, UDP, and DNS forwarding.
 - Linux, Windows, and FreeBSD HTTP/SOCKS5 need end-to-end and long-running
   validation of authentication, source restrictions, TCP/UDP forwarding, DNS, bounded
   resources, shutdown, reload, and local control. Existing automated loopback
@@ -155,10 +173,22 @@ subscription normalization, and fault/retransmission cases. `cargo audit`
 currently reports no advisories; the dependency graph excludes the previously
 unmaintained `paste` path from the TUN adapter feature set.
 
-The Linux workspace run passes 365 tests. The portable explicit-listener
+The Linux workspace run passes 391 tests. The portable explicit-listener
 integration test binds listeners for the actual host platform and checks HTTP
 CONNECT, SOCKS5 CONNECT, SOCKS5 UDP ASSOCIATE, TCP half-close, and cancellation
 with an open UDP control connection.
+
+HTTP proxy socket tests additionally cover ordinary GET and streaming POST,
+per-request routing and authentication, header/trailer filtering, redirects,
+early responses, ambiguous framing closure, Upgrade protocol selection and
+buffered bytes, and cancellation of an unfinished upstream response. SOCKS
+compatibility tests cover SOCKS4/4a forwarding, delayed success, bounded
+malformed input, and refusal to bypass required password authentication.
+
+Mixed listener tests exercise all supported HTTP/SOCKS TCP protocols on one
+address, coalesced handshake/application bytes, common credentials and flow
+context, source/protocol rejection, SOCKS5 UDP forwarding while other clients
+are idle, and bounded shutdown with open handshakes and a UDP control socket.
 
 The FreeBSD target check and CLI build use Zig 0.17.1 C/C++ compiler and archiver
 wrappers with the official FreeBSD 15.1 SDK, including the bundled SQLite and

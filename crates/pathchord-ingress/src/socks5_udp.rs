@@ -1,4 +1,4 @@
-//! Supervised SOCKS5 CONNECT and UDP ASSOCIATE runtime.
+//! Supervised SOCKS and mixed HTTP/SOCKS listener runtime.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -11,11 +11,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
-use crate::socks5::{
-    DOMAIN, IPV4, IPV6, SocksCommand, negotiate, read_request, send_reply, send_reply_address,
-};
+use crate::socks5::{DOMAIN, IPV4, IPV6, SocksCommand, accept_handshake, send_reply_address};
 use crate::{
-    AcceptedConnection, BoxedUdpFlowHandle, ConnectionContext, ConnectionResponse, FlowProtocol,
+    AcceptedConnection, BoxedUdpFlowHandle, ConnectionContext, FlowProtocol, HttpConnectListener,
     ListenerDescriptor, ListenerError, ListenerKind, NoopProcessMetadataProvider, ProcessMetadata,
     ProcessMetadataProvider, ProcessSocketTuple, SocksCredentialVerifier, TargetAddress,
     TargetHost, TcpFlowOpener, UdpFlowError, UdpFlowOpener,
@@ -106,7 +104,9 @@ impl Socks5Runtime {
         credential_verifier: Arc<dyn SocksCredentialVerifier>,
     ) -> Result<Self, Socks5RuntimeError> {
         config.validate()?;
-        if descriptor.kind != ListenerKind::Socks5 {
+        if !matches!(descriptor.kind, ListenerKind::Socks5 | ListenerKind::Mixed)
+            || (descriptor.kind == ListenerKind::Mixed && !config.tcp_enabled)
+        {
             return Err(Socks5RuntimeError::InvalidConfig);
         }
         let listener = TcpListener::bind(
@@ -297,14 +297,67 @@ async fn handle_client(
             "source address is not allowed".to_owned(),
         ));
     }
-    let identity = negotiate(
-        &mut stream,
-        descriptor.authentication_required,
-        credential_verifier.as_ref(),
+    let detected = if descriptor.kind == ListenerKind::Mixed {
+        let Some(detected) = until_cancelled(&cancel, crate::mixed::detect_protocol(&stream)).await
+        else {
+            return Ok(Socks5RuntimeReport::default());
+        };
+        Some(detected.map_err(listener_error)?)
+    } else {
+        None
+    };
+    if detected == Some(crate::mixed::ProxyProtocol::Http) {
+        let local = stream
+            .local_addr()
+            .map_err(|error| Socks5RuntimeError::Protocol(error.to_string()))?;
+        let mut http_descriptor = descriptor;
+        http_descriptor.kind = ListenerKind::Http;
+        let accepted = until_cancelled(
+            &cancel,
+            HttpConnectListener::accept_stream_with_verifier(
+                &http_descriptor,
+                stream,
+                source,
+                credential_verifier,
+            ),
+        )
+        .await;
+        let Some(accepted) = accepted else {
+            return Ok(Socks5RuntimeReport::default());
+        };
+        let mut accepted = accepted.map_err(listener_error)?;
+        if !http_descriptor.process_metadata.is_empty() {
+            accepted.context.process = process_metadata
+                .lookup(
+                    ProcessSocketTuple { source, local },
+                    http_descriptor.process_metadata,
+                )
+                .await;
+        }
+        return bridge_tcp_client(
+            accepted,
+            tcp_opener.as_ref(),
+            connection_id,
+            &events,
+            &cancel,
+        )
+        .await;
+    }
+    let handshake = until_cancelled(
+        &cancel,
+        accept_handshake(
+            &mut stream,
+            descriptor.authentication_required,
+            credential_verifier.as_ref(),
+        ),
     )
-    .await
-    .map_err(listener_error)?;
-    let request = read_request(&mut stream).await.map_err(listener_error)?;
+    .await;
+    let Some(handshake) = handshake else {
+        return Ok(Socks5RuntimeReport::default());
+    };
+    let handshake = handshake.map_err(listener_error)?;
+    let identity = handshake.authentication_identity;
+    let request = handshake.request;
     let process = if descriptor.process_metadata.is_empty() {
         None
     } else {
@@ -320,7 +373,6 @@ async fn handle_client(
     };
     match request.command {
         SocksCommand::Connect if config.tcp_enabled => {
-            emit_connection_accepted(&events, &descriptor.id, &connection_id, &request.target);
             let accepted = AcceptedConnection {
                 io: Box::new(stream),
                 context: ConnectionContext {
@@ -332,28 +384,16 @@ async fn handle_client(
                     protocol: FlowProtocol::Tcp,
                     target: request.target,
                 },
-                response: ConnectionResponse::Socks5,
+                response: handshake.version.connection_response(),
             };
-            match crate::bridge_connection(accepted, tcp_opener.as_ref()).await {
-                Ok(stats) => {
-                    emit(
-                        &events,
-                        crate::ListenerRuntimeEvent::ConnectionCompleted {
-                            listener_id: descriptor.id,
-                            connection_id,
-                            stats,
-                        },
-                    );
-                    Ok(Socks5RuntimeReport {
-                        tcp_connections: 1,
-                        ..Socks5RuntimeReport::default()
-                    })
-                }
-                Err(error) => {
-                    emit_connection_failed(&events, descriptor.id, connection_id, &error);
-                    Err(Socks5RuntimeError::Flow(error.to_string()))
-                }
-            }
+            bridge_tcp_client(
+                accepted,
+                tcp_opener.as_ref(),
+                connection_id,
+                &events,
+                &cancel,
+            )
+            .await
         }
         SocksCommand::UdpAssociate if config.udp_enabled => {
             let requested_source = associate_source(&request.target, source)?;
@@ -393,12 +433,80 @@ async fn handle_client(
             }
         }
         _ => {
-            send_reply(&mut stream, 7).await.map_err(listener_error)?;
+            handshake
+                .version
+                .reject_command(&mut stream)
+                .await
+                .map_err(listener_error)?;
             Err(Socks5RuntimeError::Protocol(
                 "SOCKS command is disabled".to_owned(),
             ))
         }
     }
+}
+
+async fn bridge_tcp_client(
+    accepted: AcceptedConnection,
+    tcp_opener: &dyn TcpFlowOpener,
+    connection_id: String,
+    events: &Option<crate::ListenerRuntimeEventSender>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Socks5RuntimeReport, Socks5RuntimeError> {
+    let listener_id = accepted.context.listener_id.clone();
+    emit_connection_accepted(
+        events,
+        &listener_id,
+        &connection_id,
+        &accepted.context.target,
+    );
+    let result = until_cancelled(cancel, crate::bridge_connection(accepted, tcp_opener)).await;
+    let Some(result) = result else {
+        emit_connection_failed(
+            events,
+            listener_id,
+            connection_id,
+            &crate::FlowBridgeError::ShuttingDown,
+        );
+        return Ok(Socks5RuntimeReport::default());
+    };
+    match result {
+        Ok(stats) => {
+            emit(
+                events,
+                crate::ListenerRuntimeEvent::ConnectionCompleted {
+                    listener_id,
+                    connection_id,
+                    stats,
+                },
+            );
+            Ok(Socks5RuntimeReport {
+                tcp_connections: 1,
+                ..Socks5RuntimeReport::default()
+            })
+        }
+        Err(error) => {
+            emit_connection_failed(events, listener_id, connection_id, &error);
+            Err(Socks5RuntimeError::Flow(error.to_string()))
+        }
+    }
+}
+
+async fn until_cancelled<T>(
+    cancel: &watch::Receiver<bool>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    let mut cancel = cancel.clone();
+    let shutdown = async move {
+        if *cancel.borrow() {
+            return;
+        }
+        loop {
+            if cancel.changed().await.is_err() || *cancel.borrow() {
+                return;
+            }
+        }
+    };
+    tokio::select! { value = work => Some(value), () = shutdown => None }
 }
 
 fn emit(events: &Option<crate::ListenerRuntimeEventSender>, event: crate::ListenerRuntimeEvent) {
@@ -1178,7 +1286,7 @@ mod tests {
         }
 
         let (mut client, mut server) = tokio::io::duplex(128);
-        let task = tokio::spawn(async move { negotiate(&mut server, true, &Deny).await });
+        let task = tokio::spawn(async move { accept_handshake(&mut server, true, &Deny).await });
         client.write_all(&[5, 1, 2]).await.unwrap();
         let mut method = [0_u8; 2];
         client.read_exact(&mut method).await.unwrap();

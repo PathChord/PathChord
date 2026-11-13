@@ -28,6 +28,7 @@ mod dns;
 mod dns_udp_opener;
 mod flow;
 mod http_connect;
+mod http_forward;
 #[cfg(target_os = "linux")]
 mod linux_routing;
 #[cfg(target_os = "linux")]
@@ -39,6 +40,7 @@ mod linux_udp_runtime;
 mod local_dispatch;
 mod local_protocol;
 mod local_server;
+mod mixed;
 mod platform;
 mod platform_runtime;
 mod process_metadata;
@@ -116,6 +118,7 @@ pub use local_protocol::{
 pub use local_server::{
     DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS, LocalControlServer, LocalServerError,
 };
+pub use mixed::MixedListener;
 #[cfg(windows)]
 pub use platform::WindowsSystemProxyAdapter;
 pub use platform::{
@@ -169,6 +172,7 @@ pub type BoxedLocalConnection = Box<dyn LocalConnection>;
 pub enum ListenerKind {
     Socks5,
     Http,
+    Mixed,
     Tproxy,
     Redirect,
     Tun,
@@ -276,10 +280,12 @@ pub struct AcceptedConnection {
     pub(crate) response: ConnectionResponse,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum ConnectionResponse {
     None,
     HttpConnect,
+    HttpForward(http_forward::HttpForwardConfig),
+    Socks4,
     Socks5,
 }
 
