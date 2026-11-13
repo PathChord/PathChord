@@ -20,7 +20,8 @@ NOT be interpreted as support for the same outbound node protocol.
 | `vless` | TCP, TLS, WebSocket, and WSS byte transports with typed TLS/transport validation | Extended transport and flow options |
 | `vmess` | Plain TCP with AES-128-GCM body records and `alter_id: 0` | TLS, WebSocket, UDP, mux, and other extended options |
 | `trojan` | TLS-wrapped TCP, WebSocket, and WSS byte transports | Extended transport options |
-| `xtls`, `hysteria`, `hysteria2`, `tuic`, `ssh`, `shadowtls`, `anytls` | Native adapter under implementation | Typed unavailable diagnostic until the native adapter is registered |
+| `anytls` | TLS stream, authentication, settings, SYN/SYNACK, PUSH/FIN, and heartbeat frames | Extended session and UDP modes |
+| `xtls`, `hysteria`, `hysteria2`, `tuic`, `ssh`, `shadowtls` | Native adapter under implementation | Typed unavailable diagnostic until the native adapter is registered |
 | `wireguard` | No native adapter | Complete userspace WireGuard endpoint document |
 | `snell` | No native adapter | Typed unavailable diagnostic |
 | `ssr` and unregistered protocols | Unavailable | Explicitly unavailable |
