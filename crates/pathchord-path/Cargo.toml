@@ -11,11 +11,11 @@ async-trait.workspace = true
 pathchord-core = { path = "../pathchord-core" }
 pathchord-noise = { path = "../pathchord-noise" }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 pathchord-egress = { path = "../pathchord-egress" }
-tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "test-util", "time"] }
 
 [lints]
 workspace = true

@@ -10,8 +10,14 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod compiled;
 mod config;
 
+pub use compiled::{
+    CompileError, CompiledPolicy, EgressRouteCandidate, EgressRoutePlan, EgressRuntimeStatus,
+    Evaluation, ProxyRoutePlan, RejectReason, RoutePlan, RuntimeCatalog, RuntimeNodeState,
+    TransitCandidate, TransitProxyRuntimeStatus,
+};
 pub use config::{ConfigError, KubeConfig, KubeResource, ObjectMeta};
 
 macro_rules! id_type {
@@ -37,6 +43,8 @@ id_type!(TransitProxyId);
 id_type!(RuleId);
 id_type!(TrafficPolicyId);
 id_type!(ListenerId);
+id_type!(SubscriptionId);
+id_type!(DnsPolicyId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -69,6 +77,29 @@ pub enum FlowProtocol {
 pub struct ProcessMetadata {
     pub process_id: Option<u32>,
     pub executable: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<u32>,
+    #[serde(default)]
+    pub group_id: Option<u32>,
+}
+
+/// Listener-requested process facts. Disabled fields are never probed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProcessMetadataRequest {
+    #[serde(default)]
+    pub executable: bool,
+    #[serde(default)]
+    pub user: bool,
+    #[serde(default)]
+    pub group: bool,
+}
+
+impl ProcessMetadataRequest {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        !self.executable && !self.user && !self.group
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,12 +154,117 @@ pub struct TransitSource {
     pub subscription: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionSourceType {
+    Static,
+    Clash,
+    Sip008,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionSource {
+    pub source_type: SubscriptionSourceType,
+    pub url: String,
+    pub credentials_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionRefresh {
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    pub max_attempts: u32,
+    pub backoff_seconds: u64,
+}
+
+impl Default for SubscriptionRefresh {
+    fn default() -> Self {
+        Self {
+            interval_seconds: 3_600,
+            timeout_seconds: 30,
+            max_attempts: 3,
+            backoff_seconds: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionCache {
+    pub path: String,
+    pub max_age_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionConfig {
+    pub id: SubscriptionId,
+    pub enabled: bool,
+    pub source: SubscriptionSource,
+    pub refresh: SubscriptionRefresh,
+    pub cache: Option<SubscriptionCache>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsRoute {
+    Local,
+    Transit,
+    Egress,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsBlockedResponse {
+    Nxdomain,
+    Refused,
+    Servfail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsLocalConfig {
+    pub servers: Vec<Endpoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsCacheConfig {
+    pub enabled: bool,
+    pub max_entries: u32,
+    pub max_ttl_seconds: u32,
+}
+
+impl Default for DnsCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: 100_000,
+            max_ttl_seconds: 86_400,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsPolicyConfig {
+    pub id: DnsPolicyId,
+    pub default_route: DnsRoute,
+    pub local: Option<DnsLocalConfig>,
+    pub transit_proxy_selector: Option<Selector>,
+    pub transit_servers: Vec<Endpoint>,
+    pub egress_selector: Option<Selector>,
+    pub egress_servers: Vec<Endpoint>,
+    pub blocked_response: DnsBlockedResponse,
+    pub timeout_seconds: u64,
+    pub max_inflight: u32,
+    pub cache: DnsCacheConfig,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitProxyConfig {
     pub id: TransitProxyId,
     pub source: Option<TransitSource>,
     pub protocol: String,
     pub endpoint: Endpoint,
+    /// Opaque reference resolved only by a local secret adapter.
+    pub credentials_ref: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub tags: BTreeSet<String>,
     pub weight: u32,
@@ -199,6 +335,7 @@ pub struct TransitRule {
 pub enum ProxySelection {
     Any,
     Selector(Selector),
+    Direct,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,11 +397,24 @@ pub enum AuthenticationMode {
 pub struct ListenerConfig {
     pub id: ListenerId,
     pub kind: ListenerKind,
+    pub platform: String,
     /// Socket bind for socket-based listeners; TUN listeners use their
     /// interface/address fields in the source configuration instead.
     pub bind: Option<Endpoint>,
     pub allowed_sources: Vec<String>,
     pub authentication: AuthenticationMode,
+    /// Opaque local secret reference; never contains credential material.
+    pub credentials_ref: Option<String>,
+    pub mark: Option<u32>,
+    pub route_table: Option<u32>,
+    pub protocols: BTreeSet<FlowProtocol>,
+    pub interface: Option<String>,
+    pub address: Option<String>,
+    pub mtu: Option<u32>,
+    pub bypass: Vec<String>,
+    pub proxy_ref: Option<String>,
+    pub flow_tags: BTreeSet<String>,
+    pub process_metadata: ProcessMetadataRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,11 +428,13 @@ pub enum FallbackAction {
 pub struct PolicyConfig {
     pub egresses: Vec<EgressConfig>,
     pub transit_proxies: Vec<TransitProxyConfig>,
+    pub subscriptions: Vec<SubscriptionConfig>,
     pub egress_rules: Vec<EgressRule>,
     pub transit_rules: Vec<TransitRule>,
     pub proxy_rules: Vec<ProxyRule>,
     pub traffic_policies: Vec<TrafficPolicy>,
     pub listeners: Vec<ListenerConfig>,
+    pub dns_policy: Option<DnsPolicyConfig>,
     /// `None` is accepted only as an unvalidated input so validation can report it.
     pub fallback: Option<FallbackAction>,
 }
@@ -320,16 +472,30 @@ pub enum ValidationError {
     ZeroMinUsablePaths { rule_id: String },
     #[error("imported Transit Proxy {proxy_id} label {label} uses a reserved namespace")]
     ReservedImportedLabelNamespace { proxy_id: String, label: String },
+    #[error("Transit Proxy {proxy_id} has an invalid credentialsRef")]
+    InvalidTransitCredentialReference { proxy_id: String },
     #[error("rule {rule_id} references unknown egress {egress_id}")]
     UnknownEgress { rule_id: String, egress_id: String },
     #[error("rule {rule_id} references unknown traffic policy {policy_id}")]
     UnknownTrafficPolicy { rule_id: String, policy_id: String },
+    #[error("Transit Proxy {proxy_id} references unknown subscription {subscription_id}")]
+    UnknownSubscription {
+        proxy_id: String,
+        subscription_id: String,
+    },
+    #[error("subscription {subscription_id} is invalid: {reason}")]
+    InvalidSubscription {
+        subscription_id: String,
+        reason: &'static str,
+    },
+    #[error("DNS policy {policy_id} is invalid: {reason}")]
+    InvalidDnsPolicy {
+        policy_id: String,
+        reason: &'static str,
+    },
 }
 
-/// Immutable, validated Phase-0 configuration input.
-///
-/// This is not a compiled rule evaluator. Phase 3 will lower these models into
-/// an ordered executable policy snapshot.
+/// Immutable, validated configuration input for [`CompiledPolicy`].
 #[derive(Debug, Clone)]
 pub struct ValidatedPolicySnapshot {
     generation: Generation,
@@ -375,6 +541,10 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         config.transit_proxies.iter().map(|item| item.id.as_str()),
     )?;
     validate_unique(
+        "subscription",
+        config.subscriptions.iter().map(|item| item.id.as_str()),
+    )?;
+    validate_unique(
         "rule",
         config
             .egress_rules
@@ -397,6 +567,13 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
     }
     for proxy in &config.transit_proxies {
         validate_port("Transit Proxy", proxy.id.as_str(), proxy.endpoint.port)?;
+        if proxy.credentials_ref.as_ref().is_some_and(|reference| {
+            reference.is_empty() || reference.len() > 256 || reference.chars().any(char::is_control)
+        }) {
+            return Err(ValidationError::InvalidTransitCredentialReference {
+                proxy_id: proxy.id.as_str().to_owned(),
+            });
+        }
         if proxy.source.is_some() {
             for label in proxy.labels.keys() {
                 if is_reserved_imported_namespace(label) {
@@ -412,6 +589,12 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         if let Some(bind) = &listener.bind {
             validate_port("listener", listener.id.as_str(), bind.port)?;
         }
+    }
+    for subscription in &config.subscriptions {
+        validate_subscription(subscription)?;
+    }
+    if let Some(dns_policy) = &config.dns_policy {
+        validate_dns_policy(dns_policy)?;
     }
     for policy in &config.traffic_policies {
         if let Some(class_bps) = policy.class_replication_budget_bps
@@ -456,6 +639,23 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
             return Err(ValidationError::UnknownTrafficPolicy {
                 rule_id: rule.id.as_str().to_owned(),
                 policy_id: rule.traffic_policy.as_str().to_owned(),
+            });
+        }
+    }
+
+    let subscription_ids: HashSet<_> = config
+        .subscriptions
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect();
+    for proxy in &config.transit_proxies {
+        if let Some(source) = &proxy.source
+            && source.source_type != "static"
+            && !subscription_ids.contains(source.subscription.as_str())
+        {
+            return Err(ValidationError::UnknownSubscription {
+                proxy_id: proxy.id.as_str().to_owned(),
+                subscription_id: source.subscription.clone(),
             });
         }
     }
@@ -510,6 +710,112 @@ fn validate_egress_reference(
         });
     }
     Ok(())
+}
+
+fn validate_subscription(subscription: &SubscriptionConfig) -> Result<(), ValidationError> {
+    let parsed = url::Url::parse(&subscription.source.url).map_err(|_| {
+        ValidationError::InvalidSubscription {
+            subscription_id: subscription.id.as_str().to_owned(),
+            reason: "source URL is invalid",
+        }
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(ValidationError::InvalidSubscription {
+            subscription_id: subscription.id.as_str().to_owned(),
+            reason: "source URL must use HTTP(S) without embedded credentials",
+        });
+    }
+    let refresh = &subscription.refresh;
+    if !(60..=604_800).contains(&refresh.interval_seconds)
+        || !(1..=300).contains(&refresh.timeout_seconds)
+        || !(1..=10).contains(&refresh.max_attempts)
+        || !(1..=3_600).contains(&refresh.backoff_seconds)
+    {
+        return Err(ValidationError::InvalidSubscription {
+            subscription_id: subscription.id.as_str().to_owned(),
+            reason: "refresh values are outside their allowed ranges",
+        });
+    }
+    if let Some(cache) = &subscription.cache
+        && (cache.path.is_empty()
+            || cache.path.chars().any(char::is_control)
+            || !(60..=2_592_000).contains(&cache.max_age_seconds))
+    {
+        return Err(ValidationError::InvalidSubscription {
+            subscription_id: subscription.id.as_str().to_owned(),
+            reason: "cache values are outside their allowed ranges",
+        });
+    }
+    Ok(())
+}
+
+fn validate_dns_policy(policy: &DnsPolicyConfig) -> Result<(), ValidationError> {
+    let invalid = |reason| ValidationError::InvalidDnsPolicy {
+        policy_id: policy.id.as_str().to_owned(),
+        reason,
+    };
+    if !(1..=60).contains(&policy.timeout_seconds)
+        || !(1..=100_000).contains(&policy.max_inflight)
+        || policy.cache.max_entries > 1_000_000
+        || !(1..=604_800).contains(&policy.cache.max_ttl_seconds)
+    {
+        return Err(invalid("limits are outside their allowed ranges"));
+    }
+    match policy.default_route {
+        DnsRoute::Local => {
+            let servers = policy.local.as_ref().map(|local| &local.servers);
+            if servers.is_none_or(Vec::is_empty) {
+                return Err(invalid("local route requires at least one server"));
+            }
+        }
+        DnsRoute::Transit
+            if policy
+                .transit_proxy_selector
+                .as_ref()
+                .is_none_or(selector_is_empty)
+                || policy.transit_servers.is_empty() =>
+        {
+            return Err(invalid(
+                "transit route requires a proxy selector and server",
+            ));
+        }
+        DnsRoute::Egress
+            if policy
+                .egress_selector
+                .as_ref()
+                .is_none_or(selector_is_empty)
+                || policy.egress_servers.is_empty() =>
+        {
+            return Err(invalid(
+                "egress route requires an Egress selector and server",
+            ));
+        }
+        _ => {}
+    }
+    if let Some(local) = &policy.local {
+        for server in &local.servers {
+            if server.host.is_empty() || server.port == 0 {
+                return Err(invalid("local DNS server endpoint is invalid"));
+            }
+        }
+    }
+    for server in policy
+        .transit_servers
+        .iter()
+        .chain(policy.egress_servers.iter())
+    {
+        if server.host.is_empty() || server.port == 0 {
+            return Err(invalid("remote DNS server endpoint is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn selector_is_empty(selector: &Selector) -> bool {
+    selector.labels.is_empty() && selector.tags.is_empty() && selector.capabilities.is_empty()
 }
 
 #[cfg(test)]
@@ -623,11 +929,12 @@ mod tests {
                     source_type: "clash".into(),
                     subscription: "provider-a".into(),
                 }),
-                protocol: "vless".into(),
+                protocol: "socks5".into(),
                 endpoint: Endpoint {
                     host: "proxy.example.net".into(),
                     port: 443,
                 },
+                credentials_ref: None,
                 labels: BTreeMap::from([(reserved_label.into(), "spoofed".into())]),
                 tags: BTreeSet::new(),
                 weight: 100,
@@ -644,6 +951,59 @@ mod tests {
     }
 
     #[test]
+    fn imported_proxy_requires_a_known_subscription() {
+        let mut config = base_config();
+        config.transit_proxies.push(TransitProxyConfig {
+            id: TransitProxyId::new("provider-node"),
+            source: Some(TransitSource {
+                source_type: "clash".into(),
+                subscription: "missing-provider".into(),
+            }),
+            protocol: "socks5".into(),
+            endpoint: Endpoint {
+                host: "proxy.example.net".into(),
+                port: 443,
+            },
+            credentials_ref: None,
+            labels: BTreeMap::new(),
+            tags: BTreeSet::new(),
+            weight: 100,
+        });
+
+        assert_eq!(
+            ValidatedPolicySnapshot::new(Generation::new(1), config).unwrap_err(),
+            ValidationError::UnknownSubscription {
+                proxy_id: "provider-node".into(),
+                subscription_id: "missing-provider".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn transit_credentials_reference_must_be_opaque_and_non_empty() {
+        let mut config = base_config();
+        config.transit_proxies.push(TransitProxyConfig {
+            id: TransitProxyId::new("private-proxy"),
+            source: None,
+            protocol: "socks5".into(),
+            endpoint: Endpoint {
+                host: "proxy.example.net".into(),
+                port: 1080,
+            },
+            credentials_ref: Some(String::new()),
+            labels: BTreeMap::new(),
+            tags: BTreeSet::new(),
+            weight: 100,
+        });
+        assert_eq!(
+            ValidatedPolicySnapshot::new(Generation::new(1), config).unwrap_err(),
+            ValidationError::InvalidTransitCredentialReference {
+                proxy_id: "private-proxy".into(),
+            }
+        );
+    }
+
+    #[test]
     fn policy_context_and_decision_are_typed_and_mutually_exclusive() {
         let context = PolicyContext {
             flow_tags: BTreeSet::from(["gaming".into()]),
@@ -653,6 +1013,8 @@ mod tests {
             process: Some(ProcessMetadata {
                 process_id: Some(42),
                 executable: Some("game.exe".into()),
+                user_id: Some(1000),
+                group_id: Some(1000),
             }),
             protocol: FlowProtocol::Udp,
             target: TargetEndpoint {

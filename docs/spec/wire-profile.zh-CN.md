@@ -364,6 +364,18 @@ reason 字节仅用于诊断，MUST NOT 作为分支 API。格式错误帧、未
 窗口重复/过旧记录、nonce/帧序号不匹配和过期状态报告。只有编码和解码都还原
 完全相同字节时，向量才有效。
 
+规范 IK 兼容向量使用 `Noise_IK_25519_ChaChaPoly_SHA256`，prologue 为
+`PathChord/wire-v1/egress/egress-id`；initiator 静态私钥为重复 32 次的 `01`，
+responder 静态私钥为重复 32 次的 `02`，initiator 和 responder 临时私钥分别为
+重复 32 次的 `04` 和 `05`。握手 payload 为空。传输明文为 ASCII
+`PathChord transport vector`，使用 initiator 到 responder 方向的 nonce 7。
+
+```text
+message_1 = ac01b2209e86354fb853237b5de0f4fab13c7fcbf433a61c019369617fecf10b5ff672297d0d3ade1dd319d94628c4340bb85d86f62343c56fe841734b841fb6026f297def6e19ed47946e13d165de43d0225e93eb0f307b235dc8a202b3603b
+message_2 = 50a61409b1ddd0325e9b16b700e719e9772c07000b1bd7786e907c653d20495dc5e12927491c58f5730f88bf3154bd48
+transport_nonce_7 = d8cd46c9df78dbd4bc8cebae020320f9bde5dba394c98104938b74b93ba7c5b808580283263e7b5df5ac
+```
+
 ## 安全考虑
 
 记录 nonce 是显式的，并通过帧序列认证。发送方 MUST NOT 在同一方向密钥下使用

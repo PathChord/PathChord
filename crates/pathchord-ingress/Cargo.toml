@@ -7,17 +7,42 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+atomic-write-file.workspace = true
+async-stream.workspace = true
 async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
 getrandom.workspace = true
+hickory-proto.workspace = true
+notify = "8.2.0"
 pathchord-core = { path = "../pathchord-core" }
+pathchord-noise = { path = "../pathchord-noise" }
+pathchord-path = { path = "../pathchord-path" }
 pathchord-policy = { path = "../pathchord-policy" }
+pathchord-transit = { path = "../pathchord-transit" }
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smoltcp.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "macros"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "macros", "time"] }
+tun-rs.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+interprocess.workspace = true
+widestring.workspace = true
+windows-registry.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix.workspace = true
+socket2.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "net", "sync"] }
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "sync", "test-util"] }
 
 [lints]
 workspace = true

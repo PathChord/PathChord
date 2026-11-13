@@ -15,13 +15,37 @@ use pathchord_noise::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod admission;
+mod autoscale;
+mod multipath;
+mod runtime;
 mod session;
 mod single_path;
+mod udp;
 
+pub use admission::{
+    EgressAdmittedPath, EgressPathAdmissionConfig, IngressAdmittedPath, IngressPathAdmissionConfig,
+    PathAdmissionError, PathAdmissionOutcome, PathAuthorizer, accept_path, dial_path,
+};
+pub use autoscale::{AutoscaleDecision, AutoscaleInput, PathAutoscaler, PathAutoscalerConfig};
+pub use multipath::{
+    MultipathConfig, MultipathError, MultipathPathObservation, MultipathSession,
+    PathEconomicStatus, PathFailureOutcome, PathSchedule, ScheduleDirection, StreamRetransmission,
+};
+pub use runtime::{
+    BoxedSessionStream, EgressSessionController, EgressSessionHandle, EgressStatusConfig,
+    EgressStatusProvider, EgressStatusSample, EgressStreamFactory, EgressStreamOpenError,
+    IngressSessionHandle, IngressUdpHandle, OpenStreamError, OpenUdpError, PathExclusionReason,
+    PathQualitySnapshot, SessionRuntimeError, SessionSnapshot, SessionStream, run_egress_session,
+};
 pub use session::{EgressPathSession, IngressPathSession, PathSessionConfig, PathSessionError};
 pub use single_path::{
     AuthorizationState, PathAuthorization, SinglePathError, SinglePathHandshakeConfig,
     SinglePathOutcome, SinglePathReady, StreamOpenDecision, StreamOpener, establish_single_path,
+};
+pub use udp::{
+    BoxedUdpTargetSocket, SessionUdpError, SessionUdpHandle, UdpAssociationRuntime,
+    UdpAssociationSnapshot, UdpRuntimeError, UdpTargetError, UdpTargetFactory, UdpTargetSocket,
 };
 
 /// An asynchronous transport whose smallest delivery unit is one complete
@@ -96,6 +120,11 @@ where
 
     pub fn into_parts(self) -> (S, NoiseTransport) {
         (self.io, self.transport)
+    }
+
+    #[must_use]
+    pub const fn limits(&self) -> pathchord_core::ProtocolLimits {
+        self.limits
     }
 
     async fn send_record(&mut self, frame: PathFrame) -> Result<(), NoiseRecordStreamError> {

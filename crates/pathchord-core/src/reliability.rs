@@ -96,6 +96,12 @@ impl<T> ControlSender<T> {
             .map(|(sequence, payload)| (*sequence, payload))
     }
 
+    pub fn pending_mut(&mut self) -> impl Iterator<Item = (u64, &mut T)> {
+        self.pending
+            .iter_mut()
+            .map(|(sequence, payload)| (*sequence, payload))
+    }
+
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }

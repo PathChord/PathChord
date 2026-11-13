@@ -10,7 +10,7 @@
 |---|---|---|
 | 语言 | Rust | 对缓冲区、并发、平台集成和长时间运行的网络服务具有较强控制力 |
 | 异步运行时 | Tokio | 异步 I/O、定时器、取消、任务监管以及 Windows/Linux 支持成熟 |
-| 密码学 | 通过可替换密码接口使用 `Noise_IK_25519_ChaChaPoly_SHA256`；在满足安全要求时使用带有经审查可清零 resolver 的 `snow` | 直接支持 Noise 模式、为每个 Path 提供独立握手状态，并可强制清理密钥状态 |
+| 密码学 | 通过 Clatter 使用 `Noise_IK_25519_ChaChaPoly_SHA256`，配合可清零 key/cipher 容器和 Orion SHA-256/HMAC adapter | 直接支持 Noise 模式、为每个 Path 提供独立握手状态、显式 nonce 传输，并可强制清理密钥状态 |
 | 对称密码原语 | 通过 Noise 实现使用 ChaCha20-Poly1305 | 与选定的 Noise 模式匹配 |
 | 序列化 | 配置和管理 API 模型使用 `serde` | 共享强类型模型，同时不将线协议耦合到文本格式 |
 | 线协议帧封装 | 使用 QUIC 风格无符号变长整数的专用 Rust 编解码器 | 协议要求显式帧封装，并且不依赖通用 RPC 模式定义 |
@@ -19,9 +19,10 @@
 | 嵌入式状态 | Egress 授权和持久本地元数据使用 SQLite | 提供原子事务、代次编号并便于检查 |
 | 规则 | 启动时编译的专用受限规则语言 | 求值具有确定性且输出模型狭窄；不能任意访问主机 |
 | Linux 拦截 | `nix`/`socket2` 加平台专用的 netlink 和 TPROXY 代码 | 能够访问套接字选项和路由原语，同时不隐藏内核行为 |
-| Linux TUN | 通过内部接口封装 `tun` 或等效的操作系统适配器 | 保持 TUN 实现可替换 |
-| Windows TUN | 通过同一内部接口封装 Wintun 适配器 | 标准的 Windows TUN 集成方式 |
+| Linux TUN | 通过 `PacketDevice` 封装 `tun-rs` 异步包设备，并使用直接的 `smoltcp` reactor | 安全、可替换的设备生命周期以及维护中的 TCP/UDP 状态机 |
+| Windows TUN | 通过同一接口封装 `tun-rs` Wintun 包设备，并使用直接的 `smoltcp` reactor | 无需平台专用 TCP 重建的标准 Windows 驱动集成方式 |
 | HTTP/SOCKS | 内部协议适配器 | 所需语义较少，并可避免不必要地耦合代理框架 |
+| DNS 线协议处理 | 路由 adapter 后使用 `hickory-proto` | 使用成熟的 DNS 解析/编码，同时保持 local、Transit、Egress 和 blocked 路由可替换 |
 | 测试 | `cargo test`、确定性模拟传输、属性测试、数据包跟踪和故障注入 | 多路径正确性依赖可复现的丢包、重复、重排序和重启测试 |
 
 调度器使用有效容量加权。配置的关系权重提供基线；Path 报告的容量、拥塞窗口、RTT、抖动和丢包率会调整即时分配。重传复制同时使用 Session 全局预算和可选的逐流量类别预算，其中 Session 预算为硬性上限。
@@ -47,7 +48,7 @@ pathchord-cli        local management API client and operational commands
 
 Ingress 拥有一个类型化 command/query service，用于节点元数据、订阅、运行时快照、连接视图和结构化事件。权威本地适配器仍然是 Linux Unix domain socket 或 Windows Named Pipe，使用协议设计中选定的带版本长度分隔 JSON 封装。
 
-可选 Web Gateway 调用同一个 service，默认关闭，且不能通过 Transit 或数据 Path 访问。选定的内置浏览器适配器使用 REST 资源接口加 Server-Sent Events（SSE）：资源 URL 和 HTTP 状态语义适合 command/query，单向 SSE 更新适合 metric 和事件。也可以在同一个类型化 service 边界后提供 GraphQL 适配器，但必须承担额外的授权、查询成本、缓存和订阅复杂度。类型化 service 拥有内部状态模型，独立于浏览器 API 风格。
+可选 Web Gateway 调用同一个 service，默认关闭，且不能通过 Transit 或数据 Path 访问。选定的内置浏览器适配器使用 REST 资源接口加 Server-Sent Events（SSE）：资源 URL 和 HTTP 状态语义适合 command/query，单向 SSE 更新适合 metric 和事件。也可以在同一个类型化 service 边界后提供 GraphQL 适配器，但必须承担额外的授权、查询成本、缓存和订阅复杂度。类型化 service 拥有内部状态模型，独立于浏览器 API 风格。内置控制台资源嵌入 Rust 二进制，生产环境不需要 Node.js runtime。
 
 节点 tag/label 修改、订阅创建/删除/刷新及其他变更都是带代次检查、幂等和审计的 command。动态快照原子替换；订阅刷新失败时保留最近一次成功快照。观测 provider 发布类型化的节点、Path、Session、Stream、目标连接、订阅和策略 metric。Web Gateway 暴露这些快照和有界事件流；运维人员不能依靠解析日志重建当前状态。
 
@@ -67,7 +68,7 @@ Ingress 拥有一个类型化 command/query service，用于节点元数据、�
 - 将身份验证失败报告为 Path 故障；
 - 绝不跨 Path 重用传输密码状态。
 
-Noise 实现必须清零其拥有的全部私钥、DH 和传输密钥缓冲区，包括 resolver 拥有的状态。记录层使用有界重放窗口，其大小和保留语义必须兼容 Session 级 ACK 保留及重传行为。
+Clatter 拥有 IK 状态机、X25519 私钥/DH 输出容器和传输密码状态，其含密钥容器在 Drop 时清零。SHA-256/HMAC adapter 使用启用清零的 Orion，因此 keyed hash 状态、chaining-key 中间值和 HMAC pad 也会被清理。PathChord 在 teardown 时显式清理仍存活的传输密码，并在 wire profile 中冻结确定性兼容向量。记录层使用有界重放窗口，其大小和保留语义必须兼容 Session 级 ACK 保留及重传行为。
 
 实现不得重用 WireGuard 密钥材料，也不得将 Transit Proxy 视为经过身份验证的对等方。
 
@@ -85,7 +86,11 @@ Egress 授权变更使用 SQLite 事务。运行中的 Egress 进程拥有数据
 
 ## 平台架构
 
-Linux 通过平台适配器集成 TPROXY、REDIRECT、进程元数据和透明路由。Windows 使用 Wintun，并通过控制面选择监听器来集成系统代理。两个平台复用核心和策略 crate。
+Linux 通过平台适配器集成 TPROXY、REDIRECT、进程元数据和透明路由。Windows 使用 Wintun，并通过控制面选择监听器来集成系统代理。TUN 适配器只暴露有界 IP 包；单一所有者的 `smoltcp` reactor 持有 `Interface`、`SocketSet`、TCP Listener、UDP socket、计时器和 flow 生命周期，并通过与普通 Listener 相同的 Ingress opener 连接已接受 flow。两个平台复用核心和策略 crate。
+
+一个 Ingress 平台运行时模块统一持有普通 Listener、透明 Listener、策略路由、UDP 适配器和 TUN
+reactor 的启动与关闭。启动时先验证所有 Listener，并以一个事务获取资源；任何失败都会回滚已持有路由并
+释放已获取设备。一棵取消树监督所有适配器，在恢复路由前 join 它们，因此 CLI 不重复平台生命周期逻辑。
 
 平台适配器负责操作系统专用的打包、服务集成、套接字行为和路由行为。Linux 透明路由支持 IPv4 和 IPv6。Tokio 任务监管和取消必须在 Path 频繁变动时避免任务或资源泄漏。SQLite 事务在并发状态查询和注册操作期间保持授权一致性。帧编解码器依据协议上限约束内存分配，规则编译器保证有界求值成本。
 

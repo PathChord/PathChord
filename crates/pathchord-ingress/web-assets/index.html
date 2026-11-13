@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PathChord Console</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">PathChord</div>
+    <div class="status-strip" aria-label="Runtime status">
+      <span><i id="control-dot" class="dot neutral"></i>Control <strong id="control-state">Loading</strong></span>
+      <span><i id="runtime-dot" class="dot neutral"></i>Runtime <strong id="runtime-state">Loading</strong></span>
+      <span><i id="path-dot" class="dot neutral"></i>Data path <strong id="path-state">Loading</strong></span>
+    </div>
+    <div class="top-actions">
+      <input id="token" class="token-input" type="password" autocomplete="off" placeholder="Bearer token" aria-label="Bearer token">
+      <button id="refresh" class="button secondary" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <nav class="tabs" aria-label="Console sections">
+      <button class="tab active" data-view="overview" type="button">Overview</button>
+      <button class="tab" data-view="nodes" type="button">Nodes</button>
+      <button class="tab" data-view="sessions" type="button">Sessions</button>
+      <button class="tab" data-view="connections" type="button">Connections</button>
+      <button class="tab" data-view="listeners" type="button">Listeners</button>
+      <button class="tab" data-view="subscriptions" type="button">Subscriptions</button>
+      <button class="tab" data-view="proxy" type="button">System proxy</button>
+    </nav>
+
+    <main class="content">
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+      <section id="view-overview" class="view active" aria-labelledby="overview-title">
+        <div class="section-head">
+          <div><h1 id="overview-title">Overview</h1><p id="snapshot-time">Waiting for runtime snapshot</p></div>
+        </div>
+        <div class="metrics" aria-label="Runtime counters">
+          <div class="metric"><span>Sessions</span><strong id="metric-sessions">0</strong></div>
+          <div class="metric"><span>Ready paths</span><strong id="metric-paths">0</strong></div>
+          <div class="metric"><span>Streams</span><strong id="metric-streams">0</strong></div>
+          <div class="metric"><span>Target connections</span><strong id="metric-targets">0</strong></div>
+        </div>
+        <div class="section-block">
+          <h2>Recent events</h2>
+          <div class="table-wrap"><table><thead><tr><th>ID</th><th>Type</th><th>Resource</th><th>Generation</th></tr></thead><tbody id="events-body"></tbody></table></div>
+        </div>
+      </section>
+
+      <section id="view-nodes" class="view" aria-labelledby="nodes-title">
+        <div class="section-head"><div><h1 id="nodes-title">Nodes</h1><p>Administrative metadata and current generation</p></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Node</th><th>Labels</th><th>Tags</th><th>Generation</th><th></th></tr></thead><tbody id="nodes-body"></tbody></table></div>
+      </section>
+
+      <section id="view-sessions" class="view" aria-labelledby="sessions-title">
+        <div class="section-head"><div><h1 id="sessions-title">Sessions</h1><p>Ingress to Egress session inventory</p></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Session</th><th>Egress</th><th>State</th><th>Ready paths</th><th>Generation</th></tr></thead><tbody id="sessions-body"></tbody></table></div>
+      </section>
+
+      <section id="view-connections" class="view" aria-labelledby="connections-title">
+        <div class="section-head"><div><h1 id="connections-title">Connections</h1><p>Live local and target connection state</p></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Connection</th><th>Session / Stream</th><th>State</th><th>Target</th><th>Traffic</th></tr></thead><tbody id="connections-body"></tbody></table></div>
+      </section>
+
+      <section id="view-listeners" class="view" aria-labelledby="listeners-title">
+        <div class="section-head"><div><h1 id="listeners-title">Listeners</h1><p>Configured ingress endpoints</p></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Listener</th><th>Kind</th><th>Bind</th><th>State</th><th>Sources</th></tr></thead><tbody id="listeners-body"></tbody></table></div>
+      </section>
+
+      <section id="view-subscriptions" class="view" aria-labelledby="subscriptions-title">
+        <div class="section-head"><div><h1 id="subscriptions-title">Subscriptions</h1><p>Dynamic Transit Proxy sources</p></div><button id="new-subscription" class="button primary" type="button">New subscription</button></div>
+        <div class="table-wrap"><table><thead><tr><th>Subscription</th><th>Source</th><th>State</th><th>Revision</th><th>Last error</th><th></th></tr></thead><tbody id="subscriptions-body"></tbody></table></div>
+      </section>
+
+      <section id="view-proxy" class="view" aria-labelledby="proxy-title">
+        <div class="section-head"><div><h1 id="proxy-title">System proxy</h1><p>Windows operating-system proxy state</p></div></div>
+        <div class="proxy-editor">
+          <dl class="details"><dt>State</dt><dd id="proxy-enabled">Unknown</dd><dt>Listener</dt><dd id="proxy-listener">None</dd><dt>Platform effect</dt><dd id="proxy-effect">Unknown</dd><dt>Restoration</dt><dd id="proxy-restoration">Unknown</dd></dl>
+          <form id="proxy-form" class="command-row">
+            <label for="proxy-listener-select">Listener</label>
+            <select id="proxy-listener-select"></select>
+            <button class="button primary" type="submit">Enable</button>
+            <button id="proxy-disable" class="button danger" type="button">Disable</button>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="node-dialog">
+    <form id="node-form" method="dialog" class="dialog-form">
+      <div class="dialog-head"><h2>Edit node metadata</h2><button class="close" value="cancel" aria-label="Close" type="submit">Close</button></div>
+      <input id="node-id" type="hidden">
+      <label for="node-label-set">Set labels</label><input id="node-label-set" placeholder="admin.region=jp, admin.owner=ops">
+      <label for="node-label-remove">Remove labels</label><input id="node-label-remove" placeholder="admin.temporary">
+      <label for="node-tag-add">Add tags</label><input id="node-tag-add" placeholder="preferred, gaming">
+      <label for="node-tag-remove">Remove tags</label><input id="node-tag-remove" placeholder="draining">
+      <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Cancel</button><button id="node-save" class="button primary" value="default" type="submit">Save</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="subscription-dialog">
+    <form id="subscription-form" method="dialog" class="dialog-form">
+      <div class="dialog-head"><h2>New subscription</h2><button class="close" value="cancel" aria-label="Close" type="submit">Close</button></div>
+      <label for="subscription-id">ID</label><input id="subscription-id" required>
+      <label for="subscription-name">Display name</label><input id="subscription-name" required>
+      <label for="subscription-type">Source type</label><select id="subscription-type"><option value="clash">Clash</option><option value="sip008">SIP008</option><option value="static">Static</option></select>
+      <label for="subscription-url">Source URL</label><input id="subscription-url" type="url" placeholder="https://provider.example/subscription" required>
+      <label for="subscription-credentials">Credentials reference</label><input id="subscription-credentials" placeholder="provider-token">
+      <label for="subscription-interval">Refresh interval (seconds)</label><input id="subscription-interval" type="number" min="60" max="604800" value="3600" required>
+      <label for="subscription-timeout">Refresh timeout (seconds)</label><input id="subscription-timeout" type="number" min="1" max="300" value="30" required>
+      <label for="subscription-attempts">Refresh attempts</label><input id="subscription-attempts" type="number" min="1" max="10" value="3" required>
+      <label for="subscription-backoff">Refresh backoff (seconds)</label><input id="subscription-backoff" type="number" min="1" max="3600" value="5" required>
+      <label for="subscription-cache-path">Cache path</label><input id="subscription-cache-path" placeholder="provider-a.snapshot">
+      <label for="subscription-cache-age">Cache max age (seconds)</label><input id="subscription-cache-age" type="number" min="60" max="2592000" value="86400">
+      <label class="check"><input id="subscription-enabled" type="checkbox" checked> Enabled</label>
+      <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Cancel</button><button class="button primary" value="default" type="submit">Create</button></div>
+    </form>
+  </dialog>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

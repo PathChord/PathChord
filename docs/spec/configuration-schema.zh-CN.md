@@ -113,13 +113,14 @@ spec:
   source:
     type: clash
     subscriptionRef: provider-a
-  protocol: vless
+  protocol: socks5
   address: proxy.example.net
   port: 443
   tags: [gaming]
   weight: 100
 ```
 
+v1 内置 adapter 包括 `direct`、`http`、`https`、`socks5` 和 `ss`。
 `source.type` 可以是 `static`、`clash` 或 `sip008`；非 static 来源必须引用现有 Subscription。
 导入的 source、observed 和 quota 属性由运行时拥有，不能写入 Proxy spec。`direct` 没有第三方端点，
 忽略 address 和 port。
@@ -177,7 +178,9 @@ Session 预算是硬上限且包含控制流量；调度器应用关系权重、
 ## Listener
 
 Listener 的完整字段见[平台和 DNS 规范](platform-and-dns.zh-CN.md)。Listener 由 metadata.name 标识，
-spec 包含 type、platform（默认 any）和 authentication（默认 disabled）；不支持的平台/type 组合必须拒绝。
+spec 包含 type、platform（默认 any）和 authentication（默认 disabled），还可以包含最多 256 个合法 tag
+组成的 `flowTags`，以及带布尔字段 `executable`、`user`、`group` 的 `processMetadata` 请求。静态 flow
+tags 会复制到每个接收的 flow；平台无法安全获取的进程事实表示 unknown。不支持的平台/type 组合必须拒绝。
 
 ## DNSPolicy 和 FallbackPolicy
 

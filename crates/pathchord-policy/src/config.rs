@@ -14,11 +14,14 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
-    AuthenticationMode, Capabilities, EgressConfig, EgressId, EgressRule, EgressSelection,
+    AuthenticationMode, Capabilities, DnsBlockedResponse, DnsCacheConfig, DnsLocalConfig,
+    DnsPolicyConfig, DnsPolicyId, DnsRoute, EgressConfig, EgressId, EgressRule, EgressSelection,
     Endpoint, FallbackAction, FlowMatch, FlowProtocol, Generation, ListenerConfig, ListenerId,
-    ListenerKind, PolicyConfig, ProxyRule, ProxySelection, RetransmissionReplication, RuleId,
-    Scheduler, Selector, TrafficPolicy, TrafficPolicyId, TransitProxyConfig, TransitProxyId,
-    TransitRule, TransitSource, ValidatedPolicySnapshot,
+    ListenerKind, PolicyConfig, ProcessMetadataRequest, ProxyRule, ProxySelection,
+    RetransmissionReplication, RuleId, Scheduler, Selector, SubscriptionCache, SubscriptionConfig,
+    SubscriptionId, SubscriptionRefresh, SubscriptionSource, SubscriptionSourceType, TrafficPolicy,
+    TrafficPolicyId, TransitProxyConfig, TransitProxyId, TransitRule, TransitSource,
+    ValidatedPolicySnapshot,
 };
 
 pub const API_VERSION: &str = "pathchord.io/v1";
@@ -368,15 +371,9 @@ pub struct ListenerSpec {
     #[serde(default)]
     proxy_ref: Option<String>,
     #[serde(default)]
-    process_metadata: Option<ProcessMetadataSpec>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ProcessMetadataSpec {
-    executable: Option<String>,
-    user: Option<String>,
-    group: Option<String>,
+    flow_tags: BTreeSet<String>,
+    #[serde(default)]
+    process_metadata: Option<ProcessMetadataRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -445,6 +442,8 @@ fn default_dns_max_inflight() -> Option<u64> {
 struct DnsSelectorSpec {
     proxy_selector: Option<SelectorSpec>,
     egress_selector: Option<SelectorSpec>,
+    #[serde(default)]
+    servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -608,6 +607,9 @@ impl KubeConfig {
 
     pub fn into_policy_config(self) -> Result<PolicyConfig, ConfigError> {
         let mut config = PolicyConfig::default();
+        let mut egress_rules = Vec::new();
+        let mut transit_rules = Vec::new();
+        let mut proxy_rules = Vec::new();
         let mut rule_orders = HashSet::new();
         let mut default_policy = false;
         for resource in self.resources {
@@ -637,6 +639,7 @@ impl KubeConfig {
                             host: value.spec.address.unwrap_or_default(),
                             port,
                         },
+                        credentials_ref: value.spec.credentials_ref,
                         labels: value.metadata.labels,
                         tags: value.spec.tags,
                         weight: value.spec.weight,
@@ -675,13 +678,16 @@ impl KubeConfig {
                                     .into(),
                         }),
                     };
-                    config.egress_rules.push(EgressRule {
-                        id: RuleId::new(value.metadata.name),
-                        matches: value.spec.matches.unwrap_or_default().into(),
-                        egress,
-                        min_usable_paths: value.spec.requirements.min_usable_paths,
-                        required_capabilities: value.spec.requirements.capabilities,
-                    });
+                    egress_rules.push((
+                        value.spec.order,
+                        EgressRule {
+                            id: RuleId::new(value.metadata.name),
+                            matches: value.spec.matches.unwrap_or_default().into(),
+                            egress,
+                            min_usable_paths: value.spec.requirements.min_usable_paths,
+                            required_capabilities: value.spec.requirements.capabilities,
+                        },
+                    ));
                 }
                 KubeResource::TransitRule(value) => {
                     if !rule_orders.insert(value.spec.order) {
@@ -695,15 +701,18 @@ impl KubeConfig {
                         default_policy = true;
                         "default".to_owned()
                     });
-                    config.transit_rules.push(TransitRule {
-                        id: RuleId::new(value.metadata.name),
-                        egress: EgressId::new(value.spec.egress_ref),
-                        matches: value.spec.matches.unwrap_or_default().into(),
-                        require: value.spec.require.into(),
-                        reject_tags: value.spec.reject.tags,
-                        weight: value.spec.weight,
-                        traffic_policy: TrafficPolicyId::new(policy),
-                    });
+                    transit_rules.push((
+                        value.spec.order,
+                        TransitRule {
+                            id: RuleId::new(value.metadata.name),
+                            egress: EgressId::new(value.spec.egress_ref),
+                            matches: value.spec.matches.unwrap_or_default().into(),
+                            require: value.spec.require.into(),
+                            reject_tags: value.spec.reject.tags,
+                            weight: value.spec.weight,
+                            traffic_policy: TrafficPolicyId::new(policy),
+                        },
+                    ));
                 }
                 KubeResource::ProxyRule(value) => {
                     if !rule_orders.insert(value.spec.order) {
@@ -732,12 +741,14 @@ impl KubeConfig {
                             reason: "proxy must be direct".into(),
                         });
                     }
-                    let select = match value.spec.select {
-                        None => ProxySelection::Any,
-                        Some(ProxySelectSpec::Any(candidate)) if candidate == "any" => {
+                    let direct = value.spec.proxy.as_deref() == Some("direct");
+                    let select = match (direct, value.spec.select) {
+                        (true, None) => ProxySelection::Direct,
+                        (false, None) => ProxySelection::Any,
+                        (false, Some(ProxySelectSpec::Any(candidate))) if candidate == "any" => {
                             ProxySelection::Any
                         }
-                        Some(ProxySelectSpec::Any(selection)) => {
+                        (false, Some(ProxySelectSpec::Any(selection))) => {
                             return Err(ConfigError::InvalidSpec {
                                 kind: value.kind.clone(),
                                 name: value.metadata.name.clone(),
@@ -746,16 +757,22 @@ impl KubeConfig {
                                 ),
                             });
                         }
-                        Some(ProxySelectSpec::Selector(selector)) => {
+                        (false, Some(ProxySelectSpec::Selector(selector))) => {
                             ProxySelection::Selector(selector.into())
                         }
+                        (true, Some(_)) => {
+                            unreachable!("proxy and select were validated as exclusive")
+                        }
                     };
-                    config.proxy_rules.push(ProxyRule {
-                        id: RuleId::new(value.metadata.name),
-                        matches: value.spec.matches.unwrap_or_default().into(),
-                        require: value.spec.require.into(),
-                        select,
-                    });
+                    proxy_rules.push((
+                        value.spec.order,
+                        ProxyRule {
+                            id: RuleId::new(value.metadata.name),
+                            matches: value.spec.matches.unwrap_or_default().into(),
+                            require: value.spec.require.into(),
+                            select,
+                        },
+                    ));
                 }
                 KubeResource::TrafficPolicy(value) => {
                     if value.spec.scheduler != "effectiveCapacityWeighted" {
@@ -811,8 +828,8 @@ impl KubeConfig {
                         }
                         None => None,
                     };
-                    let authentication = match value.spec.authentication {
-                        AuthenticationValue::Mode(mode) => mode,
+                    let (authentication, credentials_ref) = match value.spec.authentication {
+                        AuthenticationValue::Mode(mode) => (mode, None),
                         AuthenticationValue::Object(auth) => {
                             if auth.mode == AuthenticationMode::Required
                                 && auth.credentials_ref.as_deref().is_none_or(str::is_empty)
@@ -823,19 +840,164 @@ impl KubeConfig {
                                     reason: "credentialsRef is required when authentication mode is required".into(),
                                 });
                             }
-                            auth.mode
+                            (auth.mode, auth.credentials_ref)
                         }
+                    };
+                    let protocols = if value.spec.protocols.is_empty() {
+                        match value.spec.kind {
+                            ListenerKind::Http | ListenerKind::Socks5 | ListenerKind::Redirect => {
+                                BTreeSet::from([FlowProtocol::Tcp])
+                            }
+                            ListenerKind::Tproxy | ListenerKind::Tun => {
+                                BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp])
+                            }
+                        }
+                    } else {
+                        value.spec.protocols
                     };
                     config.listeners.push(ListenerConfig {
                         id: ListenerId::new(value.metadata.name),
                         kind: value.spec.kind,
+                        platform: value.spec.platform,
                         bind,
                         allowed_sources: value.spec.allowed_sources,
                         authentication,
+                        credentials_ref,
+                        mark: value.spec.mark,
+                        route_table: value.spec.route_table,
+                        protocols,
+                        interface: value.spec.interface,
+                        address: value.spec.address,
+                        mtu: value.spec.mtu,
+                        bypass: value.spec.bypass,
+                        proxy_ref: value.spec.proxy_ref,
+                        flow_tags: value.spec.flow_tags,
+                        process_metadata: value.spec.process_metadata.unwrap_or_default(),
+                    });
+                }
+                KubeResource::Subscription(value) => {
+                    let source = value
+                        .spec
+                        .source
+                        .expect("validated Subscription source is present");
+                    let source_type = match source.source_type.as_str() {
+                        "static" => SubscriptionSourceType::Static,
+                        "clash" => SubscriptionSourceType::Clash,
+                        "sip008" => SubscriptionSourceType::Sip008,
+                        _ => unreachable!("validated Subscription source type"),
+                    };
+                    let refresh = value
+                        .spec
+                        .refresh
+                        .map(|refresh| SubscriptionRefresh {
+                            interval_seconds: refresh.interval_seconds,
+                            timeout_seconds: refresh.timeout_seconds,
+                            max_attempts: refresh.max_attempts,
+                            backoff_seconds: refresh.backoff_seconds,
+                        })
+                        .unwrap_or_default();
+                    let cache = value.spec.cache.map(|cache| SubscriptionCache {
+                        path: cache.path,
+                        max_age_seconds: cache.max_age_seconds,
+                    });
+                    config.subscriptions.push(SubscriptionConfig {
+                        id: SubscriptionId::new(value.metadata.name),
+                        enabled: value.spec.enabled,
+                        source: SubscriptionSource {
+                            source_type,
+                            url: source.url,
+                            credentials_ref: source.credentials_ref,
+                        },
+                        refresh,
+                        cache,
+                    });
+                }
+                KubeResource::DnsPolicy(value) => {
+                    let default_route = match value.spec.default_route.as_str() {
+                        "local" => DnsRoute::Local,
+                        "transit" => DnsRoute::Transit,
+                        "egress" => DnsRoute::Egress,
+                        "blocked" => DnsRoute::Blocked,
+                        _ => unreachable!("validated DNS route"),
+                    };
+                    let local = value.spec.local.map(|local| DnsLocalConfig {
+                        servers: local
+                            .servers
+                            .iter()
+                            .map(|server| {
+                                parse_dns_server(server).expect("validated DNS server endpoint")
+                            })
+                            .collect(),
+                    });
+                    let transit_proxy_selector = value
+                        .spec
+                        .transit
+                        .as_ref()
+                        .and_then(|selector| selector.proxy_selector.clone())
+                        .map(Selector::from);
+                    let transit_servers = value
+                        .spec
+                        .transit
+                        .as_ref()
+                        .map(|route| {
+                            route
+                                .servers
+                                .iter()
+                                .map(|server| {
+                                    parse_dns_server(server).expect("validated DNS server endpoint")
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let egress_selector = value
+                        .spec
+                        .egress
+                        .as_ref()
+                        .and_then(|selector| selector.egress_selector.clone())
+                        .map(Selector::from);
+                    let egress_servers = value
+                        .spec
+                        .egress
+                        .as_ref()
+                        .map(|route| {
+                            route
+                                .servers
+                                .iter()
+                                .map(|server| {
+                                    parse_dns_server(server).expect("validated DNS server endpoint")
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let blocked_response = match value.spec.blocked_response.as_deref() {
+                        Some("nxdomain") => DnsBlockedResponse::Nxdomain,
+                        Some("servfail") => DnsBlockedResponse::Servfail,
+                        Some("refused") | None => DnsBlockedResponse::Refused,
+                        Some(_) => unreachable!("validated blocked response"),
+                    };
+                    let cache = value
+                        .spec
+                        .cache
+                        .map_or_else(DnsCacheConfig::default, |cache| DnsCacheConfig {
+                            enabled: cache.enabled,
+                            max_entries: cache.max_entries.unwrap_or(100_000) as u32,
+                            max_ttl_seconds: cache.max_ttl_seconds.unwrap_or(86_400) as u32,
+                        });
+                    config.dns_policy = Some(DnsPolicyConfig {
+                        id: DnsPolicyId::new(value.metadata.name),
+                        default_route,
+                        local,
+                        transit_proxy_selector,
+                        transit_servers,
+                        egress_selector,
+                        egress_servers,
+                        blocked_response,
+                        timeout_seconds: value.spec.timeout_seconds.unwrap_or(5),
+                        max_inflight: value.spec.max_inflight.unwrap_or(1_024) as u32,
+                        cache,
                     });
                 }
                 KubeResource::FallbackPolicy(value) => config.fallback = Some(value.spec.action),
-                KubeResource::Subscription(_) | KubeResource::DnsPolicy(_) => {}
             }
         }
         if default_policy
@@ -853,6 +1015,12 @@ impl KubeConfig {
                 classes: BTreeMap::new(),
             });
         }
+        egress_rules.sort_by_key(|(order, _)| *order);
+        transit_rules.sort_by_key(|(order, _)| *order);
+        proxy_rules.sort_by_key(|(order, _)| *order);
+        config.egress_rules = egress_rules.into_iter().map(|(_, rule)| rule).collect();
+        config.transit_rules = transit_rules.into_iter().map(|(_, rule)| rule).collect();
+        config.proxy_rules = proxy_rules.into_iter().map(|(_, rule)| rule).collect();
         crate::validate(&config)?;
         Ok(config)
     }
@@ -1104,6 +1272,28 @@ fn valid_resource_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
+fn valid_spec_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
+}
+
+fn validate_tag_set(field: &str, values: &BTreeSet<String>) -> Result<(), String> {
+    if values.len() > MAX_MAP_ENTRIES {
+        return Err(format!("{field} has too many entries"));
+    }
+    if values.iter().any(|value| !valid_spec_identifier(value)) {
+        return Err(format!("{field} contains an invalid tag"));
+    }
+    Ok(())
+}
+
 fn validate_string_map(field: &str, values: &BTreeMap<String, String>) -> Result<(), String> {
     if values.len() > MAX_MAP_ENTRIES {
         return Err(format!("{field} has too many entries"));
@@ -1191,9 +1381,7 @@ fn validate_egress_spec(value: &Resource<EgressSpec>) -> Result<(), ConfigError>
 fn validate_transit_proxy_spec(value: &Resource<TransitProxySpec>) -> Result<(), ConfigError> {
     let kind = value.kind.as_str();
     let name = value.metadata.name.as_str();
-    const PROTOCOLS: [&str; 7] = [
-        "direct", "http", "https", "socks5", "vless", "vmess", "xtls",
-    ];
+    const PROTOCOLS: [&str; 5] = ["direct", "http", "https", "socks5", "ss"];
     if !PROTOCOLS.contains(&value.spec.protocol.as_str()) {
         return Err(invalid_spec(
             kind,
@@ -1203,6 +1391,22 @@ fn validate_transit_proxy_spec(value: &Resource<TransitProxySpec>) -> Result<(),
     }
     if !(1..=MAX_WEIGHT).contains(&value.spec.weight) {
         return Err(invalid_spec(kind, name, "weight must be in 1..=1000000"));
+    }
+    if value
+        .spec
+        .credentials_ref
+        .as_ref()
+        .is_some_and(|reference| {
+            reference.is_empty()
+                || reference.len() > MAX_MAP_VALUE_BYTES
+                || contains_control(reference)
+        })
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "credentialsRef must be a non-empty opaque reference",
+        ));
     }
     if let Some(source) = &value.spec.source {
         if !["static", "clash", "sip008"].contains(&source.source_type.as_str()) {
@@ -1402,6 +1606,19 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
             ));
         }
     }
+    validate_tag_set("flowTags", &value.spec.flow_tags)
+        .map_err(|reason| invalid_spec(kind, name, reason))?;
+    if value
+        .spec
+        .process_metadata
+        .is_some_and(ProcessMetadataRequest::is_empty)
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "processMetadata must request executable, user, or group",
+        ));
+    }
     Ok(())
 }
 
@@ -1473,6 +1690,13 @@ fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), Confi
                 "local.servers is required for local DNS route",
             ));
         }
+        if servers.is_some_and(|servers| servers.len() > MAX_MAP_ENTRIES) {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "local.servers has too many entries",
+            ));
+        }
         for server in servers.expect("checked above") {
             validate_dns_server(server).map_err(|reason| invalid_spec(kind, name, reason))?;
         }
@@ -1490,6 +1714,44 @@ fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), Confi
             "transit.proxySelector is required for transit route",
         ));
     }
+    if value.spec.default_route == "transit" {
+        let servers = &value
+            .spec
+            .transit
+            .as_ref()
+            .expect("selector requirement checked above")
+            .servers;
+        if servers.is_empty() {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "transit.servers is required for transit route",
+            ));
+        }
+        if servers.len() > MAX_MAP_ENTRIES {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "transit.servers has too many entries",
+            ));
+        }
+        for server in servers {
+            validate_dns_server(server).map_err(|reason| invalid_spec(kind, name, reason))?;
+        }
+    }
+    if value
+        .spec
+        .transit
+        .as_ref()
+        .and_then(|selector| selector.proxy_selector.as_ref())
+        .is_some_and(selector_empty)
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "transit.proxySelector must contain a criterion",
+        ));
+    }
     if value.spec.default_route == "egress"
         && value
             .spec
@@ -1501,6 +1763,44 @@ fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), Confi
             kind,
             name,
             "egress.egressSelector is required for egress route",
+        ));
+    }
+    if value.spec.default_route == "egress" {
+        let servers = &value
+            .spec
+            .egress
+            .as_ref()
+            .expect("selector requirement checked above")
+            .servers;
+        if servers.is_empty() {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "egress.servers is required for egress route",
+            ));
+        }
+        if servers.len() > MAX_MAP_ENTRIES {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "egress.servers has too many entries",
+            ));
+        }
+        for server in servers {
+            validate_dns_server(server).map_err(|reason| invalid_spec(kind, name, reason))?;
+        }
+    }
+    if value
+        .spec
+        .egress
+        .as_ref()
+        .and_then(|selector| selector.egress_selector.as_ref())
+        .is_some_and(selector_empty)
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "egress.egressSelector must contain a criterion",
         ));
     }
     if value
@@ -1546,22 +1846,45 @@ fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), Confi
 }
 
 fn validate_dns_server(server: &str) -> Result<(), String> {
+    parse_dns_server(server).map(|_| ())
+}
+
+fn parse_dns_server(server: &str) -> Result<Endpoint, String> {
     if let Ok(address) = server.parse::<SocketAddr>() {
-        return (address.port() != 0)
-            .then_some(())
-            .ok_or_else(|| "DNS server port must be non-zero".to_owned());
+        if address.port() == 0 {
+            return Err("DNS server port must be non-zero".to_owned());
+        }
+        return Ok(Endpoint {
+            host: address.ip().to_string(),
+            port: address.port(),
+        });
     }
-    let (host, port) = server
-        .rsplit_once(':')
-        .ok_or_else(|| "DNS server must be host:port".to_owned())?;
-    let port = port
-        .parse::<u16>()
-        .map_err(|_| "DNS server port is invalid".to_owned())?;
-    validate_host("DNS server host", host.trim_matches(['[', ']']))?;
+
+    let literal = server.trim_matches(['[', ']']);
+    if let Ok(address) = literal.parse::<IpAddr>() {
+        return Ok(Endpoint {
+            host: address.to_string(),
+            port: 53,
+        });
+    }
+
+    let (host, port) = match server.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| "DNS server port is invalid".to_owned())?;
+            (host.trim_matches(['[', ']']), port)
+        }
+        None => (server, 53),
+    };
+    validate_host("DNS server host", host)?;
     if port == 0 {
         return Err("DNS server port must be non-zero".to_owned());
     }
-    Ok(())
+    Ok(Endpoint {
+        host: host.to_owned(),
+        port,
+    })
 }
 
 fn validate_rule_spec(
@@ -1649,6 +1972,11 @@ items:
       authentication:
         mode: required
         credentialsRef: local-users
+      flowTags: [interactive.local]
+      processMetadata:
+        executable: true
+        user: true
+        group: true
 "#;
 
     #[test]
@@ -1659,9 +1987,187 @@ items:
         assert_eq!(policy.fallback, Some(FallbackAction::Reject));
         assert_eq!(policy.listeners[0].id.as_str(), "local-http");
         assert_eq!(policy.listeners[0].bind.as_ref().expect("bind").port, 8080);
+        let dns = policy.dns_policy.as_ref().expect("DNS policy");
+        assert_eq!(dns.default_route, DnsRoute::Local);
+        assert_eq!(dns.timeout_seconds, 5);
+        assert_eq!(dns.max_inflight, 1_024);
+        assert_eq!(dns.blocked_response, DnsBlockedResponse::Refused);
+        assert_eq!(dns.local.as_ref().expect("local DNS").servers[0].port, 53);
         assert_eq!(
             policy.listeners[0].authentication,
             AuthenticationMode::Required
+        );
+        assert_eq!(
+            policy.listeners[0].flow_tags,
+            BTreeSet::from(["interactive.local".to_owned()])
+        );
+        assert_eq!(
+            policy.listeners[0].process_metadata,
+            ProcessMetadataRequest {
+                executable: true,
+                user: true,
+                group: true,
+            }
+        );
+    }
+
+    #[test]
+    fn listener_process_metadata_and_flow_tags_are_strictly_validated() {
+        let string_value = VALID.replace("executable: true", "executable: /usr/bin/browser");
+        assert!(KubeConfig::from_yaml(&string_value).is_err());
+
+        let unknown_field = VALID.replace("        executable: true", "        pid: true");
+        assert!(KubeConfig::from_yaml(&unknown_field).is_err());
+
+        let empty_request = VALID.replace(
+            "      processMetadata:\n        executable: true\n        user: true\n        group: true",
+            "      processMetadata: {}",
+        );
+        let error = KubeConfig::from_yaml(&empty_request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("processMetadata"));
+
+        let invalid_tag = VALID.replace("interactive.local", "not/a/tag");
+        let error = KubeConfig::from_yaml(&invalid_tag).unwrap_err().to_string();
+        assert!(error.contains("flowTags"));
+
+        let too_many = (0..=MAX_MAP_ENTRIES)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let error = KubeConfig::from_yaml(&VALID.replace(
+            "flowTags: [interactive.local]",
+            &format!("flowTags: [{too_many}]"),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("flowTags"));
+    }
+
+    #[test]
+    fn dns_server_without_port_defaults_to_53() {
+        let input = VALID.replace("servers: [192.0.2.53:53]", "servers: [192.0.2.53]");
+        let policy = KubeConfig::from_yaml(&input)
+            .expect("valid default DNS port")
+            .into_policy_config()
+            .expect("policy conversion");
+        assert_eq!(
+            policy
+                .dns_policy
+                .as_ref()
+                .unwrap()
+                .local
+                .as_ref()
+                .unwrap()
+                .servers[0],
+            Endpoint {
+                host: "192.0.2.53".into(),
+                port: 53,
+            }
+        );
+    }
+
+    #[test]
+    fn conversion_sorts_rules_and_preserves_direct_proxy_action() {
+        let input = format!(
+            r#"{VALID}
+---
+apiVersion: pathchord.io/v1
+kind: ProxyRule
+metadata:
+  name: later
+spec:
+  order: 30
+  match:
+    flowTags: [later]
+  select: any
+---
+apiVersion: pathchord.io/v1
+kind: ProxyRule
+metadata:
+  name: direct-first
+spec:
+  order: 10
+  match:
+    flowTags: [direct]
+  proxy: direct
+"#
+        );
+        let policy = KubeConfig::from_yaml(&input)
+            .expect("valid rules")
+            .into_policy_config()
+            .expect("policy conversion");
+
+        assert_eq!(policy.proxy_rules[0].id.as_str(), "direct-first");
+        assert_eq!(policy.proxy_rules[0].select, ProxySelection::Direct);
+        assert_eq!(policy.proxy_rules[1].id.as_str(), "later");
+        assert_eq!(policy.proxy_rules[1].select, ProxySelection::Any);
+    }
+
+    #[test]
+    fn conversion_preserves_subscription_defaults_and_secret_reference() {
+        let input = format!(
+            r#"{VALID}
+---
+apiVersion: pathchord.io/v1
+kind: Subscription
+metadata:
+  name: provider-a
+spec:
+  source:
+    type: clash
+    url: https://example.invalid/subscription
+    credentialsRef: provider-a-token
+  cache:
+    path: provider-a.snapshot
+"#
+        );
+        let policy = KubeConfig::from_yaml(&input)
+            .expect("valid subscription")
+            .into_policy_config()
+            .expect("policy conversion");
+        let subscription = &policy.subscriptions[0];
+        assert_eq!(subscription.id.as_str(), "provider-a");
+        assert!(subscription.enabled);
+        assert_eq!(
+            subscription.source.source_type,
+            SubscriptionSourceType::Clash
+        );
+        assert_eq!(
+            subscription.source.credentials_ref.as_deref(),
+            Some("provider-a-token")
+        );
+        assert_eq!(subscription.refresh, SubscriptionRefresh::default());
+        assert_eq!(
+            subscription.cache.as_ref().expect("cache").max_age_seconds,
+            86_400
+        );
+    }
+
+    #[test]
+    fn conversion_preserves_opaque_transit_credentials_reference() {
+        let input = format!(
+            r#"{VALID}
+---
+apiVersion: pathchord.io/v1
+kind: TransitProxy
+metadata:
+  name: private-socks
+spec:
+  protocol: socks5
+  address: proxy.example.test
+  port: 1080
+  credentialsRef: local-socks-secret
+"#
+        );
+        let policy = KubeConfig::from_yaml(&input)
+            .expect("valid Transit credentials reference")
+            .into_policy_config()
+            .expect("policy conversion");
+        assert_eq!(
+            policy.transit_proxies[0].credentials_ref.as_deref(),
+            Some("local-socks-secret")
         );
     }
 
@@ -1773,6 +2279,14 @@ spec:
             .expect("TUN listener");
         assert_eq!(tun.kind, ListenerKind::Tun);
         assert_eq!(tun.bind, None);
+        assert_eq!(tun.platform, "any");
+        assert_eq!(tun.interface.as_deref(), Some("PathChord"));
+        assert_eq!(tun.address.as_deref(), Some("198.18.0.1/30"));
+        assert_eq!(tun.mtu, Some(1500));
+        assert_eq!(
+            tun.protocols,
+            BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp])
+        );
     }
 
     #[test]

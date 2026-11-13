@@ -141,7 +141,7 @@ Each `kind: TransitProxy` object has:
 |---|---|---|
 | `metadata.name` | yes | resource name; unique in the namespace |
 | `source` | no | `{type, subscription}`; default `{type: static}` |
-| `protocol` | yes | registered adapter: `direct`, `http`, `https`, `socks5`, `vless`, `vmess`, or `xtls` |
+| `protocol` | yes | built-in v1 adapter: `direct`, `http`, `https`, `socks5`, or `ss` |
 | `address` | yes except `direct` | hostname or IP literal |
 | `port` | yes except `direct` | port |
 | `tags` | no | sequence of IDs; default `[]` |
@@ -265,9 +265,13 @@ control limit.
 Listener fields are defined in the [platform and DNS specification](platform-and-dns.md).
 Every `kind: Listener` object has a `metadata.name`, a `spec.type`, a
 `spec.platform` (default `any`), and
-an optional `authentication` block (default `disabled`). Listener IDs are
-available to rules. A listener that is unsupported on the selected platform is
-rejected during validation rather than ignored.
+an optional `authentication` block (default `disabled`). It may also contain
+`flowTags` (at most 256 valid tags) and `processMetadata` with boolean
+`executable`, `user`, and `group` requests. Static flow tags are copied into
+every accepted flow. Process facts are best-effort and unknown when the
+platform provider cannot safely obtain them. Listener IDs are available to
+rules. A listener that is unsupported on the selected platform is rejected
+during validation rather than ignored.
 
 ## DNSPolicy and FallbackPolicy
 

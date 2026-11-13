@@ -27,6 +27,11 @@ boundary, disabled by default, and MUST NOT be reachable through a Transit
 Proxy or Egress data Path. A non-loopback bind additionally requires explicit
 configuration, a protected channel, strong authentication, an origin allowlist,
 rate limits, redaction, and an administrator-visible audit record.
+The selected gateway binds loopback by default. A non-loopback bind MUST require
+an explicit protected-transport assertion, a bearer token of at least 32 bytes,
+and a non-empty exact origin allowlist. Static console assets do not grant API
+access; every REST and SSE request passes the same actor/capability checks as the
+local adapter.
 
 The local protocol is a length-prefixed UTF-8 JSON envelope. The length is one
 canonical unsigned QUIC-style varint and counts the UTF-8 bytes of exactly one
@@ -200,6 +205,37 @@ dynamic configuration generation; a failed refresh retains the last successful
 snapshot and returns a typed failure. Delete drains nodes imported solely from
 the source.
 
+The canonical `subscriptions.create` body is:
+
+```json
+{
+  "id": "provider-a",
+  "display_name": "Provider A",
+  "enabled": true,
+  "source": {
+    "type": "clash",
+    "url": "https://example.invalid/subscription",
+    "credentials_ref": "provider-a-token"
+  },
+  "refresh": {
+    "interval_seconds": 3600,
+    "timeout_seconds": 30,
+    "max_attempts": 3,
+    "backoff_seconds": 5
+  },
+  "cache": {
+    "path": "provider-a.snapshot",
+    "max_age_seconds": 86400
+  }
+}
+```
+
+`source.type` MUST be `static`, `clash`, or `sip008`; `source.url` MUST be an
+HTTP(S) URL without embedded credentials; and `credentials_ref` MUST be an
+opaque reference rather than a secret value. Refresh and cache fields use the
+same bounds as the configuration schema. `cache` MAY be null. The list read
+model returns these fields, but never resolves or returns the referenced secret.
+
 The system-proxy switch is a runtime control-plane mutation, not a YAML
 resource. `system_proxy.enable` MUST include `listener_id`, which MUST resolve
 to an HTTP or SOCKS Listener. Windows applies that listener to environment and
@@ -246,6 +282,11 @@ POST   /api/v1/authorizations/{ingress_id}/disable
 POST   /api/v1/authorizations/{ingress_id}/revoke
 DELETE /api/v1/authorizations/{ingress_id}
 ```
+
+These REST routes are mounted only when the Web Gateway is attached to the
+Egress authorization dispatcher. An Ingress Web Gateway deliberately omits
+`/api/v1/authorizations*`; authorization remains an Egress-local operation and
+must not be presented as an Ingress capability.
 
 An enrollment body contains `ingress_id`, a 32-byte public key encoded as
 lowercase base64url without padding, the canonical `egress_id`, optional admin
@@ -354,6 +395,9 @@ carry its own `revision`. Events are ordered per Ingress process.
 `Last-Event-ID` either replays from the bounded buffer or causes a complete
 snapshot event before new deltas. Query and event payloads use the same actor
 authorization and redaction policy.
+SSE connections use a separate bounded client budget. Producers MUST apply
+backpressure rather than enqueue an unbounded per-client event stream, and MUST
+send periodic comment heartbeats so dead clients release their budget.
 
 ## Explicit boundaries
 

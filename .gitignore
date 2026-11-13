@@ -3,6 +3,10 @@
 /dist/
 /build/
 
+# Local browser and tool artifacts
+/.playwright-cli/
+/output/
+
 # Local runtime state
 *.db
 *.sqlite

@@ -16,7 +16,9 @@ use tokio::task::JoinSet;
 
 use crate::{
     FlowBridgeError, FlowBridgeStats, HttpConnectListener, IngressListener, IngressTargetDialer,
-    ListenerDescriptor, ListenerError, ListenerId, ListenerKind, Socks5Listener, bridge_connection,
+    ListenerCredentialVerifier, ListenerDescriptor, ListenerError, ListenerId, ListenerKind,
+    NoopProcessMetadataProvider, ProcessMetadataProvider, ProcessSocketTuple,
+    RejectListenerCredentials, Socks5Listener, TargetAddress, TargetHost, bridge_connection,
 };
 
 /// Runtime defaults are deliberately conservative; callers can raise the
@@ -51,7 +53,10 @@ impl ListenerRuntimeConfig {
 pub enum ListenerRuntimeEvent {
     ListenerStarted {
         listener_id: ListenerId,
-        bind: std::net::SocketAddr,
+        bind: Option<std::net::SocketAddr>,
+        interface: Option<String>,
+        address: Option<String>,
+        mtu: Option<u32>,
     },
     ProtocolRejected {
         listener_id: ListenerId,
@@ -63,13 +68,17 @@ pub enum ListenerRuntimeEvent {
     },
     ConnectionAccepted {
         listener_id: ListenerId,
+        connection_id: String,
+        target_display: String,
     },
     ConnectionCompleted {
         listener_id: ListenerId,
+        connection_id: String,
         stats: FlowBridgeStats,
     },
     ConnectionFailed {
         listener_id: ListenerId,
+        connection_id: Option<String>,
         error: String,
     },
     ListenerFailed {
@@ -128,6 +137,8 @@ pub struct ListenerRuntime<D> {
     config: ListenerRuntimeConfig,
     listeners: Vec<Arc<dyn IngressListener>>,
     listener_ids: std::collections::BTreeSet<ListenerId>,
+    protected_endpoints: crate::ProtectedEndpointSet,
+    process_metadata: Arc<dyn ProcessMetadataProvider>,
     events: Option<ListenerRuntimeEventSender>,
 }
 
@@ -152,6 +163,8 @@ where
             config: ListenerRuntimeConfig::default(),
             listeners: Vec::new(),
             listener_ids: std::collections::BTreeSet::new(),
+            protected_endpoints: crate::ProtectedEndpointSet::default(),
+            process_metadata: Arc::new(NoopProcessMetadataProvider),
             events: None,
         }
     }
@@ -162,6 +175,8 @@ where
             config: config.validate()?,
             listeners: Vec::new(),
             listener_ids: std::collections::BTreeSet::new(),
+            protected_endpoints: crate::ProtectedEndpointSet::default(),
+            process_metadata: Arc::new(NoopProcessMetadataProvider),
             events: None,
         })
     }
@@ -173,6 +188,27 @@ where
         dialer: D,
         config: ListenerRuntimeConfig,
         descriptors: I,
+    ) -> Result<Self, RuntimeError>
+    where
+        I: IntoIterator<Item = ListenerDescriptor>,
+    {
+        Self::bind_descriptors_with_credentials(
+            dialer,
+            config,
+            descriptors,
+            std::collections::BTreeMap::new(),
+        )
+        .await
+    }
+
+    pub async fn bind_descriptors_with_credentials<I>(
+        dialer: D,
+        config: ListenerRuntimeConfig,
+        descriptors: I,
+        mut credentials: std::collections::BTreeMap<
+            ListenerId,
+            Arc<dyn ListenerCredentialVerifier>,
+        >,
     ) -> Result<Self, RuntimeError>
     where
         I: IntoIterator<Item = ListenerDescriptor>,
@@ -191,7 +227,12 @@ where
                         .map_err(|source| RuntimeError::Listener {
                             listener_id: descriptor.id.clone(),
                             source,
-                        })?,
+                        })?
+                        .with_credential_verifier(
+                            credentials
+                                .remove(&descriptor.id)
+                                .unwrap_or_else(|| Arc::new(RejectListenerCredentials)),
+                        ),
                 ),
                 ListenerKind::Socks5 => Arc::new(
                     Socks5Listener::bind(descriptor.clone())
@@ -199,7 +240,23 @@ where
                         .map_err(|source| RuntimeError::Listener {
                             listener_id: descriptor.id.clone(),
                             source,
-                        })?,
+                        })?
+                        .with_credential_verifier(
+                            credentials
+                                .remove(&descriptor.id)
+                                .unwrap_or_else(|| Arc::new(RejectListenerCredentials)),
+                        ),
+                ),
+                #[cfg(target_os = "linux")]
+                ListenerKind::Tproxy | ListenerKind::Redirect => Arc::new(
+                    crate::LinuxTransparentTcpListener::bind(
+                        descriptor.clone(),
+                        runtime.protected_endpoints.clone(),
+                    )
+                    .map_err(|source| RuntimeError::Listener {
+                        listener_id: descriptor.id.clone(),
+                        source,
+                    })?,
                 ),
                 kind => {
                     return Err(RuntimeError::UnsupportedListener {
@@ -220,6 +277,15 @@ where
 
     pub fn set_event_sender(&mut self, sender: ListenerRuntimeEventSender) {
         self.events = Some(sender);
+    }
+
+    pub fn set_process_metadata_provider(&mut self, provider: Arc<dyn ProcessMetadataProvider>) {
+        self.process_metadata = provider;
+    }
+
+    #[must_use]
+    pub fn protected_endpoints(&self) -> crate::ProtectedEndpointSet {
+        self.protected_endpoints.clone()
     }
 
     #[must_use]
@@ -295,9 +361,18 @@ where
         }
 
         for (listener, listener_id, bind) in listeners {
+            let interface = listener.descriptor().interface.clone();
+            let address = listener.descriptor().address.clone();
+            let mtu = listener.descriptor().mtu;
             emit(
                 &self.events,
-                ListenerRuntimeEvent::ListenerStarted { listener_id, bind },
+                ListenerRuntimeEvent::ListenerStarted {
+                    listener_id,
+                    bind: Some(bind),
+                    interface,
+                    address,
+                    mtu,
+                },
             );
             supervisors.spawn(run_listener(
                 listener,
@@ -305,6 +380,8 @@ where
                 Arc::clone(&semaphore),
                 Arc::clone(&cancellation),
                 Arc::clone(&counters),
+                Arc::clone(&self.process_metadata),
+                bind,
                 self.events.clone(),
             ));
         }
@@ -380,6 +457,7 @@ impl RuntimeCancellation {
 
 #[derive(Debug, Default)]
 struct RuntimeCounters {
+    next_connection_id: AtomicU64,
     accepted_connections: AtomicU64,
     protocol_rejections: AtomicU64,
     policy_rejections: AtomicU64,
@@ -404,12 +482,15 @@ impl RuntimeCounters {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_listener<D>(
     listener: Arc<dyn IngressListener>,
     dialer: Arc<D>,
     semaphore: Arc<Semaphore>,
     cancellation: Arc<RuntimeCancellation>,
     counters: Arc<RuntimeCounters>,
+    process_metadata: Arc<dyn ProcessMetadataProvider>,
+    listener_address: std::net::SocketAddr,
     events: Option<ListenerRuntimeEventSender>,
 ) -> Result<(), RuntimeError>
 where
@@ -436,7 +517,7 @@ where
         };
 
         match accepted {
-            Ok(connection) => {
+            Ok(mut connection) => {
                 if !listener
                     .descriptor()
                     .allows_source(connection.context.source.ip())
@@ -453,19 +534,47 @@ where
                     );
                     continue;
                 }
+                let metadata_request = listener.descriptor().process_metadata;
+                if connection.context.protocol == crate::FlowProtocol::Tcp
+                    && !metadata_request.is_empty()
+                {
+                    let local = process_metadata_local_address(
+                        listener.descriptor().kind,
+                        listener_address,
+                        &connection.context.target,
+                    );
+                    connection.context.process = process_metadata
+                        .lookup(
+                            ProcessSocketTuple {
+                                source: connection.context.source,
+                                local,
+                            },
+                            metadata_request,
+                        )
+                        .await;
+                }
                 counters
                     .accepted_connections
                     .fetch_add(1, Ordering::Relaxed);
+                let connection_id = format!(
+                    "{}-{}",
+                    listener_id.as_str(),
+                    counters.next_connection_id.fetch_add(1, Ordering::Relaxed)
+                );
+                let target_display = display_target(&connection.context.target);
                 emit(
                     &events,
                     ListenerRuntimeEvent::ConnectionAccepted {
                         listener_id: listener_id.clone(),
+                        connection_id: connection_id.clone(),
+                        target_display,
                     },
                 );
                 let flow_listener_id = listener_id.clone();
                 let flow_dialer = Arc::clone(&dialer);
                 let flow_counters = Arc::clone(&counters);
                 let flow_events = events.clone();
+                let flow_connection_id = connection_id;
                 flows.spawn(async move {
                     let result = bridge_connection(connection, flow_dialer.as_ref()).await;
                     match &result {
@@ -483,6 +592,7 @@ where
                                 &flow_events,
                                 ListenerRuntimeEvent::ConnectionCompleted {
                                     listener_id: flow_listener_id.clone(),
+                                    connection_id: flow_connection_id.clone(),
                                     stats: *stats,
                                 },
                             );
@@ -495,6 +605,7 @@ where
                                 &flow_events,
                                 ListenerRuntimeEvent::ConnectionFailed {
                                     listener_id: flow_listener_id.clone(),
+                                    connection_id: Some(flow_connection_id.clone()),
                                     error: error.to_string(),
                                 },
                             );
@@ -503,6 +614,17 @@ where
                     drop(permit);
                     result
                 });
+            }
+            Err(ListenerError::Policy(reason)) => {
+                drop(permit);
+                counters.policy_rejections.fetch_add(1, Ordering::Relaxed);
+                emit(
+                    &events,
+                    ListenerRuntimeEvent::PolicyRejected {
+                        listener_id: listener_id.clone(),
+                        reason,
+                    },
+                );
             }
             Err(ListenerError::Protocol(reason)) => {
                 drop(permit);
@@ -557,11 +679,33 @@ async fn drain_completed_flows(
                 events,
                 ListenerRuntimeEvent::ConnectionFailed {
                     listener_id: listener_id.clone(),
+                    connection_id: None,
                     error: error.to_string(),
                 },
             );
         }
     }
+}
+
+fn display_target(target: &TargetAddress) -> String {
+    match &target.host {
+        TargetHost::Hostname(host) => format!("{host}:{}", target.port),
+        TargetHost::Ip(std::net::IpAddr::V4(address)) => format!("{address}:{}", target.port),
+        TargetHost::Ip(std::net::IpAddr::V6(address)) => format!("[{address}]:{}", target.port),
+    }
+}
+
+fn process_metadata_local_address(
+    kind: ListenerKind,
+    listener_address: std::net::SocketAddr,
+    target: &TargetAddress,
+) -> std::net::SocketAddr {
+    if matches!(kind, ListenerKind::Tproxy | ListenerKind::Redirect)
+        && let TargetHost::Ip(address) = &target.host
+    {
+        return std::net::SocketAddr::new(*address, target.port);
+    }
+    listener_address
 }
 
 async fn join_supervisors(
@@ -623,7 +767,12 @@ mod tests {
                 descriptor: ListenerDescriptor {
                     id: ListenerId::new(id),
                     kind: ListenerKind::Http,
-                    bind: "127.0.0.1:0".parse().expect("bind"),
+                    bind: Some("127.0.0.1:0".parse().expect("bind")),
+                    interface: None,
+                    address: None,
+                    mtu: None,
+                    flow_tags: std::collections::BTreeSet::new(),
+                    process_metadata: crate::ProcessMetadataRequest::default(),
                     allowed_sources: Vec::new(),
                     authentication_required: false,
                 },
@@ -653,6 +802,7 @@ mod tests {
         AcceptedConnection {
             io: Box::new(local),
             context: ConnectionContext {
+                flow_tags: std::collections::BTreeSet::new(),
                 listener_id: ListenerId::new("test"),
                 source: "127.0.0.1:1234".parse().expect("source"),
                 authentication_identity: None,
@@ -663,13 +813,15 @@ mod tests {
                     port: 443,
                 },
             },
+            response: crate::ConnectionResponse::None,
         }
     }
 
     fn dialer_for(
         target_stream: Arc<Mutex<Option<DuplexStream>>>,
-    ) -> FixedTargetDialer<impl FnMut(TargetAddress) -> Result<DuplexStream, FlowBridgeError> + Send>
-    {
+    ) -> FixedTargetDialer<
+        impl FnMut(ConnectionContext) -> Result<DuplexStream, FlowBridgeError> + Send,
+    > {
         FixedTargetDialer::new(move |_| {
             target_stream
                 .lock()
@@ -699,14 +851,24 @@ mod tests {
             ListenerDescriptor {
                 id: ListenerId::new("http"),
                 kind: ListenerKind::Http,
-                bind: "127.0.0.1:0".parse().expect("HTTP bind"),
+                bind: Some("127.0.0.1:0".parse().expect("HTTP bind")),
+                interface: None,
+                address: None,
+                mtu: None,
+                flow_tags: std::collections::BTreeSet::new(),
+                process_metadata: crate::ProcessMetadataRequest::default(),
                 allowed_sources: Vec::new(),
                 authentication_required: false,
             },
             ListenerDescriptor {
                 id: ListenerId::new("socks"),
                 kind: ListenerKind::Socks5,
-                bind: "127.0.0.1:0".parse().expect("SOCKS bind"),
+                bind: Some("127.0.0.1:0".parse().expect("SOCKS bind")),
+                interface: None,
+                address: None,
+                mtu: None,
+                flow_tags: std::collections::BTreeSet::new(),
+                process_metadata: crate::ProcessMetadataRequest::default(),
                 allowed_sources: Vec::new(),
                 authentication_required: false,
             },
@@ -725,6 +887,36 @@ mod tests {
         assert!(addresses.values().all(|address| address.port() != 0));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn binds_linux_redirect_and_publishes_protected_endpoints() {
+        let runtime = ListenerRuntime::bind_descriptors(
+            FixedTargetDialer::new(|_| {
+                Err::<DuplexStream, _>(FlowBridgeError::Dial("unused".to_owned()))
+            }),
+            ListenerRuntimeConfig::default(),
+            [ListenerDescriptor {
+                id: ListenerId::new("redirect"),
+                kind: ListenerKind::Redirect,
+                bind: Some("127.0.0.1:0".parse().expect("REDIRECT bind")),
+                interface: None,
+                address: None,
+                mtu: None,
+                flow_tags: std::collections::BTreeSet::new(),
+                process_metadata: crate::ProcessMetadataRequest::default(),
+                allowed_sources: Vec::new(),
+                authentication_required: false,
+            }],
+        )
+        .await
+        .expect("bind REDIRECT listener");
+        let protected = runtime.protected_endpoints();
+        let endpoint = "192.0.2.10:443".parse().unwrap();
+        protected.replace([endpoint]);
+        assert!(runtime.protected_endpoints().contains(&endpoint));
+        assert_eq!(runtime.listener_addresses().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn rejects_unsupported_descriptor_kinds_before_starting() {
         let result = ListenerRuntime::bind_descriptors(
@@ -735,7 +927,12 @@ mod tests {
             [ListenerDescriptor {
                 id: ListenerId::new("tun"),
                 kind: ListenerKind::Tun,
-                bind: "127.0.0.1:15000".parse().expect("TUN bind"),
+                bind: Some("127.0.0.1:15000".parse().expect("TUN bind")),
+                interface: None,
+                address: None,
+                mtu: None,
+                flow_tags: std::collections::BTreeSet::new(),
+                process_metadata: crate::ProcessMetadataRequest::default(),
                 allowed_sources: Vec::new(),
                 authentication_required: false,
             }],
@@ -755,7 +952,12 @@ mod tests {
         let descriptor = ListenerDescriptor {
             id: ListenerId::new("duplicate"),
             kind: ListenerKind::Http,
-            bind: "127.0.0.1:0".parse().expect("HTTP bind"),
+            bind: Some("127.0.0.1:0".parse().expect("HTTP bind")),
+            interface: None,
+            address: None,
+            mtu: None,
+            flow_tags: std::collections::BTreeSet::new(),
+            process_metadata: crate::ProcessMetadataRequest::default(),
             allowed_sources: Vec::new(),
             authentication_required: false,
         };
@@ -804,6 +1006,44 @@ mod tests {
         shutdown.send(()).expect("shutdown receiver");
         let report = task.await.expect("runtime task").expect("runtime result");
         assert_eq!(report.protocol_rejections, 1);
+    }
+
+    #[tokio::test]
+    async fn adapter_policy_rejection_is_counted_without_stopping_the_listener() {
+        let listener = ScriptedListener::new(
+            "http",
+            [Err(ListenerError::Policy(
+                "authentication failed".to_owned(),
+            ))],
+        );
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let mut runtime = ListenerRuntime::new(FixedTargetDialer::new(|_| {
+            Err::<DuplexStream, _>(FlowBridgeError::Dial("unused".to_owned()))
+        }));
+        runtime.set_event_sender(events);
+        runtime.add_listener(listener).expect("listener");
+        let (shutdown, signal) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            runtime
+                .run_until_shutdown(async move {
+                    let _ = signal.await;
+                })
+                .await
+        });
+        loop {
+            match receiver.recv().await {
+                Some(ListenerRuntimeEvent::PolicyRejected { reason, .. }) => {
+                    assert_eq!(reason, "authentication failed");
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("runtime event channel closed before policy rejection"),
+            }
+        }
+        shutdown.send(()).expect("shutdown receiver");
+        let report = task.await.expect("runtime task").expect("runtime result");
+        assert_eq!(report.policy_rejections, 1);
+        assert_eq!(report.protocol_rejections, 0);
     }
 
     #[tokio::test]

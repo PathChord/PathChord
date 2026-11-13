@@ -1,9 +1,9 @@
 //! Replaceable Transit Proxy adapter boundary.
 //!
-//! Phase 0 defines how direct and fake adapters plug in. It intentionally does
-//! not implement a concrete proxy protocol or subscription format.
+//! Byte transports and dynamic Transit Proxy subscription normalization.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,12 +11,114 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, lookup_host};
 use tokio::time::timeout;
+use zeroize::Zeroize;
+
+mod adapter_registry;
+mod credential_provider;
+mod http_connect_adapter;
+mod shadowsocks_adapter;
+mod socks5_adapter;
+mod subscription;
+
+pub use adapter_registry::AdapterRegistry;
+pub use credential_provider::FileTransitCredentialProvider;
+pub use http_connect_adapter::{HttpConnectTransitAdapter, HttpsConnectTransitAdapter};
+pub use shadowsocks_adapter::ShadowsocksTransitAdapter;
+pub use socks5_adapter::Socks5TransitAdapter;
+pub use subscription::{
+    CacheLoadOutcome, DynamicNodeState, DynamicTransitNode, DynamicTransitSnapshot,
+    HttpSubscriptionFetcher, MAX_SUBSCRIPTION_BYTES, MAX_SUBSCRIPTION_NODES,
+    NoSubscriptionCredentials, NodeUnavailableReason, RefreshOutcome, SnapshotDiff,
+    SubscriptionCredential, SubscriptionCredentialProvider, SubscriptionError,
+    SubscriptionFetchRequest, SubscriptionFetcher, SubscriptionManager,
+};
 
 pub trait TransitConnection: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T> TransitConnection for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 pub type BoxedTransitConnection = Box<dyn TransitConnection>;
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct TransitCredential {
+    fields: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for TransitCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TransitCredential")
+            .field("field_names", &self.fields.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TransitCredential {
+    fn drop(&mut self) {
+        for value in self.fields.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
+impl TransitCredential {
+    #[must_use]
+    pub fn new(fields: BTreeMap<String, String>) -> Self {
+        Self { fields }
+    }
+
+    #[must_use]
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+
+    pub(crate) fn fields(&self) -> BTreeMap<String, String> {
+        self.fields.clone()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum TransitCredentialError {
+    #[error("Transit credential provider is unavailable")]
+    Unavailable,
+    #[error("Transit credential reference is invalid")]
+    InvalidReference,
+    #[error("Transit credential file is not a regular non-symlink file")]
+    UnsafeFileType,
+    #[error("Transit credential file permissions are too broad")]
+    InsecurePermissions,
+    #[error("Transit credential file exceeds the size bound")]
+    TooLarge,
+    #[error("Transit credential document is invalid")]
+    InvalidDocument,
+    #[error("Transit credential file I/O failed")]
+    Io,
+}
+
+#[async_trait]
+pub trait TransitCredentialProvider: Send + Sync {
+    async fn resolve(
+        &self,
+        reference: &str,
+    ) -> Result<Option<TransitCredential>, TransitCredentialError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoTransitCredentials;
+
+#[async_trait]
+impl TransitCredentialProvider for NoTransitCredentials {
+    async fn resolve(
+        &self,
+        _reference: &str,
+    ) -> Result<Option<TransitCredential>, TransitCredentialError> {
+        Ok(None)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -49,6 +151,17 @@ pub enum TransitError {
     Unsupported(String),
     #[error("Transit connection failed: {0}")]
     Connection(String),
+    #[error("Transit adapter {protocol} is unavailable: {reason}")]
+    AdapterUnavailable {
+        protocol: String,
+        reason: &'static str,
+    },
+    #[error("Transit credential reference is unavailable: {reference}")]
+    CredentialUnavailable { reference: String },
+    #[error("Transit credential provider failed")]
+    CredentialProvider,
+    #[error("Transit proxy protocol failed: {0}")]
+    Protocol(String),
 }
 
 #[async_trait]
@@ -59,6 +172,49 @@ pub trait TransitAdapter: Send + Sync {
         &self,
         request: ConnectRequest,
     ) -> Result<BoxedTransitConnection, TransitError>;
+}
+
+pub(crate) async fn connect_tcp_endpoint(
+    endpoint: &Endpoint,
+    connect_timeout: Duration,
+) -> Result<TcpStream, TransitError> {
+    if endpoint.host.is_empty() || endpoint.port == 0 {
+        return Err(TransitError::Unsupported(
+            "Transit endpoint is invalid".to_owned(),
+        ));
+    }
+    let addresses = lookup_host((endpoint.host.as_str(), endpoint.port))
+        .await
+        .map_err(|_| TransitError::Connection("Transit endpoint resolution failed".into()))?;
+    let mut last_error = None;
+    for address in addresses {
+        match timeout(connect_timeout, TcpStream::connect(address)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(_)) => last_error = Some("Transit endpoint connection failed"),
+            Err(_) => last_error = Some("Transit endpoint connection timed out"),
+        }
+    }
+    Err(TransitError::Connection(
+        last_error
+            .unwrap_or("Transit endpoint returned no addresses")
+            .to_owned(),
+    ))
+}
+
+pub(crate) fn validate_destination(destination: &Endpoint) -> Result<(), TransitError> {
+    if destination.host.is_empty()
+        || destination.port == 0
+        || destination.host.len() > 255
+        || destination
+            .host
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(TransitError::Unsupported(
+            "Transit destination is invalid".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Direct TCP Transit adapter.
