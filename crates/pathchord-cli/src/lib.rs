@@ -109,6 +109,8 @@ pub enum CliError {
     LocalServer(#[from] pathchord_ingress::LocalServerError),
     #[error("listener runtime failed: {0}")]
     Runtime(#[from] RuntimeError),
+    #[error("listener {listener_id} of kind {kind} is not supported by the current runtime")]
+    UnsupportedListenerKind { listener_id: String, kind: String },
     #[error("listener {listener_id} has invalid bind address {bind}")]
     InvalidListenerBind { listener_id: String, bind: String },
 }
@@ -247,12 +249,6 @@ async fn run_ingress(
 }
 
 fn listener_descriptor(listener: ListenerConfig) -> Result<ListenerDescriptor, CliError> {
-    let bind = parse_bind(&listener.bind.host, listener.bind.port).ok_or_else(|| {
-        CliError::InvalidListenerBind {
-            listener_id: listener.id.as_str().to_owned(),
-            bind: format!("{}:{}", listener.bind.host, listener.bind.port),
-        }
-    })?;
     let kind = match listener.kind {
         PolicyListenerKind::Http => ListenerKind::Http,
         PolicyListenerKind::Socks5 => ListenerKind::Socks5,
@@ -260,6 +256,16 @@ fn listener_descriptor(listener: ListenerConfig) -> Result<ListenerDescriptor, C
         PolicyListenerKind::Redirect => ListenerKind::Redirect,
         PolicyListenerKind::Tun => ListenerKind::Tun,
     };
+    let bind = listener
+        .bind
+        .ok_or_else(|| CliError::UnsupportedListenerKind {
+            listener_id: listener.id.as_str().to_owned(),
+            kind: format!("{kind:?}"),
+        })?;
+    let bind = parse_bind(&bind.host, bind.port).ok_or_else(|| CliError::InvalidListenerBind {
+        listener_id: listener.id.as_str().to_owned(),
+        bind: format!("{}:{}", bind.host, bind.port),
+    })?;
     Ok(ListenerDescriptor {
         id: listener.id,
         kind,
@@ -435,10 +441,10 @@ mod tests {
         let listener = ListenerConfig {
             id: pathchord_policy::ListenerId::new("local-http"),
             kind: PolicyListenerKind::Http,
-            bind: pathchord_policy::Endpoint {
+            bind: Some(pathchord_policy::Endpoint {
                 host: "127.0.0.1".into(),
                 port: 8080,
-            },
+            }),
             allowed_sources: Vec::new(),
             authentication: AuthenticationMode::Required,
         };
