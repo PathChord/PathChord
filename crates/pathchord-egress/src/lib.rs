@@ -14,6 +14,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, lookup_host};
 use tokio::time::timeout;
 
+/// Default bound for target connection establishment when callers do not
+/// provide an explicit policy timeout.
+pub const DEFAULT_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub trait TargetConnection: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T> TargetConnection for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -88,7 +92,7 @@ impl TcpTargetConnector {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            connect_timeout: None,
+            connect_timeout: Some(DEFAULT_TARGET_CONNECT_TIMEOUT),
         }
     }
 

@@ -4,10 +4,13 @@
 //! not implement a concrete proxy protocol or subscription format.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, lookup_host};
+use tokio::time::timeout;
 
 pub trait TransitConnection: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -58,9 +61,83 @@ pub trait TransitAdapter: Send + Sync {
     ) -> Result<BoxedTransitConnection, TransitError>;
 }
 
+/// Direct TCP Transit adapter.
+///
+/// This owns only the byte connection. Noise records and PathChord frames are
+/// layered above it by the Path/session owner.
+#[derive(Debug, Clone)]
+pub struct DirectTransitAdapter {
+    metadata: TransitMetadata,
+    connect_timeout: Duration,
+}
+
+impl DirectTransitAdapter {
+    #[must_use]
+    pub fn new(adapter_id: impl Into<String>, connect_timeout: Duration) -> Self {
+        Self {
+            metadata: TransitMetadata {
+                adapter_id: adapter_id.into(),
+                kind: AdapterKind::Direct,
+                labels: BTreeMap::new(),
+            },
+            connect_timeout,
+        }
+    }
+
+    async fn connect_address(
+        &self,
+        address: std::net::SocketAddr,
+    ) -> Result<TcpStream, TransitError> {
+        timeout(self.connect_timeout, TcpStream::connect(address))
+            .await
+            .map_err(|_| TransitError::Connection("direct Transit connection timed out".into()))?
+            .map_err(|_| TransitError::Connection("direct Transit connection failed".into()))
+    }
+}
+
+#[async_trait]
+impl TransitAdapter for DirectTransitAdapter {
+    fn metadata(&self) -> &TransitMetadata {
+        &self.metadata
+    }
+
+    async fn connect(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<BoxedTransitConnection, TransitError> {
+        if request.destination.host.is_empty() {
+            return Err(TransitError::Unsupported(
+                "direct Transit destination host is empty".into(),
+            ));
+        }
+        if request.destination.port == 0 {
+            return Err(TransitError::Unsupported(
+                "direct Transit destination port is zero".into(),
+            ));
+        }
+        let addresses = lookup_host((request.destination.host.as_str(), request.destination.port))
+            .await
+            .map_err(|_| {
+                TransitError::Connection("direct Transit name resolution failed".into())
+            })?;
+        let mut last_error = None;
+        for address in addresses {
+            match self.connect_address(address).await {
+                Ok(stream) => return Ok(Box::new(stream)),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            TransitError::Connection("direct Transit returned no addresses".into())
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
 
     struct FakeAdapter {
         metadata: TransitMetadata,
@@ -105,5 +182,41 @@ mod tests {
 
         assert_eq!(adapter.metadata().adapter_id, "fake-1");
         drop(connection);
+    }
+
+    #[tokio::test]
+    async fn direct_adapter_connects_to_a_tcp_endpoint_with_a_bound() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("target bind");
+        let address = listener.local_addr().expect("target address");
+        let accepted = tokio::spawn(async move { listener.accept().await.expect("accept") });
+        let adapter = DirectTransitAdapter::new("direct-test", Duration::from_secs(1));
+        let connection = adapter
+            .connect(ConnectRequest {
+                destination: Endpoint {
+                    host: address.ip().to_string(),
+                    port: address.port(),
+                },
+            })
+            .await
+            .expect("direct connection");
+        assert_eq!(adapter.metadata().kind, AdapterKind::Direct);
+        drop(connection);
+        accepted.await.expect("accepted task");
+    }
+
+    #[tokio::test]
+    async fn direct_adapter_rejects_invalid_destination() {
+        let adapter = DirectTransitAdapter::new("direct-test", Duration::from_secs(1));
+        assert!(matches!(
+            adapter
+                .connect(ConnectRequest {
+                    destination: Endpoint {
+                        host: String::new(),
+                        port: 443,
+                    },
+                })
+                .await,
+            Err(TransitError::Unsupported(_))
+        ));
     }
 }
