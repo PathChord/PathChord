@@ -10,10 +10,9 @@ use pathchord_core::{PathId, ProtocolLimits, SessionId, TargetEndpoint as WireTa
 use pathchord_noise::{STATIC_KEY_LEN, StaticKeypair, WIRE_PROFILE_V1_PROLOGUE_PREFIX};
 use pathchord_path::{
     AutoscaleDecision, AutoscaleInput, IngressPathAdmissionConfig, IngressSessionHandle,
-    IngressUdpHandle, MultipathConfig, MultipathPathObservation, OpenStreamError, OpenUdpError,
-    PathAdmissionError, PathAdmissionOutcome, PathAutoscaler, PathAutoscalerConfig,
-    PathEconomicStatus, PathQualitySnapshot, SessionRuntimeError, SessionSnapshot,
-    SessionUdpHandle, dial_path,
+    MultipathConfig, MultipathPathObservation, OpenStreamError, OpenUdpError, PathAdmissionError,
+    PathAdmissionOutcome, PathAutoscaler, PathAutoscalerConfig, PathEconomicStatus,
+    PathQualitySnapshot, SessionRuntimeError, SessionSnapshot, SessionUdpHandle, dial_path,
 };
 use pathchord_policy::{
     CompiledPolicy, EgressConfig, EgressId, EgressRuntimeStatus, Evaluation, FlowProtocol,
@@ -30,8 +29,8 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Instant, timeout};
 
 use crate::{
-    BoxedLocalConnection, ConnectionContext, DnsAdapterError, DnsRouteAdapter, DnsRouteRequest,
-    DnsRouteSelection, FlowBridgeError, MAX_DNS_MESSAGE_BYTES, TcpFlowOpener,
+    BoxedLocalConnection, BoxedUdpFlowHandle, ConnectionContext, DnsAdapterError, DnsRouteAdapter,
+    DnsRouteRequest, DnsRouteSelection, FlowBridgeError, MAX_DNS_MESSAGE_BYTES, TcpFlowOpener,
 };
 
 pub const DEFAULT_PATH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -223,8 +222,14 @@ impl IngressDataPlane {
                     id.clone(),
                     TransitProxyRuntimeStatus {
                         state: RuntimeNodeState::Ready,
-                        capabilities: BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp]),
+                        capabilities: if transit.options.udp == Some(false) {
+                            BTreeSet::from([FlowProtocol::Tcp])
+                        } else {
+                            BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp])
+                        },
                         selection_score: 1,
+                        quota_remaining: None,
+                        traffic_multiplier_basis_points: None,
                         ..TransitProxyRuntimeStatus::default()
                     },
                 );
@@ -254,10 +259,16 @@ impl IngressDataPlane {
         &self,
         id: TransitProxyId,
         adapter: Arc<dyn TransitAdapter>,
-        status: TransitProxyRuntimeStatus,
+        mut status: TransitProxyRuntimeStatus,
     ) -> Result<(), DataPlaneError> {
         if !self.transit_configs.contains_key(&id) {
             return Err(DataPlaneError::TransitUnavailable(id.as_str().to_owned()));
+        }
+        if !adapter.supports_udp() || self.transit_configs[&id].options.udp == Some(false) {
+            status.capabilities.remove(&FlowProtocol::Udp);
+        }
+        if !adapter.supports_tcp() {
+            status.capabilities.remove(&FlowProtocol::Tcp);
         }
         self.transit_adapters
             .write()
@@ -284,8 +295,14 @@ impl IngressDataPlane {
         &self,
         config: TransitProxyConfig,
         adapter: Arc<dyn TransitAdapter>,
-        status: TransitProxyRuntimeStatus,
+        mut status: TransitProxyRuntimeStatus,
     ) {
+        if !adapter.supports_udp() || config.options.udp == Some(false) {
+            status.capabilities.remove(&FlowProtocol::Udp);
+        }
+        if !adapter.supports_tcp() {
+            status.capabilities.remove(&FlowProtocol::Tcp);
+        }
         let id = config.id.clone();
         self.dynamic_transit_configs
             .write()
@@ -468,14 +485,41 @@ impl IngressDataPlane {
             let snapshot = session.snapshot();
             input.ready_paths = snapshot.ready_paths;
             let paths = slot.transit_paths.lock().await.clone();
-            for path_id in paths.values() {
+            let runtime = self.runtime.read().await;
+            let economics: BTreeMap<_, _> = paths
+                .keys()
+                .filter_map(|id| {
+                    runtime
+                        .transit_proxy(id)
+                        .cloned()
+                        .map(|status| (id.clone(), status))
+                })
+                .collect();
+            drop(runtime);
+            for (transit_id, path_id) in &paths {
+                let observed = economics.get(transit_id);
+                let quota_remaining = match (
+                    input.quota_remaining,
+                    observed.and_then(|status| status.quota_remaining),
+                ) {
+                    (Some(egress), Some(provider)) => Some(egress.min(provider)),
+                    (egress, provider) => egress.or(provider),
+                };
+                let multiplier = observed
+                    .and_then(|status| status.traffic_multiplier_basis_points)
+                    .unwrap_or(10_000);
+                let traffic_multiplier_basis_points =
+                    (u64::from(input.traffic_multiplier_basis_points)
+                        .saturating_mul(u64::from(multiplier))
+                        / 10_000)
+                        .clamp(1, u64::from(u32::MAX)) as u32;
                 session
                     .update_path_economic_status(
                         *path_id,
                         PathEconomicStatus {
                             hard_available: input.hard_available,
-                            quota_remaining: input.quota_remaining,
-                            traffic_multiplier_basis_points: input.traffic_multiplier_basis_points,
+                            quota_remaining,
+                            traffic_multiplier_basis_points,
                         },
                     )
                     .await?;
@@ -664,7 +708,7 @@ impl IngressDataPlane {
     pub async fn open_udp(
         &self,
         context: &ConnectionContext,
-    ) -> Result<IngressUdpHandle, DataPlaneError> {
+    ) -> Result<BoxedUdpFlowHandle, DataPlaneError> {
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
@@ -681,8 +725,58 @@ impl IngressDataPlane {
                 .await
                 .evaluate(&policy_context, &runtime)
         };
-        let Evaluation::Route(RoutePlan::Egress(route)) = evaluation else {
-            return Err(DataPlaneError::NoUsableRoute);
+        let route = match evaluation {
+            Evaluation::Reject { .. } => return Err(DataPlaneError::PolicyRejected),
+            Evaluation::Direct { .. } => {
+                let adapter =
+                    DirectTransitAdapter::new("builtin-direct", self.path_connect_timeout);
+                let datagram = adapter
+                    .connect_udp(ConnectRequest {
+                        destination: transit_target(&policy_context)?,
+                    })
+                    .await?;
+                return Ok(Box::new(crate::udp_flow::TransitUdpFlowHandle::new(
+                    datagram,
+                )));
+            }
+            Evaluation::Route(RoutePlan::Proxy(route)) => {
+                let disabled = self
+                    .transit_configs
+                    .get(&route.transit_proxy_id)
+                    .is_some_and(|config| config.options.udp == Some(false))
+                    || self
+                        .dynamic_transit_configs
+                        .read()
+                        .await
+                        .get(&route.transit_proxy_id)
+                        .is_some_and(|config| config.options.udp == Some(false));
+                if disabled {
+                    return Err(DataPlaneError::NoUsableRoute);
+                }
+                let adapter = self
+                    .transit_adapters
+                    .read()
+                    .await
+                    .get(&route.transit_proxy_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DataPlaneError::TransitUnavailable(
+                            route.transit_proxy_id.as_str().to_owned(),
+                        )
+                    })?;
+                if !adapter.supports_udp() {
+                    return Err(DataPlaneError::NoUsableRoute);
+                }
+                let datagram = adapter
+                    .connect_udp(ConnectRequest {
+                        destination: transit_target(&policy_context)?,
+                    })
+                    .await?;
+                return Ok(Box::new(crate::udp_flow::TransitUdpFlowHandle::new(
+                    datagram,
+                )));
+            }
+            Evaluation::Route(RoutePlan::Egress(route)) => route,
         };
         let candidate = route
             .candidates
@@ -733,14 +827,16 @@ impl IngressDataPlane {
                 )
                 .await?;
         }
-        Ok(session
-            .open_udp_routed_with_config(
-                wire_target(&policy_context)?,
-                eligible,
-                self.multipath_config_for(&candidate.traffic_policy_id)
-                    .await,
-            )
-            .await?)
+        Ok(Box::new(
+            session
+                .open_udp_routed_with_config(
+                    wire_target(&policy_context)?,
+                    eligible,
+                    self.multipath_config_for(&candidate.traffic_policy_id)
+                        .await,
+                )
+                .await?,
+        ))
     }
 
     pub async fn snapshot(&self) -> DataPlaneSnapshot {
@@ -1348,6 +1444,206 @@ mod tests {
         assert_eq!(&echoed, b"ping");
         target.await.expect("target task");
         assert_eq!(plane.snapshot().await.sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_direct_fallback_forwards_udp_without_a_session() {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = target.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut bytes = [0; 128];
+            for expected in [b"one".as_slice(), b"two-two".as_slice()] {
+                let (length, peer) = target.recv_from(&mut bytes).await.unwrap();
+                assert_eq!(&bytes[..length], expected);
+                target.send_to(&bytes[..length], peer).await.unwrap();
+            }
+        });
+        let plane = data_plane(FallbackAction::Direct);
+        let mut handle = plane.open_udp(&context(address)).await.unwrap();
+        for payload in [b"one".to_vec(), b"two-two".to_vec()] {
+            handle.send(payload.clone()).await.unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(2), handle.receive())
+                    .await
+                    .unwrap(),
+                Some(payload)
+            );
+        }
+        handle.close().await.unwrap();
+        task.await.unwrap();
+        assert_eq!(plane.snapshot().await.sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn udp_reject_fallback_never_contacts_the_target() {
+        let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let plane = data_plane(FallbackAction::Reject);
+        assert!(matches!(
+            plane.open_udp(&context(target.local_addr().unwrap())).await,
+            Err(DataPlaneError::PolicyRejected)
+        ));
+        let mut packet = [0; 16];
+        assert!(
+            timeout(Duration::from_millis(20), target.recv_from(&mut packet))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicitly_disabled_udp_is_not_admitted_as_an_ordinary_proxy_route() {
+        let id = TransitProxyId::new("tcp-only-direct");
+        let policy = ValidatedPolicySnapshot::new(
+            Generation::new(1),
+            PolicyConfig {
+                transit_proxies: vec![TransitProxyConfig {
+                    id,
+                    source: None,
+                    protocol: "direct".into(),
+                    endpoint: pathchord_policy::Endpoint {
+                        host: String::new(),
+                        port: 1,
+                    },
+                    credentials_ref: None,
+                    labels: Default::default(),
+                    tags: Default::default(),
+                    weight: 100,
+                    options: pathchord_policy::TransitOptions {
+                        udp: Some(false),
+                        ..Default::default()
+                    },
+                }],
+                proxy_rules: vec![ProxyRule {
+                    id: RuleId::new("selected-proxy"),
+                    matches: FlowMatch::default(),
+                    require: Selector::default(),
+                    select: ProxySelection::Any,
+                }],
+                fallback: Some(FallbackAction::Reject),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let plane = IngressDataPlane::new(IngressDataPlaneConfig::new(
+            "ingress-a",
+            pathchord_noise::generate_static_keypair().unwrap(),
+            policy,
+        ))
+        .unwrap();
+        assert!(matches!(
+            plane
+                .open_udp(&context("127.0.0.1:9".parse().unwrap()))
+                .await,
+            Err(DataPlaneError::PolicyRejected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_proxy_rules_open_native_udp_on_the_selected_adapter() {
+        #[derive(Debug)]
+        struct CountingAdapter {
+            sends: Arc<std::sync::atomic::AtomicU64>,
+        }
+        #[derive(Debug)]
+        struct CountingDatagram {
+            sends: Arc<std::sync::atomic::AtomicU64>,
+            reply: Option<Vec<u8>>,
+        }
+        #[async_trait::async_trait]
+        impl pathchord_transit::TransitDatagram for CountingDatagram {
+            async fn send(&mut self, payload: &[u8]) -> Result<(), TransitError> {
+                self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.reply = Some(payload.to_vec());
+                Ok(())
+            }
+            async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
+                Ok(self.reply.take().unwrap())
+            }
+        }
+        #[async_trait::async_trait]
+        impl TransitAdapter for CountingAdapter {
+            fn metadata(&self) -> &pathchord_transit::TransitMetadata {
+                panic!("metadata is not needed for routing")
+            }
+            fn supports_udp(&self) -> bool {
+                true
+            }
+            async fn connect(
+                &self,
+                _: ConnectRequest,
+            ) -> Result<pathchord_transit::BoxedTransitConnection, TransitError> {
+                panic!("UDP must not use the TCP adapter")
+            }
+            async fn connect_udp(
+                &self,
+                request: ConnectRequest,
+            ) -> Result<pathchord_transit::BoxedTransitDatagram, TransitError> {
+                assert_eq!(request.destination.host, "unresolved.example.test");
+                Ok(Box::new(CountingDatagram {
+                    sends: Arc::clone(&self.sends),
+                    reply: None,
+                }))
+            }
+        }
+        let id = TransitProxyId::new("native-udp");
+        let config = TransitProxyConfig {
+            id: id.clone(),
+            source: None,
+            protocol: "socks5".into(),
+            endpoint: pathchord_policy::Endpoint {
+                host: "127.0.0.1".into(),
+                port: 1080,
+            },
+            credentials_ref: None,
+            options: Default::default(),
+            labels: Default::default(),
+            tags: Default::default(),
+            weight: 100,
+        };
+        let policy = ValidatedPolicySnapshot::new(
+            Generation::new(1),
+            PolicyConfig {
+                transit_proxies: vec![config],
+                proxy_rules: vec![ProxyRule {
+                    id: RuleId::new("udp-proxy"),
+                    matches: FlowMatch::default(),
+                    require: Selector::default(),
+                    select: ProxySelection::Any,
+                }],
+                fallback: Some(FallbackAction::Reject),
+                ..PolicyConfig::default()
+            },
+        )
+        .unwrap();
+        let plane = IngressDataPlane::new(IngressDataPlaneConfig::new(
+            "ingress-a",
+            pathchord_noise::generate_static_keypair().unwrap(),
+            policy,
+        ))
+        .unwrap();
+        let sends = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        plane
+            .register_transit_adapter(
+                id,
+                Arc::new(CountingAdapter {
+                    sends: Arc::clone(&sends),
+                }),
+                TransitProxyRuntimeStatus {
+                    state: RuntimeNodeState::Ready,
+                    capabilities: BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp]),
+                    selection_score: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut ctx = context("127.0.0.1:53".parse().unwrap());
+        ctx.target.host = crate::TargetHost::Hostname("unresolved.example.test".into());
+        let mut handle = plane.open_udp(&ctx).await.unwrap();
+        handle.send(b"native-udp".to_vec()).await.unwrap();
+        assert_eq!(handle.receive().await, Some(b"native-udp".to_vec()));
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+        handle.close().await.unwrap();
     }
 
     #[tokio::test]

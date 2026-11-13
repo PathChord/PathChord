@@ -208,6 +208,7 @@ impl LocalControlDispatcher {
             return *response;
         }
         let snapshot = self.service.snapshot();
+        let observations = self.service.observation_snapshot();
         let items: Vec<_> = snapshot
             .nodes
             .iter()
@@ -215,6 +216,7 @@ impl LocalControlDispatcher {
                 json!({
                     "id": id.as_str(),
                     "admin": {"labels": state.labels, "tags": state.tags},
+                    "observed": node_observation_value(observations.nodes.get(id)),
                     "generation": snapshot.generation,
                 })
             })
@@ -248,11 +250,13 @@ impl LocalControlDispatcher {
                 None,
             );
         };
+        let observations = self.service.observation_snapshot();
         self.success(
             request.request_id,
             json!({
                 "id": id.as_str(),
                 "admin": {"labels": state.labels, "tags": state.tags},
+                "observed": node_observation_value(observations.nodes.get(id)),
                 "generation": snapshot.generation,
             }),
         )
@@ -1006,6 +1010,27 @@ impl LocalControlDispatcher {
     }
 }
 
+fn node_observation_value(observation: Option<&crate::NodeObservation>) -> Value {
+    let Some(observation) = observation else {
+        return json!({"state": "unknown", "diagnostic": Value::Null});
+    };
+    json!({
+        "state": format!("{:?}", observation.state).to_ascii_lowercase(),
+        "rtt_ms": observation.rtt_ms,
+        "jitter_ms": observation.jitter_ms,
+        "loss_ppm": observation.loss_ppm,
+        "throughput_bps": observation.throughput_bps,
+        "effective_capacity_bps": observation.effective_capacity_bps,
+        "diagnostic": observation.diagnostic,
+        "quota": observation.usage.as_ref().map(|usage| json!({
+            "upload_bytes": usage.upload_bytes, "download_bytes": usage.download_bytes,
+            "total_bytes": usage.total_bytes, "remaining_bytes": usage.remaining_bytes(),
+            "remaining_ratio": usage.remaining_ratio(), "expires_at": usage.expires_at,
+        })),
+        "billing": observation.usage.as_ref().and_then(|usage| usage.traffic_multiplier_basis_points).map(|basis_points| json!({"traffic_multiplier_basis_points": basis_points})),
+    })
+}
+
 fn default_platform_adapter(platform: SystemProxyPlatform) -> Arc<dyn PlatformProxyAdapter> {
     match platform {
         SystemProxyPlatform::Linux | SystemProxyPlatform::FreeBsd => {
@@ -1422,6 +1447,61 @@ mod tests {
     use super::*;
     use crate::{Actor, ListenerKind};
     use std::net::SocketAddr;
+
+    #[test]
+    fn node_queries_expose_a_sanitized_unavailability_reason() {
+        let mut dispatcher = LocalControlDispatcher::new(SystemProxyPlatform::Linux);
+        let node = crate::NodeId::new("imported-node").unwrap();
+        dispatcher.service_mut().add_node(node.clone()).unwrap();
+        dispatcher
+            .service_mut()
+            .set_node_observation(
+                node,
+                crate::NodeObservation {
+                    state: crate::NodeHealthState::Down,
+                    rtt_ms: None,
+                    jitter_ms: None,
+                    loss_ppm: None,
+                    throughput_bps: None,
+                    effective_capacity_bps: None,
+                    diagnostic: Some(pathchord_transit::NodeDiagnostic {
+                        code: pathchord_transit::NodeUnavailableReason::UnsupportedParameters,
+                        fields: vec!["reality-opts".to_owned()],
+                        message: "node has unsupported connection parameters".to_owned(),
+                    }),
+                    usage: Some(pathchord_transit::SubscriptionUsage {
+                        upload_bytes: 100,
+                        download_bytes: 150,
+                        total_bytes: Some(1000),
+                        expires_at: Some(1900000000),
+                        traffic_multiplier_basis_points: Some(25000),
+                    }),
+                },
+            )
+            .unwrap();
+        for (operation, body) in [
+            ("nodes.list", json!({})),
+            ("nodes.get", json!({"node_id":"imported-node"})),
+        ] {
+            let result = dispatcher.dispatch(request(operation, &["nodes:read"], body));
+            assert!(result.ok);
+            let value = result.result.unwrap();
+            let node = if operation == "nodes.list" {
+                &value["items"][0]
+            } else {
+                &value
+            };
+            assert_eq!(node["observed"]["state"], "down");
+            assert_eq!(node["observed"]["diagnostic"]["fields"][0], "reality-opts");
+            assert_eq!(node["observed"]["quota"]["remaining_bytes"], 750);
+            assert_eq!(node["observed"]["quota"]["expires_at"], 1900000000_u64);
+            assert_eq!(
+                node["observed"]["billing"]["traffic_multiplier_basis_points"],
+                25000
+            );
+            assert_eq!(node["admin"]["labels"], json!({}));
+        }
+    }
 
     fn request(operation: &str, capabilities: &[&str], body: Value) -> RequestEnvelope {
         RequestEnvelope {

@@ -134,6 +134,12 @@ A connect request carries a unique RequestID. Retrying the request on another Pa
 
 ## 6. UDP sessions
 
+This section describes UDP carried through a PathChord Egress. Ordinary
+direct or third-party proxy UDP does not create a PathChord Session and follows
+the [native UDP adapter contract](transit-proxies.md#udp-routing-boundaries).
+An Egress UDP Session requires a usable byte-stream Transit Path, not native
+UDP capability on that third-party node.
+
 A UDP session is bound to one Egress and one Egress-side socket context. TCP and UDP are both independent of Path identity. Path migration does not recreate or rebind the Egress-side socket, so the target-visible address and port remain unchanged.
 
 UDP preserves datagram boundaries. Ordinary application datagrams are not retransmitted by the aggregation layer and MAY be dropped when expired or over budget. Control messages remain reliable. If a reliable byte-stream transport carries the Path, its own head-of-line behavior is accepted as an implementation limitation.

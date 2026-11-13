@@ -1,10 +1,12 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use pathchord_policy::TransitProxyConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
+use zeroize::Zeroize;
 
 use crate::{
     AdapterKind, BoxedTransitConnection, ConnectRequest, Endpoint, TransitAdapter,
@@ -22,6 +24,11 @@ pub struct Socks5TransitAdapter {
     proxy: Endpoint,
     credentials: Option<(String, String)>,
     connect_timeout: Duration,
+    tls: Option<(
+        Arc<rustls::ClientConfig>,
+        rustls::pki_types::ServerName<'static>,
+    )>,
+    udp_enabled: bool,
 }
 
 impl std::fmt::Debug for Socks5TransitAdapter {
@@ -36,6 +43,15 @@ impl std::fmt::Debug for Socks5TransitAdapter {
     }
 }
 
+impl Drop for Socks5TransitAdapter {
+    fn drop(&mut self) {
+        if let Some((username, password)) = &mut self.credentials {
+            username.zeroize();
+            password.zeroize();
+        }
+    }
+}
+
 impl Socks5TransitAdapter {
     pub fn from_config(
         config: &TransitProxyConfig,
@@ -45,6 +61,38 @@ impl Socks5TransitAdapter {
         if config.protocol != "socks5" {
             return Err(TransitError::Unsupported(
                 "SOCKS5 adapter requires protocol socks5".to_owned(),
+            ));
+        }
+        crate::adapter_registry::validate_native_options(config, true, false, true)?;
+        let mut allowed = vec!["username", "password"];
+        allowed.extend(
+            config
+                .options
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.client_key_field.as_deref()),
+        );
+        crate::adapter_registry::validate_credentials(credential, &allowed)?;
+        let tls = match config.options.tls.as_ref() {
+            Some(options) if options.enabled => Some((
+                crate::tls::configure(
+                    crate::adapter_registry::native_tls_roots(),
+                    Some(options),
+                    credential,
+                )?,
+                crate::tls::server_name(&config.endpoint.host, Some(options))?,
+            )),
+            Some(options) if options == &pathchord_policy::TransitTls::default() => None,
+            Some(_) => {
+                return Err(TransitError::Unsupported(
+                    "SOCKS TLS options must enable TLS".into(),
+                ));
+            }
+            None => None,
+        };
+        if tls.is_some() && config.options.udp == Some(true) {
+            return Err(TransitError::Unsupported(
+                "SOCKS UDP over a TLS control connection is unsupported".into(),
             ));
         }
         let username = credential.and_then(|value| value.field("username"));
@@ -78,6 +126,8 @@ impl Socks5TransitAdapter {
             },
             credentials,
             connect_timeout,
+            tls,
+            udp_enabled: config.options.udp != Some(false),
         })
     }
 }
@@ -93,22 +143,59 @@ impl TransitAdapter for Socks5TransitAdapter {
         request: ConnectRequest,
     ) -> Result<BoxedTransitConnection, TransitError> {
         validate_destination(&request.destination)?;
-        let mut stream = connect_tcp_endpoint(&self.proxy, self.connect_timeout).await?;
+        let stream = connect_tcp_endpoint(&self.proxy, self.connect_timeout).await?;
+        let mut stream: BoxedTransitConnection = if let Some((tls, name)) = &self.tls {
+            let stream = timeout(
+                self.connect_timeout,
+                tokio_rustls::TlsConnector::from(Arc::clone(tls)).connect(name.clone(), stream),
+            )
+            .await
+            .map_err(|_| TransitError::Connection("SOCKS TLS handshake timed out".into()))?
+            .map_err(|_| TransitError::Connection("SOCKS TLS handshake failed".into()))?;
+            Box::new(stream)
+        } else {
+            Box::new(stream)
+        };
         timeout(
             self.connect_timeout,
             establish_socks5_tunnel(&mut stream, &request.destination, self.credentials.as_ref()),
         )
         .await
         .map_err(|_| TransitError::Connection("SOCKS5 handshake timed out".to_owned()))??;
-        Ok(Box::new(stream))
+        Ok(stream)
+    }
+
+    fn supports_udp(&self) -> bool {
+        self.udp_enabled && self.tls.is_none()
+    }
+
+    async fn connect_udp(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<crate::BoxedTransitDatagram, TransitError> {
+        if !self.supports_udp() {
+            return Err(TransitError::Unsupported(
+                "SOCKS UDP is disabled or unavailable over TLS".into(),
+            ));
+        }
+        crate::datagram::socks5_connect_udp(
+            &self.proxy,
+            self.credentials.as_ref(),
+            &request.destination,
+            self.connect_timeout,
+        )
+        .await
     }
 }
 
-async fn establish_socks5_tunnel(
-    stream: &mut tokio::net::TcpStream,
+async fn establish_socks5_tunnel<S>(
+    stream: &mut S,
     destination: &Endpoint,
     credentials: Option<&(String, String)>,
-) -> Result<(), TransitError> {
+) -> Result<(), TransitError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let methods: &[u8] = if credentials.is_some() {
         &[SOCKS_VERSION, 2, NO_AUTH, USERNAME_PASSWORD]
     } else {
@@ -257,6 +344,7 @@ mod tests {
             labels: BTreeMap::new(),
             tags: BTreeSet::new(),
             weight: 100,
+            options: Default::default(),
         }
     }
 

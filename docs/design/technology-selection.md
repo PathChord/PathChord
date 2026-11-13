@@ -22,6 +22,8 @@ This document defines the selected technologies and implementation boundaries. P
 | Linux TUN | `tun-rs` async packet device behind `PacketDevice`, with a direct `smoltcp` reactor | Safe replaceable device lifecycle and a maintained TCP/UDP state machine |
 | Windows TUN | `tun-rs` Wintun packet device behind the same interface and direct `smoltcp` reactor | Standard Windows driver integration without platform-specific TCP reconstruction |
 | HTTP/SOCKS | Hyper HTTP/1 message codec with internal HTTP routing and SOCKS4/4a/5 adapters | Maintained HTTP parsing, message framing, streaming backpressure, and explicit policy/authentication boundaries |
+| Transit protocols | Native direct/HTTP/SOCKS/SS adapters with typed rustls TLS options; optional supervised sing-box 1.14.4 backend | Reuses maintained protocol implementations while preserving node parameters, process ownership, and explicit unsupported errors |
+| Subscription imports | Bounded node normalizers and HTTP provider expansion, followed by adapter validation | Document formats do not imply protocol availability; malformed nodes remain visible without discarding valid siblings |
 | DNS wire handling | `hickory-proto` behind route adapters | Mature DNS parsing/encoding while keeping local, Transit, Egress, and blocked routing replaceable |
 | Testing | `cargo test`, deterministic fake transports, property tests, packet traces, and fault injection | Multipath correctness depends on reproducible loss, duplication, reordering, and restart tests |
 
@@ -73,6 +75,13 @@ state by parsing logs.
 
 `STATUS_REPORT` remains a compact authenticated data-Path message for Egress
 admission and health. It is not the management API or the metrics transport.
+
+Prometheus export reads aggregate gauges from the same observation snapshot
+through the Web Gateway's authentication and capability boundary. Provider
+usage is optional explicit metadata, persisted with private subscription
+snapshots and consumed by scheduling without converting it into a hard limit.
+The [Transit Proxy contract](../spec/transit-proxies.md) owns node and import
+semantics, including native UDP and optional engine lifecycle.
 
 ## Noise and record handling
 

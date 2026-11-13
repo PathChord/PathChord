@@ -310,6 +310,7 @@ where
             post(disable_subscription::<D>),
         )
         .route("/api/v1/metrics/snapshot", get(get_metrics::<D>))
+        .route("/metrics", get(get_prometheus::<D>))
         .route("/api/v1/metrics/paths", get(get_path_metrics::<D>))
         .route("/api/v1/metrics/streams", get(get_stream_metrics::<D>))
         .route(
@@ -633,6 +634,41 @@ where
         Value::Object(Map::new()),
     )
     .await
+}
+
+async fn get_prometheus<D>(State(state): State<WebState<D>>, headers: HeaderMap) -> Response
+where
+    D: ManagementDispatcher,
+{
+    let request = request_envelope(
+        &state,
+        "metrics.snapshot",
+        request_id(&headers),
+        None,
+        json!({}),
+    );
+    let response = state.dispatcher.lock().await.dispatch(request).await;
+    if !response.ok {
+        let status = response
+            .error
+            .as_ref()
+            .map_or(StatusCode::INTERNAL_SERVER_ERROR, |error| {
+                error_status(error.code)
+            });
+        return (status, Json(response)).into_response();
+    }
+    let Some(snapshot) = response.result else {
+        return gateway_failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            "metric snapshot is unavailable",
+        );
+    };
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        crate::metrics_export::prometheus(&snapshot),
+    )
+        .into_response()
 }
 
 async fn get_path_metrics<D>(State(state): State<WebState<D>>, headers: HeaderMap) -> Response
@@ -1435,6 +1471,63 @@ mod tests {
         assert_eq!(
             connections["result"]["items"][0]["target_redaction_reason"],
             "capability_required"
+        );
+        gateway.stop().await;
+    }
+
+    #[tokio::test]
+    async fn prometheus_export_uses_the_gateway_authentication_and_metric_capability() {
+        let gateway = start(
+            WebGatewayConfig {
+                bearer_token: Some(WebBearerToken::new("scrape-token-secret".to_owned())),
+                ..WebGatewayConfig::default()
+            },
+            dispatcher(),
+        )
+        .await;
+        let client = Client::new();
+        assert_eq!(
+            client
+                .get(gateway.url("/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = client
+            .get(gateway.url("/metrics"))
+            .bearer_auth("scrape-token-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain; version=0.0.4")
+        );
+        let text = response.text().await.unwrap();
+        assert!(text.contains("# TYPE pathchord_active_sessions gauge"));
+        assert!(!text.contains("scrape-token-secret"));
+        gateway.stop().await;
+        let gateway = start(
+            WebGatewayConfig {
+                actor_capabilities: BTreeSet::from(["status:read".to_owned()]),
+                ..WebGatewayConfig::default()
+            },
+            dispatcher(),
+        )
+        .await;
+        assert_eq!(
+            client
+                .get(gateway.url("/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
         );
         gateway.stop().await;
     }

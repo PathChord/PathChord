@@ -64,6 +64,9 @@ spec:
 
 ## 动态 Transit Proxy 数据
 
+节点协议、类型化 `options`、导入格式、凭据边界和提供方用量遵循
+[Transit Proxy 契约](transit-proxies.zh-CN.md)。订阅格式与可执行节点协议是独立能力。
+
 ```yaml
 apiVersion: pathchord.io/v1
 kind: TransitProxy
@@ -160,6 +163,10 @@ spec:
 Session 预算是硬性上限。流量类别预算可以减少该类别的分配量，但不能超过 Session 的剩余预算。
 
 ## 普通 Proxy 规则与回退
+
+选定节点允许 UDP 时，普通路由可以通过 direct、SOCKS5 和 SS 适配器执行原生 UDP。
+Egress UDP Session 流量独立于 Transit 节点的原生 UDP 能力。不支持的普通 UDP 路由必须
+按策略失败，不得绕过为 direct。
 
 ```yaml
 apiVersion: pathchord.io/v1

@@ -12,6 +12,11 @@ use thiserror::Error;
 
 mod compiled;
 mod config;
+mod transit_options;
+
+pub use transit_options::{
+    TransitMultiplex, TransitOptions, TransitReality, TransitTls, TransitTransport,
+};
 
 pub use compiled::{
     CompileError, CompiledPolicy, EgressRouteCandidate, EgressRoutePlan, EgressRuntimeStatus,
@@ -160,6 +165,43 @@ pub enum SubscriptionSourceType {
     Static,
     Clash,
     Sip008,
+    Auto,
+    Uri,
+    SingBox,
+    Surge,
+    Quantumult,
+    Loon,
+}
+
+impl SubscriptionSourceType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "static" => Self::Static,
+            "clash" | "mihomo" => Self::Clash,
+            "sip008" => Self::Sip008,
+            "auto" => Self::Auto,
+            "uri" | "base64" | "v2ray" => Self::Uri,
+            "sing_box" | "sing-box" | "singbox" => Self::SingBox,
+            "surge" => Self::Surge,
+            "quantumult" | "quantumult_x" | "quantumult-x" => Self::Quantumult,
+            "loon" => Self::Loon,
+            _ => return None,
+        })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Clash => "clash",
+            Self::Sip008 => "sip008",
+            Self::Auto => "auto",
+            Self::Uri => "uri",
+            Self::SingBox => "sing_box",
+            Self::Surge => "surge",
+            Self::Quantumult => "quantumult",
+            Self::Loon => "loon",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +310,8 @@ pub struct TransitProxyConfig {
     pub labels: BTreeMap<String, String>,
     pub tags: BTreeSet<String>,
     pub weight: u32,
+    #[serde(default)]
+    pub options: TransitOptions,
 }
 
 /// Runtime-owned observations are deliberately separate from imported config.
@@ -456,6 +500,11 @@ pub enum PolicyDecision {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ValidationError {
+    #[error("Transit Proxy {proxy_id} has invalid connection options: {reason}")]
+    InvalidTransitOptions {
+        proxy_id: String,
+        reason: &'static str,
+    },
     #[error("global fallback is required")]
     MissingFallback,
     #[error("{kind} id must not be empty")]
@@ -568,6 +617,13 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         validate_port("egress", egress.id.as_str(), egress.endpoint.port)?;
     }
     for proxy in &config.transit_proxies {
+        proxy
+            .options
+            .validate()
+            .map_err(|reason| ValidationError::InvalidTransitOptions {
+                proxy_id: proxy.id.as_str().to_owned(),
+                reason,
+            })?;
         validate_port("Transit Proxy", proxy.id.as_str(), proxy.endpoint.port)?;
         if proxy.credentials_ref.as_ref().is_some_and(|reference| {
             reference.is_empty() || reference.len() > 256 || reference.chars().any(char::is_control)
@@ -926,6 +982,7 @@ mod tests {
         for reserved_label in ["admin.owner", "observed.rtt_ms", "quota.remaining_ratio"] {
             let mut config = base_config();
             config.transit_proxies.push(TransitProxyConfig {
+                options: Default::default(),
                 id: TransitProxyId::new("provider-node"),
                 source: Some(TransitSource {
                     source_type: "clash".into(),
@@ -956,6 +1013,7 @@ mod tests {
     fn imported_proxy_requires_a_known_subscription() {
         let mut config = base_config();
         config.transit_proxies.push(TransitProxyConfig {
+            options: Default::default(),
             id: TransitProxyId::new("provider-node"),
             source: Some(TransitSource {
                 source_type: "clash".into(),
@@ -985,6 +1043,7 @@ mod tests {
     fn transit_credentials_reference_must_be_opaque_and_non_empty() {
         let mut config = base_config();
         config.transit_proxies.push(TransitProxyConfig {
+            options: Default::default(),
             id: TransitProxyId::new("private-proxy"),
             source: None,
             protocol: "socks5".into(),

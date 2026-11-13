@@ -108,7 +108,7 @@ billing.*   optional provider billing reference
 admin.*     local administrator annotations
 ```
 
-`billing.traffic_multiplier` is an optional positive decimal in `0.001..=1000`.
+`billing.traffic_multiplier` is an optional positive decimal in `0.0001..=100`.
 When present, the scheduler multiplies the configured relationship weight by
 this reference value before effective-capacity weighting. It is never a hard
 quota, never blocks connectivity by itself, and cannot be written by an
@@ -140,19 +140,28 @@ Each `kind: TransitProxy` object has:
 | Field | Required | Type and semantics |
 |---|---|---|
 | `metadata.name` | yes | resource name; unique in the namespace |
-| `source` | no | `{type, subscription}`; default `{type: static}` |
-| `protocol` | yes | built-in v1 adapter: `direct`, `http`, `https`, `socks5`, or `ss` |
+| `source` | no | `{type, subscriptionRef}`; default `{type: static}` |
+| `protocol` | yes | node protocol from the [adapter contract](transit-proxies.md#adapter-selection-and-failure); executable support is validated separately |
 | `address` | yes except `direct` | hostname or IP literal |
 | `port` | yes except `direct` | port |
 | `tags` | no | sequence of IDs; default `[]` |
 | `weight` | no | integer weight; default `100` |
 | `credentialsRef` | no | opaque local secret reference; never a secret value |
+| `options` | no | typed TLS, transport, header, UDP, multiplex, and dialer options; default `{}` |
 
-`source.type` is `static`, `clash`, or `sip008`. A non-static source MUST name
+`source.type` is one of the [subscription document types](transit-proxies.md#subscription-document-families),
+including `static`, `auto`, `clash`, `sip008`, `uri`, `sing_box`, `surge`,
+`quantumult`, and `loon`. A non-static source MUST name
 an existing `Subscription` object. Imported `source.*`, `observed.*`, and
 `quota.*` attributes are runtime-owned and cannot be authored inside a proxy
 object. Labels belong in `metadata.labels`.
 `direct` has no third-party endpoint and ignores `address` and `port`.
+
+The [Transit Proxy contract](transit-proxies.md) defines every typed option,
+protocol-specific credential handling, complete engine node documents,
+per-node diagnostics, bounded HTTP provider expansion, accounting metadata,
+and native versus Egress-carried UDP. Unknown YAML option fields are rejected.
+An adapter MUST NOT ignore unsupported connection options or downgrade TLS.
 
 The `kind: Subscription` object has this shape:
 
@@ -185,7 +194,9 @@ spec:
 the service data directory unless an administrator explicitly supplies an
 absolute path. The cache is written atomically with restrictive permissions.
 
-Refresh validates the complete candidate before publication. A failed refresh
+Refresh validates the document and each node before publication. Invalid or
+unsupported nodes remain visible and unselectable alongside valid nodes; a
+malformed document or failed fetch retains the previous snapshot. A failed refresh
 keeps the last successful snapshot, records a typed failure, and retries with
 bounded exponential backoff. Deleting or disabling a subscription prevents
 future refreshes; nodes imported solely from it enter `draining`, are excluded

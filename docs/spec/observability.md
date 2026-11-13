@@ -161,6 +161,30 @@ less than its overhead.
 
 ## Counters, gauges, and histograms
 
+The Web Gateway exposes `GET /metrics` as Prometheus text format 0.0.4 with
+`Content-Type: text/plain; version=0.0.4; charset=utf-8`. It uses the same
+authentication, Origin restrictions, and `metrics:read` authorization as JSON
+metric queries; it is not a separately privileged or unauthenticated listener.
+The response reads one canonical observation snapshot and provides these
+aggregate gauges without user-controlled or target-address labels:
+
+```text
+pathchord_active_sessions
+pathchord_ready_paths
+pathchord_active_streams
+pathchord_target_connections
+pathchord_observed_nodes
+pathchord_observed_connections
+pathchord_observation_generation
+```
+
+These values describe current snapshot state. They MUST NOT be presented as
+historical event counters or lifetime totals; absent snapshot facts are not
+fabricated. High-cardinality connection details remain in authorized resource
+queries. Provider quota, expiry, and explicit billing metadata follow the
+[Transit Proxy accounting contract](transit-proxies.md#provider-accounting-metadata).
+
+
 The service SHOULD provide these metric families:
 
 ```text

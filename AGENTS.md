@@ -49,3 +49,9 @@ Follow the existing `type: lowercase imperative summary` pattern, for example `d
 ## Security and configuration
 
 Never commit `.env`, `config.local.*`, private keys, certificates, or secret files. Use placeholders in examples. Preserve explicit enrollment, independent per-Path Noise state, and the documented prohibition on trust-on-first-use.
+
+Imported connection options must be consumed by the selected adapter or produce
+an explicit node diagnostic; never silently downgrade TLS or discard transport
+parameters. Keep complete engine documents in private credential storage and
+validate the configured backend before making a node eligible. Subscription
+provider references must preserve fetch budgets and credential origin boundaries.

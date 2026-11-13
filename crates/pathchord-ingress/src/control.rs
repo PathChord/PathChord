@@ -225,7 +225,7 @@ pub struct SubscriptionSpec {
 
 impl SubscriptionSpec {
     pub(crate) fn validate(&self) -> Result<(), ControlError> {
-        if !matches!(self.source_type.as_str(), "static" | "clash" | "sip008") {
+        if SubscriptionSourceType::from_name(&self.source_type).is_none() {
             return Err(ControlError::InvalidSubscription {
                 field: "source.type",
             });
@@ -278,16 +278,11 @@ impl SubscriptionSpec {
 
     pub fn runtime_config(&self) -> Result<PolicySubscriptionConfig, ControlError> {
         self.validate()?;
-        let source_type = match self.source_type.as_str() {
-            "static" => SubscriptionSourceType::Static,
-            "clash" => SubscriptionSourceType::Clash,
-            "sip008" => SubscriptionSourceType::Sip008,
-            _ => {
-                return Err(ControlError::InvalidSubscription {
-                    field: "source.type",
-                });
-            }
-        };
+        let source_type = SubscriptionSourceType::from_name(&self.source_type).ok_or(
+            ControlError::InvalidSubscription {
+                field: "source.type",
+            },
+        )?;
         Ok(PolicySubscriptionConfig {
             id: pathchord_policy::SubscriptionId::new(self.id.as_str()),
             enabled: self.enabled,
@@ -351,7 +346,7 @@ pub enum NodeHealthState {
     Down,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeObservation {
     pub state: NodeHealthState,
     pub rtt_ms: Option<u32>,
@@ -361,6 +356,8 @@ pub struct NodeObservation {
     pub loss_ppm: Option<u32>,
     pub throughput_bps: Option<u64>,
     pub effective_capacity_bps: Option<u64>,
+    pub diagnostic: Option<pathchord_transit::NodeDiagnostic>,
+    pub usage: Option<pathchord_transit::SubscriptionUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1936,6 +1933,8 @@ mod tests {
             .set_node_observation(
                 node,
                 NodeObservation {
+                    diagnostic: None,
+                    usage: None,
                     state: NodeHealthState::Up,
                     rtt_ms: Some(12),
                     jitter_ms: Some(2),

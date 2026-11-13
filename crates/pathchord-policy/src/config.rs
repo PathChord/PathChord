@@ -102,6 +102,8 @@ pub struct TransitProxySpec {
     #[serde(default = "default_weight")]
     weight: u32,
     credentials_ref: Option<String>,
+    #[serde(default)]
+    options: crate::TransitOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -643,6 +645,7 @@ impl KubeConfig {
                         labels: value.metadata.labels,
                         tags: value.spec.tags,
                         weight: value.spec.weight,
+                        options: value.spec.options,
                     });
                 }
                 KubeResource::EgressRule(value) => {
@@ -881,12 +884,8 @@ impl KubeConfig {
                         .spec
                         .source
                         .expect("validated Subscription source is present");
-                    let source_type = match source.source_type.as_str() {
-                        "static" => SubscriptionSourceType::Static,
-                        "clash" => SubscriptionSourceType::Clash,
-                        "sip008" => SubscriptionSourceType::Sip008,
-                        _ => unreachable!("validated Subscription source type"),
-                    };
+                    let source_type = SubscriptionSourceType::from_name(&source.source_type)
+                        .expect("validated Subscription source type");
                     let refresh = value
                         .spec
                         .refresh
@@ -1382,7 +1381,33 @@ fn validate_egress_spec(value: &Resource<EgressSpec>) -> Result<(), ConfigError>
 fn validate_transit_proxy_spec(value: &Resource<TransitProxySpec>) -> Result<(), ConfigError> {
     let kind = value.kind.as_str();
     let name = value.metadata.name.as_str();
-    const PROTOCOLS: [&str; 5] = ["direct", "http", "https", "socks5", "ss"];
+    value
+        .spec
+        .options
+        .validate()
+        .map_err(|reason| invalid_spec(kind, name, reason))?;
+    const PROTOCOLS: &[&str] = &[
+        "direct",
+        "http",
+        "https",
+        "socks4",
+        "socks4a",
+        "socks5",
+        "ss",
+        "vless",
+        "vmess",
+        "xtls",
+        "trojan",
+        "hysteria",
+        "hysteria2",
+        "tuic",
+        "wireguard",
+        "ssh",
+        "shadowtls",
+        "anytls",
+        "snell",
+        "ssr",
+    ];
     if !PROTOCOLS.contains(&value.spec.protocol.as_str()) {
         return Err(invalid_spec(
             kind,
@@ -1410,11 +1435,11 @@ fn validate_transit_proxy_spec(value: &Resource<TransitProxySpec>) -> Result<(),
         ));
     }
     if let Some(source) = &value.spec.source {
-        if !["static", "clash", "sip008"].contains(&source.source_type.as_str()) {
+        if SubscriptionSourceType::from_name(&source.source_type).is_none() {
             return Err(invalid_spec(
                 kind,
                 name,
-                "source.type must be static, clash, or sip008",
+                "source.type is not a recognized subscription format",
             ));
         }
         if source.source_type != "static"
@@ -1449,11 +1474,11 @@ fn validate_subscription_spec(value: &Resource<SubscriptionSpec>) -> Result<(), 
         .source
         .as_ref()
         .ok_or_else(|| invalid_spec(kind, name, "source is required"))?;
-    if !["static", "clash", "sip008"].contains(&source.source_type.as_str()) {
+    if SubscriptionSourceType::from_name(&source.source_type).is_none() {
         return Err(invalid_spec(
             kind,
             name,
-            "source.type must be static, clash, or sip008",
+            "source.type is not a recognized subscription format",
         ));
     }
     let parsed = Url::parse(&source.url)
@@ -2054,6 +2079,48 @@ items:
                 group: true,
             }
         );
+    }
+
+    #[test]
+    fn deployment_examples_compile_into_validated_policy() {
+        for source in [
+            include_str!("../../../examples/ingress-direct.yaml"),
+            include_str!("../../../examples/ingress-subscriptions.yaml"),
+            include_str!("../../../examples/ingress-egress.yaml"),
+        ] {
+            let source = source.replace(
+                "REPLACE_WITH_EGRESS_PUBLIC_KEY",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            );
+            KubeConfig::from_yaml(&source)
+                .unwrap()
+                .into_validated_snapshot(Generation::new(1))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn typed_tls_and_transport_options_are_preserved_and_unknown_fields_rejected() {
+        let source = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: tls-node}}\nspec:\n  protocol: vless\n  address: proxy.example\n  port: 443\n  credentialsRef: node-secret\n  options:\n    tls: {{enabled: true, serverName: verified.example, alpn: [http/1.1], reality: {{publicKey: public-example, shortId: abcd}}}}\n    transport: {{type: ws, path: /proxy, headers: {{Host: ws.example}}}}\n    udp: false\n"
+        );
+        let policy = KubeConfig::from_yaml(&source)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        let node = policy
+            .transit_proxies
+            .iter()
+            .find(|node| node.id.as_str() == "tls-node")
+            .unwrap();
+        assert_eq!(
+            node.options.tls.as_ref().unwrap().server_name.as_deref(),
+            Some("verified.example")
+        );
+        assert_eq!(node.options.transport.as_ref().unwrap().kind, "ws");
+        assert_eq!(node.options.udp, Some(false));
+        assert!(KubeConfig::from_yaml(&source.replace("serverName:", "silentlyIgnored:")).is_err());
+        assert!(KubeConfig::from_yaml(&source.replace("enabled: true", "enabled: false")).is_err());
     }
 
     #[test]

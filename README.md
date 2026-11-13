@@ -29,6 +29,16 @@ job. Transparent interception and TUN work follow this listener baseline. See th
 [implementation plan](docs/progress/implementation-plan.md) for platform
 validation, shared runtime gaps, and subsequent adapter work.
 
+Node imports support automatic detection, Clash/Mihomo providers, SIP008,
+URI/Base64 lists, sing-box JSON, and supported Surge/Quantumult X/Loon node
+lines. Native transports support typed TLS settings and direct/SOCKS5/
+Shadowsocks UDP, including SS2022. Advanced protocols and transports can use
+an explicitly selected sing-box 1.14.4 executable through `--outbound-engine`.
+Unsupported nodes and parameters expose individual diagnostics. See the
+[Transit Proxy and subscription contract](docs/spec/transit-proxies.md) for
+the exact compatibility boundaries and [deployment guide](docs/spec/deployment.md)
+for runnable configurations.
+
 ## Terminology
 
 - **Ingress**: local traffic entry point and policy engine.
@@ -63,6 +73,8 @@ source.
 - [State machines](docs/spec/state-machines.md)
 - [Ingress control plane](docs/spec/ingress-control-plane.md)
 - [Ingress observability](docs/spec/observability.md)
+- [Transit Proxies and subscriptions](docs/spec/transit-proxies.md)
+- [Deployment and local operation](docs/spec/deployment.md)
 
 ### Progress
 

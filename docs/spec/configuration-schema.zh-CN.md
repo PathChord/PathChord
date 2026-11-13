@@ -80,7 +80,7 @@ billing.*   可选的提供方计费参考信息
 admin.*     本地管理员注解
 ```
 
-`billing.traffic_multiplier` 是范围 `0.001..=1000` 的可选正十进制定数。存在该值时，调度器在
+`billing.traffic_multiplier` 是范围 `0.0001..=100` 的可选正十进制定数。存在该值时，调度器在
 有效容量加权前将关系权重乘以该倍率。它不是硬配额，不会单独阻止连通性，也不能通过管理员 label
 mutation 写入。导入的 source、observed、quota 和 billing 值均由运行时拥有。
 
@@ -120,10 +120,16 @@ spec:
   weight: 100
 ```
 
-v1 内置 adapter 包括 `direct`、`http`、`https`、`socks5` 和 `ss`。
-`source.type` 可以是 `static`、`clash` 或 `sip008`；非 static 来源必须引用现有 Subscription。
+节点 protocol 遵循[适配器契约](transit-proxies.zh-CN.md#适配器选择与失败)，可执行支持必须单独验证。
+`options` 默认 `{}`，包含类型化 TLS、transport、header、UDP、multiplex 和拨号选项。
+`source.type` 遵循[订阅文档类型](transit-proxies.zh-CN.md#订阅文档类型)，包括 `static`、`auto`、
+`clash`、`sip008`、`uri`、`sing_box`、`surge`、`quantumult` 和 `loon`；非 static 来源必须引用现有 Subscription。
 导入的 source、observed 和 quota 属性由运行时拥有，不能写入 Proxy spec。`direct` 没有第三方端点，
 忽略 address 和 port。
+
+[Transit Proxy 契约](transit-proxies.zh-CN.md)定义全部类型化选项、按协议区分的凭据处理、完整
+引擎节点文档、单节点诊断、有界 HTTP provider 展开、用量元数据，以及原生和 Egress 承载的 UDP。
+未知 YAML 选项字段必须拒绝。适配器不得忽略不支持的连接选项或降级 TLS。
 
 Subscription 的 spec 包含 `enabled`、`source`、`refresh` 和 `cache`：
 
@@ -150,7 +156,8 @@ spec:
 
 `enabled` 默认 true；intervalSeconds 默认 3600 且范围 `60..=604800`；timeoutSeconds 默认 30 且范围
 `1..=300`；maxAttempts 默认 3 且范围 `1..=10`；backoffSeconds 默认 5 且范围 `1..=3600`；
-maxAgeSeconds 默认 86400 且范围 `60..=2592000`。URL 不得包含凭据。刷新验证完整候选后才发布；失败
+maxAgeSeconds 默认 86400 且范围 `60..=2592000`。URL 不得包含凭据。刷新先验证文档与每个节点再发布；
+无效或不支持节点保持可见且不可选，有效节点仍可发布；文档格式错误或获取失败保留上一快照。刷新失败
 保留上一成功快照，记录类型化错误并使用有界指数退避。删除或禁用订阅会阻止后续刷新，仅由该来源导入
 的节点进入排空并排除新选择。成功刷新发布一个动态代次，失败不发布代次。
 

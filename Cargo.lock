@@ -73,6 +73,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-gcm-siv"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c32325128cb24de2a2d14d92da7569dae7073f9e47334521d494747fa94d902"
+dependencies = [
+ "aead 0.6.1",
+ "aes 0.9.4",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ctutils",
+ "polyval 0.7.3",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -478,6 +492,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "camellia"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3ed33f9863ee76491bbe0d7e16a225c694d8525287e320dc7fbe71ee212254c"
+dependencies = [
+ "cipher 0.5.2",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -487,6 +510,18 @@ dependencies = [
  "jobserver",
  "libc",
  "shlex",
+]
+
+[[package]]
+name = "ccm"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0be9b34d99d395af800e996c5784f810f8400ccd64202f91859dc677825b5378"
+dependencies = [
+ "aead 0.6.1",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ctutils",
 ]
 
 [[package]]
@@ -1791,6 +1826,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "lru_time_cache"
+version = "0.11.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9106e1d747ffd48e6be5bb2d97fa706ed25b144fbee4d5c02eae110cd8d6badd"
+
+[[package]]
 name = "managed"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2232,6 +2273,7 @@ dependencies = [
  "async-trait",
  "atomic-write-file",
  "base64",
+ "getrandom 0.4.3",
  "noyalib-serde-yaml",
  "pathchord-policy",
  "rcgen",
@@ -2244,6 +2286,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "url",
  "zeroize",
 ]
 
@@ -2962,6 +3005,7 @@ version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2065b026dbe4f47048eca384adf07f693bf901050d80abd3adb7b2422709b2d"
 dependencies = [
+ "aes 0.9.4",
  "base64",
  "blake3",
  "byte_string",
@@ -2971,8 +3015,10 @@ dependencies = [
  "futures",
  "libc",
  "log",
+ "lru_time_cache",
  "percent-encoding",
  "pin-project",
+ "rand",
  "sealed",
  "sendfd",
  "serde",
@@ -2995,14 +3041,26 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b404a62ebea5003f44b9a2748dee7555c5f9ae39896508e466a2a91ee6fa5df5"
 dependencies = [
+ "aead 0.6.1",
+ "aes 0.9.4",
  "aes-gcm 0.11.1",
+ "aes-gcm-siv",
  "aws-lc-rs",
+ "blake3",
+ "bytes",
+ "camellia",
+ "ccm",
  "cfg-if",
+ "chacha20 0.10.2",
  "chacha20poly1305 0.11.0",
+ "ctr 0.10.1",
+ "ghash 0.6.0",
  "hkdf",
  "md-5",
  "rand",
  "sha1",
+ "sm4",
+ "subtle",
 ]
 
 [[package]]
@@ -3042,6 +3100,15 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "sm4"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2d621883cdeeaee6759d39f4bc8cd314b29db72b6ac3d6714b31422512ee11"
+dependencies = [
+ "cipher 0.5.2",
+]
 
 [[package]]
 name = "smallvec"
