@@ -412,6 +412,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Stdio;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UdpSocket;
     use tokio::process::Command;
 
     #[tokio::test]
@@ -515,6 +516,26 @@ mod tests {
         stream.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"hy2test");
         target_task.await.unwrap();
+        let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_address = udp_target.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut payload = [0_u8; 32];
+            let (length, peer) = udp_target.recv_from(&mut payload).await.unwrap();
+            udp_target.send_to(&payload[..length], peer).await.unwrap();
+        });
+        let mut datagram = adapter
+            .connect_udp(ConnectRequest {
+                destination: crate::Endpoint {
+                    host: udp_address.ip().to_string(),
+                    port: udp_address.port(),
+                },
+            })
+            .await
+            .unwrap();
+        datagram.send(b"hy2-udp").await.unwrap();
+        assert_eq!(datagram.receive().await.unwrap(), b"hy2-udp");
+        datagram.close().await.unwrap();
+        udp_task.await.unwrap();
         server.kill().await.unwrap();
         server.wait().await.unwrap();
     }

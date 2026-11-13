@@ -53,6 +53,7 @@ where
             "vmess",
             "anytls",
             "hysteria2",
+            "tuic",
         ]
         .map(str::to_owned)
         .into();
@@ -198,6 +199,12 @@ where
                 Arc::clone(&self.tls),
             )?),
             "hysteria2" => Arc::new(crate::hysteria2_adapter::Hysteria2Adapter::from_config(
+                config,
+                credential,
+                self.connect_timeout,
+                Arc::clone(&self.tls),
+            )?),
+            "tuic" => Arc::new(crate::tuic_adapter::TuicAdapter::from_config(
                 config,
                 credential,
                 self.connect_timeout,

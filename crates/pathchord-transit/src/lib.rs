@@ -33,6 +33,7 @@ mod shadowsocks_adapter;
 mod socks5_adapter;
 mod subscription;
 mod tls;
+mod tuic_adapter;
 #[allow(dead_code)]
 mod tuic_codec;
 mod vmess;
