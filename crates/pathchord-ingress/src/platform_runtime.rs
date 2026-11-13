@@ -337,7 +337,7 @@ impl IngressPlatformRuntime {
         for listener in listeners.iter().filter(|listener| {
             matches!(
                 listener.kind,
-                PolicyListenerKind::Http | PolicyListenerKind::Socks5
+                PolicyListenerKind::Http | PolicyListenerKind::Socks5 | PolicyListenerKind::Mixed
             )
         }) {
             let verifier = factories
@@ -373,7 +373,7 @@ impl IngressPlatformRuntime {
                 PolicyListenerKind::Http | PolicyListenerKind::Redirect => {
                     tcp_descriptors.push(listener_descriptor(listener)?);
                 }
-                PolicyListenerKind::Socks5 => {
+                PolicyListenerKind::Socks5 | PolicyListenerKind::Mixed => {
                     let descriptor = listener_descriptor(listener)?;
                     let credential_verifier =
                         listener_credentials.remove(&listener.id).ok_or_else(|| {
@@ -896,6 +896,7 @@ fn preflight_listeners(
         match listener.kind {
             PolicyListenerKind::Http
             | PolicyListenerKind::Socks5
+            | PolicyListenerKind::Mixed
             | PolicyListenerKind::Redirect => {
                 listener_descriptor(listener)?;
             }
@@ -948,6 +949,7 @@ fn listener_descriptor(
     let kind = match listener.kind {
         PolicyListenerKind::Http => ListenerKind::Http,
         PolicyListenerKind::Socks5 => ListenerKind::Socks5,
+        PolicyListenerKind::Mixed => ListenerKind::Mixed,
         PolicyListenerKind::Tproxy => ListenerKind::Tproxy,
         PolicyListenerKind::Redirect => ListenerKind::Redirect,
         PolicyListenerKind::Tun => ListenerKind::Tun,

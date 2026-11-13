@@ -15,6 +15,7 @@ async-stream = "0.3.6"
 async-trait = "0.1.92"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 clatter = { version = "2.3.0", default-features = false, features = [
     "std",
@@ -23,6 +24,9 @@ clatter = { version = "2.3.0", default-features = false, features = [
 ] }
 getrandom = "0.4.3"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 interprocess = { version = "2.4.8", default-features = false, features = ["tokio"] }
 nix = { version = "0.31.3", default-features = false, features = ["net", "socket", "uio"] }
 orion = { version = "0.18.1", default-features = false, features = ["zeroize"] }

@@ -11,15 +11,17 @@ Session 或线协议。
 | 监听器类型 | Linux | Windows | FreeBSD | 地址语义 |
 |---|---|---|---|---|
 | `http` | 必须支持 | 必须支持 | 必须支持 | 显式 HTTP 主机名或地址 |
-| `socks5` | 必须支持 | 必须支持 | 必须支持 | 显式 SOCKS5 主机名或地址 |
+| `socks5` | 必须支持 | 必须支持 | 必须支持 | 显式 SOCKS4/4a/5 主机名或地址 |
+| `mixed` | 必须支持 | 必须支持 | 必须支持 | 在一个 TCP 监听器上接收 HTTP 和 SOCKS |
 | `tproxy` | 必须支持 | 必须不支持 | 必须不支持 | 透明 TCP/UDP IP 流 |
 | `redirect` | 必须支持 | 必须不支持 | 必须不支持 | 透明 TCP 流 |
 | `tun` | 可以支持 | 必须支持 | 必须不支持 | 通过 TUN 适配器传输的 IP 包 |
 
 不支持的类型/平台组合属于配置错误。平台适配器必须将不可用监听器报告为类型化本地失败，
 不得静默替换为另一种监听器类型。
-HTTP/SOCKS 要求包括三个平台上的 HTTP CONNECT、SOCKS5 CONNECT 和 SOCKS5 UDP ASSOCIATE。
-FreeBSD v1 只支持显式 `http` 和 `socks5` 监听器类型。
+HTTP/SOCKS 要求包括三个平台上的普通 HTTP 转发、HTTP CONNECT、SOCKS4/4a/5 CONNECT 和 SOCKS5
+UDP ASSOCIATE。FreeBSD v1 支持显式 `http`、`socks5` 和 `mixed` 监听器类型。`socks` 是 `socks5` 的输入别名；
+规范化配置和序列化均使用 `socks5`。该名称不限制可接受的 SOCKS 协议版本。
 
 ## 通用监听器 schema
 
@@ -47,7 +49,7 @@ spec:
 
 `metadata.name` 是唯一资源名。`spec.type` 为矩阵中的一种类型，`spec.platform` 为 `linux`、`windows`、`freebsd` 或 `any`
 （默认 `any`）。显式平台必须与实际主机匹配。`any` 选择实际主机对应的矩阵列，不得绕过类型/平台验证。
-`bind` 是套接字地址，对 `http`、`socks5`、`tproxy` 和 `redirect` 必填；对 `tun`
+`bind` 是套接字地址，对 `http`、`socks5`、`mixed`、`tproxy` 和 `redirect` 必填；对 `tun`
 禁止。系统代理集成由仅限 Windows 的控制面开关管理，不增加 Listener 类型。`spec.allowedSources` 是最多 256 个 CIDR 的列表；回环绑定默认只允许本机，
 显式非回环监听器的空列表表示“所有来源地址”。非回环绑定应当使用显式列表。
 
@@ -76,20 +78,83 @@ Path 发送或由控制 API 返回。监听器认证独立于 Ingress 到 Egress
 ## HTTP 和 SOCKS 监听器
 
 HTTP 和 SOCKS 监听器终止本地代理协议，并将显式主机名、地址候选和端口交给策略求值。由于请求
-携带主机名，它们可以按主机名路由。格式错误、未支持命令或监听器认证失败必须返回适配器的正常
-本地错误，不得创建 Session 或目标连接。
+携带主机名，它们可以按主机名路由。协议握手失败、请求头或目标格式错误、未支持命令或监听器认证
+失败必须返回适配器的正常本地错误，且不得为被拒绝的请求创建 Session 或目标连接。无效 body framing
+可能在目标 flow 打开之后才被发现；此时必须使受影响的 flow 失败并关闭受影响的连接，不得要求在
+打开前完整缓冲 body。来源身份必须是已接受 socket 的对端；`X-Forwarded-For` 及其他由客户端编写的
+转发头不得替换该身份。
 
-HTTP CONNECT 和 SOCKS5 CONNECT 使用 TCP Stream 契约。SOCKS5 UDP ASSOCIATE 使用 UDP Association
-契约并保留数据报边界。监听器必须保留原始主机名，即使同时解析了本地候选地址；不得仅为绕过配置的
-DNS 路由而解析名称。
+普通 HTTP 转发、HTTP CONNECT 和 SOCKS4/4a/5 CONNECT 使用 TCP Stream 契约。SOCKS5 UDP ASSOCIATE
+使用 UDP Association 契约并保留数据报边界。监听器必须保留原始主机名，即使同时解析了本地候选
+地址；不得仅为绕过配置的 DNS 路由而解析名称。
 
-要求认证的 HTTP 监听器只接受有界 CONNECT 头部块中的一个
-`Proxy-Authorization: Basic` 头。解码值必须是非空的 `username:password` 对，并由
-`credentialsRef` 解析出的监听器专属 verifier 校验；成功后 username 成为认证身份。凭据缺失、
-重复、格式错误或被拒绝时，监听器必须返回带 Basic `Proxy-Authenticate` challenge 的
-`407 Proxy Authentication Required`，并关闭该连接。包括请求行在内的完整 HTTP 请求头部块上限为
-16 KiB。要求认证的 SOCKS5 监听器必须选择 username/password 方法；只有同一个监听器专属
-verifier 同时接受两个字段时协商才能成功。两个适配器都不得记录、列入清单或返回凭据值。
+### HTTP 请求路由与 framing
+
+HTTP 监听器接受 HTTP/1.0 和 HTTP/1.1 请求。CONNECT 使用带显式非零端口的 authority target。
+普通转发必须使用包含有效主机名或 IP 字面量的 absolute-form `http://` URI；省略端口时使用 80。
+目标不得包含用户信息或 fragment。必须拒绝 origin-form target 和 absolute-form `https://` URI；
+HTTPS 使用 CONNECT。适配器必须从同一个 URI authority 派生策略目标和转发的 `Host`，将 target
+转换为保留 path 和 query 的 origin-form，并独立地将每个普通请求交给 TCP flow opener 和策略求值。
+客户端持久连接不得将后续请求绑定到第一个请求的目标、Session 或 Egress。
+
+包括请求行在内的每个请求头部块上限为 16 KiB。普通请求最多接受 128 个头字段。必须拒绝无效
+framing、冲突的 `Content-Length` 值、格式错误的目标和超出头部限制的请求。普通请求同时携带
+`Content-Length` 和有效 `Transfer-Encoding` 时必须使用 transfer coding；适配器必须移除
+`Content-Length`，不得原样转发两个字段。该响应之后必须关闭客户端连接，不得再接受该连接中的
+另一个流水线请求。维护中的 HTTP 消息 codec 必须解析并重新编码请求和响应的
+framing（包括 chunked body），而不是将客户端连接的剩余字节当作一个无界请求。body 必须通过背压
+进行流式传输；上传和响应不得要求完整缓冲 body。上游提前响应不得导致未完成的上传死锁，也不得把
+未读请求字节当作后续请求。
+
+HTTP/1.1 连接支持顺序请求，除非连接 token 或消息 framing 要求关闭。HTTP/1.0 请求在响应后关闭。
+必须识别 `Proxy-Connection` token 以兼容客户端；token 名称不区分大小写，`close` 禁止复用。
+每个响应必须完成消息 body，之后才能分发下一个请求。重定向响应必须保持其语义并返回客户端；
+代理不得主动跟随重定向。
+
+### HTTP 认证与头字段处理
+
+要求认证的 HTTP 监听器对每个请求只接受一个 `Proxy-Authorization: Basic` 头，包括持久连接上的
+每个请求。解码值必须是非空的 `username:password` 对，并由 `credentialsRef` 解析出的监听器专属
+verifier 校验；成功后，已验证 username 成为该请求的认证身份。凭据缺失、重复、格式错误或被拒绝时，
+必须返回带 Basic `Proxy-Authenticate` challenge 的 `407 Proxy Authentication Required`，并关闭
+受影响的连接。
+
+转发的普通请求头和响应头必须移除代理凭据和逐跳字段，包括 `Proxy-Authorization`、
+`Proxy-Authenticate`、`Proxy-Connection`、`Connection`、由 `Connection` token 指定的字段、
+`Keep-Alive`、`TE`、`Trailer`、`Transfer-Encoding` 和 `Upgrade`。下一跳所需的消息 framing 头必须
+由 HTTP codec 生成。原始 `Trailer` 声明必须替换为只包含允许 trailer 字段名称的声明；该集合为空时
+必须移除声明。trailer 声明和 trailer frame 都必须剥除代理凭据、认证、framing、逐跳字段和由
+`Connection` 指定的字段。`Digest`、`X-Checksum` 等安全的端到端 trailer 必须保留。在普通头部块中，
+源服务器的 `Authorization` 等端到端字段应当保留，除非被显式指定为逐跳字段。两个适配器都不得
+记录、列入清单或返回凭据值。
+
+Upgrade 请求在移除代理凭据和其他逐跳字段后，只保留已验证升级握手所需的字段。适配器必须转发
+真实的上游响应。客户端可以提供升级协议列表；上游 `101` 选择其中一个已提供的协议属于有效选择。
+只有收到有效上游 `101 Switching Protocols` 后，才能切换到双向字节隧道，并保留
+两个方向中已经缓冲的字节。被拒绝的升级保持为 HTTP 响应。CONNECT 同样只能在选定 TCP flow 打开
+成功后返回成功；目标或策略失败不得产生成功响应。
+
+格式错误请求返回 `400 Bad Request`；头部超限可以返回 `400 Bad Request` 或
+`431 Request Header Fields Too Large`。策略拒绝返回 `403 Forbidden`；认证失败返回
+`407 Proxy Authentication Required`；目标或传输失败返回 `502 Bad Gateway`；路由、Session 或
+资源预算不可用时返回 `503 Service Unavailable`。响应头已经发送后，适配器不得再发出第二个响应；
+后续 framing 或传输失败必须关闭受影响的连接。
+
+### SOCKS 版本与认证
+
+规范名称为 `socks5` 的监听器在配置的 TCP socket 上接受 SOCKS4、SOCKS4a 和 SOCKS5。SOCKS4/4a
+只支持 CONNECT。SOCKS4 地址为 IPv4；非零 `X` 的 `0.0.0.X` 选择 SOCKS4a，并要求后续域名。
+user ID 和域名均以 NUL 终止，且各自最多 255 字节。空域名或零目标端口无效。未验证的 user ID
+不得成为已认证身份。SOCKS4/4a 不携带密码；监听器要求认证时，必须以 reply code 91 拒绝，
+不得降级或绕过配置的 verifier。只有选定目标 flow 打开成功后才能以 reply code 90 返回成功。
+BIND 和其他不支持的命令使用 reply code 91。
+
+SOCKS5 支持使用 IPv4、IPv6 或域名目标的 CONNECT 和 UDP ASSOCIATE。要求认证的监听器必须选择
+username/password 方法；只有同一个监听器专属 verifier 同时接受两个字段时协商才能成功。客户端
+没有可接受的方法时返回 `0xff`；BIND 和其他不支持的命令返回 reply code `0x07`。SOCKS5 认证失败
+必须关闭连接，且不得打开目标 flow。
+
+### SOCKS5 UDP 生命周期
 
 SOCKS5 UDP relay 只接受来自 TCP 控制连接对端 IP 地址的数据报。UDP ASSOCIATE 请求中有效的非零
 客户端端口会立即固定精确来源端点；否则，第一个被接受的数据报会为该 Association 的剩余生命周期
@@ -98,7 +163,49 @@ SOCKS5 UDP relay 只接受来自 TCP 控制连接对端 IP 地址的数据报。
 
 并发客户端数量、每客户端目标 Association 数量、每目标队列和 Association 空闲时间都必须有界。
 目标 UDP flow 完成或失败时必须移除该目标 Association，使后续数据报可以为同一目标打开新 flow。
-关停操作必须在配置的关停超时内取消并 join 控制任务和目标任务。
+关闭 TCP 控制连接必须取消其 UDP Association。关停操作必须在配置的关停超时内取消并 join 控制
+任务和目标任务。
+
+### Mixed 监听器分流
+
+`mixed` 监听器绑定一个 TCP 端点，并对每条接收的连接独立识别协议。首字节为 `0x04` 或
+`0x05` 时选择 SOCKS，其他字节进入 HTTP parser。识别不得消耗该字节，也不得丢失已缓冲的
+请求或应用数据。选中的 parser 遵循前述 HTTP 和 SOCKS 契约。非法输入不得回退为直接目标连接。
+等待某客户端的首字节或握手不得阻塞其他客户端准入；取消操作必须关闭等待中的客户端。
+
+`protocols` 默认值为 `[tcp, udp]`。TCP 必须启用；`[tcp]` 禁用 SOCKS5 UDP ASSOCIATE。
+HTTP 和所有 SOCKS 版本共用配置的 Listener ID、凭据、来源限制、flow tags 和进程元数据策略。
+要求认证时，按识别的协议使用 HTTP Basic 或 SOCKS5 username/password；SOCKS4/4a 必须继续拒绝。
+协议选择不得绕过认证或创建不同的 Listener 身份。SOCKS5 UDP 使用 UDP ASSOCIATE 协商的 relay
+端点；TCP 端口不接收原始 UDP 数据报，也不进行 UDP 协议识别。
+
+```yaml
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata:
+  name: local-mixed
+spec:
+  type: mixed
+  platform: any
+  bind: 127.0.0.1:7890
+  protocols: [tcp, udp]
+  authentication: disabled
+```
+
+Windows 系统代理选择可以引用 mixed 监听器，并为共享端点应用 HTTP 代理设置；SOCKS 客户端
+可以显式使用同一个 TCP 地址。
+
+### 兼容性参考
+
+参考行为基于稳定版 sing-box 的
+[HTTP 选项](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/docs/configuration/inbound/http.md)
+和 [SOCKS 选项](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/docs/configuration/inbound/socks.md)，
+以及其固定 sing 依赖中的
+[HTTP handler](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/http/handshake.go)
+和 [SOCKS handler](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/socks/handshake.go)。
+PathChord 的认证、来源身份、framing 和失败行为以本节要求为准。
+[mixed 入站](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/docs/configuration/inbound/mixed.md)
+是同端口 HTTP/SOCKS 准入的参考。TLS 终止属于独立监听器功能，不改变本契约。
 
 ## Linux 透明监听器
 

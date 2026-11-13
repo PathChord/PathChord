@@ -1,4 +1,4 @@
-//! SOCKS5 CONNECT listener adapter.
+//! SOCKS4/4a and SOCKS5 CONNECT listener adapter.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use crate::{
 };
 
 const VERSION: u8 = 5;
+const VERSION_4: u8 = 4;
 const NO_AUTH: u8 = 0;
 const USERPASS: u8 = 2;
 const NO_METHOD: u8 = 0xff;
@@ -23,6 +24,32 @@ pub(crate) const IPV4: u8 = 1;
 pub(crate) const DOMAIN: u8 = 3;
 pub(crate) const IPV6: u8 = 4;
 const MAX_DOMAIN: usize = 255;
+const MAX_USER_ID: usize = 255;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocksVersion {
+    V4,
+    V5,
+}
+
+impl SocksVersion {
+    pub(crate) fn connection_response(self) -> crate::ConnectionResponse {
+        match self {
+            Self::V4 => crate::ConnectionResponse::Socks4,
+            Self::V5 => crate::ConnectionResponse::Socks5,
+        }
+    }
+
+    pub(crate) async fn reject_command<S>(self, stream: &mut S) -> Result<(), ListenerError>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        match self {
+            Self::V4 => send_reply_v4(stream, 91).await,
+            Self::V5 => send_reply(stream, 7).await,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SocksCommand {
@@ -34,6 +61,12 @@ pub(crate) enum SocksCommand {
 pub(crate) struct SocksRequest {
     pub command: SocksCommand,
     pub target: TargetAddress,
+}
+
+pub(crate) struct SocksHandshake {
+    pub version: SocksVersion,
+    pub authentication_identity: Option<String>,
+    pub request: SocksRequest,
 }
 
 pub struct Socks5Listener {
@@ -121,15 +154,15 @@ impl Socks5Listener {
             return Err(policy_error("source address is not allowed"));
         }
         let mut stream = stream;
-        let identity = negotiate(
+        let handshake = accept_handshake(
             &mut stream,
             descriptor.authentication_required,
             credential_verifier.as_ref(),
         )
         .await?;
-        let request = read_request(&mut stream).await?;
+        let request = handshake.request;
         if request.command != SocksCommand::Connect {
-            send_reply(&mut stream, 7).await?;
+            handshake.version.reject_command(&mut stream).await?;
             return Err(error("SOCKS command is not CONNECT"));
         }
         Ok(AcceptedConnection {
@@ -138,12 +171,12 @@ impl Socks5Listener {
                 flow_tags: descriptor.flow_tags.clone(),
                 listener_id: descriptor.id.clone(),
                 source,
-                authentication_identity: identity,
+                authentication_identity: handshake.authentication_identity,
                 process: None,
                 protocol: FlowProtocol::Tcp,
                 target: request.target,
             },
-            response: crate::ConnectionResponse::Socks5,
+            response: handshake.version.connection_response(),
         })
     }
 
@@ -184,7 +217,51 @@ impl IngressListener for Socks5Listener {
     }
 }
 
-pub(crate) async fn negotiate<S>(
+pub(crate) async fn accept_handshake<S>(
+    stream: &mut S,
+    authentication_required: bool,
+    credential_verifier: &dyn ListenerCredentialVerifier,
+) -> Result<SocksHandshake, ListenerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match read_u8(stream, "greeting version").await? {
+        VERSION => {
+            let authentication_identity =
+                negotiate_v5(stream, authentication_required, credential_verifier).await?;
+            let request = read_request(stream).await?;
+            Ok(SocksHandshake {
+                version: SocksVersion::V5,
+                authentication_identity,
+                request,
+            })
+        }
+        VERSION_4 => {
+            let request = match read_request_v4(stream).await {
+                Ok(request) => request,
+                Err(error) => {
+                    let _ = send_reply_v4(stream, 91).await;
+                    return Err(error);
+                }
+            };
+            if authentication_required {
+                send_reply_v4(stream, 91).await?;
+                return Err(policy_error(
+                    "SOCKS4 cannot provide password authentication",
+                ));
+            }
+            Ok(SocksHandshake {
+                version: SocksVersion::V4,
+                // SOCKS4 UserID is unverified client input, not an authenticated identity.
+                authentication_identity: None,
+                request,
+            })
+        }
+        _ => Err(error("SOCKS greeting version is not supported")),
+    }
+}
+
+async fn negotiate_v5<S>(
     stream: &mut S,
     authentication_required: bool,
     credential_verifier: &dyn ListenerCredentialVerifier,
@@ -192,9 +269,6 @@ pub(crate) async fn negotiate<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if read_u8(stream, "greeting version").await? != VERSION {
-        return Err(error("SOCKS greeting version is not 5"));
-    }
     let count = read_u8(stream, "greeting method count").await? as usize;
     if count == 0 {
         send_method(stream, NO_METHOD).await?;
@@ -238,7 +312,7 @@ where
     Ok(Some(username_string))
 }
 
-pub(crate) async fn read_request<S>(stream: &mut S) -> Result<SocksRequest, ListenerError>
+async fn read_request<S>(stream: &mut S) -> Result<SocksRequest, ListenerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -298,6 +372,71 @@ where
         command,
         target: TargetAddress { host, port },
     })
+}
+
+async fn read_request_v4<S>(stream: &mut S) -> Result<SocksRequest, ListenerError>
+where
+    S: AsyncRead + Unpin,
+{
+    if read_u8(stream, "SOCKS4 command").await? != CONNECT {
+        return Err(error("SOCKS4 command is not CONNECT"));
+    }
+    let port = read_u16(stream, "SOCKS4 target port").await?;
+    if port == 0 {
+        return Err(error("SOCKS4 target port is zero"));
+    }
+    let mut address = [0_u8; 4];
+    stream
+        .read_exact(&mut address)
+        .await
+        .map_err(|error| ListenerError::Protocol(format!("SOCKS4 address: {error}")))?;
+    // UserID has no password or verification mechanism and is deliberately discarded.
+    read_c_string(stream, "SOCKS4 user ID", MAX_USER_ID).await?;
+    let host = if address[..3] == [0, 0, 0] && address[3] != 0 {
+        let domain = read_c_string(stream, "SOCKS4a domain", MAX_DOMAIN).await?;
+        if domain.is_empty() {
+            return Err(error("SOCKS4a domain is empty"));
+        }
+        let domain = String::from_utf8(domain).map_err(|_| error("SOCKS4a domain is not UTF-8"))?;
+        TargetHost::Hostname(domain)
+    } else {
+        TargetHost::Ip(IpAddr::V4(Ipv4Addr::from(address)))
+    };
+    Ok(SocksRequest {
+        command: SocksCommand::Connect,
+        target: TargetAddress { host, port },
+    })
+}
+
+async fn read_c_string<S>(
+    stream: &mut S,
+    field: &'static str,
+    maximum: usize,
+) -> Result<Vec<u8>, ListenerError>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut value = Vec::new();
+    loop {
+        let byte = read_u8(stream, field).await?;
+        if byte == 0 {
+            return Ok(value);
+        }
+        if value.len() == maximum {
+            return Err(error(format!("{field} exceeds maximum length")));
+        }
+        value.push(byte);
+    }
+}
+
+async fn send_reply_v4<S>(stream: &mut S, code: u8) -> Result<(), ListenerError>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream
+        .write_all(&[0, code, 0, 0, 0, 0, 0, 0])
+        .await
+        .map_err(|error| ListenerError::Protocol(error.to_string()))
 }
 
 async fn send_method<S>(stream: &mut S, method: u8) -> Result<(), ListenerError>

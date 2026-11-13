@@ -200,8 +200,7 @@ APPLIED → FAILED
 FAILED → APPLYING
 ```
 
-`APPLYING` MUST verify that the requested `listener_id` resolves to an HTTP or
-SOCKS Listener on Windows. Enabling the already-selected listener is idempotent
+`APPLYING` MUST verify that the requested `listener_id` resolves to an HTTP, SOCKS, or Mixed Listener on Windows. Enabling the already-selected listener is idempotent
 and MUST return the current applied state without rewriting saved values.
 `APPLIED` MUST record the exact previous environment and operating-system proxy
 values. Disable MUST restore those values; a restore failure enters `FAILED`,

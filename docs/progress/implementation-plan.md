@@ -5,17 +5,18 @@ Final-state requirements remain under `docs/design/` and `docs/spec/`.
 
 ## Current focus
 
-Prioritize explicit HTTP CONNECT and SOCKS5 listeners on Linux, Windows, and
+Prioritize HTTP forwarding/CONNECT and SOCKS listeners on Linux, Windows, and
 FreeBSD.
-SOCKS5 includes CONNECT and UDP ASSOCIATE; deferring transparent UDP does not
-defer SOCKS5 UDP forwarding. FreeBSD uses the same listener surface and Unix
-local control.
+The SOCKS listener accepts SOCKS4/4a/5 CONNECT and SOCKS5 UDP ASSOCIATE;
+deferring transparent UDP does not defer SOCKS5 UDP forwarding. FreeBSD uses
+the same listener surface and Unix local control. `type: mixed` shares one TCP
+endpoint across HTTP and SOCKS with the same authentication and flow context.
 
 | Platform | Listener target | Local control | Validation state |
 | --- | --- | --- | --- |
-| Linux | HTTP CONNECT; SOCKS5 CONNECT and UDP ASSOCIATE | Unix socket | Automated loopback coverage exists; continue end-to-end and soak validation. |
-| Windows | HTTP CONNECT; SOCKS5 CONNECT and UDP ASSOCIATE | Named Pipe | Cross-checks and fake adapters exist; native listener, ACL, and system-proxy validation remain. |
-| FreeBSD | HTTP CONNECT; SOCKS5 CONNECT and UDP ASSOCIATE | Unix socket | Target compilation and CLI linking pass; native host validation remains. |
+| Linux | HTTP forwarding/CONNECT; SOCKS4/4a/5 CONNECT; SOCKS5 UDP ASSOCIATE | Unix socket | Automated loopback coverage exists; continue end-to-end and soak validation. |
+| Windows | HTTP forwarding/CONNECT; SOCKS4/4a/5 CONNECT; SOCKS5 UDP ASSOCIATE | Named Pipe | Cross-checks and fake adapters exist; native listener, ACL, and system-proxy validation remain. |
+| FreeBSD | HTTP forwarding/CONNECT; SOCKS4/4a/5 CONNECT; SOCKS5 UDP ASSOCIATE | Unix socket | Target compilation and CLI linking pass; native host validation remains. |
 
 The explicit-listener baseline covers authentication, source restrictions,
 IPv4/IPv6 and domain targets, policy and DNS routing, authenticated Egress
@@ -23,6 +24,58 @@ forwarding, bounded resources, cancellation, configuration reload, and local
 control. Windows system-proxy integration selects one of these listeners.
 FreeBSD explicit listeners do not require system-proxy integration or process
 discovery; unavailable process facts remain unknown.
+
+## Explicit proxy compatibility
+
+Use the stable `sing-box` v1.14.4 source at
+[`c005f35300ce76427dc285481ec5695f5b179cd2`](https://github.com/SagerNet/sing-box/tree/c005f35300ce76427dc285481ec5695f5b179cd2)
+as the compatibility reference. Its
+[`sing` dependency](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/go.mod#L48)
+is pinned to `5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f`.
+
+- Validate ordinary HTTP forwarding alongside CONNECT. The reference parses each
+  request, requires an absolute URL for ordinary forwarding, routes the target
+  through its connection handler, streams the request/response bodies, returns
+  upstream redirects to the client, and maps transport failure to `502`.
+  Cover HTTP/1.0 and HTTP/1.1, methods with bodies, chunked messages, early
+  upstream responses, and sequential requests to different targets on one
+  client connection. Sources:
+  [request dispatch](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/http/handshake.go#L32-L134),
+  [forwarding and body lifecycle](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/http/handshake.go#L137-L251),
+  [early-response regression](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/http/handshake_test.go#L67-L165).
+- Validate stripping proxy credentials and hop-by-hop fields, including fields named by
+  `Connection`, from forwarded ordinary requests and responses. Authenticate
+  HTTP requests through the existing local credential verifier and preserve
+  bounded parsing and credential redaction. The reference enables local
+  keep-alive through `Proxy-Connection: keep-alive`; explicit message framing
+  and per-request policy evaluation remain required. Sources:
+  [Basic authentication](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/http/handshake.go#L37-L65),
+  [header filtering](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/http/handshake.go#L254-L274).
+- Validate SOCKS4 and SOCKS4a CONNECT compatibility while retaining
+  SOCKS5 CONNECT, username/password authentication, and UDP ASSOCIATE. The
+  reference's `socks` inbound includes all three versions; its handlers reject
+  BIND. SOCKS4/4a encode a bounded NUL-terminated user ID and optional domain,
+  but carry no password. Reject them when PathChord listener authentication is
+  required, and do not treat an unverified user ID as an authenticated identity.
+  Sources:
+  [SOCKS inbound](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/docs/configuration/inbound/socks.md),
+  [command and authentication handling](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/socks/handshake.go#L140-L289),
+  [SOCKS4a address and string bounds](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/socks/socks4/protocol.go#L47-L80).
+- Retain PathChord's successful-open-before-CONNECT-response, trusted socket
+  peer identity, UDP peer/port binding, and strict reserved/fragment validation.
+  The reference is an interoperability guide, not a requirement to reproduce
+  its early CONNECT success, header-derived source identity, error credential
+  formatting, or unchecked UDP reserved/fragment fields. Sources:
+  [CONNECT dispatch](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/http/handshake.go#L68-L98),
+  [source address handling](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/http/addr.go#L10-L22),
+  [UDP decoding](https://github.com/SagerNet/sing/blob/5dc452e537bf75c5c51c54c8c4a4be1d19d85c4f/protocol/socks/packet.go#L75-L89).
+
+Mixed-protocol port detection reuses ordinary HTTP/SOCKS handling on one TCP
+listener. Validate the same authentication and UDP boundaries on the shared
+endpoint. TLS termination and automatic system-proxy configuration remain
+separate listener/platform options; preserve the existing platform boundaries. Sources:
+[HTTP options](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/docs/configuration/inbound/http.md),
+[mixed options](https://github.com/SagerNet/sing-box/blob/c005f35300ce76427dc285481ec5695f5b179cd2/docs/configuration/inbound/mixed.md).
 
 ## Current sequence
 

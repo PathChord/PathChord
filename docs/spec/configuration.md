@@ -207,13 +207,19 @@ ordered effective Egress rules
 
 ## Listeners
 
-The complete listener schema, including mandatory HTTP CONNECT and SOCKS5
-CONNECT/UDP ASSOCIATE support on Linux, Windows, and FreeBSD, Linux transparent
+The complete listener schema, including mandatory ordinary HTTP forwarding,
+HTTP CONNECT, SOCKS4/4a/5 CONNECT, and SOCKS5 UDP ASSOCIATE support on Linux,
+Windows, and FreeBSD, Linux transparent
 modes and optional TUN, Windows TUN and the control-plane system-proxy switch,
 authentication references, source restrictions, and loop prevention is defined in
 [the platform and DNS specification](platform-and-dns.md).
 `spec.platform` accepts `linux`, `windows`, `freebsd`, and `any`; `any` uses the
 actual host's platform matrix. FreeBSD rejects `tproxy`, `redirect`, and `tun`.
+`spec.type: socks` is an input alias for canonical `socks5`; normalized output
+uses `socks5`, and either spelling accepts SOCKS4/4a/5. HTTP requests on a
+persistent client connection are authenticated and routed independently. Full
+request framing, header filtering, upgrade, and version-specific authentication
+contracts are defined in the linked platform specification.
 
 ```yaml
 apiVersion: pathchord.io/v1
@@ -238,6 +244,11 @@ DNS is an independent policy. Its `local`, `transit`, `egress`, and `blocked`
 routes, resolver limits, cache behavior, hostname/candidate handling, and
 Fake-IP prohibition are normative in
 [the platform and DNS specification](platform-and-dns.md).
+
+`spec.type: mixed` binds one TCP port for the HTTP and SOCKS contracts above.
+Its `protocols` default to `[tcp, udp]` and MUST include TCP. SOCKS5 UDP uses
+the negotiated relay endpoint. See [mixed dispatch](platform-and-dns.md#mixed-listener-dispatch)
+for protocol detection and shared authentication semantics.
 
 ## Runtime snapshots
 

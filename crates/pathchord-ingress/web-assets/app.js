@@ -185,7 +185,7 @@ function renderListeners(result) {
   }
   const select = $("proxy-listener-select");
   select.replaceChildren();
-  items.filter((item) => ["http", "socks5"].includes(String(item.kind).toLowerCase())).forEach((item) => {
+  items.filter((item) => ["http", "socks5", "mixed"].includes(String(item.kind).toLowerCase())).forEach((item) => {
     const option = document.createElement("option");
     option.value = item.id;
     option.textContent = `${item.id} (${item.bind})`;

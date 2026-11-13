@@ -4,7 +4,7 @@
 
 ## 1. 范围
 
-PathChord 支持 Linux、Windows 和 FreeBSD。三个平台都必须支持 HTTP CONNECT、SOCKS5 CONNECT 和 SOCKS5 UDP ASSOCIATE 监听器。Linux 支持 TPROXY、REDIRECT，可以支持 TUN；Windows 通过控制面选择监听器来提供 TUN 和系统代理集成。v1 平台契约禁止 FreeBSD 暴露 TPROXY、REDIRECT 或 TUN 监听器。三个平台共享策略、节点、Noise、Session 和多路径核心。
+PathChord 支持 Linux、Windows 和 FreeBSD。三个平台都必须支持普通 HTTP 转发、HTTP CONNECT、SOCKS4/4a/5 CONNECT 和 SOCKS5 UDP ASSOCIATE 监听器。Linux 支持 TPROXY、REDIRECT，可以支持 TUN；Windows 通过控制面选择监听器来提供 TUN 和系统代理集成。v1 平台契约禁止 FreeBSD 暴露 TPROXY、REDIRECT 或 TUN 监听器。三个平台共享策略、节点、Noise、Session 和多路径核心。
 
 系统支持 TCP、UDP 和独立 DNS。Fake-IP、通用 ICMP 转发、组播代理和任意 IP 隧道不在协议范围内。
 
@@ -101,9 +101,11 @@ Ingress 通过原子运行时快照 provider 发布这些观测数据。该 prov
 
 ## 10. 入口与 DNS
 
-多个 HTTP/SOCKS 监听器各自具有唯一 ID，并参与策略评估。监听器认证和来源网络限制独立于 Ingress 到 Egress 的 Noise 认证。
+多个 HTTP/SOCKS 监听器各自具有唯一 ID，并参与策略评估。`mixed` 监听器在一个 TCP 端点上共用 HTTP 和 SOCKS，两个协议分支保留同一个身份。监听器认证和来源网络限制独立于 Ingress 到 Egress 的 Noise 认证。
 
-Windows 系统代理集成是控制面开关，按 ID 选择一个 HTTP/SOCKS 监听器。Linux 和 FreeBSD 不暴露系统代理激活模式；其监听器及系统代理不受支持的状态仍可通过控制面查看。Linux 和 FreeBSD 的本地控制使用 Unix socket，Windows 使用 Named Pipe。
+普通 HTTP 请求分别独立路由，包括同一个客户端持久连接中发往不同目标的请求。代理凭据保留在本地，按 framing 转发以保留消息边界和流式背压。HTTP CONNECT 和 SOCKS 连接只有在目标准入成功后才成为字节流。请求、认证、升级和 SOCKS 兼容性的细节以[平台与 DNS 规范](../spec/platform-and-dns.zh-CN.md#http-和-socks-监听器)为准。
+
+Windows 系统代理集成是控制面开关，按 ID 选择一个 HTTP/SOCKS 或 mixed 监听器。选中 mixed 监听器时，使用共享端点的 HTTP 代理设置。Linux 和 FreeBSD 不暴露系统代理激活模式；其监听器及系统代理不受支持的状态仍可通过控制面查看。Linux 和 FreeBSD 的本地控制使用 Unix socket，Windows 使用 Named Pipe。
 
 透明入口不执行域名路由。HTTP/SOCKS 请求显式携带域名，因此可以按域名路由。DNS 独立运行，并选择查询的解析位置：本地、通过 Transit Proxy、通过选定的 Egress，或阻止查询。不使用 Fake-IP 映射。
 

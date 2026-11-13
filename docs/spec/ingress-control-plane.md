@@ -238,7 +238,7 @@ model returns these fields, but never resolves or returns the referenced secret.
 
 The system-proxy switch is a runtime control-plane mutation, not a YAML
 resource. `system_proxy.enable` MUST include `listener_id`, which MUST resolve
-to an HTTP or SOCKS Listener. Windows applies that listener to environment and
+to an HTTP, SOCKS, or Mixed Listener. Windows applies that listener to environment and
 operating-system proxy settings; `system_proxy.disable` restores the previous
 values. Linux and FreeBSD return `UNSUPPORTED_OPERATION` for both activation
 and disable and continue to expose ordinary listeners through `nodes` and status.

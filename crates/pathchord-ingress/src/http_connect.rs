@@ -1,4 +1,4 @@
-//! Bounded HTTP CONNECT inbound adapter.
+//! Bounded HTTP proxy inbound adapter.
 //!
 //! The adapter terminates only the local HTTP proxy handshake. Target dialing
 //! and Stream creation remain owned by the policy/Session layers.
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use pathchord_policy::{TargetEndpoint, TargetHost};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -23,7 +23,7 @@ pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 const PROXY_AUTHENTICATION_REQUIRED_RESPONSE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"PathChord\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
-/// A local HTTP CONNECT listener.
+/// A local HTTP forward proxy and CONNECT listener.
 pub struct HttpConnectListener {
     descriptor: ListenerDescriptor,
     listener: TcpListener,
@@ -44,7 +44,7 @@ impl HttpConnectListener {
     pub async fn bind(descriptor: ListenerDescriptor) -> Result<Self, ListenerError> {
         if descriptor.kind != ListenerKind::Http {
             return Err(ListenerError::InvalidDescriptor(
-                "HTTP CONNECT adapter requires an HTTP ListenerDescriptor".to_owned(),
+                "HTTP proxy adapter requires an HTTP ListenerDescriptor".to_owned(),
             ));
         }
         let listener = TcpListener::bind(descriptor.required_bind()?)
@@ -77,7 +77,7 @@ impl HttpConnectListener {
             .map_err(|error| ListenerError::Accept(error.to_string()))
     }
 
-    /// Parses one HTTP CONNECT request from a generic stream. This is useful for
+    /// Parses the first HTTP proxy request from a generic stream. This is useful for
     /// deterministic adapter tests and for platform wrappers that already own
     /// an accepted stream.
     pub async fn accept_stream<S>(
@@ -108,7 +108,7 @@ impl HttpConnectListener {
     {
         if descriptor.kind != ListenerKind::Http {
             return Err(ListenerError::InvalidDescriptor(
-                "HTTP CONNECT adapter requires an HTTP ListenerDescriptor".to_owned(),
+                "HTTP proxy adapter requires an HTTP ListenerDescriptor".to_owned(),
             ));
         }
         if !descriptor.allows_source(source.ip()) {
@@ -120,11 +120,11 @@ impl HttpConnectListener {
         let first_line = read_header_line(&mut reader, &mut remaining)
             .await
             .map_err(|reason| ListenerError::Protocol(reason.to_owned()));
-        let first_line = match first_line {
+        let first_line_bytes = match first_line {
             Ok(line) => line,
             Err(error) => return Err(reject(reader, &error.to_string()).await),
         };
-        let first_line = match trim_line(&first_line) {
+        let first_line = match trim_line(&first_line_bytes) {
             Some(line) => line,
             None => return Err(reject(reader, "HTTP request line is not UTF-8").await),
         };
@@ -132,17 +132,30 @@ impl HttpConnectListener {
         let method = fields.next();
         let authority = fields.next();
         let version = fields.next();
-        if method != Some("CONNECT")
+        if method.is_none()
             || authority.is_none()
-            || version != Some("HTTP/1.1")
+            || !matches!(version, Some("HTTP/1.0" | "HTTP/1.1"))
             || fields.next().is_some()
         {
-            return Err(reject(reader, "HTTP CONNECT is required").await);
+            return Err(reject(reader, "malformed HTTP proxy request line").await);
         }
         let authority = authority.expect("checked above");
-        let target = match parse_authority(authority) {
+        let is_connect = method == Some("CONNECT");
+        let target = match if is_connect {
+            parse_authority(authority)
+        } else {
+            authority
+                .parse::<hyper::Uri>()
+                .map_err(|_| "invalid HTTP proxy URI".to_owned())
+                .and_then(|uri| crate::http_forward::forward_target(&uri))
+        } {
             Ok(target) => target,
             Err(reason) => return Err(reject(reader, &reason).await),
+        };
+        let mut prefix = if is_connect {
+            Vec::new()
+        } else {
+            first_line_bytes
         };
 
         let mut proxy_authorization: Option<Zeroizing<String>> = None;
@@ -156,6 +169,9 @@ impl HttpConnectListener {
                 return Err(reject(reader, "HTTP header is not UTF-8").await);
             };
             if header.is_empty() {
+                if !is_connect {
+                    prefix.extend_from_slice(&line);
+                }
                 line.zeroize();
                 break;
             }
@@ -166,6 +182,9 @@ impl HttpConnectListener {
             let authorization = name
                 .eq_ignore_ascii_case("Proxy-Authorization")
                 .then(|| value.trim().to_owned());
+            if !is_connect && authorization.is_none() {
+                prefix.extend_from_slice(&line);
+            }
             line.zeroize();
             if let Some(authorization) = authorization {
                 if proxy_authorization.is_some() {
@@ -189,8 +208,21 @@ impl HttpConnectListener {
             None
         };
 
+        let (io, response): (BoxedLocalConnection, _) = if is_connect {
+            (Box::new(reader), crate::ConnectionResponse::HttpConnect)
+        } else {
+            let (read, write) = tokio::io::split(reader);
+            let io = tokio::io::join(std::io::Cursor::new(prefix).chain(read), write);
+            (
+                Box::new(io),
+                crate::ConnectionResponse::HttpForward(crate::http_forward::HttpForwardConfig {
+                    authentication_required: descriptor.authentication_required,
+                    credential_verifier,
+                }),
+            )
+        };
         Ok(AcceptedConnection {
-            io: Box::new(reader) as BoxedLocalConnection,
+            io,
             context: ConnectionContext {
                 flow_tags: descriptor.flow_tags.clone(),
                 listener_id: descriptor.id.clone(),
@@ -200,7 +232,7 @@ impl HttpConnectListener {
                 protocol: crate::FlowProtocol::Tcp,
                 target,
             },
-            response: crate::ConnectionResponse::HttpConnect,
+            response,
         })
     }
 }
@@ -231,7 +263,7 @@ impl IngressListener for HttpConnectListener {
     }
 }
 
-async fn authenticate_basic(
+pub(crate) async fn authenticate_basic(
     authorization: Option<&str>,
     credential_verifier: &dyn ListenerCredentialVerifier,
 ) -> Option<String> {
@@ -304,7 +336,7 @@ fn trim_line(line: &[u8]) -> Option<&str> {
     std::str::from_utf8(line).ok()
 }
 
-fn parse_authority(authority: &str) -> Result<TargetEndpoint, String> {
+pub(crate) fn parse_authority(authority: &str) -> Result<TargetEndpoint, String> {
     let bracketed = authority.starts_with('[');
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         let (host, port) = rest

@@ -1597,6 +1597,35 @@ mod tests {
     }
 
     #[test]
+    fn listeners_list_preserves_and_filters_the_mixed_kind() {
+        let mut dispatcher = dispatcher(SystemProxyPlatform::Linux);
+        let mut mixed = dispatcher
+            .service()
+            .listeners()
+            .get(&ListenerId::new("local-http"))
+            .cloned()
+            .unwrap();
+        mixed.id = ListenerId::new("shared-proxy");
+        mixed.kind = ListenerKind::Mixed;
+        mixed.authentication_required = true;
+        mixed.flow_tags.insert("interactive".to_owned());
+        dispatcher.service_mut().register_listener(mixed);
+        let response = dispatcher.dispatch(request(
+            "listeners.list",
+            &["listeners:read"],
+            json!({"filter": {"kind": "mixed"}, "sort": "kind"}),
+        ));
+        assert!(response.ok);
+        let result = response.result.expect("mixed listener inventory");
+        let items = result["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "shared-proxy");
+        assert_eq!(items[0]["kind"], "mixed");
+        assert_eq!(items[0]["authentication"], "required");
+        assert_eq!(items[0]["flow_tags"], json!(["interactive"]));
+    }
+
+    #[test]
     fn node_and_subscription_mutations_use_generation_preconditions() {
         let mut dispatcher = dispatcher(SystemProxyPlatform::Linux);
         dispatcher

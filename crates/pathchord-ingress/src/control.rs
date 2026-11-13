@@ -965,7 +965,7 @@ impl IngressControlService {
             .get(&listener_id)
             .ok_or_else(|| ControlError::ListenerNotFound(listener_id.clone()))?;
         let proxy_kind = match descriptor.kind {
-            ListenerKind::Http => PlatformProxyKind::Http,
+            ListenerKind::Http | ListenerKind::Mixed => PlatformProxyKind::Http,
             ListenerKind::Socks5 => PlatformProxyKind::Socks5,
             kind => {
                 return Err(ControlError::InvalidSystemProxyListener { listener_id, kind });
@@ -2175,6 +2175,31 @@ mod tests {
             .disable_system_proxy("operator", RequestId::new(11), SystemProxyPlatform::Windows)
             .expect("idempotent disable");
         assert!(replay.replayed);
+    }
+
+    #[test]
+    fn mixed_system_proxy_selection_uses_the_shared_http_endpoint() {
+        let adapter = Arc::new(FakePlatformProxyAdapter::new());
+        let mut service = IngressControlService::with_platform_proxy(adapter.clone());
+        let mixed = listener("shared-proxy", crate::ListenerKind::Mixed);
+        let endpoint = mixed.bind.unwrap();
+        service.register_listener(mixed);
+        let result = service
+            .enable_system_proxy(
+                "operator",
+                RequestId::new(12),
+                SystemProxyPlatform::Windows,
+                pathchord_policy::ListenerId::new("shared-proxy"),
+            )
+            .expect("enable mixed system proxy");
+        assert!(result.status.enabled);
+        assert_eq!(
+            result.status.listener_id,
+            Some(pathchord_policy::ListenerId::new("shared-proxy"))
+        );
+        let applied = adapter.applied().expect("applied proxy settings");
+        assert_eq!(applied.kind, PlatformProxyKind::Http);
+        assert_eq!(applied.endpoint, endpoint);
     }
 
     #[test]

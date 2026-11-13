@@ -849,7 +849,7 @@ impl KubeConfig {
                             ListenerKind::Http | ListenerKind::Socks5 | ListenerKind::Redirect => {
                                 BTreeSet::from([FlowProtocol::Tcp])
                             }
-                            ListenerKind::Tproxy | ListenerKind::Tun => {
+                            ListenerKind::Mixed | ListenerKind::Tproxy | ListenerKind::Tun => {
                                 BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp])
                             }
                         }
@@ -1578,6 +1578,27 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
                 ));
             }
         }
+        ListenerKind::Mixed => {
+            if !value.spec.protocols.is_empty()
+                && !value.spec.protocols.contains(&FlowProtocol::Tcp)
+            {
+                return Err(invalid_spec(kind, name, "mixed listeners require TCP"));
+            }
+            if value.spec.mark.is_some()
+                || value.spec.route_table.is_some()
+                || value.spec.interface.is_some()
+                || value.spec.address.is_some()
+                || value.spec.mtu.is_some()
+                || !value.spec.bypass.is_empty()
+                || value.spec.proxy_ref.is_some()
+            {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "mixed listeners do not accept transparent, TUN, or proxyRef fields",
+                ));
+            }
+        }
         ListenerKind::Http | ListenerKind::Socks5 => {}
     }
     let bind_required = !matches!(value.spec.kind, ListenerKind::Tun);
@@ -1632,12 +1653,15 @@ fn validate_listener_kind_for_platform(
     platform: &str,
 ) -> Result<(), ConfigError> {
     if platform == "freebsd"
-        && !matches!(value.spec.kind, ListenerKind::Http | ListenerKind::Socks5)
+        && !matches!(
+            value.spec.kind,
+            ListenerKind::Http | ListenerKind::Socks5 | ListenerKind::Mixed
+        )
     {
         return Err(invalid_spec(
             &value.kind,
             &value.metadata.name,
-            "freebsd listeners support http and socks5 only",
+            "freebsd listeners support http, socks5, and mixed only",
         ));
     }
     Ok(())
@@ -2349,7 +2373,7 @@ spec:
             let input = platform_listener_yaml(kind, "freebsd", fields);
             let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
             assert!(
-                error.contains("freebsd listeners support http and socks5 only"),
+                error.contains("freebsd listeners support http, socks5, and mixed only"),
                 "{kind}: {error}"
             );
         }
@@ -2401,6 +2425,126 @@ spec:
         }
     }
 
+    #[test]
+    fn socks_listener_alias_preserves_the_canonical_kind_and_protocols() {
+        let input = platform_listener_yaml(
+            "socks",
+            "any",
+            "  bind: 127.0.0.1:1080\n  protocols: [tcp, udp]\n",
+        );
+        let policy = KubeConfig::from_yaml(&input)
+            .expect("SOCKS listener alias")
+            .into_policy_config()
+            .expect("native SOCKS listener");
+        let listener = policy
+            .listeners
+            .iter()
+            .find(|listener| listener.id.as_str() == "platform-listener")
+            .unwrap();
+        assert_eq!(listener.kind, ListenerKind::Socks5);
+        assert_eq!(
+            listener.protocols,
+            BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp])
+        );
+        assert_eq!(
+            serde_yaml::to_string(&listener.kind).unwrap().trim(),
+            "socks5"
+        );
+    }
+
+    #[test]
+    fn mixed_listener_preserves_credentials_and_flow_context_with_both_protocols() {
+        let input = platform_listener_yaml(
+            "mixed",
+            "any",
+            "  bind: 127.0.0.1:17890\n  allowedSources: [127.0.0.1/32]\n  flowTags: [interactive]\n  processMetadata: {executable: true, user: true}\n  authentication: {mode: required, credentialsRef: mixed-users}\n",
+        );
+        let policy = KubeConfig::from_yaml(&input)
+            .expect("mixed listener config")
+            .into_policy_config()
+            .expect("native mixed listener");
+        let listener = policy
+            .listeners
+            .iter()
+            .find(|listener| listener.id.as_str() == "platform-listener")
+            .unwrap();
+        assert_eq!(listener.kind, ListenerKind::Mixed);
+        assert_eq!(
+            listener.protocols,
+            BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp])
+        );
+        assert_eq!(listener.authentication, AuthenticationMode::Required);
+        assert_eq!(listener.credentials_ref.as_deref(), Some("mixed-users"));
+        assert_eq!(listener.allowed_sources, ["127.0.0.1/32"]);
+        assert_eq!(
+            listener.flow_tags,
+            BTreeSet::from(["interactive".to_owned()])
+        );
+        assert!(listener.process_metadata.executable);
+        assert!(listener.process_metadata.user);
+        assert!(!listener.process_metadata.group);
+        assert_eq!(
+            serde_yaml::to_string(&listener.kind).unwrap().trim(),
+            "mixed"
+        );
+    }
+
+    #[test]
+    fn mixed_listener_accepts_supported_platforms_and_tcp_only_selection() {
+        for platform in ["any", "linux", "windows", "freebsd"] {
+            let input = platform_listener_yaml(
+                "mixed",
+                platform,
+                "  bind: 127.0.0.1:17890\n  protocols: [tcp]\n",
+            );
+            let config = KubeConfig::from_yaml(&input).expect("supported mixed platform");
+            if platform == "any" || platform == std::env::consts::OS {
+                let policy = config.into_policy_config().expect("native mixed platform");
+                let listener = policy
+                    .listeners
+                    .iter()
+                    .find(|listener| listener.id.as_str() == "platform-listener")
+                    .unwrap();
+                assert_eq!(listener.kind, ListenerKind::Mixed);
+                assert_eq!(listener.protocols, BTreeSet::from([FlowProtocol::Tcp]));
+            } else {
+                let error = config.into_policy_config().unwrap_err().to_string();
+                assert!(error.contains("is not supported by this build"));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_listener_rejects_udp_only_and_inapplicable_platform_fields() {
+        let input = platform_listener_yaml(
+            "mixed",
+            "any",
+            "  bind: 127.0.0.1:17890\n  protocols: [udp]\n",
+        );
+        let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
+        assert!(error.contains("mixed listeners require TCP"));
+        for field in [
+            "mark: 1",
+            "routeTable: 100",
+            "interface: PathChord",
+            "address: 198.18.0.1/30",
+            "mtu: 1500",
+            "bypass: [192.0.2.1/32]",
+            "proxyRef: a-proxy",
+        ] {
+            let input = platform_listener_yaml(
+                "mixed",
+                "any",
+                &format!("  bind: 127.0.0.1:17890\n  {field}\n"),
+            );
+            let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("mixed listeners do not accept"),
+                "{field}: {error}"
+            );
+        }
+    }
+
     #[cfg(target_os = "freebsd")]
     #[test]
     fn rejects_any_transparent_and_tun_listeners_on_freebsd() {
@@ -2419,7 +2563,7 @@ spec:
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("freebsd listeners support http and socks5 only"),
+                error.contains("freebsd listeners support http, socks5, and mixed only"),
                 "{kind}: {error}"
             );
         }

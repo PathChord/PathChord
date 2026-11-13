@@ -21,7 +21,7 @@
 | Linux 拦截 | `nix`/`socket2` 加平台专用的 netlink 和 TPROXY 代码 | 能够访问套接字选项和路由原语，同时不隐藏内核行为 |
 | Linux TUN | 通过 `PacketDevice` 封装 `tun-rs` 异步包设备，并使用直接的 `smoltcp` reactor | 安全、可替换的设备生命周期以及维护中的 TCP/UDP 状态机 |
 | Windows TUN | 通过同一接口封装 `tun-rs` Wintun 包设备，并使用直接的 `smoltcp` reactor | 无需平台专用 TCP 重建的标准 Windows 驱动集成方式 |
-| HTTP/SOCKS | 内部协议适配器 | 所需语义较少，并可避免不必要地耦合代理框架 |
+| HTTP/SOCKS | Hyper HTTP/1 消息 codec，配合内部 HTTP 路由和 SOCKS4/4a/5 adapter | 维护中的 HTTP 解析、消息 framing、流式背压，以及显式的策略和认证边界 |
 | DNS 线协议处理 | 路由 adapter 后使用 `hickory-proto` | 使用成熟的 DNS 解析/编码，同时保持 local、Transit、Egress 和 blocked 路由可替换 |
 | 测试 | `cargo test`、确定性模拟传输、属性测试、数据包跟踪和故障注入 | 多路径正确性依赖可复现的丢包、重复、重排序和重启测试 |
 
@@ -86,7 +86,11 @@ Egress 授权变更使用 SQLite 事务。运行中的 Egress 进程拥有数据
 
 ## 平台架构
 
-Linux、Windows 和 FreeBSD 共享 HTTP CONNECT 和 SOCKS5 CONNECT/UDP ASSOCIATE adapter。FreeBSD 使用 Unix 本地控制，v1 平台契约禁止其暴露 TPROXY、REDIRECT 或 TUN 监听器。系统代理 mutation 仅限 Windows；Linux 和 FreeBSD 报告激活不受支持。平台无法安全获取的进程元数据保持 unknown。
+mixed TCP 监听器在不消耗首字节的情况下选择 HTTP 或 SOCKS，然后复用现有协议编解码器、
+凭据 verifier、flow opener 和任务监督。其 SOCKS5 UDP Association 与独立 SOCKS 监听器
+保留相同的有界 relay 生命周期。
+
+Linux、Windows 和 FreeBSD 共享普通 HTTP 转发、HTTP CONNECT、SOCKS4/4a/5 CONNECT 和 SOCKS5 UDP ASSOCIATE adapter。HTTP 消息 framing 使用 Hyper，每个普通请求使用与其他本地 flow 相同的 TCP flow opener 和策略引擎。规范配置名 `socks5` 接受输入别名 `socks` 及全部三个 SOCKS 版本。协议行为以[平台与 DNS 规范](../spec/platform-and-dns.zh-CN.md#http-和-socks-监听器)为准。FreeBSD 使用 Unix 本地控制，v1 平台契约禁止其暴露 TPROXY、REDIRECT 或 TUN 监听器。系统代理 mutation 仅限 Windows；Linux 和 FreeBSD 报告激活不受支持。平台无法安全获取的进程元数据保持 unknown。
 
 Linux 通过平台适配器集成 TPROXY、REDIRECT、进程元数据和透明路由。Windows 使用 Wintun，并通过控制面选择监听器来集成系统代理。TUN 适配器只暴露有界 IP 包；单一所有者的 `smoltcp` reactor 持有 `Interface`、`SocketSet`、TCP Listener、UDP socket、计时器和 flow 生命周期，并通过与普通 Listener 相同的 Ingress opener 连接已接受 flow。三个平台复用核心和策略 crate。
 

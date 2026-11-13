@@ -271,9 +271,21 @@ an optional `authentication` block (default `disabled`). It may also contain
 every accepted flow. Process facts are best-effort and unknown when the
 platform provider cannot safely obtain them. Listener IDs are available to
 rules. An explicit platform MUST match the actual host; `any` uses the actual
-host's platform matrix. FreeBSD permits `http` and `socks5` and rejects
+host's platform matrix. FreeBSD permits `http`, `socks5`, and `mixed` and rejects
 `tproxy`, `redirect`, and `tun`. A listener that is unsupported on the selected
 platform is rejected during validation rather than ignored.
+
+`spec.type` accepts `socks` as an input alias for canonical `socks5`; normalized
+serialization MUST emit `socks5`. The canonical listener accepts SOCKS4/4a/5
+CONNECT and SOCKS5 UDP ASSOCIATE. Required password authentication rejects
+SOCKS4/4a rather than downgrading the verifier. An HTTP listener supports
+ordinary `http://` forwarding and CONNECT with per-request authentication and
+policy evaluation. Message framing, limits, credential/header filtering, and
+upgrade behavior follow the [HTTP and SOCKS contract](platform-and-dns.md#http-and-socks-listeners).
+
+`spec.type: mixed` shares one TCP endpoint between HTTP and SOCKS. Its default
+`protocols` are `[tcp, udp]`; TCP is required and UDP is optional. Both parsers
+share the same credentials, source restrictions, and listener identity.
 
 ## DNSPolicy and FallbackPolicy
 

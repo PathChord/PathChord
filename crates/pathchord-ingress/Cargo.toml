@@ -12,8 +12,12 @@ async-stream.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
+bytes.workspace = true
 getrandom.workspace = true
 hickory-proto.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 notify = "8.2.0"
 pathchord-core = { path = "../pathchord-core" }
 pathchord-noise = { path = "../pathchord-noise" }

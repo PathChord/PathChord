@@ -181,8 +181,17 @@ Listener 的完整字段见[平台和 DNS 规范](platform-and-dns.zh-CN.md)。L
 spec 包含 type、platform（`linux`、`windows`、`freebsd` 或默认值 `any`）和 authentication（默认 disabled），还可以包含最多 256 个合法 tag
 组成的 `flowTags`，以及带布尔字段 `executable`、`user`、`group` 的 `processMetadata` 请求。静态 flow
 tags 会复制到每个接收的 flow；平台无法安全获取的进程事实表示 unknown。显式平台必须与实际主机匹配，
-`any` 使用实际主机的平台矩阵。FreeBSD 允许 `http` 和 `socks5`，拒绝 `tproxy`、`redirect` 和 `tun`。
+`any` 使用实际主机的平台矩阵。FreeBSD 允许 `http`、`socks5` 和 `mixed`，拒绝 `tproxy`、`redirect` 和 `tun`。
 不支持的平台/type 组合必须在验证期间拒绝，不得忽略。
+
+`spec.type` 接受 `socks` 作为规范名称 `socks5` 的输入别名；规范化序列化必须输出 `socks5`。
+规范名称的监听器接受 SOCKS4/4a/5 CONNECT 和 SOCKS5 UDP ASSOCIATE。要求密码认证时必须拒绝
+SOCKS4/4a，不得降级 verifier。HTTP 监听器支持普通 `http://` 转发和 CONNECT，并对每个请求独立
+认证和求值策略。消息 framing、限制、凭据/头字段过滤和升级行为遵循
+[HTTP 和 SOCKS 契约](platform-and-dns.zh-CN.md#http-和-socks-监听器)。
+
+`spec.type: mixed` 在一个 TCP 端点上共用 HTTP 和 SOCKS。其 `protocols` 默认值为
+`[tcp, udp]`；TCP 必须启用，UDP 可选。两个 parser 共用相同的凭据、来源限制和 Listener 身份。
 
 ## DNSPolicy 和 FallbackPolicy
 

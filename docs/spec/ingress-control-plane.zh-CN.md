@@ -215,7 +215,7 @@ schema 中相同的边界；`cache` 可以为 null。列表读模型返回这些
 机密值。
 
 系统代理开关是控制面运行时 mutation，不是 YAML 资源。`system_proxy.enable` 必须包含 `listener_id`，
-且该 ID 必须引用 HTTP 或 SOCKS Listener。Windows 将其应用到环境变量和操作系统代理配置；
+且该 ID 必须引用 HTTP、SOCKS 或 Mixed Listener。Windows 将其应用到环境变量和操作系统代理配置；
 `system_proxy.disable` 恢复之前的值。Linux 和 FreeBSD 对启用和关闭都返回 `UNSUPPORTED_OPERATION`，并继续通过
 `nodes` 和 status 展示普通 Listener。
 

@@ -57,7 +57,10 @@ impl ListenerView {
 
     #[must_use]
     pub const fn supports_system_proxy(&self) -> bool {
-        matches!(self.kind, ListenerKind::Http | ListenerKind::Socks5)
+        matches!(
+            self.kind,
+            ListenerKind::Http | ListenerKind::Socks5 | ListenerKind::Mixed
+        )
     }
 }
 
@@ -209,6 +212,18 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn mixed_listener_is_available_for_system_proxy_selection() {
+        let mixed = descriptor("shared-proxy", ListenerKind::Mixed);
+        let inventory = ListenerInventory::from_descriptors(9, [&mixed]);
+        let selected = inventory
+            .select_system_proxy_listener(&mixed.id)
+            .expect("mixed listener");
+        assert_eq!(selected.kind, ListenerKind::Mixed);
+        assert_eq!(selected.bind, mixed.bind);
+        assert_eq!(selected.generation, 9);
     }
 
     #[test]
