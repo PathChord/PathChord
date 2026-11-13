@@ -112,13 +112,42 @@ impl LocalControlDispatcher {
             return *response;
         }
         let generation = self.service.snapshot().generation;
-        let mut items = Vec::new();
-        for descriptor in self.service.listeners().values() {
-            items.push(listener_value(descriptor, generation));
-        }
+        let query = match ListenerListQuery::parse(&request.body) {
+            Ok(query) => query,
+            Err(message) => {
+                return self.failure(
+                    request.request_id,
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    &message,
+                    None,
+                );
+            }
+        };
+        let mut descriptors: Vec<_> = self.service.listeners().into_values().collect();
+        descriptors.retain(|descriptor| query.matches(descriptor));
+        descriptors.sort_by(|left, right| query.compare(left, right));
+        let end = query
+            .offset
+            .saturating_add(query.page_size)
+            .min(descriptors.len());
+        let page = if query.offset < descriptors.len() {
+            &descriptors[query.offset..end]
+        } else {
+            &[]
+        };
+        let items: Vec<_> = page
+            .iter()
+            .map(|descriptor| listener_value(descriptor, generation))
+            .collect();
+        let next_page_token = if end < descriptors.len() {
+            Some(end.to_string())
+        } else {
+            None
+        };
         self.success(
             request.request_id,
-            json!({"items": items, "next_page_token": Value::Null}),
+            json!({"items": items, "next_page_token": next_page_token}),
         )
     }
 
@@ -132,6 +161,9 @@ impl LocalControlDispatcher {
     fn dispatch_system_proxy_enable(&mut self, request: RequestEnvelope) -> ResponseEnvelope {
         if let Err(response) = self.require_capability(&request, "system_proxy:write") {
             return *response;
+        }
+        if let Some(response) = self.check_expected_generation(&request, "configuration") {
+            return response;
         }
         let listener_id = match request.body.get("listener_id").and_then(Value::as_str) {
             Some(value) if !value.is_empty() => ListenerId::new(value),
@@ -178,6 +210,9 @@ impl LocalControlDispatcher {
     fn dispatch_system_proxy_disable(&mut self, request: RequestEnvelope) -> ResponseEnvelope {
         if let Err(response) = self.require_capability(&request, "system_proxy:write") {
             return *response;
+        }
+        if let Some(response) = self.check_expected_generation(&request, "configuration") {
+            return response;
         }
         let internal_request_id = match request_id(&request.request_id) {
             Ok(value) => value,
@@ -265,6 +300,41 @@ impl LocalControlDispatcher {
         }
     }
 
+    fn check_expected_generation(
+        &self,
+        request: &RequestEnvelope,
+        scope: &str,
+    ) -> Option<ResponseEnvelope> {
+        let expected = request.expected_generation.as_ref()?;
+        let current = match scope {
+            "configuration" => self.service.snapshot().generation,
+            "observation" => self.service.observation_snapshot().generation,
+            _ => {
+                return Some(self.failure(
+                    request.request_id.clone(),
+                    self.observed_generation(),
+                    ErrorCode::ValidationFailed,
+                    "unsupported generation scope",
+                    None,
+                ));
+            }
+        };
+        if expected.scope != scope || expected.value != current {
+            Some(self.failure(
+                request.request_id.clone(),
+                self.observed_generation(),
+                ErrorCode::GenerationConflict,
+                "generation mismatch",
+                Some(json!({
+                    "expected": {"scope": expected.scope, "value": expected.value},
+                    "current": {"scope": scope, "value": current},
+                })),
+            ))
+        } else {
+            None
+        }
+    }
+
     fn system_proxy_value(&self) -> Value {
         // Linux exposes ordinary listener inventory but has no system-proxy
         // activation state. Keep this response distinct from Windows'
@@ -328,6 +398,137 @@ fn listener_value(descriptor: &ListenerDescriptor, generation: u64) -> Value {
         "generation": generation,
         "status": {"reason": Value::Null},
     })
+}
+
+#[derive(Debug, Default)]
+struct ListenerListQuery {
+    page_size: usize,
+    offset: usize,
+    kind: Option<String>,
+    platform: Option<String>,
+    state: Option<String>,
+    sort: String,
+    descending: bool,
+}
+
+impl ListenerListQuery {
+    fn parse(body: &Value) -> Result<Self, String> {
+        let object = body
+            .as_object()
+            .ok_or_else(|| "listeners.list body must be an object".to_owned())?;
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "page_size" | "page_token" | "filter" | "sort" | "direction"
+            ) {
+                return Err(format!("unknown listeners.list query field: {key}"));
+            }
+        }
+        let page_size = match object.get("page_size") {
+            None => 100,
+            Some(value) => value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| (1..=1000).contains(value))
+                .ok_or_else(|| "page_size must be an integer in 1..=1000".to_owned())?,
+        };
+        let offset = match object.get("page_token") {
+            None | Some(Value::Null) => 0,
+            Some(Value::String(value)) => value
+                .parse::<usize>()
+                .map_err(|_| "page_token is invalid".to_owned())?,
+            Some(_) => return Err("page_token must be an opaque string".to_owned()),
+        };
+        let mut query = Self {
+            page_size,
+            offset,
+            sort: "id".to_owned(),
+            ..Self::default()
+        };
+        if let Some(filter) = object.get("filter") {
+            let filter = filter
+                .as_object()
+                .ok_or_else(|| "filter must be an object".to_owned())?;
+            for key in filter.keys() {
+                if !matches!(key.as_str(), "kind" | "platform" | "state") {
+                    return Err(format!("unknown listener filter field: {key}"));
+                }
+            }
+            query.kind = filter
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            query.platform = filter
+                .get("platform")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            query.state = filter
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if filter.values().any(|value| !value.is_string()) {
+                return Err("listener filter values must be strings".to_owned());
+            }
+        }
+        if let Some(sort) = object.get("sort") {
+            query.sort = sort
+                .as_str()
+                .ok_or_else(|| "sort must be a string".to_owned())?
+                .to_owned();
+        }
+        if !matches!(
+            query.sort.as_str(),
+            "id" | "kind" | "platform" | "state" | "bind"
+        ) {
+            return Err("sort must be id, kind, platform, state, or bind".to_owned());
+        }
+        if let Some(direction) = object.get("direction") {
+            query.descending = match direction
+                .as_str()
+                .ok_or_else(|| "direction must be asc or desc".to_owned())?
+            {
+                "asc" => false,
+                "desc" => true,
+                _ => return Err("direction must be asc or desc".to_owned()),
+            };
+        }
+        Ok(query)
+    }
+
+    fn matches(&self, descriptor: &ListenerDescriptor) -> bool {
+        let kind = format!("{:?}", descriptor.kind).to_ascii_lowercase();
+        let platform = std::env::consts::OS;
+        let state = "available";
+        self.kind.as_deref().is_none_or(|value| value == kind)
+            && self
+                .platform
+                .as_deref()
+                .is_none_or(|value| value == platform)
+            && self.state.as_deref().is_none_or(|value| value == state)
+    }
+
+    fn compare(&self, left: &ListenerDescriptor, right: &ListenerDescriptor) -> std::cmp::Ordering {
+        let left_value = listener_sort_key(left, &self.sort);
+        let right_value = listener_sort_key(right, &self.sort);
+        let ordering = left_value
+            .cmp(&right_value)
+            .then_with(|| left.id.cmp(&right.id));
+        if self.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    }
+}
+
+fn listener_sort_key(descriptor: &ListenerDescriptor, sort: &str) -> String {
+    match sort {
+        "kind" => format!("{:?}", descriptor.kind).to_ascii_lowercase(),
+        "platform" => std::env::consts::OS.to_owned(),
+        "state" => "available".to_owned(),
+        "bind" => descriptor.bind.to_string(),
+        _ => descriptor.id.as_str().to_owned(),
+    }
 }
 
 fn zero_cleanup() -> Value {
@@ -409,6 +610,45 @@ mod tests {
     }
 
     #[test]
+    fn listeners_list_validates_query_and_paginates_deterministically() {
+        let mut dispatcher = dispatcher(SystemProxyPlatform::Linux);
+        let first = dispatcher.dispatch(request(
+            "listeners.list",
+            &["listeners:read"],
+            json!({"page_size": 1, "sort": "id"}),
+        ));
+        assert!(first.ok);
+        let result = first.result.expect("first page");
+        assert_eq!(result["items"].as_array().expect("items").len(), 1);
+        let token = result["next_page_token"].as_str().expect("next token");
+
+        let second = dispatcher.dispatch(request(
+            "listeners.list",
+            &["listeners:read"],
+            json!({"page_size": 1, "page_token": token}),
+        ));
+        assert!(second.ok);
+        assert_eq!(
+            second.result.expect("second page")["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let invalid = dispatcher.dispatch(request(
+            "listeners.list",
+            &["listeners:read"],
+            json!({"page_size": 0}),
+        ));
+        assert!(!invalid.ok);
+        assert_eq!(
+            invalid.error.expect("validation error").code,
+            ErrorCode::ValidationFailed
+        );
+    }
+
+    #[test]
     fn windows_system_proxy_enable_disable_and_linux_rejection() {
         let mut windows = dispatcher(SystemProxyPlatform::Windows);
         let enabled = windows.dispatch(request(
@@ -444,6 +684,26 @@ mod tests {
         assert_eq!(resource["enabled"], false);
         assert_eq!(resource["platform_effect"], "unsupported");
         assert_eq!(resource["restoration_state"], "not_required");
+    }
+
+    #[test]
+    fn system_proxy_mutation_checks_expected_generation_when_supplied() {
+        let mut dispatcher = dispatcher(SystemProxyPlatform::Windows);
+        let mut request = request(
+            "system_proxy.enable",
+            &["system_proxy:write"],
+            json!({"listener_id": "local-http"}),
+        );
+        request.expected_generation = Some(GenerationExpectation {
+            scope: "configuration".to_owned(),
+            value: 99,
+        });
+        let response = dispatcher.dispatch(request);
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.expect("generation error").code,
+            ErrorCode::GenerationConflict
+        );
     }
 
     #[test]
