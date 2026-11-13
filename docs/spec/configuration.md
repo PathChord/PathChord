@@ -17,6 +17,12 @@ configuration YAML is not a management-message or data-Path wire encoding.
 
 ## Canonical object set
 
+Configuration may be a single resource file or a recursively loaded resource
+directory. Ingress selects command-line configuration before environment
+configuration and account defaults. The complete bundle is validated together;
+see [configuration sources](configuration-schema.md#configuration-sources)
+for directory discovery, defaults, limits, and reload semantics.
+
 ```yaml
 apiVersion: pathchord.io/v1
 kind: List

@@ -58,8 +58,13 @@ sing-box 1.14.4 可执行文件。未支持的节点和参数具有独立诊断�
 
 ## 命令界面
 
+Ingress 为普通用户默认加载 `~/.config/pathchord`，为 root/服务账号默认加载 `/etc/pathchord`。
+`--config-dir` 将目录中的 YAML/YML/JSON 资源递归载入并统一验证。优先级为命令行，
+然后是 `PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`，最后是账号默认值。
+
 ```text
 pathchord ingress
+pathchord ingress --config-dir /path/to/conf.d
 pathchord egress
 pathchord status
 pathchord enroll

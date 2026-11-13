@@ -5,6 +5,27 @@
 `pathchord` 可执行文件提供 Ingress、Egress 服务子命令和本地管理命令。每次服务调用拥有独立
 进程。配置示例使用显式监听器，不需要流量拦截或 TUN 权限。
 
+## 配置目录与覆写
+
+没有显式配置选项时，Ingress 为普通账号加载 `~/.config/pathchord`，为 root/服务账号加载
+`/etc/pathchord`。显式命令行来源覆盖环境变量，环境变量覆盖账号默认值。例如：
+
+```sh
+pathchord ingress
+PATHCHORD_CONFIG_DIR=/opt/pathchord/conf.d pathchord ingress
+pathchord ingress --config-dir /opt/pathchord/conf.d
+pathchord ingress --config /opt/pathchord/single.yaml
+```
+
+`PATHCHORD_CONFIG` 也接受文件或目录。未指定命令行来源时，只能设置一个非空配置环境变量。
+`--config`/`-c` 与 `--config-dir`/`-C` 互斥。精确的账号分类和优先级由
+[配置来源契约](configuration-schema.zh-CN.md#配置来源)定义。
+
+可以把资源拆到所选树中的 `.yaml`、`.yml` 或 `.json` 文件，子目录也会载入。所有资源组成一张
+经过统一验证的资源图，因此 Listener、DNSPolicy、FallbackPolicy、节点和路由规则可以放在
+不同文件中。私钥/凭据 JSON 和 `--data-dir` 应放在该树外。文件新增、修改、删除和重命名后，
+只在完整资源图有效时原子替换；候选失败时保留原配置。
+
 ## 本地显式代理
 
 构建可执行文件并运行直接路由示例：

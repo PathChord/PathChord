@@ -7,6 +7,33 @@ and local management commands. Each service invocation owns a separate
 process. Configuration examples use explicit listeners and require no packet
 interception or TUN privileges.
 
+## Configuration directory and overrides
+
+With no explicit configuration option, Ingress loads `~/.config/pathchord` for
+a regular account or `/etc/pathchord` for root/service accounts. An explicit
+command-line source overrides environment variables, which override the
+account default. For example:
+
+```sh
+pathchord ingress
+PATHCHORD_CONFIG_DIR=/opt/pathchord/conf.d pathchord ingress
+pathchord ingress --config-dir /opt/pathchord/conf.d
+pathchord ingress --config /opt/pathchord/single.yaml
+```
+
+`PATHCHORD_CONFIG` also accepts a file or directory. Set only one non-empty
+configuration environment variable when no command-line source is supplied.
+`--config`/`-c` and `--config-dir`/`-C` are mutually exclusive. The exact
+account classification and precedence are defined in the
+[configuration source contract](configuration-schema.md#configuration-sources).
+
+Split resources into `.yaml`, `.yml`, or `.json` files in the selected tree;
+subdirectories are included. All resources form one validated graph, so a
+Listener, DNSPolicy, FallbackPolicy, node, and routing rules can live in
+different files. Keep private key/credential JSON and `--data-dir` outside
+that tree. Reloading additions, modifications, removals, and renames replaces
+the complete valid graph atomically; a failed candidate retains the old one.
+
 ## Local explicit proxy
 
 Build the executable and run the direct-routing example:

@@ -20,6 +20,7 @@ pub use pathchord_policy::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+mod configuration_source;
 mod control;
 mod control_views;
 mod credentials;

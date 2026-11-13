@@ -314,9 +314,47 @@ spec:
   action: reject # or direct
 ```
 
+## Configuration sources
+
+Ingress accepts one resource file or one directory tree. Source selection uses
+the following priority, from highest to lowest:
+
+1. Explicit `--config` (`-c`) or `--config-dir` (`-C`). The options are mutually
+   exclusive. `--config` accepts a file or directory; `--config-dir` requires a
+   directory.
+2. Non-empty `PATHCHORD_CONFIG` or `PATHCHORD_CONFIG_DIR`. These are mutually
+   exclusive at the environment tier and have the same file/directory meaning
+   as their corresponding command-line options. An explicit command-line
+   source overrides both environment variables, including their conflict.
+3. The account default: `~/.config/pathchord` for a regular user and
+   `/etc/pathchord` for root or a service account. Unix uses the effective UID;
+   system UIDs below 1000 and accounts with `nologin` or `false` shells are
+   classified as service accounts. A regular Unix user's home comes from
+   `HOME`, falling back to the account database. Windows uses `USERPROFILE`
+   (then `HOME`); its standard System/Local Service/Network Service principals
+   are service accounts. An unavailable user home is an error.
+
+The directory loader recursively reads `.yaml`, `.yml`, and `.json` resource
+files, with case-insensitive extensions, in relative-path order. Hidden and
+editor temporary paths are ignored; visible child symlinks are rejected.
+The selected root is resolved once at startup. A single explicitly selected
+file retains support for any filename extension. A directory with no supported
+files is rejected. The combined bound is 4 MiB and 1024 resource files, with
+at most 16 levels of subdirectories.
+
+Each source is parsed independently, including YAML multi-document streams
+and `kind: List`; the complete combined resource graph is then validated.
+Resources may reference objects in other files. Duplicate resource identities
+are rejected across the whole bundle; filename order MUST NOT implement a
+last-file-wins override. Exactly one DNSPolicy and one FallbackPolicy remain
+required in the combined graph. Runtime data and private credential JSON MUST
+be kept outside the resource tree or use a non-resource file extension.
+Resource identity and explicit rule order determine the normalized graph;
+moving unchanged resources between source files MUST NOT require a restart.
+
 ## Snapshot publication and reload
 
-The adapter parses, validates, normalizes, and compiles the complete document
+The adapter parses, validates, normalizes, and compiles the complete source bundle
 before publication. Each published snapshot has a monotonically increasing
 generation. A connection captures one generation before Egress and Proxy
 selection and uses that generation for the complete decision. Runtime
@@ -330,3 +368,9 @@ be hot-reloaded. Snapshot replacement is atomic. On any parse, validation,
 compilation, persistence, or cache-write failure, the last successful snapshot
 remains active and the failure is exposed through structured status.
 
+
+Directory create, modify, remove, and rename events trigger a full candidate
+rescan. Atomic file replacement and root-directory replacement MUST preserve
+watching. All files pass validation before one snapshot is published; an
+invalid, incomplete, or duplicate candidate retains the last good bundle.
+Startup-only changes continue to report restart required.

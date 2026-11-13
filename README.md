@@ -83,8 +83,14 @@ source.
 
 ## Command surface
 
+Ingress defaults to `~/.config/pathchord` for regular users and `/etc/pathchord`
+for root/service accounts. `--config-dir` loads YAML/YML/JSON resources
+recursively as one validated bundle. Selection priority is command line,
+then `PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`, then the account default.
+
 ```text
 pathchord ingress
+pathchord ingress --config-dir /path/to/conf.d
 pathchord egress
 pathchord status
 pathchord enroll

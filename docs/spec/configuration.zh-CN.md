@@ -6,6 +6,10 @@
 
 ## 规范对象集合
 
+配置可以是单个资源文件，也可以是递归载入的资源目录。Ingress 按命令行、环境变量、账号
+默认值的优先级选择来源，并统一验证完整资源集合。目录发现、默认路径、限制和重载语义见
+[配置来源](configuration-schema.zh-CN.md#配置来源)。
+
 ```yaml
 apiVersion: pathchord.io/v1
 kind: List
