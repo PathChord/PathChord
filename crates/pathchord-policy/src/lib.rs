@@ -12,7 +12,9 @@ use thiserror::Error;
 
 mod compiled;
 mod config;
+mod service_config;
 mod transit_options;
+pub use service_config::{EgressServiceSpec, NodeProbePolicySpec};
 
 pub use transit_options::{
     TransitMultiplex, TransitOptions, TransitReality, TransitTls, TransitTransport,
@@ -372,6 +374,8 @@ pub struct TransitRule {
     pub reject_tags: BTreeSet<String>,
     pub weight: u32,
     pub traffic_policy: TrafficPolicyId,
+    #[serde(default)]
+    pub traffic_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,6 +476,7 @@ pub enum FallbackAction {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PolicyConfig {
+    pub node_probe: Option<NodeProbePolicySpec>,
     pub egresses: Vec<EgressConfig>,
     pub transit_proxies: Vec<TransitProxyConfig>,
     pub subscriptions: Vec<SubscriptionConfig>,
@@ -500,6 +505,9 @@ pub enum PolicyDecision {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ValidationError {
+    #[error("rule {rule_id} references unknown traffic class {class}")]
+    UnknownTrafficClass { rule_id: String, class: String },
+
     #[error("Transit Proxy {proxy_id} has invalid connection options: {reason}")]
     InvalidTransitOptions {
         proxy_id: String,
@@ -655,6 +663,20 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         validate_dns_policy(dns_policy)?;
     }
     for policy in &config.traffic_policies {
+        for (name, class) in &policy.classes {
+            if name.is_empty()
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                || !(1..=1_000_000).contains(&class.share)
+            {
+                return Err(ValidationError::UnknownTrafficClass {
+                    rule_id: policy.id.as_str().to_owned(),
+                    class: name.clone(),
+                });
+            }
+        }
         if let Some(class_bps) = policy.class_replication_budget_bps
             && class_bps > policy.session_replication_budget_bps
         {
@@ -701,6 +723,26 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         }
     }
 
+    for rule in &config.transit_rules {
+        if let Some(class) = &rule.traffic_class {
+            let policy = config
+                .traffic_policies
+                .iter()
+                .find(|policy| policy.id == rule.traffic_policy);
+            if class.is_empty()
+                || class.len() > 128
+                || !class
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                || !policy.is_some_and(|policy| policy.classes.contains_key(class))
+            {
+                return Err(ValidationError::UnknownTrafficClass {
+                    rule_id: rule.id.as_str().to_owned(),
+                    class: class.clone(),
+                });
+            }
+        }
+    }
     let subscription_ids: HashSet<_> = config
         .subscriptions
         .iter()

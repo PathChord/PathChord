@@ -50,18 +50,8 @@ curl -x socks5h://127.0.0.1:7890 https://example.com
 pathchord ingress --config examples/ingress-subscriptions.yaml
 ```
 
-## 可选出站引擎
-
-原生传输不依赖外部可执行文件。高级节点可以使用显式指定、本地安装的 `sing-box` 1.14.4：
-
-```sh
-pathchord ingress --config examples/ingress-subscriptions.yaml \
-  --outbound-engine /absolute/path/to/sing-box
-```
-
-提供的可执行文件必须满足版本契约。引擎配置是私有数据，通过 stdin 传递，并在适配器进入
-候选集合前验证。Ingress 监督子进程及其经过认证的私有回环端点。引擎缺失、节点参数被拒绝或
-协议不可用时，必须保留可查询的节点诊断，不得变成明文或 direct 回退。见
+未实现的 Transit 协议和参数会保持为类型化节点诊断，直到对应的 PathChord 原生适配器完成。
+PathChord 不启动或嵌入外部代理进程作为兼容后端。见
 [Transit Proxy 契约](transit-proxies.zh-CN.md)。
 
 ## Ingress 与 Egress 登记
@@ -102,7 +92,7 @@ pathchord --socket /tmp/pathchord-egress.sock enroll list
 ```
 
 示例的 `direct-path` 是到经过认证的 Egress 的直接传输。将它替换为 HTTP、HTTPS、SOCKS5、
-Shadowsocks 或引擎支持的 Transit 时，只改变传输，端到端 Noise 和显式登记契约保持一致。
+Shadowsocks Transit 时，只改变传输，端到端 Noise 和显式登记契约保持一致。
 经由 Egress 的 UDP flow 要求 Egress 具有 UDP 能力，并具有 TCP Transit Path；普通第三方 UDP
 路由还要求所选节点自身支持原生 UDP。
 

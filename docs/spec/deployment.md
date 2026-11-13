@@ -59,22 +59,10 @@ usable matching node. Its provider URL MUST be replaced before use:
 pathchord ingress --config examples/ingress-subscriptions.yaml
 ```
 
-## Optional outbound engine
-
-The native transports do not require an external executable. Advanced nodes
-can use an explicitly selected, locally installed `sing-box` version 1.14.4:
-
-```sh
-pathchord ingress --config examples/ingress-subscriptions.yaml \
-  --outbound-engine /absolute/path/to/sing-box
-```
-
-The supplied executable MUST match the version contract. Engine configuration
-is private, passed on stdin, and checked before the adapter is made eligible.
-The Ingress supervises the child and its private authenticated loopback
-endpoint. A missing engine, rejected node parameter, or unavailable protocol
-MUST remain visible as a node diagnostic and MUST NOT become a plaintext or
-direct fallback. See the [Transit Proxy contract](transit-proxies.md).
+Unsupported Transit protocols and parameters remain visible as typed node
+diagnostics until their native PathChord adapters are implemented. PathChord
+does not start or embed an external proxy process as a compatibility backend.
+See the [Transit Proxy contract](transit-proxies.md).
 
 ## Ingress and Egress enrollment
 
@@ -119,7 +107,7 @@ pathchord --socket /tmp/pathchord-egress.sock enroll list
 ```
 
 The example's `direct-path` is a direct transport to the authenticated Egress.
-Replacing it with an HTTP, HTTPS, SOCKS5, Shadowsocks, or engine-backed Transit
+Replacing it with an HTTP, HTTPS, SOCKS5, or Shadowsocks Transit
 changes the transport while preserving the end-to-end Noise and enrollment
 contracts. UDP flows through an Egress require its UDP capability and a TCP
 Transit Path; ordinary third-party UDP routing additionally requires native

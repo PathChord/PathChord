@@ -21,11 +21,13 @@ use pathchord_policy::{
     ValidatedPolicySnapshot,
 };
 use pathchord_transit::{
-    ConnectRequest, DirectTransitAdapter, Endpoint as TransitEndpoint, TransitAdapter, TransitError,
+    AdapterRegistry, ConnectRequest, DirectTransitAdapter, Endpoint as TransitEndpoint,
+    TransitAdapter, TransitCredentialProvider, TransitError,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 
 use crate::{
@@ -36,6 +38,33 @@ use crate::{
 pub const DEFAULT_PATH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_CAPABILITY: u64 = 1;
 const UDP_CAPABILITY: u64 = 1 << 1;
+const STATIC_PATH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticReloadOutcome {
+    pub generation: u64,
+    pub added: Vec<TransitProxyId>,
+    pub changed: Vec<TransitProxyId>,
+    pub removed: Vec<TransitProxyId>,
+}
+
+pub struct PreparedStaticReload {
+    base_generation: u64,
+    compiled: CompiledPolicy,
+    configs: BTreeMap<TransitProxyId, TransitProxyConfig>,
+    adapters: BTreeMap<TransitProxyId, Arc<dyn TransitAdapter>>,
+    outcome: StaticReloadOutcome,
+}
+
+impl std::fmt::Debug for PreparedStaticReload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedStaticReload")
+            .field("base_generation", &self.base_generation)
+            .field("outcome", &self.outcome)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug)]
 pub struct IngressDataPlaneConfig {
@@ -109,6 +138,16 @@ pub enum DataPlaneError {
     ShuttingDown,
     #[error("secure identifier generation failed")]
     IdentifierGeneration,
+    #[error("static Transit reload generation conflicts with the active snapshot")]
+    StaticReloadConflict,
+    #[error("changing Egress topology requires restarting the data plane")]
+    StaticReloadRequiresRestart,
+    #[error("static Transit identity conflicts with a subscription node")]
+    StaticDynamicConflict,
+    #[error("node probe configuration is invalid")]
+    InvalidProbeConfig,
+    #[error("control-plane reload transaction was rejected")]
+    ControlCommitRejected,
 }
 
 struct SessionSlot {
@@ -151,7 +190,8 @@ pub struct IngressDataPlane {
     compiled: RwLock<CompiledPolicy>,
     generation: std::sync::atomic::AtomicU64,
     egresses: BTreeMap<EgressId, EgressConfig>,
-    transit_configs: BTreeMap<TransitProxyId, TransitProxyConfig>,
+    transit_configs: RwLock<BTreeMap<TransitProxyId, TransitProxyConfig>>,
+    configuration_gate: RwLock<()>,
     traffic_policies: RwLock<BTreeMap<TrafficPolicyId, TrafficPolicy>>,
     dynamic_transit_configs: RwLock<BTreeMap<TransitProxyId, TransitProxyConfig>>,
     transit_adapters: RwLock<BTreeMap<TransitProxyId, Arc<dyn TransitAdapter>>>,
@@ -159,6 +199,9 @@ pub struct IngressDataPlane {
     sessions: BTreeMap<EgressId, Arc<SessionSlot>>,
     path_connect_timeout: Duration,
     shutting_down: std::sync::atomic::AtomicBool,
+    retired_paths: Mutex<JoinSet<()>>,
+    probes: Mutex<crate::node_probe::ProbeStore>,
+    probe_running: Mutex<()>,
 }
 
 impl std::fmt::Debug for IngressDataPlane {
@@ -171,7 +214,14 @@ impl std::fmt::Debug for IngressDataPlane {
                 &self.generation.load(std::sync::atomic::Ordering::Relaxed),
             )
             .field("egress_count", &self.egresses.len())
-            .field("transit_count", &self.transit_configs.len())
+            .field(
+                "transit_count",
+                &self
+                    .transit_configs
+                    .try_read()
+                    .map(|configs| configs.len())
+                    .ok(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -244,7 +294,8 @@ impl IngressDataPlane {
             compiled: RwLock::new(compiled),
             generation: std::sync::atomic::AtomicU64::new(generation.get()),
             egresses,
-            transit_configs,
+            transit_configs: RwLock::new(transit_configs),
+            configuration_gate: RwLock::new(()),
             traffic_policies: RwLock::new(traffic_policies),
             dynamic_transit_configs: RwLock::new(BTreeMap::new()),
             transit_adapters: RwLock::new(transit_adapters),
@@ -252,6 +303,9 @@ impl IngressDataPlane {
             sessions,
             path_connect_timeout: config.path_connect_timeout,
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            retired_paths: Mutex::new(JoinSet::new()),
+            probes: Mutex::new(crate::node_probe::ProbeStore::default()),
+            probe_running: Mutex::new(()),
         })
     }
 
@@ -261,15 +315,18 @@ impl IngressDataPlane {
         adapter: Arc<dyn TransitAdapter>,
         mut status: TransitProxyRuntimeStatus,
     ) -> Result<(), DataPlaneError> {
-        if !self.transit_configs.contains_key(&id) {
+        let _configuration = self.configuration_gate.read().await;
+        let config = self.transit_configs.read().await.get(&id).cloned();
+        let Some(config) = config else {
             return Err(DataPlaneError::TransitUnavailable(id.as_str().to_owned()));
-        }
-        if !adapter.supports_udp() || self.transit_configs[&id].options.udp == Some(false) {
+        };
+        if !adapter.supports_udp() || config.options.udp == Some(false) {
             status.capabilities.remove(&FlowProtocol::Udp);
         }
         if !adapter.supports_tcp() {
             status.capabilities.remove(&FlowProtocol::Tcp);
         }
+        self.probes.lock().await.forget(&id);
         self.transit_adapters
             .write()
             .await
@@ -279,6 +336,7 @@ impl IngressDataPlane {
     }
 
     pub async fn replace_compiled_policy(&self, compiled: CompiledPolicy) {
+        let _configuration = self.configuration_gate.write().await;
         let generation = compiled.generation().get();
         let traffic_policies = compiled.traffic_policies();
         // Keep runtime admission budgets aligned with the atomically published
@@ -291,12 +349,320 @@ impl IngressDataPlane {
             .store(generation, std::sync::atomic::Ordering::Release);
     }
 
+    /// Builds and validates every changed adapter before publishing any part
+    /// of the next static policy generation. New admissions hold the same
+    /// gate while selecting both policy and adapter, so they cannot mix them.
+    pub async fn prepare_static_snapshot<P>(
+        &self,
+        snapshot: &ValidatedPolicySnapshot,
+        registry: &AdapterRegistry<P>,
+    ) -> Result<PreparedStaticReload, DataPlaneError>
+    where
+        P: TransitCredentialProvider + 'static,
+    {
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DataPlaneError::ShuttingDown);
+        }
+        let compiled = snapshot.compile()?;
+        let desired: BTreeMap<_, _> = snapshot
+            .config()
+            .transit_proxies
+            .iter()
+            .cloned()
+            .map(|config| (config.id.clone(), config))
+            .collect();
+        let egresses: BTreeMap<_, _> = snapshot
+            .config()
+            .egresses
+            .iter()
+            .cloned()
+            .map(|config| (config.id.clone(), config))
+            .collect();
+        if egresses != self.egresses {
+            return Err(DataPlaneError::StaticReloadRequiresRestart);
+        }
+        let (generation, previous, previous_adapters) = {
+            let _configuration = self.configuration_gate.read().await;
+            (
+                self.generation.load(std::sync::atomic::Ordering::Acquire),
+                self.transit_configs.read().await.clone(),
+                self.transit_adapters.read().await.clone(),
+            )
+        };
+        if snapshot.generation().get() <= generation {
+            return Err(DataPlaneError::StaticReloadConflict);
+        }
+        let mut outcome = StaticReloadOutcome {
+            generation: snapshot.generation().get(),
+            added: Vec::new(),
+            changed: Vec::new(),
+            removed: previous
+                .keys()
+                .filter(|id| !desired.contains_key(*id))
+                .cloned()
+                .collect(),
+        };
+        let mut prepared = BTreeMap::new();
+        for (id, config) in &desired {
+            let adapter = if previous.get(id) == Some(config) && previous_adapters.contains_key(id)
+            {
+                Arc::clone(&previous_adapters[id])
+            } else {
+                let adapter = registry.build(config).await?;
+                timeout(self.path_connect_timeout, adapter.prepare())
+                    .await
+                    .map_err(|_| {
+                        TransitError::Connection("Transit adapter preparation timed out".to_owned())
+                    })??;
+                if previous.contains_key(id) {
+                    outcome.changed.push(id.clone());
+                } else {
+                    outcome.added.push(id.clone());
+                }
+                adapter
+            };
+            prepared.insert(id.clone(), adapter);
+        }
+        Ok(PreparedStaticReload {
+            base_generation: generation,
+            compiled,
+            configs: desired,
+            adapters: prepared,
+            outcome,
+        })
+    }
+
+    pub async fn apply_static_snapshot<P>(
+        &self,
+        snapshot: &ValidatedPolicySnapshot,
+        registry: &AdapterRegistry<P>,
+    ) -> Result<StaticReloadOutcome, DataPlaneError>
+    where
+        P: TransitCredentialProvider + 'static,
+    {
+        let prepared = self.prepare_static_snapshot(snapshot, registry).await?;
+        self.commit_static_snapshot(prepared, || Ok(())).await
+    }
+
+    /// Acquires every runtime publication guard before calling the synchronous
+    /// durable hook. No await separates a successful hook from publication.
+    pub async fn commit_static_snapshot<F>(
+        &self,
+        prepared: PreparedStaticReload,
+        before_commit: F,
+    ) -> Result<StaticReloadOutcome, DataPlaneError>
+    where
+        F: FnOnce() -> Result<(), DataPlaneError> + Send,
+    {
+        let _configuration = self.configuration_gate.write().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DataPlaneError::ShuttingDown);
+        }
+        if self.generation.load(std::sync::atomic::Ordering::Acquire) != prepared.base_generation {
+            return Err(DataPlaneError::StaticReloadConflict);
+        }
+        let dynamic = self.dynamic_transit_configs.read().await;
+        if prepared.configs.keys().any(|id| dynamic.contains_key(id)) {
+            return Err(DataPlaneError::StaticDynamicConflict);
+        }
+        let mut configs = self.transit_configs.write().await;
+        let mut adapters = self.transit_adapters.write().await;
+        let mut runtime = self.runtime.write().await;
+        let mut policies = self.traffic_policies.write().await;
+        let mut compiled = self.compiled.write().await;
+        let mut probes = self.probes.lock().await;
+        let mut retirement = self.retired_paths.lock().await;
+        let mut next_adapters = adapters.clone();
+        let mut next_runtime = runtime.clone();
+        for id in configs.keys() {
+            if !prepared.configs.contains_key(id) {
+                next_adapters.remove(id);
+                next_runtime.remove_dynamic_transit_proxy(id);
+            }
+        }
+        for (id, adapter) in &prepared.adapters {
+            let mut status = next_runtime.transit_proxy(id).cloned().unwrap_or_default();
+            status.state = RuntimeNodeState::Ready;
+            status.capabilities = adapter_capabilities(adapter.as_ref(), &prepared.configs[id]);
+            status.selection_score = status.selection_score.max(1);
+            next_runtime.set_transit_proxy(id.clone(), status);
+            next_adapters.insert(id.clone(), Arc::clone(adapter));
+        }
+        let next_policies = prepared.compiled.traffic_policies();
+        let retired: BTreeSet<_> = prepared
+            .outcome
+            .changed
+            .iter()
+            .chain(prepared.outcome.removed.iter())
+            .cloned()
+            .collect();
+        let mut guarded_paths = Vec::new();
+        if !retired.is_empty() {
+            for slot in self.sessions.values() {
+                let session = slot.session.lock().await.clone();
+                guarded_paths.push((
+                    session,
+                    slot.transit_paths.lock().await,
+                    slot.draining_paths.lock().await,
+                    slot.eligible_transits.lock().await,
+                ));
+            }
+        }
+        before_commit()?;
+        *configs = prepared.configs;
+        *adapters = next_adapters;
+        *runtime = next_runtime;
+        *policies = next_policies;
+        *compiled = prepared.compiled;
+        self.generation.store(
+            prepared.outcome.generation,
+            std::sync::atomic::Ordering::Release,
+        );
+        for id in &retired {
+            probes.forget(id);
+        }
+        while retirement.try_join_next().is_some() {}
+        for (session, mut paths, mut draining, mut eligible) in guarded_paths {
+            for id in &retired {
+                let path = paths.remove(id);
+                draining.remove(id);
+                eligible.remove(id);
+                if let Some(path_id) = path
+                    && let Some(session) = session.as_ref()
+                {
+                    let session = Arc::clone(session);
+                    retirement.spawn(async move {
+                        let _ = timeout(Duration::from_secs(1), session.drain_path(path_id)).await;
+                        tokio::time::sleep(STATIC_PATH_DRAIN_TIMEOUT).await;
+                        let _ = timeout(Duration::from_secs(1), session.close_path(path_id)).await;
+                    });
+                }
+            }
+        }
+        Ok(prepared.outcome)
+    }
+
+    pub fn policy_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub async fn configure_node_probe(
+        &self,
+        config: Option<crate::TransitProbeConfig>,
+    ) -> Result<(), DataPlaneError> {
+        if config.as_ref().is_some_and(|config| !config.valid()) {
+            return Err(DataPlaneError::InvalidProbeConfig);
+        }
+        self.probes.lock().await.configure(config);
+        Ok(())
+    }
+
+    pub async fn probe_transits(&self) {
+        let Ok(_running) = self.probe_running.try_lock() else {
+            return;
+        };
+        let (config, candidates) = {
+            let _configuration = self.configuration_gate.read().await;
+            let mut probes = self.probes.lock().await;
+            let Some(config) = probes.config.clone() else {
+                return;
+            };
+            let adapters: Vec<_> = self
+                .transit_adapters
+                .read()
+                .await
+                .iter()
+                .map(|(id, adapter)| (id.clone(), Arc::clone(adapter)))
+                .collect();
+            let runtime = self.runtime.read().await;
+            let adapters: Vec<_> = adapters
+                .into_iter()
+                .filter(|(id, _)| {
+                    runtime.transit_proxy(id).is_some_and(|status| {
+                        matches!(
+                            status.state,
+                            RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+                        )
+                    })
+                })
+                .collect();
+            drop(runtime);
+            if adapters.is_empty() {
+                return;
+            }
+            let start = probes.cursor % adapters.len();
+            let candidates: Vec<_> = adapters
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(config.max_nodes_per_batch.min(adapters.len()))
+                .cloned()
+                .collect();
+            probes.cursor = (start + candidates.len()) % adapters.len();
+            (config, candidates)
+        };
+        let expected: BTreeMap<_, _> = candidates.iter().cloned().collect();
+        let results = crate::node_probe::probe_batch(config.clone(), candidates).await;
+        let _configuration = self.configuration_gate.read().await;
+        let current = self.transit_adapters.read().await;
+        let mut probes = self.probes.lock().await;
+        if probes.config.as_ref() != Some(&config) {
+            return;
+        }
+        for (id, outcome) in results {
+            if current
+                .get(&id)
+                .zip(expected.get(&id))
+                .is_some_and(|(current, expected)| Arc::ptr_eq(current, expected))
+            {
+                probes.record(id, outcome, config.window_size);
+            }
+        }
+    }
+
+    pub async fn transit_observations(
+        &self,
+    ) -> BTreeMap<TransitProxyId, crate::TransitProbeObservation> {
+        let _configuration = self.configuration_gate.read().await;
+        let runtime = self.runtime.read().await;
+        let static_configs = self.transit_configs.read().await;
+        let dynamic_configs = self.dynamic_transit_configs.read().await;
+        let adapters = self.transit_adapters.read().await;
+        let nodes = static_configs
+            .keys()
+            .chain(dynamic_configs.keys())
+            .map(|id| {
+                (
+                    id.clone(),
+                    adapters.contains_key(id)
+                        && runtime.transit_proxy(id).is_some_and(|status| {
+                            matches!(
+                                status.state,
+                                RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+                            )
+                        }),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.probes.lock().await.observations(nodes)
+    }
+
     pub async fn register_dynamic_transit_adapter(
         &self,
         config: TransitProxyConfig,
         adapter: Arc<dyn TransitAdapter>,
         mut status: TransitProxyRuntimeStatus,
     ) {
+        let _configuration = self.configuration_gate.read().await;
+        if self.transit_configs.read().await.contains_key(&config.id) {
+            return;
+        }
         if !adapter.supports_udp() || config.options.udp == Some(false) {
             status.capabilities.remove(&FlowProtocol::Udp);
         }
@@ -304,6 +670,7 @@ impl IngressDataPlane {
             status.capabilities.remove(&FlowProtocol::Tcp);
         }
         let id = config.id.clone();
+        self.probes.lock().await.forget(&id);
         self.dynamic_transit_configs
             .write()
             .await
@@ -320,6 +687,10 @@ impl IngressDataPlane {
         config: TransitProxyConfig,
         status: TransitProxyRuntimeStatus,
     ) {
+        let _configuration = self.configuration_gate.read().await;
+        if self.transit_configs.read().await.contains_key(&config.id) {
+            return;
+        }
         self.dynamic_transit_configs
             .write()
             .await
@@ -336,6 +707,7 @@ impl IngressDataPlane {
         labels: BTreeMap<String, String>,
         tags: BTreeSet<String>,
     ) -> bool {
+        let _configuration = self.configuration_gate.read().await;
         let mut runtime = self.runtime.write().await;
         let Some(mut status) = runtime.transit_proxy(id).cloned() else {
             return false;
@@ -347,6 +719,7 @@ impl IngressDataPlane {
     }
 
     pub async fn drain_transit(&self, id: &TransitProxyId) {
+        let _configuration = self.configuration_gate.read().await;
         for slot in self.sessions.values() {
             let path_id = slot.transit_paths.lock().await.get(id).copied();
             let session = slot.session.lock().await.clone();
@@ -373,9 +746,19 @@ impl IngressDataPlane {
     }
 
     pub async fn remove_dynamic_transit(&self, id: &TransitProxyId) {
+        let _configuration = self.configuration_gate.read().await;
+        if self
+            .dynamic_transit_configs
+            .write()
+            .await
+            .remove(id)
+            .is_none()
+        {
+            return;
+        }
         self.transit_adapters.write().await.remove(id);
-        self.dynamic_transit_configs.write().await.remove(id);
         self.runtime.write().await.remove_dynamic_transit_proxy(id);
+        self.probes.lock().await.forget(id);
     }
 
     pub fn dns_route_adapter(self: &Arc<Self>) -> Arc<dyn DnsRouteAdapter> {
@@ -387,6 +770,7 @@ impl IngressDataPlane {
     /// Establishes the Phase-1 single Path for every configured Egress that has
     /// at least one available Transit adapter. Failed relationships remain down.
     pub async fn warmup(&self) {
+        let _configuration = self.configuration_gate.read().await;
         for egress_id in self.egresses.keys() {
             let Some(slot) = self.sessions.get(egress_id) else {
                 continue;
@@ -453,11 +837,24 @@ impl IngressDataPlane {
                 .duration_since(slot.maintenance_epoch)
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64;
-            let _ = self.maintain_egress_paths(egress_id, input, now_ms).await;
+            let _ = self
+                .maintain_egress_paths_inner(egress_id, input, now_ms)
+                .await;
         }
     }
 
     pub async fn maintain_egress_paths(
+        &self,
+        egress_id: &EgressId,
+        input: AutoscaleInput,
+        now_ms: u64,
+    ) -> Result<AutoscaleDecision, DataPlaneError> {
+        let _configuration = self.configuration_gate.read().await;
+        self.maintain_egress_paths_inner(egress_id, input, now_ms)
+            .await
+    }
+
+    async fn maintain_egress_paths_inner(
         &self,
         egress_id: &EgressId,
         mut input: AutoscaleInput,
@@ -573,7 +970,11 @@ impl IngressDataPlane {
         Ok(decision)
     }
 
-    async fn multipath_config_for(&self, policy_id: &TrafficPolicyId) -> MultipathConfig {
+    async fn multipath_config_for(
+        &self,
+        policy_id: &TrafficPolicyId,
+        class_ref: Option<&str>,
+    ) -> MultipathConfig {
         let default = MultipathConfig::default();
         let policies = self.traffic_policies.read().await;
         let Some(policy) = policies.get(policy_id) else {
@@ -601,6 +1002,16 @@ impl IngressDataPlane {
             .map(|class| (class.clone(), class_budget))
             .collect();
         MultipathConfig {
+            traffic_class: class_ref.and_then(|name| {
+                policy
+                    .classes
+                    .get(name)
+                    .map(|class| pathchord_core::TrafficClassConfig {
+                        name: format!("{}:{name}", policy_id.as_str()),
+                        priority: class.priority,
+                        share: class.share,
+                    })
+            }),
             session_replication_budget_bytes: session_budget,
             default_stream_replication_budget_bytes: session_budget,
             class_replication_budget_bytes,
@@ -616,6 +1027,7 @@ impl IngressDataPlane {
         &self,
         context: &ConnectionContext,
     ) -> Result<BoxedLocalConnection, DataPlaneError> {
+        let _configuration = self.configuration_gate.read().await;
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
@@ -696,8 +1108,11 @@ impl IngressDataPlane {
                     .open_tcp_routed_with_config(
                         wire_target(&policy_context)?,
                         eligible,
-                        self.multipath_config_for(&candidate.traffic_policy_id)
-                            .await,
+                        self.multipath_config_for(
+                            &candidate.traffic_policy_id,
+                            candidate.traffic_class.as_deref(),
+                        )
+                        .await,
                     )
                     .await?;
                 Ok(Box::new(stream) as BoxedLocalConnection)
@@ -709,6 +1124,7 @@ impl IngressDataPlane {
         &self,
         context: &ConnectionContext,
     ) -> Result<BoxedUdpFlowHandle, DataPlaneError> {
+        let _configuration = self.configuration_gate.read().await;
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
@@ -742,6 +1158,8 @@ impl IngressDataPlane {
             Evaluation::Route(RoutePlan::Proxy(route)) => {
                 let disabled = self
                     .transit_configs
+                    .read()
+                    .await
                     .get(&route.transit_proxy_id)
                     .is_some_and(|config| config.options.udp == Some(false))
                     || self
@@ -832,8 +1250,11 @@ impl IngressDataPlane {
                 .open_udp_routed_with_config(
                     wire_target(&policy_context)?,
                     eligible,
-                    self.multipath_config_for(&candidate.traffic_policy_id)
-                        .await,
+                    self.multipath_config_for(
+                        &candidate.traffic_policy_id,
+                        candidate.traffic_class.as_deref(),
+                    )
+                    .await,
                 )
                 .await?,
         ))
@@ -884,6 +1305,10 @@ impl IngressDataPlane {
     pub async fn shutdown(&self) -> Result<DataPlaneSnapshot, DataPlaneError> {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
+        let mut retired = self.retired_paths.lock().await;
+        retired.abort_all();
+        while retired.join_next().await.is_some() {}
+        drop(retired);
         for slot in self.sessions.values() {
             let session = slot.session.lock().await.take();
             if let Some(session) = session {
@@ -1028,7 +1453,9 @@ impl IngressDataPlane {
                 ingress_id: self.ingress_id.as_bytes().to_vec(),
                 session_id,
                 path_id,
-                offered_capabilities: TCP_CAPABILITY | UDP_CAPABILITY,
+                offered_capabilities: TCP_CAPABILITY
+                    | UDP_CAPABILITY
+                    | pathchord_core::CAPABILITY_TRAFFIC_CLASSES,
                 local_limits: ProtocolLimits::default(),
             },
         )
@@ -1110,6 +1537,7 @@ impl std::fmt::Debug for DataPlaneDnsAdapter {
 #[async_trait::async_trait]
 impl DnsRouteAdapter for DataPlaneDnsAdapter {
     async fn exchange(&self, request: DnsRouteRequest) -> Result<Vec<u8>, DnsAdapterError> {
+        let _configuration = self.data_plane.configuration_gate.read().await;
         match request.selection {
             DnsRouteSelection::Egress {
                 egress_selector,
@@ -1222,8 +1650,8 @@ impl DataPlaneDnsAdapter {
     async fn select_transit(&self, selector: &Selector) -> Option<TransitProxyId> {
         let runtime = self.data_plane.runtime.read().await;
         let dynamic = self.data_plane.dynamic_transit_configs.read().await;
-        self.data_plane
-            .transit_configs
+        let static_configs = self.data_plane.transit_configs.read().await;
+        static_configs
             .iter()
             .chain(dynamic.iter())
             .find(|(id, config)| {
@@ -1236,6 +1664,20 @@ impl DataPlaneDnsAdapter {
             })
             .map(|(id, _)| id.clone())
     }
+}
+
+fn adapter_capabilities(
+    adapter: &dyn TransitAdapter,
+    config: &TransitProxyConfig,
+) -> BTreeSet<FlowProtocol> {
+    let mut capabilities = BTreeSet::new();
+    if adapter.supports_tcp() {
+        capabilities.insert(FlowProtocol::Tcp);
+    }
+    if adapter.supports_udp() && config.options.udp != Some(false) {
+        capabilities.insert(FlowProtocol::Udp);
+    }
+    capabilities
 }
 
 fn selector_matches_egress(
@@ -1311,9 +1753,18 @@ fn flow_error(error: DataPlaneError) -> FlowBridgeError {
         | DataPlaneError::Session(_)
         | DataPlaneError::Stream(OpenStreamError::SessionClosed)
         | DataPlaneError::Udp(_)
+        | DataPlaneError::StaticReloadConflict
+        | DataPlaneError::StaticReloadRequiresRestart
+        | DataPlaneError::StaticDynamicConflict
+        | DataPlaneError::InvalidProbeConfig
+        | DataPlaneError::ControlCommitRejected
         | DataPlaneError::IdentifierGeneration => FlowBridgeError::SessionUnavailable,
     }
 }
+
+#[cfg(test)]
+#[path = "data_plane_reload_tests.rs"]
+mod reload_tests;
 
 async fn shutdown_session(session: Arc<IngressSessionHandle>) -> Result<(), DataPlaneError> {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1675,12 +2126,16 @@ mod tests {
             IngressDataPlane::new(IngressDataPlaneConfig::new("ingress-a", identity, policy))
                 .expect("data plane");
         let config = plane
-            .multipath_config_for(&TrafficPolicyId::new("latency"))
+            .multipath_config_for(&TrafficPolicyId::new("latency"), Some("interactive"))
             .await;
         assert_eq!(config.session_replication_budget_bytes, 2_000);
         assert_eq!(config.default_stream_replication_budget_bytes, 2_000);
         assert_eq!(config.class_replication_budget_bytes["interactive"], 1_000);
         assert!(!config.retransmission_replication_enabled);
+        let class = config.traffic_class.expect("selected traffic class");
+        assert_eq!(class.name, "latency:interactive");
+        assert_eq!(class.priority, 10);
+        assert_eq!(class.share, 100);
     }
 
     #[tokio::test]

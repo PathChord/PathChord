@@ -66,6 +66,7 @@ pub struct IngressAdmittedPath<S> {
     session_id: SessionId,
     path_id: PathId,
     authorization_generation: u64,
+    negotiated_capabilities: u64,
     limits: PathReady,
 }
 
@@ -86,6 +87,9 @@ where
 }
 
 impl<S> IngressAdmittedPath<S> {
+    pub const fn negotiated_capabilities(&self) -> u64 {
+        self.negotiated_capabilities
+    }
     pub const fn session_id(&self) -> SessionId {
         self.session_id
     }
@@ -294,8 +298,15 @@ where
 
     let ready_frame = receive_required(&mut records, "PATH_READY").await?;
     validate_frame_ids(&ready_frame, config.session_id, config.path_id)?;
-    let limits = match decode_message(&ready_frame, config.local_limits)? {
-        Message::PathReady(value) => value,
+    let (limits, negotiated_capabilities) = match decode_message(&ready_frame, config.local_limits)?
+    {
+        Message::PathReady(value) => (value, 0),
+        Message::PathReadyCapabilities(value)
+            if value.capabilities & !config.offered_capabilities == 0
+                && value.capabilities & pathchord_core::CAPABILITY_TRAFFIC_CLASSES != 0 =>
+        {
+            (value.limits, value.capabilities)
+        }
         other => {
             return Err(PathAdmissionError::UnexpectedMessage {
                 expected: "PATH_READY",
@@ -309,6 +320,7 @@ where
         session_id: config.session_id,
         path_id: config.path_id,
         authorization_generation,
+        negotiated_capabilities,
         limits,
     }))
 }
@@ -438,7 +450,14 @@ where
     .await?;
     send_message(
         &mut records,
-        Message::PathReady(config.ready_limits.clone()),
+        if negotiated_capabilities & pathchord_core::CAPABILITY_TRAFFIC_CLASSES != 0 {
+            Message::PathReadyCapabilities(pathchord_core::PathReadyCapabilities {
+                limits: config.ready_limits.clone(),
+                capabilities: negotiated_capabilities,
+            })
+        } else {
+            Message::PathReady(config.ready_limits.clone())
+        },
         session_id,
         path_id,
         1,

@@ -19,6 +19,7 @@ pub enum ConfigurationError {
 pub(crate) struct ConfigSelection {
     pub path: PathBuf,
     pub directory: bool,
+    pub explicit: bool,
 }
 
 impl ConfigSelection {
@@ -54,12 +55,14 @@ fn select(
         return Ok(ConfigSelection {
             path: path.to_owned(),
             directory: true,
+            explicit: true,
         });
     }
     if let Some(path) = file {
         return Ok(ConfigSelection {
             path: path.to_owned(),
             directory: false,
+            explicit: true,
         });
     }
     match (
@@ -70,10 +73,12 @@ fn select(
         (Some(path), None) => Ok(ConfigSelection {
             path: path.into(),
             directory: false,
+            explicit: true,
         }),
         (None, Some(path)) => Ok(ConfigSelection {
             path: path.into(),
             directory: true,
+            explicit: true,
         }),
         (None, None) => default(),
     }
@@ -94,6 +99,7 @@ fn account_selection(
     Ok(ConfigSelection {
         path,
         directory: true,
+        explicit: false,
     })
 }
 

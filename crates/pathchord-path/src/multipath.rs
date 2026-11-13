@@ -13,6 +13,7 @@ const QUOTA_ZERO_WEIGHT_FLOOR_BASIS_POINTS: u128 = 1_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultipathConfig {
     pub max_paths: usize,
+    pub traffic_class: Option<pathchord_core::TrafficClassConfig>,
     pub session_replication_budget_bytes: u64,
     pub default_stream_replication_budget_bytes: u64,
     pub class_replication_budget_bytes: BTreeMap<String, u64>,
@@ -24,6 +25,7 @@ impl Default for MultipathConfig {
     fn default() -> Self {
         Self {
             max_paths: 8,
+            traffic_class: None,
             session_replication_budget_bytes: 8 * 1024 * 1024,
             default_stream_replication_budget_bytes: 2 * 1024 * 1024,
             class_replication_budget_bytes: BTreeMap::new(),

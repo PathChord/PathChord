@@ -170,7 +170,7 @@ maxAgeSeconds 默认 86400 且范围 `60..=2592000`。URL 不得包含凭据。�
 
 EgressRule 的 spec 在 `egressRef`、`egressSelector` 或 `mode: none` 中选择一个。selector 至少一个条件；
 mode none 是普通 Proxy 模式，不得创建 Session。TransitRule 在选定 Egress 后求值，使用 egressRef、
-require、reject、weight（默认 100）和可选 trafficPolicyRef；没有准入 Proxy 时继续下一条 EgressRule，
+require、reject、weight（默认 100）和可选 trafficPolicyRef；可选 `trafficClassRef` 选择所选 TrafficPolicy 类别映射中的 key；未知 key 必须拒绝。没有准入 Proxy 时继续下一条 EgressRule，
 不得隐式选择任意 Proxy。ProxyRule 的 select 默认 any，也可以使用 `proxy: direct`；proxy 与 select 互斥。
 规则求值必须确定、有界且无 I/O，编译器必须拒绝未知字段、无界表达式和无效引用，编译失败保留上一快照。
 
@@ -180,6 +180,8 @@ TrafficPolicy spec 支持 `scheduler`（默认 `effectiveCapacityWeighted`）、
 （默认 0）、可选 `classReplicationBudgetBps`、`retransmissionReplication`（默认 disabled）以及
 `classes`（priority/share 映射）。预算不得超过 `10^12`，priority 为 `0..=255`，share 为 `1..=1_000_000`。
 Session 预算是硬上限且包含控制流量；调度器应用关系权重、billing 倍率、有效容量、拥塞窗口、RTT、抖动和丢包，
+`TransitRule.spec.trafficClassRef` 可以将准入 flow 分配到所选 `TrafficPolicy.classes` 中的一个 key。未知类别引用属于验证错误；缺少引用时使用默认类别。
+
 不得超过 Path 的流控上报限制。
 
 ## Listener

@@ -150,7 +150,7 @@ spec:
 
 规则按顺序执行。首个匹配规则决定准入和关系的基础权重。
 
-流量策略可以定义多路径调度和复制预算：
+流量策略可以定义多路径调度和复制预算；`TransitRule.spec.trafficClassRef` 可以将准入 flow 分配到所选策略的类别，未知引用必须拒绝，缺少引用时使用默认类别：
 
 ```yaml
 apiVersion: pathchord.io/v1

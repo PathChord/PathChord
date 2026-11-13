@@ -10,6 +10,12 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme
 
 use crate::{TransitCredential, TransitError};
 
+pub(crate) fn client_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("the selected AWS-LC provider supports the default TLS versions")
+}
+
 pub(crate) fn configure(
     base: Arc<ClientConfig>,
     options: Option<&TransitTls>,
@@ -43,7 +49,7 @@ pub(crate) fn configure(
                 .add(certificate)
                 .map_err(|_| TransitError::Unsupported("TLS CA certificate is invalid".into()))?;
         }
-        let builder = ClientConfig::builder().with_root_certificates(roots);
+        let builder = client_builder().with_root_certificates(roots);
         if options.client_certificate.is_empty() && options.client_key_field.is_none() {
             builder.with_no_client_auth()
         } else {

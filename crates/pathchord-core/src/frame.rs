@@ -62,6 +62,7 @@ pub enum FrameType {
     StatusReport = 9,
     Heartbeat = 10,
     ControlAck = 11,
+    PathReadyCapabilities = 12,
 
     StreamOpen = 32,
     StreamOpenOk = 33,
@@ -71,16 +72,18 @@ pub enum FrameType {
     StreamWindow = 37,
     StreamFin = 38,
     StreamRst = 39,
+    StreamOpenClass = 40,
 
     UdpOpen = 64,
     UdpOpenOk = 65,
     UdpOpenErr = 66,
     UdpDatagram = 67,
     UdpClose = 68,
+    UdpOpenClass = 69,
 }
 
 impl FrameType {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 27] = [
         Self::PathHello,
         Self::SessionAttach,
         Self::SessionAttachOk,
@@ -92,6 +95,7 @@ impl FrameType {
         Self::StatusReport,
         Self::Heartbeat,
         Self::ControlAck,
+        Self::PathReadyCapabilities,
         Self::StreamOpen,
         Self::StreamOpenOk,
         Self::StreamOpenErr,
@@ -100,11 +104,13 @@ impl FrameType {
         Self::StreamWindow,
         Self::StreamFin,
         Self::StreamRst,
+        Self::StreamOpenClass,
         Self::UdpOpen,
         Self::UdpOpenOk,
         Self::UdpOpenErr,
         Self::UdpDatagram,
         Self::UdpClose,
+        Self::UdpOpenClass,
     ];
 
     pub const fn code(self) -> u64 {
@@ -140,6 +146,7 @@ impl TryFrom<u64> for FrameType {
             9 => Self::StatusReport,
             10 => Self::Heartbeat,
             11 => Self::ControlAck,
+            12 => Self::PathReadyCapabilities,
             32 => Self::StreamOpen,
             33 => Self::StreamOpenOk,
             34 => Self::StreamOpenErr,
@@ -148,11 +155,13 @@ impl TryFrom<u64> for FrameType {
             37 => Self::StreamWindow,
             38 => Self::StreamFin,
             39 => Self::StreamRst,
+            40 => Self::StreamOpenClass,
             64 => Self::UdpOpen,
             65 => Self::UdpOpenOk,
             66 => Self::UdpOpenErr,
             67 => Self::UdpDatagram,
             68 => Self::UdpClose,
+            69 => Self::UdpOpenClass,
             code => return Err(FrameCodecError::UnknownFrameType { code }),
         };
         Ok(frame_type)

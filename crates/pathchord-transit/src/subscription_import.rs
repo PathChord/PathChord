@@ -30,7 +30,6 @@ const KNOWN_PROTOCOLS: &[&str] = &[
     "wireguard",
     "shadowtls",
     "anytls",
-    "ssr",
     "xtls",
     "snell",
 ];

@@ -152,6 +152,19 @@ Per-Path scheduling uses effective-capacity weighting: the configured Proxy-to-E
 
 Retransmission replication is limited by two budgets: a Session-wide replication budget and an OPTIONAL per-traffic-class budget. A traffic-class budget MAY further restrict replication but MAY never exceed the remaining Session-wide budget. Control messages use the default control replication policy and are accounted against the Session budget.
 
+### Traffic-class capability
+
+The optional `traffic-classes` capability is represented by `PATH_READY_CAPABILITIES`.
+When selected, `STREAM_OPEN_CLASS` and `UDP_OPEN_CLASS` carry a bounded class
+name, priority, and share alongside the legacy open payload. A flow that
+requires a class MUST be rejected when the capability is absent; an
+implementation MUST NOT silently discard its class.
+
+Across backlogged business classes, bounded priority preference is followed by
+weighted fair service. Each class schedules its Streams round-robin and receives
+a bounded service opportunity even when another class has more Streams. Control
+messages use an independent budget.
+
 ## 8. Versioning
 
 Session creation negotiates `wire-profile-v1` and its registered capabilities.

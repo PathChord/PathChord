@@ -180,6 +180,8 @@ spec:
   retransmissionReplication: allowed
 ```
 
+`TransitRule.spec.trafficClassRef` optionally assigns admitted flows to a class in the selected `TrafficPolicy`. Unknown references are rejected during validation; a missing reference uses the default class.
+
 The Session budget is the hard upper bound. A traffic-class budget can reduce the allocation for that class but cannot exceed the remaining Session budget.
 
 ## Ordinary Proxy rules and fallback
@@ -211,6 +213,8 @@ metadata:
 spec:
   action: reject # or direct
 ```
+
+`TransitRule.spec.trafficClassRef` optionally selects the class snapshot used by the Session scheduler.
 
 Selection order is:
 
