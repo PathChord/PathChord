@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 use thiserror::Error;
 
@@ -53,6 +53,11 @@ impl LocalControlServer {
         prepare_socket_path(&path)?;
         let listener =
             std::os::unix::net::UnixListener::bind(&path).map_err(LocalServerError::Io)?;
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        {
+            let _ = std::fs::remove_file(&path);
+            return Err(LocalServerError::Io(error));
+        }
         listener
             .set_nonblocking(true)
             .map_err(LocalServerError::Io)?;
@@ -165,6 +170,7 @@ mod tests {
     use super::*;
     use crate::{Actor, ErrorCode, LOCAL_API_VERSION, RequestEnvelope, SystemProxyPlatform};
     use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::net::UnixStream;
 
@@ -200,6 +206,12 @@ mod tests {
             LocalControlDispatcher::new(SystemProxyPlatform::Linux),
         )
         .expect("bind");
+        let mode = std::fs::metadata(&path)
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
         let mut client = UnixStream::connect(&path).await.expect("connect");
         let request = request("status.get", &["status:read"], json!({}));
         let (server_result, ()) = tokio::join!(server.serve_once(), async {
