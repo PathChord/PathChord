@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 pathchord-core = { path = "../pathchord-core" }
+pathchord-noise = { path = "../pathchord-noise" }
 thiserror.workspace = true
 
 [dev-dependencies]
