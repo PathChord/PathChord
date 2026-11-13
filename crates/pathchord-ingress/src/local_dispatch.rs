@@ -196,7 +196,7 @@ impl LocalControlDispatcher {
         }
         let expected = match self.required_configuration_generation(&request) {
             Ok(value) => value,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         let node_id = match request.body.get("node_id").and_then(Value::as_str) {
             Some(value) => match crate::NodeId::new(value) {
@@ -263,7 +263,7 @@ impl LocalControlDispatcher {
         }
         let expected = match self.required_configuration_generation(&request) {
             Ok(value) => value,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         let body = &request.body;
         let id = match body.get("id").and_then(Value::as_str) {
@@ -331,7 +331,7 @@ impl LocalControlDispatcher {
         }
         let expected = match self.required_configuration_generation(&request) {
             Ok(value) => value,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         let id = match subscription_id_from_body(&request.body) {
             Ok(id) => id,
@@ -721,23 +721,23 @@ impl LocalControlDispatcher {
     fn required_configuration_generation(
         &self,
         request: &RequestEnvelope,
-    ) -> Result<u64, ResponseEnvelope> {
+    ) -> Result<u64, Box<ResponseEnvelope>> {
         match request.expected_generation.as_ref() {
             Some(expected) if expected.scope == "configuration" => Ok(expected.value),
-            Some(_) => Err(self.failure(
+            Some(_) => Err(Box::new(self.failure(
                 request.request_id.clone(),
                 self.observed_generation(),
                 ErrorCode::ValidationFailed,
                 "configuration generation precondition is required",
                 None,
-            )),
-            None => Err(self.failure(
+            ))),
+            None => Err(Box::new(self.failure(
                 request.request_id.clone(),
                 self.observed_generation(),
                 ErrorCode::ValidationFailed,
                 "expected_generation is required for this mutation",
                 None,
-            )),
+            ))),
         }
     }
 
