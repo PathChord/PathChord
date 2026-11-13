@@ -9,10 +9,10 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 
 [lints]
 workspace = true
