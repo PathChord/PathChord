@@ -27,9 +27,9 @@ Named Pipe control transport, and Web Gateway adapters are not implemented yet.
 ## Documentation
 
 Design documents describe the intended architecture and durable decisions.
-Specifications define the final behavioral and format contracts. Implementation
-status, sequencing, phase scope, and acceptance tracking live only under
-`docs/progress/` (or in the repository status summary above).
+Specifications define the final behavioral and format contracts. The maintained
+progress documents contain only current implementation status and the active
+implementation plan; superseded process history is kept in Git history.
 Every design and specification document is available in both English and
 Simplified Chinese. Progress documents use English as their single maintained
 source.
@@ -54,10 +54,6 @@ source.
 
 - [Implementation status](docs/progress/status.md)
 - [Implementation plan](docs/progress/implementation-plan.md)
-- [Design review record](docs/progress/design-review.md)
-- [Phase 1 single-path scope](docs/progress/phase-1-single-path.md)
-- [Phase 1 provisional wire contract](docs/progress/phase-1-wire.md)
-- [Phase 1 acceptance tracking](docs/progress/phase-1-acceptance.md)
 
 ## Command surface
 
