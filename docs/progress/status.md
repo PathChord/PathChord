@@ -48,6 +48,14 @@ separate from `docs/design/`, which describes the intended architecture, and
   rejections, exposes bound addresses/events, and shuts down listener and flow
   tasks together. The CLI wires this runtime to the concrete TCP target
   connector for a direct local-listener-to-target bootstrap path.
+- `pathchord-path` now provides a deterministic single-Path admission harness:
+  Noise IK, EgressID prologue validation, `PATH_HELLO`, `SESSION_ATTACH`,
+  authorization generation/key checks, capability negotiation, `PATH_READY`
+  limits, and typed attach rejection. It remains an in-memory protocol harness
+  and is not yet connected to a live Transit adapter or `STREAM_OPEN` routing.
+- Configuration validation now enforces the documented resource-name, bounded
+  map, Egress key/capability, Transit adapter, subscription URL/refresh/cache,
+  DNS route/limit, listener platform, rule catch-all, and proxy-action rules.
 
 ## Missing operational integration
 
@@ -58,6 +66,8 @@ separate from `docs/design/`, which describes the intended architecture, and
   adapters are not implemented; the direct bootstrap bridge does not create
   PathChord Sessions or Paths and therefore is not the full multipath data
   plane.
+- The single-Path admission harness is not yet wired to a Transit byte/record
+  loop, Session manager, Egress target Stream, or live `FakeEgress` integration.
 - The Session/Path end-to-end proxy data plane is not operational.
 - Named Pipe transport, persistent authorization and metadata stores,
   subscription worker, REST/SSE Web Gateway, and frontend are not integrated.
