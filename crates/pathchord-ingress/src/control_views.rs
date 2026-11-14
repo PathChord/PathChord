@@ -117,7 +117,7 @@ pub enum ListenerSelectionError {
 }
 
 /// Platform effect of the Windows system-proxy control-plane switch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SystemProxyPlatformEffect {
     Disabled,
     Applied,
@@ -126,7 +126,7 @@ pub enum SystemProxyPlatformEffect {
 }
 
 /// Restoration status for values captured before system-proxy activation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SystemProxyRestorationState {
     NotRequired,
     Pending,

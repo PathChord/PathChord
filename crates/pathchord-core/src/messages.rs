@@ -174,6 +174,38 @@ pub struct ControlAck {
     pub ranges: Vec<AckRange>,
 }
 
+/// A reliably delivered Session-scoped control message. The embedded payload
+/// uses the same codec as its registered frame type, without a second header.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionControl {
+    pub sequence: u64,
+    pub depends_on: Option<u64>,
+    pub frame_type: FrameType,
+    /// Sorted Path IDs allowed for this opening flow; empty means unrestricted.
+    pub eligible_paths: Vec<PathId>,
+    pub payload: Vec<u8>,
+}
+
+/// An opaque flow identity carried without the flow's target or payload.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SessionControlFlow {
+    Stream(StreamId),
+    Udp(u64),
+}
+
+/// Replaces one Session control sequence whose flow has no eligible Path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionControlCancel {
+    pub sequence: u64,
+    pub flow: SessionControlFlow,
+}
+
+/// An authenticated replacement Path's predecessor within the same Session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathRebind {
+    pub previous_path_id: PathId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionClose {
     pub error: ErrorClass,
@@ -271,6 +303,11 @@ pub struct UdpClose {
 /// All v1 payloads carried by the canonical frame registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
+    SessionControl(SessionControl),
+    SessionControlAck(ControlAck),
+    SessionControlCancel(SessionControlCancel),
+    PathRebind(PathRebind),
+    PathRebindAck(PathRebind),
     PathReadyCapabilities(PathReadyCapabilities),
     StreamOpenClass(StreamOpenClass),
     UdpOpenClass(UdpOpenClass),
@@ -304,6 +341,11 @@ impl Message {
     #[must_use]
     pub const fn frame_type(&self) -> FrameType {
         match self {
+            Self::SessionControl(_) => FrameType::SessionControl,
+            Self::SessionControlAck(_) => FrameType::SessionControlAck,
+            Self::SessionControlCancel(_) => FrameType::SessionControlCancel,
+            Self::PathRebind(_) => FrameType::PathRebind,
+            Self::PathRebindAck(_) => FrameType::PathRebindAck,
             Self::PathReadyCapabilities(_) => FrameType::PathReadyCapabilities,
             Self::StreamOpenClass(_) => FrameType::StreamOpenClass,
             Self::UdpOpenClass(_) => FrameType::UdpOpenClass,
@@ -371,6 +413,17 @@ impl Message {
         }
         let mut reader = Reader::new(input);
         let message = match frame_type {
+            FrameType::SessionControl => {
+                Self::SessionControl(SessionControl::decode(&mut reader, limits)?)
+            }
+            FrameType::SessionControlAck => {
+                Self::SessionControlAck(ControlAck::decode(&mut reader)?)
+            }
+            FrameType::SessionControlCancel => {
+                Self::SessionControlCancel(SessionControlCancel::decode(&mut reader)?)
+            }
+            FrameType::PathRebind => Self::PathRebind(PathRebind::decode(&mut reader)?),
+            FrameType::PathRebindAck => Self::PathRebindAck(PathRebind::decode(&mut reader)?),
             FrameType::PathReadyCapabilities => {
                 Self::PathReadyCapabilities(PathReadyCapabilities::decode(&mut reader, limits)?)
             }
@@ -427,6 +480,10 @@ impl Message {
         limits: ProtocolLimits,
     ) -> Result<(), MessageCodecError> {
         match self {
+            Self::SessionControl(value) => value.encode(output, limits),
+            Self::SessionControlAck(value) => value.encode(output),
+            Self::SessionControlCancel(value) => value.encode(output),
+            Self::PathRebind(value) | Self::PathRebindAck(value) => value.encode(output),
             Self::PathReadyCapabilities(value) => value.encode(output, limits),
             Self::StreamOpenClass(value) => value.encode(output, limits),
             Self::UdpOpenClass(value) => value.encode(output, limits),
@@ -1166,6 +1223,154 @@ impl_simple_codec!(
         })
     }
 );
+
+impl SessionControl {
+    fn encode(
+        &self,
+        output: &mut Vec<u8>,
+        limits: ProtocolLimits,
+    ) -> Result<(), MessageCodecError> {
+        if !self.frame_type.is_session_control()
+            || self
+                .depends_on
+                .is_some_and(|dependency| dependency >= self.sequence)
+            || self.eligible_paths.len() > 256
+            || self
+                .eligible_paths
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || (!self.eligible_paths.is_empty()
+                && !matches!(
+                    self.frame_type,
+                    FrameType::StreamOpen
+                        | FrameType::StreamOpenClass
+                        | FrameType::UdpOpen
+                        | FrameType::UdpOpenClass
+                ))
+        {
+            return Err(MessageCodecError::InvalidField {
+                field: "session_control",
+            });
+        }
+        put_varint(self.sequence, output)?;
+        match self.depends_on {
+            Some(dependency) => {
+                put_varint(1, output)?;
+                put_varint(dependency, output)?;
+            }
+            None => put_varint(0, output)?,
+        }
+        put_varint(self.frame_type.code(), output)?;
+        put_varint(self.eligible_paths.len() as u64, output)?;
+        for path in &self.eligible_paths {
+            put_id128(path.to_be_bytes(), output);
+        }
+        put_bytes(
+            &self.payload,
+            limits.max_control_payload(),
+            "session_control_payload",
+            output,
+        )
+    }
+
+    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
+        let sequence = reader.varint("control_seqno")?;
+        let depends_on = match reader.varint("dependency_present")? {
+            0 => None,
+            1 => Some(reader.varint("depends_on")?),
+            _ => {
+                return Err(MessageCodecError::InvalidField {
+                    field: "dependency_present",
+                });
+            }
+        };
+        let frame_type =
+            FrameType::try_from(reader.varint("control_frame_type")?).map_err(|_| {
+                MessageCodecError::InvalidField {
+                    field: "control_frame_type",
+                }
+            })?;
+        let count = reader.varint("eligible_path_count")?;
+        if count > 256 {
+            return Err(MessageCodecError::InvalidField {
+                field: "eligible_path_count",
+            });
+        }
+        let mut eligible_paths = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            eligible_paths.push(PathId::from_be_bytes(reader.id128("eligible_path")?));
+        }
+        let payload = reader.bytes(limits.max_control_payload(), "session_control_payload")?;
+        let value = Self {
+            sequence,
+            depends_on,
+            frame_type,
+            eligible_paths,
+            payload,
+        };
+        if !value.frame_type.is_session_control()
+            || value
+                .depends_on
+                .is_some_and(|dependency| dependency >= value.sequence)
+            || value
+                .eligible_paths
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || (!value.eligible_paths.is_empty()
+                && !matches!(
+                    value.frame_type,
+                    FrameType::StreamOpen
+                        | FrameType::StreamOpenClass
+                        | FrameType::UdpOpen
+                        | FrameType::UdpOpenClass
+                ))
+        {
+            return Err(MessageCodecError::InvalidField {
+                field: "session_control",
+            });
+        }
+        Ok(value)
+    }
+}
+
+impl SessionControlCancel {
+    fn encode(&self, output: &mut Vec<u8>) -> Result<(), MessageCodecError> {
+        put_varint(self.sequence, output)?;
+        match self.flow {
+            SessionControlFlow::Stream(id) => {
+                put_varint(0, output)?;
+                put_stream_id(id, output)
+            }
+            SessionControlFlow::Udp(id) => {
+                put_varint(1, output)?;
+                put_varint(id, output)
+            }
+        }
+    }
+
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, MessageCodecError> {
+        let sequence = reader.varint("control_seqno")?;
+        let flow = match reader.varint("flow_kind")? {
+            0 => SessionControlFlow::Stream(get_stream_id(reader)?),
+            1 => SessionControlFlow::Udp(reader.varint("udp_association_id")?),
+            _ => return Err(MessageCodecError::InvalidField { field: "flow_kind" }),
+        };
+        Ok(Self { sequence, flow })
+    }
+}
+
+impl PathRebind {
+    fn encode(&self, output: &mut Vec<u8>) -> Result<(), MessageCodecError> {
+        put_id128(self.previous_path_id.to_be_bytes(), output);
+        Ok(())
+    }
+
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, MessageCodecError> {
+        Ok(Self {
+            previous_path_id: PathId::from_be_bytes(reader.id128("previous_path_id")?),
+        })
+    }
+}
 
 impl SessionClose {
     fn encode(
@@ -1984,6 +2189,40 @@ mod tests {
                 message
             );
         }
+    }
+
+    #[test]
+    fn session_control_has_a_canonical_envelope_and_rejects_invalid_types() {
+        let limits = ProtocolLimits::default();
+        let message = Message::SessionControl(SessionControl {
+            sequence: 1,
+            depends_on: Some(0),
+            frame_type: FrameType::StreamFin,
+            eligible_paths: Vec::new(),
+            payload: vec![1, 1],
+        });
+        let encoded = message.encode(limits).unwrap();
+        assert_eq!(encoded, [1, 1, 0, 38, 0, 2, 1, 1]);
+        assert_eq!(
+            Message::decode(FrameType::SessionControl, &encoded, limits).unwrap(),
+            message
+        );
+        let nested = Message::SessionControl(SessionControl {
+            sequence: 0,
+            depends_on: None,
+            frame_type: FrameType::SessionControl,
+            eligible_paths: Vec::new(),
+            payload: vec![],
+        });
+        assert!(nested.encode(limits).is_err());
+        let forward_dependency = Message::SessionControl(SessionControl {
+            sequence: 1,
+            depends_on: Some(1),
+            frame_type: FrameType::StreamFin,
+            eligible_paths: Vec::new(),
+            payload: vec![1, 1],
+        });
+        assert!(forward_dependency.encode(limits).is_err());
     }
 
     #[test]

@@ -286,8 +286,6 @@ impl Hysteria2Adapter {
             "obfs_password",
             "server_ports",
             "hop_interval",
-            "up_mbps",
-            "down_mbps",
         ];
         if let Some(field) = config
             .options
@@ -299,6 +297,14 @@ impl Hysteria2Adapter {
         }
         crate::adapter_registry::validate_credentials(Some(credential), &allowed)?;
         crate::adapter_registry::validate_native_options(config, true, false, false)?;
+        if let (Some(password), Some(auth)) =
+            (credential.field("password"), credential.field("auth"))
+            && password != auth
+        {
+            return Err(TransitError::Unsupported(
+                "Hysteria2 authentication aliases conflict".into(),
+            ));
+        }
         let password = credential
             .field("password")
             .or_else(|| credential.field("auth"))
@@ -736,6 +742,39 @@ mod tests {
             Duration::from_millis(500)
         );
         assert!(parse_hop_interval("0s").is_err());
+    }
+
+    #[test]
+    fn rejects_unimplemented_bandwidth_fields_before_connecting() {
+        let config = pathchord_policy::TransitProxyConfig {
+            id: TransitProxyId::new("hy2"),
+            source: None,
+            protocol: "hysteria2".into(),
+            endpoint: PolicyEndpoint {
+                host: "127.0.0.1".into(),
+                port: 443,
+            },
+            credentials_ref: None,
+            labels: BTreeMap::new(),
+            tags: BTreeSet::new(),
+            weight: 100,
+            options: TransitOptions::default(),
+        };
+        for field in ["up_mbps", "down_mbps"] {
+            let credentials = TransitCredential::new(BTreeMap::from([
+                ("password".into(), "secret".into()),
+                (field.into(), "10".into()),
+            ]));
+            assert!(matches!(
+                Hysteria2Adapter::from_config(
+                    &config,
+                    &credentials,
+                    Duration::from_secs(1),
+                    crate::adapter_registry::native_tls_roots()
+                ),
+                Err(TransitError::Unsupported(_))
+            ));
+        }
     }
 
     #[tokio::test]

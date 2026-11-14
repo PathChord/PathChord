@@ -68,6 +68,7 @@ async fn http_connect_crosses_transit_noise_session_and_egress() {
                 capacity_bps: 1_000_000_000,
                 recommended_path_count: 1,
                 max_streams_per_ingress: 128,
+                remote_dns_only: false,
                 quota_remaining: None,
                 traffic_multiplier_basis_points: 10_000,
             },

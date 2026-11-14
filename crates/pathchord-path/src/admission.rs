@@ -119,6 +119,7 @@ impl<S> IngressAdmittedPath<S> {
 pub struct EgressAdmittedPath<S> {
     transport: NoiseRecordStream<S>,
     ingress_id: Vec<u8>,
+    authenticated_remote_key: [u8; STATIC_KEY_LEN],
     session_id: SessionId,
     path_id: PathId,
     negotiated_capabilities: u64,
@@ -147,6 +148,13 @@ where
 impl<S> EgressAdmittedPath<S> {
     pub fn ingress_id(&self) -> &[u8] {
         &self.ingress_id
+    }
+
+    /// The Ingress static public key authenticated by this Path's Noise
+    /// handshake. It is the handshake result, not a later store lookup.
+    #[must_use]
+    pub const fn authenticated_remote_key(&self) -> &[u8; STATIC_KEY_LEN] {
+        &self.authenticated_remote_key
     }
 
     pub const fn session_id(&self) -> SessionId {
@@ -467,6 +475,7 @@ where
     Ok(PathAdmissionOutcome::Ready(EgressAdmittedPath {
         transport: records,
         ingress_id: attach.ingress_id,
+        authenticated_remote_key: authenticated_key,
         session_id,
         path_id,
         negotiated_capabilities,
@@ -704,6 +713,7 @@ mod tests {
         assert_eq!(ingress.authorization_generation(), 12);
         assert_eq!(egress.negotiated_capabilities(), 0b01);
         assert_eq!(egress.ingress_id(), b"ingress-a");
+        assert_eq!(egress.authenticated_remote_key(), initiator.public());
 
         let heartbeat = Message::Heartbeat(Heartbeat { control_seq: 44 });
         let frame_type = heartbeat.frame_type();

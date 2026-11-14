@@ -21,6 +21,7 @@ use pathchord_policy::{
     SubscriptionConfig as PolicySubscriptionConfig,
     SubscriptionRefresh as PolicySubscriptionRefresh, SubscriptionSource, SubscriptionSourceType,
 };
+use serde_json::{Value, json};
 use thiserror::Error;
 
 pub const MAX_NODE_COUNT: usize = 4096;
@@ -52,7 +53,7 @@ impl SystemProxyPlatform {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SystemProxyState {
     Disabled,
     Applying,
@@ -61,7 +62,7 @@ pub enum SystemProxyState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SystemProxyStatus {
     pub state: SystemProxyState,
     pub enabled: bool,
@@ -360,6 +361,30 @@ pub struct NodeObservation {
     pub usage: Option<pathchord_transit::SubscriptionUsage>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeMetadata {
+    pub namespace: Option<String>,
+    pub protocol: Option<String>,
+    pub endpoint: Option<String>,
+    pub source_subscription: Option<String>,
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionRuntimeObservation {
+    pub next_refresh_at_ms: Option<u64>,
+    pub imported_node_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressRuntimeObservation {
+    pub report: Option<pathchord_core::StatusReport>,
+    pub age_ms: u64,
+    pub fresh: bool,
+    pub active_udp_associations: usize,
+    pub pending_session_controls: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Opening,
@@ -402,6 +427,8 @@ pub struct StreamObservation {
     /// Hostname and port only; credentials and payloads are never represented.
     pub target_display: String,
     pub traffic_class: Option<String>,
+    pub traffic_class_priority: Option<u8>,
+    pub traffic_class_share: Option<u32>,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub bytes_acked: u64,
@@ -418,11 +445,11 @@ pub struct PathObservation {
     pub path_id: PathId,
     pub session_id: SessionId,
     pub state: PathState,
-    pub rtt_ms: u64,
-    pub jitter_ms: u64,
-    pub loss_ppm: u32,
-    pub throughput_bps: u64,
-    pub reordering_events: u64,
+    pub rtt_ms: Option<u64>,
+    pub jitter_ms: Option<u64>,
+    pub loss_ppm: Option<u32>,
+    pub throughput_bps: Option<u64>,
+    pub reordering_events: Option<u64>,
     pub exclusion_reason: Option<String>,
 }
 
@@ -436,11 +463,22 @@ pub struct ObservationSnapshot {
     pub runtime: RuntimeCounts,
     pub runtime_state: RuntimeSnapshotState,
     pub active_listener_count: usize,
+    pub listener_states: BTreeMap<ListenerId, ListenerObservation>,
+    pub connection_listeners: BTreeMap<String, ListenerId>,
+    pub node_metadata: BTreeMap<NodeId, NodeMetadata>,
+    pub subscription_runtime: BTreeMap<SubscriptionId, SubscriptionRuntimeObservation>,
+    pub egress_runtime: BTreeMap<String, EgressRuntimeObservation>,
     pub nodes: BTreeMap<NodeId, NodeObservation>,
     pub sessions: BTreeMap<SessionId, SessionObservation>,
     pub streams: BTreeMap<(SessionId, StreamId), StreamObservation>,
     pub paths: BTreeMap<PathId, PathObservation>,
     pub connections: BTreeMap<String, ConnectionObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerObservation {
+    pub state: &'static str,
+    pub reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,12 +494,27 @@ struct SharedObservationState {
     runtime: RuntimeCounts,
     last_updated_ms: Option<u64>,
     active_listeners: BTreeSet<ListenerId>,
+    listener_states: BTreeMap<ListenerId, ListenerObservation>,
     nodes: BTreeMap<NodeId, NodeObservation>,
     sessions: BTreeMap<SessionId, SessionObservation>,
     streams: BTreeMap<(SessionId, StreamId), StreamObservation>,
     paths: BTreeMap<PathId, PathObservation>,
     connections: BTreeMap<String, ConnectionObservation>,
     connection_listeners: BTreeMap<String, ListenerId>,
+    node_metadata: BTreeMap<NodeId, NodeMetadata>,
+    subscription_runtime: BTreeMap<SubscriptionId, SubscriptionRuntimeObservation>,
+    egress_runtime: BTreeMap<String, EgressRuntimeObservation>,
+    pending_events: VecDeque<PendingObservationEvent>,
+    pending_overflow: bool,
+}
+
+#[derive(Debug)]
+struct PendingObservationEvent {
+    kind: ControlEventKind,
+    resource_id: String,
+    generation: u64,
+    emitted_at_ms: u64,
+    payload: Value,
 }
 
 /// Cloneable, capability-limited writer for live runtime observations.
@@ -471,12 +524,155 @@ pub struct IngressObservationHandle {
 }
 
 impl IngressObservationHandle {
+    pub fn set_egress_runtime(
+        &self,
+        egress_id: String,
+        report: Option<pathchord_core::StatusReport>,
+        age_ms: u64,
+        fresh: bool,
+        active_udp_associations: usize,
+        pending_session_controls: usize,
+    ) -> Result<(), ControlError> {
+        if egress_id.is_empty() || egress_id.len() > 128 || egress_id.chars().any(char::is_control)
+        {
+            return Err(ControlError::InvalidIdentifier { kind: "egress" });
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ControlError::ObservationUnavailable)?;
+        if !state.egress_runtime.contains_key(&egress_id)
+            && state.egress_runtime.len() >= MAX_NODE_COUNT
+        {
+            return Err(ControlError::ResourceLimit {
+                resource: "egress observations",
+            });
+        }
+        let next = EgressRuntimeObservation {
+            report,
+            age_ms,
+            fresh,
+            active_udp_associations,
+            pending_session_controls,
+        };
+        if state.egress_runtime.get(&egress_id) != Some(&next) {
+            state.egress_runtime.insert(egress_id, next);
+            touch_observations(&mut state);
+        }
+        Ok(())
+    }
+    pub fn set_node_metadata(
+        &self,
+        node_id: NodeId,
+        namespace: Option<String>,
+        protocol: Option<String>,
+        endpoint: Option<String>,
+        source_subscription: Option<String>,
+        labels: BTreeMap<String, String>,
+    ) -> Result<(), ControlError> {
+        if [&namespace, &protocol, &endpoint, &source_subscription]
+            .into_iter()
+            .flatten()
+            .any(|value| value.len() > 256 || value.chars().any(char::is_control))
+            || labels.len() > 256
+            || labels.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > 64
+                    || value.len() > 256
+                    || key.chars().any(char::is_control)
+                    || value.chars().any(char::is_control)
+            })
+        {
+            return Err(ControlError::FieldTooLarge {
+                field: "node metadata",
+            });
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ControlError::ObservationUnavailable)?;
+        if !state.node_metadata.contains_key(&node_id)
+            && state.node_metadata.len() >= MAX_NODE_COUNT
+        {
+            return Err(ControlError::ResourceLimit {
+                resource: "node metadata",
+            });
+        }
+        let next = NodeMetadata {
+            namespace,
+            protocol,
+            endpoint,
+            source_subscription,
+            labels,
+        };
+        if state.node_metadata.get(&node_id) != Some(&next) {
+            state.node_metadata.insert(node_id, next);
+            touch_observations(&mut state);
+        }
+        Ok(())
+    }
+
+    pub fn set_subscription_runtime(
+        &self,
+        id: SubscriptionId,
+        next_refresh_at_ms: Option<u64>,
+        imported_node_count: usize,
+    ) -> Result<(), ControlError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ControlError::ObservationUnavailable)?;
+        if !state.subscription_runtime.contains_key(&id)
+            && state.subscription_runtime.len() >= MAX_SUBSCRIPTION_COUNT
+        {
+            return Err(ControlError::ResourceLimit {
+                resource: "subscription observations",
+            });
+        }
+        let next = SubscriptionRuntimeObservation {
+            next_refresh_at_ms,
+            imported_node_count,
+        };
+        if state.subscription_runtime.get(&id) != Some(&next) {
+            state.subscription_runtime.insert(id, next);
+            touch_observations(&mut state);
+        }
+        Ok(())
+    }
+
+    pub fn remove_node_metadata(&self, id: &NodeId) -> Result<(), ControlError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ControlError::ObservationUnavailable)?;
+        if state.node_metadata.remove(id).is_some() {
+            touch_observations(&mut state);
+        }
+        Ok(())
+    }
+
+    pub fn remove_subscription_runtime(&self, id: &SubscriptionId) -> Result<(), ControlError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ControlError::ObservationUnavailable)?;
+        if state.subscription_runtime.remove(id).is_some() {
+            touch_observations(&mut state);
+        }
+        Ok(())
+    }
+
     pub fn set_runtime_counts(&self, counts: RuntimeCounts) -> Result<(), ControlError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| ControlError::ObservationUnavailable)?;
-        state.runtime = counts;
+        // Listener events own the live target-connection count. The data-plane
+        // refresh supplies only Session/Path/Stream totals and must not replace
+        // that independently observed value with a stream count.
+        state.runtime.sessions = counts.sessions;
+        state.runtime.ready_paths = counts.ready_paths;
+        state.runtime.streams = counts.streams;
         touch_observations(&mut state);
         Ok(())
     }
@@ -501,6 +697,35 @@ impl IngressObservationHandle {
             .state
             .lock()
             .map_err(|_| ControlError::ObservationUnavailable)?;
+        let mut changes = Vec::new();
+        for (id, session) in &sessions {
+            if state.sessions.get(id) != Some(session) {
+                changes.push((ControlEventKind::SessionChanged, id.to_string(), json!({"session_id": id.to_string(), "egress_id": session.egress_id, "state": format!("{:?}", session.state).to_ascii_lowercase(), "ready_path_count": session.ready_paths, "active_streams": session.active_streams})));
+            }
+        }
+        for id in state
+            .sessions
+            .keys()
+            .filter(|id| !sessions.contains_key(*id))
+        {
+            changes.push((
+                ControlEventKind::SessionChanged,
+                id.to_string(),
+                json!({"session_id": id.to_string(), "state": "removed"}),
+            ));
+        }
+        for (id, path) in &paths {
+            if state.paths.get(id) != Some(path) {
+                changes.push((ControlEventKind::PathChanged, id.to_string(), json!({"path_id": id.to_string(), "session_id": path.session_id.to_string(), "state": format!("{:?}", path.state).to_ascii_lowercase(), "rtt_ms": path.rtt_ms, "jitter_ms": path.jitter_ms, "loss_ppm": path.loss_ppm, "throughput_bps": path.throughput_bps, "exclusion_reason": path.exclusion_reason})));
+            }
+        }
+        for id in state.paths.keys().filter(|id| !paths.contains_key(*id)) {
+            changes.push((
+                ControlEventKind::PathChanged,
+                id.to_string(),
+                json!({"path_id": id.to_string(), "state": "removed"}),
+            ));
+        }
         state.runtime.sessions = sessions.len() as u64;
         state.runtime.ready_paths = paths
             .values()
@@ -514,6 +739,9 @@ impl IngressObservationHandle {
         state.paths = paths;
         state.last_updated_ms = Some(now_ms());
         state.generation = state.generation.saturating_add(1);
+        for (kind, id, payload) in changes {
+            queue_observation_event(&mut state, kind, id, payload);
+        }
         Ok(())
     }
 
@@ -534,8 +762,24 @@ impl IngressObservationHandle {
             .state
             .lock()
             .map_err(|_| ControlError::ObservationUnavailable)?;
+        let mut changes = Vec::new();
+        for (key, stream) in &streams {
+            if state.streams.get(key) != Some(stream) {
+                changes.push((format!("{}:{}", stream.session_id, stream.stream_id), json!({"session_id": stream.session_id.to_string(), "stream_id": stream.stream_id.to_string(), "state": format!("{:?}", stream.state).to_ascii_lowercase(), "bytes_sent": stream.bytes_sent, "bytes_received": stream.bytes_received, "bytes_acked": stream.bytes_acked, "traffic_class_name": stream.traffic_class, "traffic_class_priority": stream.traffic_class_priority, "traffic_class_share": stream.traffic_class_share, "close_reason": stream.close_reason})));
+            }
+        }
+        for (session_id, stream_id) in state
+            .streams
+            .keys()
+            .filter(|key| !streams.contains_key(*key))
+        {
+            changes.push((format!("{session_id}:{stream_id}"), json!({"session_id": session_id.to_string(), "stream_id": stream_id.to_string(), "state": "removed"})));
+        }
         state.streams = streams;
         touch_observations(&mut state);
+        for (id, payload) in changes {
+            queue_observation_event(&mut state, ControlEventKind::StreamChanged, id, payload);
+        }
         Ok(())
     }
 
@@ -591,13 +835,52 @@ impl IngressObservationHandle {
             .state
             .lock()
             .map_err(|_| ControlError::ObservationUnavailable)?;
+        let event_connection_id = match &event {
+            crate::runtime::ListenerRuntimeEvent::ConnectionAccepted { connection_id, .. }
+            | crate::runtime::ListenerRuntimeEvent::ConnectionCompleted { connection_id, .. }
+            | crate::runtime::ListenerRuntimeEvent::ConnectionFailed {
+                connection_id: Some(connection_id),
+                ..
+            } => Some(connection_id.clone()),
+            _ => None,
+        };
         let changed = match event {
             crate::runtime::ListenerRuntimeEvent::ListenerStarted { listener_id, .. } => {
-                state.active_listeners.insert(listener_id)
+                state.active_listeners.insert(listener_id.clone());
+                state.listener_states.insert(
+                    listener_id,
+                    ListenerObservation {
+                        state: "available",
+                        reason: None,
+                    },
+                );
+                true
             }
-            crate::runtime::ListenerRuntimeEvent::ListenerStopped { listener_id }
-            | crate::runtime::ListenerRuntimeEvent::ListenerFailed { listener_id, .. } => {
+            event @ (crate::runtime::ListenerRuntimeEvent::ListenerStopped { .. }
+            | crate::runtime::ListenerRuntimeEvent::ListenerFailed { .. }) => {
+                let (listener_id, status) = match event {
+                    crate::runtime::ListenerRuntimeEvent::ListenerStopped { listener_id } => (
+                        listener_id,
+                        ListenerObservation {
+                            state: "stopped",
+                            reason: Some("listener_stopped"),
+                        },
+                    ),
+                    crate::runtime::ListenerRuntimeEvent::ListenerFailed {
+                        listener_id, ..
+                    } => (
+                        listener_id,
+                        ListenerObservation {
+                            state: "degraded",
+                            reason: Some("listener_failed"),
+                        },
+                    ),
+                    _ => unreachable!(),
+                };
                 let removed = state.active_listeners.remove(&listener_id);
+                let previous = state
+                    .listener_states
+                    .insert(listener_id.clone(), status.clone());
                 let affected: Vec<_> = state
                     .connection_listeners
                     .iter()
@@ -616,9 +899,8 @@ impl IngressObservationHandle {
                     {
                         connection.state = ConnectionState::Reset;
                     }
-                    state.connection_listeners.remove(&connection_id);
                 }
-                removed || had_affected
+                removed || had_affected || previous.as_ref() != Some(&status)
             }
             crate::runtime::ListenerRuntimeEvent::ConnectionAccepted {
                 listener_id,
@@ -654,29 +936,25 @@ impl IngressObservationHandle {
                 stats,
                 ..
             } => {
-                let changed = if let Some(connection) = state.connections.get_mut(&connection_id) {
+                if let Some(connection) = state.connections.get_mut(&connection_id) {
                     connection.state = ConnectionState::Closed;
                     connection.bytes_sent = stats.local_to_target_bytes;
                     connection.bytes_received = stats.target_to_local_bytes;
                     true
                 } else {
                     false
-                };
-                state.connection_listeners.remove(&connection_id);
-                changed
+                }
             }
             crate::runtime::ListenerRuntimeEvent::ConnectionFailed {
                 connection_id: Some(connection_id),
                 ..
             } => {
-                let changed = if let Some(connection) = state.connections.get_mut(&connection_id) {
+                if let Some(connection) = state.connections.get_mut(&connection_id) {
                     connection.state = ConnectionState::Reset;
                     true
                 } else {
                     false
-                };
-                state.connection_listeners.remove(&connection_id);
-                changed
+                }
             }
             crate::runtime::ListenerRuntimeEvent::ProtocolRejected { .. }
             | crate::runtime::ListenerRuntimeEvent::PolicyRejected { .. }
@@ -688,6 +966,17 @@ impl IngressObservationHandle {
         if changed {
             touch_observations(&mut state);
             refresh_target_connection_count(&mut state);
+            if let Some(id) = event_connection_id
+                && let Some(connection) = state.connections.get(&id)
+            {
+                let payload = json!({"connection_id": id, "state": format!("{:?}", connection.state).to_ascii_lowercase(), "bytes_sent": connection.bytes_sent, "bytes_received": connection.bytes_received});
+                queue_observation_event(
+                    &mut state,
+                    ControlEventKind::ConnectionChanged,
+                    id,
+                    payload,
+                );
+            }
         } else {
             state.last_updated_ms = Some(now_ms());
         }
@@ -713,6 +1002,25 @@ fn touch_observations(state: &mut SharedObservationState) {
     state.last_updated_ms = Some(now_ms());
 }
 
+fn queue_observation_event(
+    state: &mut SharedObservationState,
+    kind: ControlEventKind,
+    resource_id: String,
+    payload: Value,
+) {
+    if state.pending_events.len() == MAX_EVENT_COUNT {
+        state.pending_events.pop_front();
+        state.pending_overflow = true;
+    }
+    state.pending_events.push_back(PendingObservationEvent {
+        kind,
+        resource_id,
+        generation: state.generation,
+        emitted_at_ms: now_ms(),
+        payload,
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlEventKind {
     NodeChanged,
@@ -720,6 +1028,11 @@ pub enum ControlEventKind {
     SubscriptionRefreshRequested,
     ObservationChanged,
     SystemProxyChanged,
+    AuditNotice,
+    PathChanged,
+    SessionChanged,
+    StreamChanged,
+    ConnectionChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -728,6 +1041,9 @@ pub struct ControlEvent {
     pub generation: u64,
     pub kind: ControlEventKind,
     pub resource_id: String,
+    /// Old persisted events may predate event timestamps and payloads.
+    pub emitted_at_ms: Option<u64>,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -735,6 +1051,21 @@ pub struct MutationReceipt {
     pub generation: u64,
     pub event_id: u64,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenerationPrecondition {
+    Expected(u64),
+    Force,
+}
+
+impl std::fmt::Display for GenerationPrecondition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Expected(value) => write!(formatter, "expected:{value}"),
+            Self::Force => formatter.write_str("force"),
+        }
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -757,6 +1088,8 @@ pub enum ControlError {
     InvalidSubscription { field: &'static str },
     #[error("generation conflict: expected {expected}, current {current}")]
     GenerationConflict { expected: u64, current: u64 },
+    #[error("subscription revision conflict: expected {expected}, current {current}")]
+    RevisionConflict { expected: u64, current: u64 },
     #[error("request {request_id} was reused with a different command")]
     IdempotencyConflict { request_id: RequestId },
     #[error("refresh for subscription {0} is already queued")]
@@ -783,35 +1116,62 @@ pub enum ControlError {
     PersistenceUnavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CachedCommand {
     pub(crate) fingerprint: String,
     pub(crate) receipt: MutationReceipt,
     pub(crate) created_at_ms: u64,
+    pub(crate) system_proxy_status: Option<SystemProxyStatus>,
+    pub(crate) response_fingerprint: Option<String>,
+    pub(crate) response: Option<pathchord_core::management::ResponseEnvelope>,
+}
+
+impl CachedCommand {
+    /// An idempotency record expires only after both the minimum retention
+    /// period and the generation that produced it have passed.
+    pub(crate) fn is_live(&self, current_generation: u64, now: u64) -> bool {
+        self.receipt.generation >= current_generation
+            || now.saturating_sub(self.created_at_ms) <= REQUEST_CACHE_TTL_MS
+    }
 }
 
 /// Transport-neutral control service with an optional durable SQLite adapter.
 #[derive(Debug)]
 pub struct IngressControlService {
     snapshot: IngressControlSnapshot,
+    declarative_subscriptions: BTreeMap<SubscriptionId, DeclarativeSubscriptionBaseline>,
+    declarative_initialized: bool,
     observations: Arc<Mutex<SharedObservationState>>,
     events: VecDeque<ControlEvent>,
     refresh_queue: VecDeque<SubscriptionId>,
     request_cache: HashMap<(String, RequestId), CachedCommand>,
     next_event_id: u64,
+    last_observation_gap: Option<u64>,
     listeners: BTreeMap<ListenerId, ListenerDescriptor>,
     system_proxy: SystemProxyStatus,
     platform_proxy: Arc<dyn PlatformProxyAdapter>,
     store: Option<Arc<IngressControlStore>>,
+    reload_handle: Option<crate::ConfigReloadHandle>,
+    audit_degraded: bool,
 }
 
 #[derive(Clone)]
 struct DurableCheckpoint {
     snapshot: IngressControlSnapshot,
+    declarative_subscriptions: BTreeMap<SubscriptionId, DeclarativeSubscriptionBaseline>,
+    declarative_initialized: bool,
     events: VecDeque<ControlEvent>,
     refresh_queue: VecDeque<SubscriptionId>,
     request_cache: HashMap<(String, RequestId), CachedCommand>,
     next_event_id: u64,
+    last_observation_gap: Option<u64>,
+}
+
+/// Tracks the last declaration without storing a second copy of its source URL.
+#[derive(Debug, Clone)]
+pub(crate) struct DeclarativeSubscriptionBaseline {
+    pub(crate) fingerprint: String,
+    pub(crate) deleted: bool,
 }
 
 impl Default for IngressControlService {
@@ -829,6 +1189,84 @@ impl Drop for IngressControlService {
 }
 
 impl IngressControlService {
+    pub(crate) fn replay_management_response(
+        &self,
+        request: &pathchord_core::management::RequestEnvelope,
+        request_id: RequestId,
+        fingerprint: &str,
+    ) -> Result<Option<pathchord_core::management::ResponseEnvelope>, ControlError> {
+        let Some(cached) = self
+            .request_cache
+            .get(&(request.actor.id.clone(), request_id))
+        else {
+            return Ok(None);
+        };
+        if !cached.is_live(self.snapshot.generation, now_ms()) {
+            return Ok(None);
+        }
+        match (&cached.response_fingerprint, &cached.response) {
+            (Some(stored), Some(response)) if stored == fingerprint => Ok(Some(response.clone())),
+            (Some(_), Some(_)) => Err(ControlError::IdempotencyConflict { request_id }),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn remember_management_response(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        fingerprint: String,
+        response: &pathchord_core::management::ResponseEnvelope,
+    ) {
+        if let Some(cached) = self.request_cache.get_mut(&(actor.to_owned(), request_id)) {
+            cached.response_fingerprint = Some(fingerprint);
+            cached.response = Some(response.clone());
+        }
+    }
+
+    /// Persist a deterministic failure together with the request identity. A
+    /// store failure restores the in-memory cache so the operation can retry.
+    pub(crate) fn remember_management_failure(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        fingerprint: String,
+        response: &pathchord_core::management::ResponseEnvelope,
+    ) -> Result<(), ControlError> {
+        if self
+            .request_cache
+            .get(&(actor.to_owned(), request_id))
+            .is_some_and(|entry| entry.is_live(self.snapshot.generation, now_ms()))
+        {
+            return Err(ControlError::IdempotencyConflict { request_id });
+        }
+        self.ensure_cache_capacity(actor, request_id)?;
+        let checkpoint = self.durable_checkpoint();
+        let generation = self.snapshot.generation;
+        let now = now_ms();
+        self.request_cache
+            .retain(|_, entry| entry.is_live(generation, now));
+        self.request_cache.insert(
+            (actor.to_owned(), request_id),
+            CachedCommand {
+                fingerprint: fingerprint.clone(),
+                receipt: MutationReceipt {
+                    generation,
+                    event_id: self.next_event_id,
+                    replayed: false,
+                },
+                created_at_ms: now,
+                system_proxy_status: None,
+                response_fingerprint: Some(fingerprint),
+                response: Some(response.clone()),
+            },
+        );
+        if let Err(error) = self.persist(None) {
+            self.restore_checkpoint(checkpoint);
+            return Err(error);
+        }
+        Ok(())
+    }
     #[must_use]
     pub fn new() -> Self {
         Self::with_platform_proxy(Arc::new(FakePlatformProxyAdapter::new()))
@@ -859,15 +1297,20 @@ impl IngressControlService {
                 nodes: BTreeMap::new(),
                 subscriptions: BTreeMap::new(),
             },
+            declarative_subscriptions: BTreeMap::new(),
+            declarative_initialized: false,
             observations: Arc::new(Mutex::new(SharedObservationState::default())),
             events: VecDeque::new(),
             refresh_queue: VecDeque::new(),
             request_cache: HashMap::new(),
             next_event_id: 0,
+            last_observation_gap: None,
             listeners: BTreeMap::new(),
             system_proxy,
             platform_proxy,
             store: None,
+            reload_handle: None,
+            audit_degraded: false,
         }
     }
 
@@ -884,6 +1327,8 @@ impl IngressControlService {
             .map_err(|_| ControlError::PersistenceUnavailable)?;
         let mut service = Self::with_platform_proxy(platform_proxy);
         service.snapshot = durable.snapshot;
+        service.declarative_subscriptions = durable.declarative_subscriptions;
+        service.declarative_initialized = durable.declarative_initialized;
         service.events = durable.events;
         service.refresh_queue = durable.refresh_queue;
         service.request_cache = durable.request_cache;
@@ -899,13 +1344,39 @@ impl IngressControlService {
         self.listeners.insert(descriptor.id.clone(), descriptor);
     }
 
+    pub fn set_reload_handle(&mut self, handle: crate::ConfigReloadHandle) {
+        self.reload_handle = Some(handle);
+    }
+
+    #[must_use]
+    pub fn reload_status(&self) -> Option<crate::ReloadStatus> {
+        self.reload_handle
+            .as_ref()
+            .map(crate::ConfigReloadHandle::status)
+    }
+
     pub fn reconcile_declarative_resources(
         &mut self,
         generation: u64,
         nodes: impl IntoIterator<Item = NodeId>,
         subscriptions: impl IntoIterator<Item = SubscriptionSpec>,
     ) -> Result<(), ControlError> {
+        // Validate the whole candidate before modifying any runtime or durable state.
+        let mut declared = BTreeMap::new();
+        for spec in subscriptions {
+            spec.validate()?;
+            let id = spec.id.clone();
+            if declared.insert(id.clone(), spec).is_some() {
+                return Err(ControlError::SubscriptionExists(id));
+            }
+        }
+        if declared.len() > MAX_SUBSCRIPTION_COUNT {
+            return Err(ControlError::ResourceLimit {
+                resource: "subscriptions",
+            });
+        }
         let checkpoint = self.durable_checkpoint();
+        let mut changed = false;
         for node in nodes {
             if !self.snapshot.nodes.contains_key(&node)
                 && self.snapshot.nodes.len() >= MAX_NODE_COUNT
@@ -913,11 +1384,47 @@ impl IngressControlService {
                 self.restore_checkpoint(checkpoint);
                 return Err(ControlError::ResourceLimit { resource: "nodes" });
             }
-            self.snapshot.nodes.entry(node).or_default();
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.snapshot.nodes.entry(node)
+            {
+                entry.insert(NodeAdminState::default());
+                changed = true;
+            }
         }
-        for spec in subscriptions {
-            spec.validate()?;
-            if !self.snapshot.subscriptions.contains_key(&spec.id)
+        // Remove only resources known to have originated in the declaration.
+        let removed: Vec<_> = self
+            .declarative_subscriptions
+            .keys()
+            .filter(|id| !declared.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in removed {
+            self.declarative_subscriptions.remove(&id);
+            changed |= self.snapshot.subscriptions.remove(&id).is_some();
+            self.refresh_queue.retain(|queued| queued != &id);
+        }
+
+        for (id, spec) in declared {
+            let fingerprint = subscription_declaration_fingerprint(&spec);
+            let previous = self.declarative_subscriptions.get(&id);
+            let unchanged = previous.is_some_and(|baseline| baseline.fingerprint == fingerprint);
+            let deleted = unchanged && previous.is_some_and(|baseline| baseline.deleted);
+            // An existing DB predating baselines may contain an administrator's
+            // override. Adopt that state on migration, then track future changes.
+            let adopt_existing = !self.declarative_initialized
+                && previous.is_none()
+                && self.snapshot.subscriptions.contains_key(&id);
+            self.declarative_subscriptions.insert(
+                id.clone(),
+                DeclarativeSubscriptionBaseline {
+                    fingerprint,
+                    deleted,
+                },
+            );
+            if deleted || unchanged || adopt_existing {
+                continue;
+            }
+            if !self.snapshot.subscriptions.contains_key(&id)
                 && self.snapshot.subscriptions.len() >= MAX_SUBSCRIPTION_COUNT
             {
                 self.restore_checkpoint(checkpoint);
@@ -925,16 +1432,24 @@ impl IngressControlService {
                     resource: "subscriptions",
                 });
             }
-            match self.snapshot.subscriptions.get_mut(&spec.id) {
+            match self.snapshot.subscriptions.get_mut(&id) {
                 Some(existing) if existing.spec != spec => {
                     let was_enabled = existing.spec.enabled;
+                    let source_changed = existing.spec.source_type != spec.source_type
+                        || existing.spec.url != spec.url
+                        || existing.spec.credentials_ref != spec.credentials_ref;
                     existing.spec = spec;
                     existing.refresh_state = SubscriptionRefreshState::Idle;
                     existing.last_error = None;
+                    if source_changed {
+                        existing.cache_metadata.clear();
+                        existing.last_refresh_at_ms = None;
+                    }
                     if was_enabled && !existing.spec.enabled {
                         self.refresh_queue
                             .retain(|queued| queued != &existing.spec.id);
                     }
+                    changed = true;
                 }
                 Some(_) => {}
                 None => {
@@ -949,10 +1464,16 @@ impl IngressControlService {
                             last_refresh_at_ms: None,
                         },
                     );
+                    changed = true;
                 }
             }
         }
-        self.snapshot.generation = self.snapshot.generation.max(generation);
+        self.snapshot.generation = self
+            .snapshot
+            .generation
+            .saturating_add(u64::from(changed))
+            .max(generation);
+        self.declarative_initialized = true;
         if let Err(error) = self.persist(None) {
             self.restore_checkpoint(checkpoint);
             return Err(error);
@@ -960,19 +1481,82 @@ impl IngressControlService {
         Ok(())
     }
 
-    pub fn record_authentication_failure(&self, source: &str) -> Result<(), ControlError> {
+    pub fn record_authentication_failure(&mut self, source: &str) -> Result<(), ControlError> {
         if source.is_empty() || source.len() > 256 {
             return Err(ControlError::FieldTooLarge {
                 field: "authentication source",
             });
         }
-        self.persist(Some(AuditRecord::new(
-            "unauthenticated",
-            None,
-            "authentication.failure",
-            source.to_owned(),
+        let checkpoint = self.durable_checkpoint();
+        let receipt = self.emit(ControlEventKind::AuditNotice, source.to_owned());
+        if let Err(error) = self.persist(Some(AuditRecord::authentication_failure(
+            source,
             self.snapshot.generation,
-        )))
+            receipt.event_id,
+        ))) {
+            self.restore_checkpoint(checkpoint);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_management_outcome(
+        &mut self,
+        request: &pathchord_core::management::RequestEnvelope,
+        response: &pathchord_core::management::ResponseEnvelope,
+        source: pathchord_core::management::ManagementSource,
+    ) {
+        let resource_id = ["node_id", "listener_id", "id"]
+            .iter()
+            .find_map(|field| request.body.get(field).and_then(Value::as_str))
+            .filter(|value| {
+                value.len() <= 128
+                    && value
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || "._-".contains(ch))
+            })
+            .unwrap_or("unknown")
+            .to_owned();
+        let checkpoint = self.durable_checkpoint();
+        let receipt = self.emit(ControlEventKind::AuditNotice, resource_id.clone());
+        let reason = response
+            .error
+            .as_ref()
+            .and_then(|error| serde_json::to_value(error.code).ok());
+        let expected = request.expected_generation.as_ref().map(|value| json!({
+            "scope": if matches!(value.scope.as_str(), "configuration" | "observation" | "authorization") { value.scope.as_str() } else { "invalid" },
+            "value": value.value,
+        }));
+        if let Some(event) = self.events.back_mut() {
+            event.payload = json!({
+                "actor_id": request.actor.id.chars().filter(|ch| !ch.is_control()).take(128).collect::<String>(),
+                "source": source.as_str(),
+                "operation": request.operation,
+                "request_id": request.request_id.chars().filter(|ch| !ch.is_control()).take(128).collect::<String>(),
+                "target_resource": resource_id,
+                "expected_generation": expected,
+                "applied_generation": response.result.as_ref().and_then(|value| value.get("applied_generation")),
+                "result": if response.ok { "success" } else { "failed" },
+                "reason": reason,
+            });
+        }
+        let audit = AuditRecord::management(
+            request,
+            response,
+            resource_id,
+            self.snapshot.generation,
+            receipt.event_id,
+            source,
+        );
+        if self.persist(Some(audit)).is_err() {
+            self.restore_checkpoint(checkpoint);
+            self.audit_degraded = true;
+        }
+    }
+
+    #[must_use]
+    pub const fn audit_degraded(&self) -> bool {
+        self.audit_degraded
     }
 
     #[must_use]
@@ -992,6 +1576,23 @@ impl IngressControlService {
         request_id: RequestId,
         platform: SystemProxyPlatform,
         listener_id: ListenerId,
+    ) -> Result<SystemProxyMutation, ControlError> {
+        self.enable_system_proxy_precondition(
+            actor,
+            request_id,
+            platform,
+            listener_id,
+            GenerationPrecondition::Force,
+        )
+    }
+
+    pub(crate) fn enable_system_proxy_precondition(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        platform: SystemProxyPlatform,
+        listener_id: ListenerId,
+        expected_generation: GenerationPrecondition,
     ) -> Result<SystemProxyMutation, ControlError> {
         self.check_actor(actor)?;
         if platform != SystemProxyPlatform::Windows {
@@ -1021,14 +1622,29 @@ impl IngressControlService {
                     kind: descriptor.kind,
                 })?,
         };
-        let fingerprint = format!("system-proxy-enable:{listener_id:?}:{platform:?}");
-        if self.cached(actor, request_id, &fingerprint)?.is_some()
-            || (self.system_proxy.enabled
-                && self.system_proxy.listener_id.as_ref() == Some(&listener_id))
-        {
-            return Ok(self.system_proxy_mutation(true));
+        let fingerprint =
+            format!("system-proxy-enable:{listener_id:?}:{platform:?}:{expected_generation}");
+        if let Some(receipt) = self.cached(actor, request_id, &fingerprint)? {
+            return Ok(self.replayed_system_proxy_mutation(actor, request_id, receipt));
         }
         self.ensure_cache_capacity(actor, request_id)?;
+        self.check_generation(expected_generation)?;
+        if self.system_proxy.enabled && self.system_proxy.listener_id.as_ref() == Some(&listener_id)
+        {
+            let mutation = self.system_proxy_mutation(true);
+            self.cache(
+                actor,
+                request_id,
+                fingerprint,
+                MutationReceipt {
+                    generation: mutation.generation,
+                    event_id: mutation.event_id,
+                    replayed: false,
+                },
+            )?;
+            self.persist(None)?;
+            return Ok(mutation);
+        }
         self.system_proxy = SystemProxyStatus {
             state: SystemProxyState::Applying,
             enabled: false,
@@ -1092,6 +1708,21 @@ impl IngressControlService {
         request_id: RequestId,
         platform: SystemProxyPlatform,
     ) -> Result<SystemProxyMutation, ControlError> {
+        self.disable_system_proxy_precondition(
+            actor,
+            request_id,
+            platform,
+            GenerationPrecondition::Force,
+        )
+    }
+
+    pub(crate) fn disable_system_proxy_precondition(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        platform: SystemProxyPlatform,
+        expected_generation: GenerationPrecondition,
+    ) -> Result<SystemProxyMutation, ControlError> {
         self.check_actor(actor)?;
         if platform != SystemProxyPlatform::Windows {
             return Err(ControlError::UnsupportedOperation {
@@ -1099,13 +1730,27 @@ impl IngressControlService {
                 platform,
             });
         }
-        let fingerprint = format!("system-proxy-disable:{platform:?}");
-        if self.cached(actor, request_id, &fingerprint)?.is_some()
-            || self.system_proxy.state == SystemProxyState::Disabled
-        {
-            return Ok(self.system_proxy_mutation(true));
+        let fingerprint = format!("system-proxy-disable:{platform:?}:{expected_generation}");
+        if let Some(receipt) = self.cached(actor, request_id, &fingerprint)? {
+            return Ok(self.replayed_system_proxy_mutation(actor, request_id, receipt));
         }
         self.ensure_cache_capacity(actor, request_id)?;
+        self.check_generation(expected_generation)?;
+        if self.system_proxy.state == SystemProxyState::Disabled {
+            let mutation = self.system_proxy_mutation(true);
+            self.cache(
+                actor,
+                request_id,
+                fingerprint,
+                MutationReceipt {
+                    generation: mutation.generation,
+                    event_id: mutation.event_id,
+                    replayed: false,
+                },
+            )?;
+            self.persist(None)?;
+            return Ok(mutation);
+        }
         let listener_id = self.system_proxy.listener_id.clone();
         self.system_proxy.state = SystemProxyState::Restoring;
         let effect = match self.platform_proxy.restore() {
@@ -1164,6 +1809,25 @@ impl IngressControlService {
         }
     }
 
+    fn replayed_system_proxy_mutation(
+        &self,
+        actor: &str,
+        request_id: RequestId,
+        receipt: MutationReceipt,
+    ) -> SystemProxyMutation {
+        let status = self
+            .request_cache
+            .get(&(actor.to_owned(), request_id))
+            .and_then(|entry| entry.system_proxy_status.clone())
+            .unwrap_or_else(|| self.system_proxy.clone());
+        SystemProxyMutation {
+            generation: receipt.generation,
+            event_id: receipt.event_id,
+            replayed: true,
+            status,
+        }
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> IngressControlSnapshot {
         self.snapshot.clone()
@@ -1201,6 +1865,11 @@ impl IngressControlService {
             runtime: observations.runtime,
             runtime_state,
             active_listener_count: observations.active_listeners.len(),
+            listener_states: observations.listener_states.clone(),
+            connection_listeners: observations.connection_listeners.clone(),
+            node_metadata: observations.node_metadata.clone(),
+            subscription_runtime: observations.subscription_runtime.clone(),
+            egress_runtime: observations.egress_runtime.clone(),
             nodes: observations.nodes.clone(),
             sessions: observations.sessions.clone(),
             streams: observations.streams.clone(),
@@ -1284,7 +1953,9 @@ impl IngressControlService {
             .observations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        observations.runtime = counts;
+        observations.runtime.sessions = counts.sessions;
+        observations.runtime.ready_paths = counts.ready_paths;
+        observations.runtime.streams = counts.streams;
         touch_observations(&mut observations);
         drop(observations);
         self.emit(ControlEventKind::ObservationChanged, "runtime".to_owned())
@@ -1298,12 +1969,105 @@ impl IngressControlService {
             .collect()
     }
 
+    #[must_use]
+    pub fn event_replay_gap(&self, last_event_id: Option<u64>) -> bool {
+        last_event_id.is_some_and(|id| {
+            id > self.next_event_id
+                || self.last_observation_gap.is_some_and(|gap| id < gap)
+                || self
+                    .events
+                    .front()
+                    .map_or(id < self.next_event_id, |first| {
+                        id.saturating_add(1) < first.id
+                    })
+                || self
+                    .events
+                    .iter()
+                    .zip(self.events.iter().skip(1))
+                    .any(|(before, after)| before.id.saturating_add(1) < after.id && id < after.id)
+        })
+    }
+
+    #[must_use]
+    pub const fn latest_event_id(&self) -> u64 {
+        self.next_event_id
+    }
+
+    pub(crate) fn flush_observation_events(&mut self) -> Result<(), ControlError> {
+        let (pending, overflow) = {
+            let mut observations = self
+                .observations
+                .lock()
+                .map_err(|_| ControlError::ObservationUnavailable)?;
+            (
+                std::mem::take(&mut observations.pending_events),
+                std::mem::take(&mut observations.pending_overflow),
+            )
+        };
+        if pending.is_empty() && !overflow {
+            return Ok(());
+        }
+        let checkpoint = self.durable_checkpoint();
+        if overflow {
+            self.next_event_id = self.next_event_id.saturating_add(1);
+            self.last_observation_gap = Some(self.next_event_id);
+        }
+        for event in &pending {
+            self.next_event_id = self.next_event_id.saturating_add(1);
+            self.events.push_back(ControlEvent {
+                id: self.next_event_id,
+                generation: event.generation,
+                kind: event.kind,
+                resource_id: event.resource_id.clone(),
+                emitted_at_ms: Some(event.emitted_at_ms),
+                payload: event.payload.clone(),
+            });
+            if self.events.len() > MAX_EVENT_COUNT {
+                self.events.pop_front();
+            }
+        }
+        if let Err(error) = self.persist(None) {
+            self.restore_checkpoint(checkpoint);
+            let mut observations = self
+                .observations
+                .lock()
+                .map_err(|_| ControlError::ObservationUnavailable)?;
+            for event in pending.into_iter().rev() {
+                observations.pending_events.push_front(event);
+            }
+            while observations.pending_events.len() > MAX_EVENT_COUNT {
+                observations.pending_events.pop_front();
+                observations.pending_overflow = true;
+            }
+            observations.pending_overflow |= overflow;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn patch_node(
         &mut self,
         actor: &str,
         request_id: RequestId,
         node_id: NodeId,
         expected_generation: u64,
+        patch: NodeAdminPatch,
+    ) -> Result<MutationReceipt, ControlError> {
+        self.patch_node_precondition(
+            actor,
+            request_id,
+            node_id,
+            GenerationPrecondition::Expected(expected_generation),
+            patch,
+        )
+    }
+
+    pub(crate) fn patch_node_precondition(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        node_id: NodeId,
+        expected_generation: GenerationPrecondition,
         patch: NodeAdminPatch,
     ) -> Result<MutationReceipt, ControlError> {
         patch.validate()?;
@@ -1409,6 +2173,21 @@ impl IngressControlService {
         expected_generation: u64,
         spec: SubscriptionSpec,
     ) -> Result<MutationReceipt, ControlError> {
+        self.add_subscription_precondition(
+            actor,
+            request_id,
+            GenerationPrecondition::Expected(expected_generation),
+            spec,
+        )
+    }
+
+    pub(crate) fn add_subscription_precondition(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        expected_generation: GenerationPrecondition,
+        spec: SubscriptionSpec,
+    ) -> Result<MutationReceipt, ControlError> {
         spec.validate()?;
         let fingerprint = format!("add-subscription:{spec:?}:{expected_generation}");
         if let Some(receipt) = self.cached(actor, request_id, &fingerprint)? {
@@ -1427,6 +2206,9 @@ impl IngressControlService {
         }
         let checkpoint = self.durable_checkpoint();
         let id = spec.id.clone();
+        if let Some(baseline) = self.declarative_subscriptions.get_mut(&id) {
+            baseline.deleted = false;
+        }
         self.snapshot.subscriptions.insert(
             id.clone(),
             SubscriptionState {
@@ -1461,6 +2243,21 @@ impl IngressControlService {
         expected_generation: u64,
         id: &SubscriptionId,
     ) -> Result<MutationReceipt, ControlError> {
+        self.delete_subscription_precondition(
+            actor,
+            request_id,
+            GenerationPrecondition::Expected(expected_generation),
+            id,
+        )
+    }
+
+    pub(crate) fn delete_subscription_precondition(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        expected_generation: GenerationPrecondition,
+        id: &SubscriptionId,
+    ) -> Result<MutationReceipt, ControlError> {
         let fingerprint = format!("delete-subscription:{id:?}:{expected_generation}");
         if let Some(receipt) = self.cached(actor, request_id, &fingerprint)? {
             return Ok(receipt);
@@ -1473,6 +2270,9 @@ impl IngressControlService {
             .subscriptions
             .remove(id)
             .ok_or_else(|| ControlError::SubscriptionNotFound(id.clone()))?;
+        if let Some(baseline) = self.declarative_subscriptions.get_mut(id) {
+            baseline.deleted = true;
+        }
         self.refresh_queue.retain(|queued| queued != id);
         self.snapshot.generation += 1;
         let receipt = self.emit(ControlEventKind::SubscriptionChanged, id.0.clone());
@@ -1495,6 +2295,23 @@ impl IngressControlService {
         actor: &str,
         request_id: RequestId,
         expected_generation: u64,
+        id: &SubscriptionId,
+        enabled: bool,
+    ) -> Result<MutationReceipt, ControlError> {
+        self.set_subscription_enabled_precondition(
+            actor,
+            request_id,
+            GenerationPrecondition::Expected(expected_generation),
+            id,
+            enabled,
+        )
+    }
+
+    pub(crate) fn set_subscription_enabled_precondition(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        expected_generation: GenerationPrecondition,
         id: &SubscriptionId,
         enabled: bool,
     ) -> Result<MutationReceipt, ControlError> {
@@ -1543,18 +2360,87 @@ impl IngressControlService {
         request_id: RequestId,
         id: &SubscriptionId,
     ) -> Result<MutationReceipt, ControlError> {
-        let fingerprint = format!("refresh-subscription:{id:?}");
+        let expected_generation = self.snapshot.generation;
+        self.request_subscription_refresh_with_generation(
+            actor,
+            request_id,
+            expected_generation,
+            id,
+        )
+    }
+
+    pub fn request_subscription_refresh_with_generation(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        expected_generation: u64,
+        id: &SubscriptionId,
+    ) -> Result<MutationReceipt, ControlError> {
+        let revision = self
+            .snapshot
+            .subscriptions
+            .get(id)
+            .ok_or_else(|| ControlError::SubscriptionNotFound(id.clone()))?
+            .revision;
+        self.request_subscription_refresh_checked(
+            actor,
+            request_id,
+            expected_generation,
+            id,
+            revision,
+        )
+    }
+
+    pub fn request_subscription_refresh_checked(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        expected_generation: u64,
+        id: &SubscriptionId,
+        expected_revision: u64,
+    ) -> Result<MutationReceipt, ControlError> {
+        self.request_subscription_refresh_precondition(
+            actor,
+            request_id,
+            GenerationPrecondition::Expected(expected_generation),
+            id,
+            expected_revision,
+        )
+    }
+
+    pub(crate) fn request_subscription_refresh_precondition(
+        &mut self,
+        actor: &str,
+        request_id: RequestId,
+        expected_generation: GenerationPrecondition,
+        id: &SubscriptionId,
+        expected_revision: u64,
+    ) -> Result<MutationReceipt, ControlError> {
+        let fingerprint =
+            format!("refresh-subscription:{id:?}:{expected_generation}:{expected_revision}");
         if let Some(receipt) = self.cached(actor, request_id, &fingerprint)? {
             return Ok(receipt);
         }
         self.check_actor(actor)?;
         self.ensure_cache_capacity(actor, request_id)?;
+        self.check_generation(expected_generation)?;
         let checkpoint = self.durable_checkpoint();
         let subscription = self
             .snapshot
             .subscriptions
             .get_mut(id)
             .ok_or_else(|| ControlError::SubscriptionNotFound(id.clone()))?;
+        if subscription.revision != expected_revision {
+            return Err(ControlError::RevisionConflict {
+                expected: expected_revision,
+                current: subscription.revision,
+            });
+        }
+        if !subscription.spec.enabled || subscription.spec.source_type == "static" {
+            return Err(ControlError::InvalidSubscription {
+                field: "enabled/source.type",
+            });
+        }
         if self.refresh_queue.iter().any(|queued| queued == id) {
             return Err(ControlError::RefreshAlreadyQueued(id.clone()));
         }
@@ -1663,19 +2549,25 @@ impl IngressControlService {
     fn durable_checkpoint(&self) -> DurableCheckpoint {
         DurableCheckpoint {
             snapshot: self.snapshot.clone(),
+            declarative_subscriptions: self.declarative_subscriptions.clone(),
+            declarative_initialized: self.declarative_initialized,
             events: self.events.clone(),
             refresh_queue: self.refresh_queue.clone(),
             request_cache: self.request_cache.clone(),
             next_event_id: self.next_event_id,
+            last_observation_gap: self.last_observation_gap,
         }
     }
 
     fn restore_checkpoint(&mut self, checkpoint: DurableCheckpoint) {
         self.snapshot = checkpoint.snapshot;
+        self.declarative_subscriptions = checkpoint.declarative_subscriptions;
+        self.declarative_initialized = checkpoint.declarative_initialized;
         self.events = checkpoint.events;
         self.refresh_queue = checkpoint.refresh_queue;
         self.request_cache = checkpoint.request_cache;
         self.next_event_id = checkpoint.next_event_id;
+        self.last_observation_gap = checkpoint.last_observation_gap;
     }
 
     fn persist(&self, audit: Option<AuditRecord>) -> Result<(), ControlError> {
@@ -1685,6 +2577,8 @@ impl IngressControlService {
         store
             .commit(StoreCommit {
                 snapshot: &self.snapshot,
+                declarative_subscriptions: &self.declarative_subscriptions,
+                declarative_initialized: self.declarative_initialized,
                 events: &self.events,
                 refresh_queue: &self.refresh_queue,
                 request_cache: &self.request_cache,
@@ -1714,12 +2608,17 @@ impl IngressControlService {
         }
     }
 
-    fn check_generation(&self, expected: u64) -> Result<(), ControlError> {
-        if expected == self.snapshot.generation {
+    fn check_generation(&self, expected: GenerationPrecondition) -> Result<(), ControlError> {
+        if matches!(expected, GenerationPrecondition::Force)
+            || expected == GenerationPrecondition::Expected(self.snapshot.generation)
+        {
             Ok(())
         } else {
             Err(ControlError::GenerationConflict {
-                expected,
+                expected: match expected {
+                    GenerationPrecondition::Expected(value) => value,
+                    GenerationPrecondition::Force => unreachable!(),
+                },
                 current: self.snapshot.generation,
             })
         }
@@ -1734,10 +2633,13 @@ impl IngressControlService {
         let Some(cached) = self.request_cache.get(&(actor.to_owned(), request_id)) else {
             return Ok(None);
         };
-        if now_ms().saturating_sub(cached.created_at_ms) > REQUEST_CACHE_TTL_MS {
+        if !cached.is_live(self.snapshot.generation, now_ms()) {
             return Ok(None);
         }
-        if cached.fingerprint == fingerprint {
+        let legacy = fingerprint.replace(":expected:", ":");
+        if cached.fingerprint == fingerprint_digest(fingerprint)
+            || (legacy != fingerprint && cached.fingerprint == fingerprint_digest(&legacy))
+        {
             Ok(Some(MutationReceipt {
                 replayed: true,
                 ..cached.receipt
@@ -1754,15 +2656,22 @@ impl IngressControlService {
         fingerprint: String,
         receipt: MutationReceipt,
     ) -> Result<(), ControlError> {
-        let cutoff = now_ms().saturating_sub(REQUEST_CACHE_TTL_MS);
+        let now = now_ms();
+        let generation = self.snapshot.generation;
         self.request_cache
-            .retain(|_, cached| cached.created_at_ms >= cutoff);
+            .retain(|_, cached| cached.is_live(generation, now));
+        let system_proxy_status = fingerprint
+            .starts_with("system-proxy-")
+            .then(|| self.system_proxy.clone());
         self.request_cache.insert(
             (actor.to_owned(), request_id),
             CachedCommand {
-                fingerprint,
+                fingerprint: fingerprint_digest(&fingerprint),
                 receipt,
                 created_at_ms: now_ms(),
+                system_proxy_status,
+                response_fingerprint: None,
+                response: None,
             },
         );
         Ok(())
@@ -1773,11 +2682,11 @@ impl IngressControlService {
         actor: &str,
         request_id: RequestId,
     ) -> Result<(), ControlError> {
-        let cutoff = now_ms().saturating_sub(REQUEST_CACHE_TTL_MS);
+        let now = now_ms();
         let live_count = self
             .request_cache
             .values()
-            .filter(|cached| cached.created_at_ms >= cutoff)
+            .filter(|cached| cached.is_live(self.snapshot.generation, now))
             .count();
         if live_count >= MAX_REQUEST_CACHE_COUNT
             && !self
@@ -1802,18 +2711,81 @@ impl IngressControlService {
 
     fn emit(&mut self, kind: ControlEventKind, resource_id: String) -> MutationReceipt {
         self.next_event_id += 1;
+        let observation = self.observation_snapshot();
+        let generation = match kind {
+            ControlEventKind::ObservationChanged
+            | ControlEventKind::AuditNotice
+            | ControlEventKind::PathChanged
+            | ControlEventKind::SessionChanged
+            | ControlEventKind::StreamChanged
+            | ControlEventKind::ConnectionChanged => observation.generation,
+            _ => self.snapshot.generation,
+        };
+        let payload = match kind {
+            ControlEventKind::NodeChanged => self
+                .snapshot
+                .nodes
+                .iter()
+                .find(|(id, _)| id.as_str() == resource_id)
+                .map_or_else(
+                    || json!({"id": resource_id, "state": "deleted"}),
+                    |(id, node)| json!({"id": id.as_str(), "admin": {"labels": node.labels, "tags": node.tags}}),
+                ),
+            ControlEventKind::SubscriptionChanged | ControlEventKind::SubscriptionRefreshRequested => self
+                .snapshot
+                .subscriptions
+                .iter()
+                .find(|(id, _)| id.as_str() == resource_id)
+                .map_or_else(
+                    || json!({"id": resource_id, "state": "deleted"}),
+                    |(id, subscription)| json!({
+                        "id": id.as_str(),
+                        "enabled": subscription.spec.enabled,
+                        "revision": subscription.revision,
+                        "state": if !subscription.spec.enabled {"disabled"} else {
+                            match subscription.refresh_state {
+                                SubscriptionRefreshState::Idle | SubscriptionRefreshState::Healthy => "enabled",
+                                SubscriptionRefreshState::Queued => "refreshing",
+                                SubscriptionRefreshState::Failed => "failed",
+                            }
+                        },
+                        "last_error": subscription.last_error,
+                    }),
+                ),
+            ControlEventKind::ObservationChanged => json!({
+                "sessions": observation.runtime.sessions,
+                "ready_paths": observation.runtime.ready_paths,
+                "streams": observation.runtime.streams,
+                "target_connections": observation.runtime.target_connections,
+                "freshness": format!("{:?}", observation.runtime_state).to_ascii_lowercase(),
+            }),
+            ControlEventKind::SystemProxyChanged => json!({
+                "enabled": self.system_proxy.enabled,
+                "listener_id": self.system_proxy.listener_id.as_ref().map(ListenerId::as_str),
+                "platform_effect": format!("{:?}", self.system_proxy.platform_effect).to_ascii_lowercase(),
+                "restoration_state": format!("{:?}", self.system_proxy.restoration_state).to_ascii_lowercase(),
+            }),
+            ControlEventKind::AuditNotice => json!({
+                "source": resource_id,
+                "operation": "authentication.failure",
+                "result": "denied",
+            }),
+            ControlEventKind::PathChanged | ControlEventKind::SessionChanged | ControlEventKind::StreamChanged | ControlEventKind::ConnectionChanged => Value::Null,
+        };
         let event = ControlEvent {
             id: self.next_event_id,
-            generation: self.snapshot.generation,
+            generation,
             kind,
             resource_id,
+            emitted_at_ms: Some(now_ms()),
+            payload,
         };
         self.events.push_back(event.clone());
         while self.events.len() > MAX_EVENT_COUNT {
             self.events.pop_front();
         }
         MutationReceipt {
-            generation: event.generation,
+            generation: self.snapshot.generation,
             event_id: event.id,
             replayed: false,
         }
@@ -1828,9 +2800,161 @@ fn now_ms() -> u64 {
         })
 }
 
+pub(crate) fn fingerprint_digest(fingerprint: &str) -> String {
+    use std::fmt::Write as _;
+    let digest = orion::hazardous::hash::sha2::sha256::Sha256::digest(fingerprint.as_bytes())
+        .expect("bounded management fingerprint");
+    let mut result = String::from("sha256:");
+    for byte in digest.as_ref() {
+        write!(result, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    result
+}
+
+fn subscription_declaration_fingerprint(spec: &SubscriptionSpec) -> String {
+    // A fixed JSON array is unambiguous and stable across map ordering and
+    // debug-format changes; only its digest is written to the database.
+    let value = json!([
+        "subscription-declaration-v1",
+        spec.id.as_str(),
+        spec.source_type,
+        spec.display_name,
+        spec.enabled,
+        spec.url,
+        spec.credentials_ref,
+        spec.refresh.interval_seconds,
+        spec.refresh.timeout_seconds,
+        spec.refresh.max_attempts,
+        spec.refresh.backoff_seconds,
+        spec.cache
+            .as_ref()
+            .map(|cache| (&cache.path, cache.max_age_seconds)),
+    ]);
+    fingerprint_digest(&value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_cache_requires_both_elapsed_time_and_superseded_generation_to_expire() {
+        let cached = CachedCommand {
+            fingerprint: "request".into(),
+            receipt: MutationReceipt {
+                generation: 5,
+                event_id: 1,
+                replayed: false,
+            },
+            created_at_ms: 1,
+            system_proxy_status: None,
+            response_fingerprint: None,
+            response: None,
+        };
+        assert!(cached.is_live(5, REQUEST_CACHE_TTL_MS + 2));
+        assert!(cached.is_live(6, REQUEST_CACHE_TTL_MS));
+        assert!(!cached.is_live(6, REQUEST_CACHE_TTL_MS + 2));
+    }
+
+    #[test]
+    fn repeated_runtime_publication_does_not_advance_observation_generation() {
+        let service = IngressControlService::new();
+        let handle = service.observation_handle();
+        let id = NodeId::new("node-a").unwrap();
+        handle
+            .set_node_metadata(
+                id.clone(),
+                None,
+                Some("socks5".into()),
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .unwrap();
+        let generation = service.observation_snapshot().generation;
+        handle
+            .set_node_metadata(id, None, Some("socks5".into()), None, None, BTreeMap::new())
+            .unwrap();
+        assert_eq!(service.observation_snapshot().generation, generation);
+    }
+
+    #[test]
+    fn manual_refresh_rejects_disabled_and_static_sources() {
+        for (enabled, source_type) in [(false, "clash"), (true, "static")] {
+            let mut service = IngressControlService::new();
+            let id = SubscriptionId::new(format!("{source_type}-{enabled}")).unwrap();
+            service
+                .add_subscription(
+                    "operator",
+                    RequestId::new(1),
+                    0,
+                    SubscriptionSpec {
+                        id: id.clone(),
+                        source_type: source_type.into(),
+                        display_name: "Provider".into(),
+                        enabled,
+                        url: "https://example.invalid/subscription".into(),
+                        credentials_ref: None,
+                        refresh: SubscriptionRefreshSpec::default(),
+                        cache: None,
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                service.request_subscription_refresh_with_generation(
+                    "operator",
+                    RequestId::new(2),
+                    1,
+                    &id
+                ),
+                Err(ControlError::InvalidSubscription { .. })
+            ));
+            assert!(service.next_queued_subscription_refresh().is_none());
+            assert_eq!(service.snapshot().subscriptions[&id].revision, 0);
+        }
+    }
+
+    #[test]
+    fn refresh_checks_revision_and_replays_before_current_revision_changes() {
+        let mut service = IngressControlService::new();
+        let id = SubscriptionId::new("provider").unwrap();
+        service
+            .add_subscription(
+                "operator",
+                RequestId::new(1),
+                0,
+                SubscriptionSpec {
+                    id: id.clone(),
+                    source_type: "clash".into(),
+                    display_name: "Provider".into(),
+                    enabled: true,
+                    url: "https://example.invalid/subscription".into(),
+                    credentials_ref: None,
+                    refresh: SubscriptionRefreshSpec::default(),
+                    cache: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            service.request_subscription_refresh_checked("operator", RequestId::new(2), 1, &id, 1),
+            Err(ControlError::RevisionConflict {
+                expected: 1,
+                current: 0
+            })
+        ));
+        let first = service
+            .request_subscription_refresh_checked("operator", RequestId::new(3), 1, &id, 0)
+            .unwrap();
+        service
+            .complete_subscription_refresh(&id, true, None)
+            .unwrap();
+        let replay = service
+            .request_subscription_refresh_checked("operator", RequestId::new(3), 1, &id, 0)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.generation, first.generation);
+        assert_eq!(service.snapshot().subscriptions[&id].revision, 1);
+    }
 
     fn service_with_node() -> (IngressControlService, NodeId) {
         let mut service = IngressControlService::new();
@@ -2009,6 +3133,7 @@ mod tests {
         assert_eq!(service.snapshot().generation, 0);
         assert_eq!(snapshot.generation, 3);
         assert_eq!(snapshot.runtime.streams, 4);
+        assert_eq!(snapshot.runtime.target_connections, 1);
         assert_eq!(snapshot.nodes.len(), 1);
         assert_eq!(snapshot.connections.len(), 1);
         assert_eq!(service.events_since(None).len(), 3);
@@ -2037,22 +3162,22 @@ mod tests {
                     path_id,
                     session_id,
                     state: PathState::Degraded,
-                    rtt_ms: 12,
-                    jitter_ms: 3,
-                    loss_ppm: 4_000,
-                    throughput_bps: 5_000_000,
-                    reordering_events: 6,
+                    rtt_ms: Some(12),
+                    jitter_ms: Some(3),
+                    loss_ppm: Some(4_000),
+                    throughput_bps: Some(5_000_000),
+                    reordering_events: Some(6),
                     exclusion_reason: Some("status_stale".into()),
                 }],
             )
             .unwrap();
         let snapshot = service.observation_snapshot();
         let path = snapshot.paths.get(&path_id).expect("path observation");
-        assert_eq!(path.rtt_ms, 12);
-        assert_eq!(path.jitter_ms, 3);
-        assert_eq!(path.loss_ppm, 4_000);
-        assert_eq!(path.throughput_bps, 5_000_000);
-        assert_eq!(path.reordering_events, 6);
+        assert_eq!(path.rtt_ms, Some(12));
+        assert_eq!(path.jitter_ms, Some(3));
+        assert_eq!(path.loss_ppm, Some(4_000));
+        assert_eq!(path.throughput_bps, Some(5_000_000));
+        assert_eq!(path.reordering_events, Some(6));
         assert_eq!(path.exclusion_reason.as_deref(), Some("status_stale"));
     }
 

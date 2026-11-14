@@ -95,14 +95,21 @@ PATH_CLOSE
 STATUS_REPORT
 HEARTBEAT
 CONTROL_ACK
+SESSION_CONTROL
+SESSION_CONTROL_ACK
+SESSION_CONTROL_CANCEL
 SESSION_CLOSE
 ```
 
 版本和能力协商属于 `PATH_HELLO`，并遵循[线协议 profile 注册表](wire-profile.zh-CN.md#帧封装)。`STATUS_REPORT` 是 Egress 状态报告的规范名称，`HEARTBEAT` 用于 Path 存活检测。需要返回结果的操作使用各自的成功和错误帧，例如 `STREAM_OPEN_OK` 和 `STREAM_OPEN_ERR`，而不是通用 `ERROR` 帧。
 
-控制流量拥有预留容量。一个 Session 至少需要一条活跃 Path；最后一条 Path 丢失时，Session 终止。状态报告、心跳和 Session 控制消息使用当前可用的 Path，并通过 Session 控制序列号抑制重复。当执行顺序很重要时，控制消息 MAY 选择携带依赖序列号。任何可用 Path 都 MAY 承载任何控制或数据交换。
+控制流量拥有预留容量。一个 Session 至少需要一条活跃 Path；最后一条 Path 丢失时，Session 终止。状态报告和心跳使用各自的 Path 本地序列。Session 控制消息使用 Session 范围的控制序列号抑制重复，并 MAY 携带依赖序列号。控制和数据交换使用可用且符合策略的 Path。
 
-默认情况下，控制消息会在当前多条可用 Path 上复制。接收方对每个 `control_seqno` 最多应用一次，因此复制是安全的。`CONTROL_ACK` 报告已应用的最高连续序列号以及 OPTIONAL 的选择性范围。发送方保留未确认的控制消息，并持续重传，直至消息得到确认或 Session 关闭。
+默认情况下，当 Session 复制预算允许时，Session 控制消息会在当前多条可用且符合条件的 Path 上复制；首份消息和普通重传不消耗该预算。接收方对每个 `control_seqno` 最多应用一次。`SESSION_CONTROL_ACK` 报告已应用的最高连续序列号以及 OPTIONAL 的选择性范围。发送方保留未确认的 Session 控制消息，并持续重传，直至消息得到确认或 Session transport 关闭。`CONTROL_ACK` 用于确认 Path 本地心跳。
+
+当 flow 失去符合条件的 Path 而 Session 中仍有其他可用 Path 时，
+`SESSION_CONTROL_CANCEL` 仅使用不透明 flow ID 推进或替换其控制序号。它清理该 flow，
+不会将其目标或数据发送到其他 flow 的 Path。其他 flow 和 Session 控制序号继续运行。
 
 ## 5. TCP Stream
 
@@ -219,7 +226,10 @@ PATH_CLOSE       close this Path
 SESSION_CLOSE    close the Session and all related Streams
 STATUS_REPORT    Egress capacity and health report
 HEARTBEAT        liveness and control sequence exchange
-CONTROL_ACK      applied control sequence and selective ranges
+CONTROL_ACK      applied Path heartbeat sequence and selective ranges
+SESSION_CONTROL  Session-scoped control operation and sequence
+SESSION_CONTROL_ACK  applied Session control sequence and selective ranges
+SESSION_CONTROL_CANCEL  opaque cancellation of a flow's control sequence
 ```
 
 `PATH_DRAIN` 是建议性的，可能被紧急故障中断。`PATH_CLOSE` 对该 Path 而言是最终状态。`SESSION_CLOSE` 对该 Session 而言是最终状态；最后一条 Path 消失或任一端点重启后，MUST 建立新 Session。载荷布局和排空原因由 [wire-profile-v1](wire-profile.zh-CN.md#path-和-session-控制) 定义。

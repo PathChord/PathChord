@@ -128,6 +128,58 @@ fn service_account(uid: u32, shell: Option<&Path>) -> bool {
             .is_some_and(|name| name == "nologin" || name == "false")
 }
 
+/// Resolve a default control endpoint using the same account classification as
+/// configuration discovery. Explicit socket arguments bypass this helper.
+#[cfg(unix)]
+pub(crate) fn default_control_socket(name: &str, service_default: &str) -> PathBuf {
+    use nix::unistd::{Uid, User};
+    let uid = Uid::effective();
+    let account = User::from_uid(uid).ok().flatten();
+    let service = service_account(
+        uid.as_raw(),
+        account.as_ref().map(|user| user.shell.as_path()),
+    );
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            account
+                .map(|user| user.dir)
+                .filter(|path| path.is_absolute())
+        });
+    control_socket_for_account(service, runtime, home, name, service_default)
+}
+
+#[cfg(unix)]
+fn control_socket_for_account(
+    service: bool,
+    runtime: Option<PathBuf>,
+    home: Option<PathBuf>,
+    name: &str,
+    service_default: &str,
+) -> PathBuf {
+    if service {
+        return PathBuf::from(service_default);
+    }
+    if let Some(runtime) = runtime {
+        return runtime.join("pathchord").join(name);
+    }
+    home.map_or_else(
+        || PathBuf::from(service_default),
+        |home| home.join(".config/pathchord").join(name),
+    )
+}
+
+#[cfg(not(unix))]
+pub(crate) fn default_control_socket(_name: &str, service_default: &str) -> PathBuf {
+    PathBuf::from(service_default)
+}
+
 #[cfg(not(unix))]
 fn default_selection() -> Result<ConfigSelection, ConfigurationError> {
     let name = std::env::var("USERNAME")
@@ -213,5 +265,37 @@ mod tests {
         assert!(service_account(1001, Some(Path::new("/usr/sbin/nologin"))));
         assert!(service_account(65534, Some(Path::new("/bin/false"))));
         assert!(!service_account(1000, Some(Path::new("/bin/bash"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_and_user_control_socket_defaults_are_distinct() {
+        let service_default = "/run/pathchord/ingress.sock";
+        let runtime = Some(PathBuf::from("/run/user/1001"));
+        let home = Some(PathBuf::from("/home/user"));
+        assert_eq!(
+            control_socket_for_account(
+                true,
+                runtime.clone(),
+                home.clone(),
+                "ingress.sock",
+                service_default
+            ),
+            PathBuf::from(service_default)
+        );
+        assert_eq!(
+            control_socket_for_account(
+                false,
+                runtime,
+                home.clone(),
+                "ingress.sock",
+                service_default
+            ),
+            PathBuf::from("/run/user/1001/pathchord/ingress.sock")
+        );
+        assert_eq!(
+            control_socket_for_account(false, None, home, "ingress.sock", service_default),
+            PathBuf::from("/home/user/.config/pathchord/ingress.sock")
+        );
     }
 }

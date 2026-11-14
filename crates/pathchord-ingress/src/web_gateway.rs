@@ -19,7 +19,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, options, patch, post};
 use axum::{Json, Router};
 use getrandom::fill;
-use pathchord_core::management::ManagementDispatcher;
+use pathchord_core::management::{ManagementDispatcher, ManagementSource};
 use serde_json::{Map, Value, json};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -318,6 +318,14 @@ where
             get(get_system_proxy::<D>)
                 .put(enable_system_proxy::<D>)
                 .delete(disable_system_proxy::<D>),
+        )
+        .route(
+            "/api/v1/system-proxy/enable",
+            post(enable_system_proxy::<D>),
+        )
+        .route(
+            "/api/v1/system-proxy/disable",
+            post(disable_system_proxy::<D>),
         )
         .route("/api/v1/events", get(events::<D>))
         .route("/api/v1/{*rest}", options(preflight));
@@ -647,7 +655,12 @@ where
         None,
         json!({}),
     );
-    let response = state.dispatcher.lock().await.dispatch(request).await;
+    let response = state
+        .dispatcher
+        .lock()
+        .await
+        .dispatch_from(request, ManagementSource::Web)
+        .await;
     if !response.ok {
         let status = response
             .error
@@ -671,37 +684,37 @@ where
         .into_response()
 }
 
-async fn get_path_metrics<D>(State(state): State<WebState<D>>, headers: HeaderMap) -> Response
+async fn get_path_metrics<D>(
+    State(state): State<WebState<D>>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response
 where
     D: ManagementDispatcher,
 {
-    get_operation(&state, &headers, "metrics.paths", Value::Object(Map::new())).await
+    get_operation(&state, &headers, "metrics.paths", query_body(query)).await
 }
 
-async fn get_stream_metrics<D>(State(state): State<WebState<D>>, headers: HeaderMap) -> Response
+async fn get_stream_metrics<D>(
+    State(state): State<WebState<D>>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response
 where
     D: ManagementDispatcher,
 {
-    get_operation(
-        &state,
-        &headers,
-        "metrics.streams",
-        Value::Object(Map::new()),
-    )
-    .await
+    get_operation(&state, &headers, "metrics.streams", query_body(query)).await
 }
 
-async fn get_authorizations<D>(State(state): State<WebState<D>>, headers: HeaderMap) -> Response
+async fn get_authorizations<D>(
+    State(state): State<WebState<D>>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response
 where
     D: ManagementDispatcher,
 {
-    get_operation(
-        &state,
-        &headers,
-        "authorizations.list",
-        Value::Object(Map::new()),
-    )
-    .await
+    get_operation(&state, &headers, "authorizations.list", query_body(query)).await
 }
 
 async fn get_authorization<D>(
@@ -834,16 +847,18 @@ async fn refresh_subscription<D>(
     State(state): State<WebState<D>>,
     Path(subscription_id): Path<String>,
     headers: HeaderMap,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Response
 where
     D: ManagementDispatcher,
 {
-    dispatch_http(
+    mutation_with_resource(
         &state,
-        "subscriptions.refresh",
         &headers,
-        json!({"id": subscription_id}),
-        true,
+        payload,
+        "subscriptions.refresh",
+        "id",
+        subscription_id,
         StatusCode::OK,
     )
     .await
@@ -1070,7 +1085,7 @@ where
 {
     let request_id = request_id(headers);
     let expected_generation = if mutation {
-        match expected_generation(headers) {
+        match expected_generation(headers, operation) {
             Ok(value) => value,
             Err(response) => return *response,
         }
@@ -1078,7 +1093,12 @@ where
         None
     };
     let request = request_envelope(state, operation, request_id, expected_generation, body);
-    let mut response = state.dispatcher.lock().await.dispatch(request).await;
+    let mut response = state
+        .dispatcher
+        .lock()
+        .await
+        .dispatch_from(request, ManagementSource::Web)
+        .await;
     redact_response(operation, &state.config.actor_capabilities, &mut response);
     let status = if response.ok {
         success_status
@@ -1130,6 +1150,7 @@ fn request_id(headers: &HeaderMap) -> String {
 
 fn expected_generation(
     headers: &HeaderMap,
+    operation: &str,
 ) -> Result<Option<GenerationExpectation>, Box<Response>> {
     let Some(value) = headers.get("x-pathchord-generation") else {
         return Ok(None);
@@ -1146,7 +1167,12 @@ fn expected_generation(
             ))
         })?;
     Ok(Some(GenerationExpectation {
-        scope: "configuration".to_owned(),
+        scope: if operation.starts_with("authorizations.") {
+            "authorization"
+        } else {
+            "configuration"
+        }
+        .to_owned(),
         value,
     }))
 }
@@ -1274,9 +1300,25 @@ where
                 "events.subscribe",
                 json!({"last_event_id": cursor}),
             ).await;
-            let events = response
-                .result
-                .and_then(|value| value.get("items").cloned())
+            let result = response.result.unwrap_or(Value::Null);
+            if result.get("reset_required").and_then(Value::as_bool) == Some(true) {
+                let boundary = result.get("latest_event_id").and_then(Value::as_u64).unwrap_or(0);
+                let snapshot = complete_snapshot_for_sse(&stream_state).await;
+                let value = json!({
+                    "id": boundary,
+                    "type": "metrics.snapshot",
+                    "generation": snapshot.get("generation").cloned().unwrap_or(Value::Null),
+                    "emitted_at": snapshot.pointer("/metrics/captured_at").cloned().unwrap_or(Value::Null),
+                    "resource_type": "snapshot",
+                    "resource_id": "runtime",
+                    "payload": snapshot,
+                });
+                cursor = Some(boundary);
+                yield Ok::<Event, Infallible>(Event::default().id(boundary.to_string()).event("metrics.snapshot").data(value.to_string()));
+                continue;
+            }
+            let events = result
+                .get("items").cloned()
                 .and_then(|value| value.as_array().cloned())
                 .unwrap_or_default();
             for item in events {
@@ -1285,16 +1327,19 @@ where
                     item.get("type").and_then(Value::as_str).unwrap_or("audit.notice")
                 );
                 let resource_id = item.get("resource_id").and_then(Value::as_str).unwrap_or("unknown");
-                let generation = item.get("generation").and_then(Value::as_u64).unwrap_or(0);
+                let generation = item
+                    .get("generation")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"scope": "observation", "value": 0}));
                 let resource_type = event_type.split('.').next().unwrap_or("runtime");
                 let value = json!({
                     "id": id,
                     "type": event_type,
-                    "generation": {"scope": "observation", "value": generation},
-                    "emitted_at": now_ms(),
-                    "resource_type": resource_type,
+                    "generation": generation,
+                    "emitted_at": item.get("emitted_at").cloned().unwrap_or(Value::Null),
+                    "resource_type": item.get("resource_type").and_then(Value::as_str).unwrap_or(resource_type),
                     "resource_id": resource_id,
-                    "payload": {},
+                    "payload": item.get("payload").cloned().unwrap_or_else(|| json!({})),
                 });
                 cursor = Some(id);
                 yield Ok::<Event, Infallible>(
@@ -1312,6 +1357,66 @@ where
         .into_response()
 }
 
+async fn complete_snapshot_for_sse<D>(state: &WebState<D>) -> Value
+where
+    D: ManagementDispatcher,
+{
+    let metrics = dispatch_for_sse(state, "metrics.snapshot", json!({})).await;
+    let mut resources = Map::new();
+    let mut operations = vec![
+        ("nodes", "nodes.list"),
+        ("listeners", "listeners.list"),
+        ("sessions", "sessions.list"),
+        ("connections", "connections.list"),
+        ("subscriptions", "subscriptions.list"),
+        ("paths", "metrics.paths"),
+        ("streams", "metrics.streams"),
+    ];
+    if state.config.authorizations_enabled {
+        operations.push(("authorizations", "authorizations.list"));
+    }
+    for (name, operation) in operations {
+        let mut items = Vec::new();
+        let mut token: Option<String> = None;
+        let mut complete = false;
+        for _ in 0..64 {
+            let response = dispatch_for_sse(
+                state,
+                operation,
+                json!({"page_size": 1000, "page_token": token}),
+            )
+            .await;
+            if !response.ok {
+                break;
+            }
+            let Some(result) = response.result else {
+                break;
+            };
+            let Some(page) = result.get("items").and_then(Value::as_array) else {
+                break;
+            };
+            items.extend(page.iter().cloned());
+            token = result
+                .get("next_page_token")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if token.is_none() {
+                complete = true;
+                break;
+            }
+        }
+        resources.insert(
+            name.to_owned(),
+            if complete {
+                Value::Array(items)
+            } else {
+                Value::Null
+            },
+        );
+    }
+    json!({"generation": metrics.observed_generation, "metrics": metrics.result, "resources": resources})
+}
+
 async fn dispatch_for_sse<D>(
     state: &WebState<D>,
     operation: &'static str,
@@ -1321,7 +1426,12 @@ where
     D: ManagementDispatcher,
 {
     let request = request_envelope(state, operation, request_id(&HeaderMap::new()), None, body);
-    state.dispatcher.lock().await.dispatch(request).await
+    state
+        .dispatcher
+        .lock()
+        .await
+        .dispatch_from(request, ManagementSource::Web)
+        .await
 }
 
 fn canonical_event_type(value: &str) -> &'static str {
@@ -1331,6 +1441,12 @@ fn canonical_event_type(value: &str) -> &'static str {
         "subscriptionrefreshrequested" => "subscription.changed",
         "observationchanged" | "metrics.snapshot" => "metrics.snapshot",
         "systemproxychanged" | "system_proxy.changed" => "system_proxy.changed",
+        "auditnotice" | "audit.notice" => "audit.notice",
+        "authorizationchanged" | "authorization.changed" => "authorization.changed",
+        "pathchanged" | "path.changed" => "path.changed",
+        "sessionchanged" | "session.changed" => "session.changed",
+        "streamchanged" | "stream.changed" => "stream.changed",
+        "connectionchanged" | "connection.changed" => "connection.changed",
         _ => "audit.notice",
     }
 }
@@ -1716,5 +1832,48 @@ mod tests {
         assert!(body.contains("id: 1"));
         assert!(body.contains("node.changed"));
         gateway.stop().await;
+    }
+
+    #[tokio::test]
+    async fn replay_gap_emits_a_resource_snapshot_at_a_new_cursor() {
+        let gateway = start(
+            WebGatewayConfig {
+                event_poll_interval: Duration::from_millis(10),
+                ..WebGatewayConfig::default()
+            },
+            dispatcher(),
+        )
+        .await;
+        let stream = Client::new()
+            .get(gateway.url("/api/v1/events"))
+            .header("last-event-id", "9999")
+            .send()
+            .await
+            .unwrap();
+        let body = read_sse_until(stream, "\"resources\"").await;
+        assert!(body.contains("id: 1"));
+        assert!(body.contains("node-1"));
+        assert!(body.contains("\"metrics\""));
+        gateway.stop().await;
+    }
+
+    #[test]
+    fn generation_header_uses_the_owner_of_the_operation() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pathchord-generation", HeaderValue::from_static("7"));
+        assert_eq!(
+            expected_generation(&headers, "authorizations.enroll")
+                .unwrap()
+                .unwrap()
+                .scope,
+            "authorization"
+        );
+        assert_eq!(
+            expected_generation(&headers, "nodes.patch_tags")
+                .unwrap()
+                .unwrap()
+                .scope,
+            "configuration"
+        );
     }
 }

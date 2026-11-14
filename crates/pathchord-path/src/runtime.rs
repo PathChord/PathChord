@@ -1,6 +1,6 @@
 //! Long-lived, reliable TCP Stream ownership for one admitted Path.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::pending;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,14 +10,15 @@ use pathchord_core::{
     AckRange, CAPABILITY_TRAFFIC_CLASSES, ControlAck, ControlReceiver, ControlSender,
     EgressServiceState, ErrorClass, FrameCodecError, FrameFlags, FrameType, Heartbeat, MAX_VARINT,
     Message, MessageCodecError, PathClose, PathDrain, PathFrame, PathId, ProtocolLimits,
-    ReliabilityError, RequestId, SessionClose, SessionId, StatusReport, StatusReportDisposition,
-    StreamAck, StreamData, StreamFin, StreamId, StreamOpen, StreamOpenClass, StreamOpenErr,
-    StreamOpenOk, StreamReceiveBuffer, StreamRst, StreamState, StreamWindow, TargetEndpoint,
-    TrafficClassConfig, UdpClose, UdpDatagram, UdpOpen, UdpOpenClass, UdpOpenErr,
+    ReliabilityError, RequestId, SessionClose, SessionControl, SessionControlCancel,
+    SessionControlFlow, SessionId, StatusReport, StatusReportDisposition, StreamAck, StreamData,
+    StreamFin, StreamId, StreamOpen, StreamOpenClass, StreamOpenErr, StreamOpenOk,
+    StreamReceiveBuffer, StreamRst, StreamState, StreamWindow, TargetEndpoint, TrafficClassConfig,
+    UdpClose, UdpDatagram, UdpOpen, UdpOpenClass, UdpOpenErr,
 };
 use pathchord_noise::{
     MAX_NOISE_MESSAGE_LEN, NoiseError, NoiseTransport, RECORD_ENVELOPE_HEADER_LEN,
-    TRANSPORT_TAG_LEN,
+    ReplayAwareFrame, TRANSPORT_TAG_LEN,
 };
 use thiserror::Error;
 use tokio::io::{
@@ -45,8 +46,8 @@ const STREAM_FLAG_RST: u64 = 2;
 const MIN_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_RETRANSMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RETRANSMISSION_ATTEMPTS: u32 = 3;
-const MAX_CLASS_OPEN_ATTEMPTS: u32 = 8;
 const MAX_PENDING_CONTROL_MESSAGES: usize = 32;
+const MAX_SESSION_CONTROL_MESSAGES: usize = 4096;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const CONTROL_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(500);
 const PATH_DEGRADED_AFTER: Duration = Duration::from_secs(3);
@@ -248,12 +249,16 @@ pub struct SessionSnapshot {
     pub path_id: PathId,
     pub ready_paths: usize,
     pub ready_path_ids: Vec<PathId>,
+    pub path_states: BTreeMap<PathId, pathchord_core::PathState>,
     pub degraded_paths: usize,
     pub effective_capacity_bps: u64,
     pub egress_aggregate_capacity_bps: u64,
     pub recommended_path_count: u64,
     pub path_quality: BTreeMap<PathId, PathQualitySnapshot>,
     pub active_streams: usize,
+    pub active_udp_associations: usize,
+    pub pending_session_controls: usize,
+    pub egress_status: Option<EgressStatusObservation>,
     pub streams: BTreeMap<StreamId, StreamSnapshot>,
     pub pending_stream_opens: usize,
     pub retained_outbound_bytes: usize,
@@ -262,12 +267,22 @@ pub struct SessionSnapshot {
     pub closed: bool,
 }
 
+/// Latest authenticated Egress sample and its observed age at snapshot time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressStatusObservation {
+    pub report: StatusReport,
+    pub age_ms: u64,
+    pub fresh: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathExclusionReason {
     HeartbeatStale,
     StatusStale,
     Draining,
     HardUnavailable,
+    IncrementalCapacityBelowOverhead,
+    CongestionWindowExhausted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,12 +374,16 @@ impl IngressSessionHandle {
             path_id,
             ready_paths: 1,
             ready_path_ids: vec![path_id],
+            path_states: BTreeMap::from([(path_id, pathchord_core::PathState::Active)]),
             degraded_paths: 0,
             effective_capacity_bps: 0,
             egress_aggregate_capacity_bps: 0,
             recommended_path_count: 1,
             path_quality: BTreeMap::new(),
             active_streams: 0,
+            active_udp_associations: 0,
+            pending_session_controls: 0,
+            egress_status: None,
             streams: BTreeMap::new(),
             pending_stream_opens: 0,
             retained_outbound_bytes: 0,
@@ -535,6 +554,22 @@ impl IngressSessionHandle {
             .await
             .map_err(|_| SessionRuntimeError::PathClosed)?;
         result.await.map_err(|_| SessionRuntimeError::PathClosed)?
+    }
+
+    pub async fn add_replacement_path<S>(
+        &self,
+        path: IngressAdmittedPath<S>,
+        observation: MultipathPathObservation,
+        previous_path_id: PathId,
+    ) -> Result<(), SessionRuntimeError>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let result = self.add_path(path, observation).await;
+        if result.is_ok() {
+            let _ = previous_path_id;
+        }
+        result
     }
 
     pub async fn drain_path(&self, path_id: PathId) -> Result<(), SessionRuntimeError> {
@@ -863,12 +898,16 @@ impl EgressSessionHandle {
             path_id,
             ready_paths: 1,
             ready_path_ids: vec![path_id],
+            path_states: BTreeMap::from([(path_id, pathchord_core::PathState::Active)]),
             degraded_paths: 0,
             effective_capacity_bps: 0,
             egress_aggregate_capacity_bps: 0,
             recommended_path_count: 1,
             path_quality: BTreeMap::new(),
             active_streams: 0,
+            active_udp_associations: 0,
+            pending_session_controls: 0,
+            egress_status: None,
             streams: BTreeMap::new(),
             pending_stream_opens: 0,
             retained_outbound_bytes: 0,
@@ -1054,7 +1093,6 @@ impl ErasedAdmittedPath {
 }
 
 struct PendingIngressOpen {
-    retry: Option<(Message, Instant, u32)>,
     traffic_class: Option<TrafficClassConfig>,
     io: BoxedSessionStream,
     eligible_paths: Option<BTreeMap<PathId, u32>>,
@@ -1062,7 +1100,6 @@ struct PendingIngressOpen {
 }
 
 struct PendingIngressUdp {
-    retry: Option<(Message, Instant, u32)>,
     traffic_class: Option<TrafficClassConfig>,
     datagrams: mpsc::Sender<Vec<u8>>,
     eligible_paths: Option<BTreeMap<PathId, u32>>,
@@ -1086,6 +1123,7 @@ struct CachedEgressOpen {
     request: StreamOpen,
     result: CachedOpenResult,
     eligible_paths: BTreeMap<PathId, u32>,
+    unrestricted_paths: bool,
 }
 
 struct FactoryCompletion {
@@ -1106,6 +1144,11 @@ enum ReaderEvent {
         path_id: PathId,
         error: SessionRuntimeError,
     },
+}
+
+enum RecordRead {
+    Frame(PathFrame),
+    ReplayDropped,
 }
 
 enum PathWriterCommand {
@@ -1181,6 +1224,7 @@ struct ActiveStream {
     local_receive_limit: u64,
     local_fin: bool,
     remote_fin: bool,
+    remote_fin_offset: Option<u64>,
     eligible_paths: Option<BTreeMap<PathId, u32>>,
 }
 
@@ -1195,6 +1239,34 @@ struct PendingHeartbeat {
     first_sent_at: Instant,
     last_sent_at: Instant,
     attempts: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionControlEntry {
+    Control(SessionControl),
+    Cancel(SessionControlCancel),
+}
+
+impl SessionControlEntry {
+    fn sequence(&self) -> u64 {
+        match self {
+            Self::Control(value) => value.sequence,
+            Self::Cancel(value) => value.sequence,
+        }
+    }
+
+    fn message(&self) -> Message {
+        match self {
+            Self::Control(value) => Message::SessionControl(value.clone()),
+            Self::Cancel(value) => Message::SessionControlCancel(value.clone()),
+        }
+    }
+}
+
+struct PendingSessionControl {
+    message: SessionControlEntry,
+    eligible_paths: Option<BTreeMap<PathId, u32>>,
+    last_sent_at: Instant,
 }
 
 struct PathHealth {
@@ -1213,6 +1285,10 @@ struct PathHealth {
     throughput_bps: u64,
     reordering_events: u64,
     data_events: u64,
+    effective_capacity_bps: u64,
+    congestion_window_bytes: Option<u64>,
+    incremental_capacity_bps: Option<u64>,
+    scheduling_overhead_bps: Option<u64>,
     exclusion_reason: Option<PathExclusionReason>,
     relationship_weight_basis_points: u16,
 }
@@ -1235,6 +1311,10 @@ impl PathHealth {
             throughput_bps: 0,
             reordering_events: 0,
             data_events: 0,
+            effective_capacity_bps: 1,
+            congestion_window_bytes: None,
+            incremental_capacity_bps: None,
+            scheduling_overhead_bps: None,
             exclusion_reason: None,
             relationship_weight_basis_points: 10_000,
         })
@@ -1248,12 +1328,19 @@ struct PendingUdpSend {
 }
 
 struct SessionActor<W> {
+    session_control_sender: ControlSender<PendingSessionControl>,
+    next_session_control: u64,
+    queued_session_controls: BTreeMap<u64, (BTreeSet<PathId>, SessionControlEntry)>,
+    active_control_eligible: Option<Option<BTreeMap<PathId, u32>>>,
+    local_close_sequence: Option<u64>,
+    remote_closing: bool,
     capabilities: u64,
     traffic_queue: crate::traffic_queue::TrafficQueue,
     stream_observations: BTreeMap<StreamId, StreamSnapshot>,
     closed_streams: VecDeque<StreamId>,
     udp_classes: HashMap<u64, TrafficClassConfig>,
     pending_udp: HashMap<u64, VecDeque<PendingUdpSend>>,
+    closing_udp: HashMap<u64, Vec<oneshot::Sender<Result<(), OpenUdpError>>>>,
     role: ActorRole,
     writer: RecordWriter<W>,
     reader_task: JoinHandle<()>,
@@ -1267,6 +1354,8 @@ struct SessionActor<W> {
     status_provider: Arc<dyn EgressStatusProvider>,
     recommended_path_count: u64,
     egress_aggregate_capacity_bps: u64,
+    latest_egress_status: Option<(StatusReport, Instant)>,
+    session_policy_floor: Option<MultipathConfig>,
     commands: Option<mpsc::Receiver<IngressCommand>>,
     stream_events: mpsc::Receiver<StreamEvent>,
     stream_event_tx: mpsc::Sender<StreamEvent>,
@@ -1280,6 +1369,8 @@ struct SessionActor<W> {
     pending_ingress_udp: HashMap<u64, PendingIngressUdp>,
     ingress_udp: HashMap<u64, IngressUdpAssociation>,
     egress_udp_paths: HashMap<u64, BTreeMap<PathId, u32>>,
+    unrestricted_udp_paths: BTreeSet<u64>,
+    retired_udp_associations: BTreeSet<u64>,
     next_udp_association_id: u64,
     udp_send_sequences: HashMap<u64, u64>,
     udp_runtime: Option<UdpAssociationRuntime<Arc<dyn UdpTargetFactory>>>,
@@ -1354,11 +1445,17 @@ where
         let reader_task = tokio::spawn(record_reader_loop(path_id, reader, frame_tx.clone()));
         let (stream_event_tx, stream_events) = mpsc::channel(STREAM_EVENT_QUEUE_CAPACITY);
         let (factory_result_tx, factory_results) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let outgoing_budget = if matches!(role, ActorRole::Egress { .. }) {
+            0
+        } else {
+            buffer_limit as u64
+        };
         let mut multipath = MultipathSession::new(
             session_id,
             MultipathConfig {
-                session_replication_budget_bytes: buffer_limit as u64,
-                default_stream_replication_budget_bytes: buffer_limit as u64,
+                session_replication_budget_bytes: outgoing_budget,
+                default_stream_replication_budget_bytes: outgoing_budget,
+                retransmission_replication_enabled: outgoing_budget != 0,
                 ..MultipathConfig::default()
             },
         )?;
@@ -1373,12 +1470,19 @@ where
         let status_provider: Arc<dyn EgressStatusProvider> =
             status_provider.unwrap_or_else(|| Arc::new(StaticEgressStatusProvider(egress_status)));
         Ok(Self {
+            session_control_sender: ControlSender::new(MAX_SESSION_CONTROL_MESSAGES)?,
+            next_session_control: 0,
+            queued_session_controls: BTreeMap::new(),
+            active_control_eligible: None,
+            local_close_sequence: None,
+            remote_closing: false,
             capabilities,
             traffic_queue: Default::default(),
             stream_observations: BTreeMap::new(),
             closed_streams: VecDeque::new(),
             udp_classes: HashMap::new(),
             pending_udp: HashMap::new(),
+            closing_udp: HashMap::new(),
             role,
             writer,
             reader_task,
@@ -1392,6 +1496,8 @@ where
             status_provider,
             recommended_path_count: egress_status.recommended_path_count,
             egress_aggregate_capacity_bps: 0,
+            latest_egress_status: None,
+            session_policy_floor: None,
             commands,
             stream_events,
             stream_event_tx,
@@ -1405,6 +1511,8 @@ where
             pending_ingress_udp: HashMap::new(),
             ingress_udp: HashMap::new(),
             egress_udp_paths: HashMap::new(),
+            unrestricted_udp_paths: BTreeSet::new(),
+            retired_udp_associations: BTreeSet::new(),
             next_udp_association_id: 1,
             udp_send_sequences: HashMap::new(),
             udp_runtime,
@@ -1433,6 +1541,55 @@ impl<W> SessionActor<W>
 where
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    /// Several flows can share this Session. Until per-flow budgets are
+    /// negotiated, keep the most restrictive budget seen for its lifetime.
+    fn restrict_session_policy(&mut self, incoming: MultipathConfig) -> Result<(), MultipathError> {
+        if incoming.max_paths == 0
+            || (incoming.retransmission_replication_enabled
+                && (incoming.session_replication_budget_bytes == 0
+                    || incoming.default_stream_replication_budget_bytes == 0))
+        {
+            return Err(MultipathError::ZeroCapacity);
+        }
+        if incoming
+            .class_replication_budget_bytes
+            .values()
+            .any(|budget| *budget > incoming.session_replication_budget_bytes)
+        {
+            return Err(MultipathError::InvalidReplicationBudget);
+        }
+        let mut restricted = self
+            .session_policy_floor
+            .clone()
+            .unwrap_or_else(|| incoming.clone());
+        restricted.max_paths = restricted.max_paths.min(incoming.max_paths);
+        restricted.session_replication_budget_bytes = restricted
+            .session_replication_budget_bytes
+            .min(incoming.session_replication_budget_bytes);
+        restricted.default_stream_replication_budget_bytes = restricted
+            .default_stream_replication_budget_bytes
+            .min(incoming.default_stream_replication_budget_bytes)
+            .min(restricted.session_replication_budget_bytes);
+        restricted.retransmission_replication_enabled &= incoming
+            .retransmission_replication_enabled
+            && restricted.session_replication_budget_bytes > 0
+            && restricted.default_stream_replication_budget_bytes > 0;
+        restricted.require_fresh_status_report |= incoming.require_fresh_status_report;
+        for (class, budget) in incoming.class_replication_budget_bytes {
+            restricted
+                .class_replication_budget_bytes
+                .entry(class)
+                .and_modify(|current| *current = (*current).min(budget))
+                .or_insert(budget);
+        }
+        for budget in restricted.class_replication_budget_bytes.values_mut() {
+            *budget = (*budget).min(restricted.session_replication_budget_bytes);
+        }
+        self.multipath.reconfigure(restricted.clone())?;
+        self.session_policy_floor = Some(restricted);
+        Ok(())
+    }
+
     async fn run(mut self) -> Result<SessionSnapshot, SessionRuntimeError> {
         self.publish_snapshot(false);
         let result = self.run_loop().await;
@@ -1466,6 +1623,7 @@ where
                             }
                         }
                         Some(ReaderEvent::Closed { path_id }) => {
+                            if self.remote_closing { return Ok(()); }
                             if self.handle_path_failure(path_id).await? {
                                 let retained = self.retained_outbound_bytes();
                                 return if retained == 0 {
@@ -1476,6 +1634,7 @@ where
                             }
                         }
                         Some(ReaderEvent::Failed { path_id, error }) => {
+                            if self.remote_closing { return Ok(()); }
                             if self.handle_path_failure(path_id).await? {
                                 return Err(error);
                             }
@@ -1494,7 +1653,7 @@ where
                     }
                 }
                 _ = retransmission_tick.tick() => {
-                    self.retry_class_opens().await?;
+                    self.retry_session_controls().await?;
                     self.handle_retransmission_timeouts().await?;
                     self.poll_udp_targets().await?;
                     if self.handle_path_health().await? {
@@ -1512,6 +1671,8 @@ where
                 self.handle_stream_event(event).await?;
             }
             self.flush_business().await?;
+            self.finish_pending_udp_closes().await?;
+            self.retire_drained_udp();
             self.publish_snapshot(false);
         }
     }
@@ -1522,12 +1683,20 @@ where
     ) -> Result<bool, SessionRuntimeError> {
         match command {
             IngressCommand::Shutdown => {
-                self.send_message(Message::SessionClose(SessionClose {
-                    error: ErrorClass::PathFailure,
-                    reason: b"Ingress shutdown".to_vec(),
-                }))
-                .await?;
-                Ok(true)
+                if self.local_close_sequence.is_some() {
+                    return Ok(false);
+                }
+                let sequence = self
+                    .send_session_control(
+                        Message::SessionClose(SessionClose {
+                            error: ErrorClass::PathFailure,
+                            reason: b"Ingress shutdown".to_vec(),
+                        }),
+                        None,
+                    )
+                    .await?;
+                self.local_close_sequence = Some(sequence);
+                Ok(false)
             }
             IngressCommand::OpenUdp {
                 target,
@@ -1552,7 +1721,7 @@ where
                     return Ok(false);
                 }
                 if let Some(config) = multipath_config
-                    && let Err(error) = self.multipath.reconfigure(config)
+                    && let Err(error) = self.restrict_session_policy(config)
                 {
                     let _ = reply.send(Err(OpenUdpError::Rejected {
                         error: ErrorClass::LocalPolicy,
@@ -1595,28 +1764,13 @@ where
                 self.pending_ingress_udp.insert(
                     association_id,
                     PendingIngressUdp {
-                        retry: traffic_class
-                            .as_ref()
-                            .map(|_| (open.clone(), Instant::now(), 0)),
                         traffic_class,
                         datagrams,
                         eligible_paths: eligible_paths.clone(),
                         reply,
                     },
                 );
-                if let Some(eligible) = eligible_paths {
-                    let mut sent = false;
-                    for path_id in eligible.keys().copied() {
-                        if self.send_message_on(path_id, open.clone()).await.is_ok() {
-                            sent = true;
-                        }
-                    }
-                    if !sent {
-                        return Err(SessionRuntimeError::PathClosed);
-                    }
-                } else {
-                    self.send_message(open).await?;
-                }
+                self.send_session_control(open, eligible_paths).await?;
                 Ok(false)
             }
             IngressCommand::SendUdp {
@@ -1625,6 +1779,7 @@ where
                 reply,
             } => {
                 if !self.ingress_udp.contains_key(&association_id)
+                    || self.closing_udp.contains_key(&association_id)
                     || payload.len() > self.limits.max_frame_payload()
                 {
                     let _ = reply.send(Err(OpenUdpError::SessionClosed));
@@ -1649,21 +1804,14 @@ where
                 association_id,
                 reply,
             } => {
-                self.send_udp_message(
-                    association_id,
-                    Message::UdpClose(UdpClose {
-                        association_id,
-                        error: ErrorClass::PathFailure,
-                        reason: b"UDP Association closed locally".to_vec(),
-                    }),
-                )
-                .await?;
-                self.pending_ingress_udp.remove(&association_id);
-                self.ingress_udp.remove(&association_id);
-                self.pending_udp.remove(&association_id);
-                self.udp_classes.remove(&association_id);
-                self.udp_send_sequences.remove(&association_id);
-                let _ = reply.send(Ok(()));
+                if self.ingress_udp.contains_key(&association_id) {
+                    self.closing_udp
+                        .entry(association_id)
+                        .or_default()
+                        .push(reply);
+                } else {
+                    let _ = reply.send(Ok(()));
+                }
                 Ok(false)
             }
             IngressCommand::AddPath {
@@ -1750,6 +1898,10 @@ where
             } => {
                 if let Some(health) = self.path_health.get_mut(&path_id) {
                     health.relationship_weight_basis_points = observation.weight_basis_points;
+                    health.effective_capacity_bps = observation.effective_capacity_bps;
+                    health.congestion_window_bytes = observation.congestion_window_bytes;
+                    health.incremental_capacity_bps = observation.incremental_capacity_bps;
+                    health.scheduling_overhead_bps = observation.scheduling_overhead_bps;
                 }
                 let result = self
                     .multipath
@@ -1781,7 +1933,7 @@ where
                     return Ok(false);
                 }
                 if let Some(config) = multipath_config
-                    && let Err(error) = self.multipath.reconfigure(config)
+                    && let Err(error) = self.restrict_session_policy(config)
                 {
                     let _ = reply.send(Err(OpenStreamError::Rejected {
                         error: ErrorClass::LocalPolicy,
@@ -1827,32 +1979,17 @@ where
                 self.pending_ingress.insert(
                     stream_id,
                     PendingIngressOpen {
-                        retry: traffic_class
-                            .as_ref()
-                            .map(|_| (open.clone(), Instant::now(), 0)),
                         traffic_class,
                         io,
                         eligible_paths,
                         reply,
                     },
                 );
-                if let Some(eligible) = self
+                let eligible = self
                     .pending_ingress
                     .get(&stream_id)
-                    .and_then(|pending| pending.eligible_paths.clone())
-                {
-                    let mut sent = false;
-                    for path_id in eligible.keys().copied() {
-                        if self.send_message_on(path_id, open.clone()).await.is_ok() {
-                            sent = true;
-                        }
-                    }
-                    if !sent {
-                        return Err(SessionRuntimeError::PathClosed);
-                    }
-                } else {
-                    self.send_message(open).await?;
-                }
+                    .and_then(|pending| pending.eligible_paths.clone());
+                self.send_session_control(open, eligible).await?;
                 Ok(false)
             }
         }
@@ -1877,7 +2014,7 @@ where
         {
             return Err(SessionRuntimeError::InvalidRuntimeLimit);
         }
-        self.multipath.add_path(path.path_id, observation)?;
+        self.multipath.add_path(path.path_id, observation.clone())?;
         let path_id = path.path_id;
         let limits = path.records.limits();
         let (io, noise) = path.records.into_parts();
@@ -1914,8 +2051,32 @@ where
                 reader_task,
             },
         );
-        self.path_health
-            .insert(path_id, PathHealth::new(Instant::now())?);
+        let mut health = PathHealth::new(Instant::now())?;
+        health.relationship_weight_basis_points = observation.weight_basis_points;
+        health.effective_capacity_bps = observation.effective_capacity_bps;
+        health.congestion_window_bytes = observation.congestion_window_bytes;
+        health.incremental_capacity_bps = observation.incremental_capacity_bps;
+        health.scheduling_overhead_bps = observation.scheduling_overhead_bps;
+        self.path_health.insert(path_id, health);
+        for cached in self
+            .egress_requests
+            .values_mut()
+            .filter(|cached| cached.unrestricted_paths)
+        {
+            cached.eligible_paths.entry(path_id).or_insert(100);
+            if let Some(stream) = self.streams.get_mut(&cached.request.stream_id)
+                && let Some(eligible) = stream.eligible_paths.as_mut()
+            {
+                eligible.entry(path_id).or_insert(100);
+            }
+        }
+        for id in &self.unrestricted_udp_paths {
+            self.egress_udp_paths
+                .entry(*id)
+                .or_default()
+                .entry(path_id)
+                .or_insert(100);
+        }
         Ok(())
     }
 
@@ -1936,6 +2097,7 @@ where
         self.path_health.remove(&path_id);
         let outcome = self.multipath.mark_path_failed(path_id)?;
         if !outcome.session_closed {
+            self.cancel_unroutable_flows().await?;
             let retained: Vec<_> = self
                 .streams
                 .iter()
@@ -1974,6 +2136,8 @@ where
                         snapshot.retransmissions = snapshot.retransmissions.saturating_add(1);
                     }
                 }
+                self.send_additional_replica(stream_id, offset, plan.path_id, eligible.as_ref())
+                    .await?;
             }
             reset.sort_unstable();
             reset.dedup();
@@ -2029,13 +2193,27 @@ where
                 continue;
             }
             let excluded = (self.multipath.ready_path_count() > 1).then_some(last_path);
-            let plan = self.multipath.retransmit_range(
-                stream_id,
-                offset,
-                excluded,
-                self.outbound_direction(),
-                eligible.as_ref(),
-            )?;
+            let plan = self
+                .multipath
+                .retransmit_range(
+                    stream_id,
+                    offset,
+                    excluded,
+                    self.outbound_direction(),
+                    eligible.as_ref(),
+                )
+                .or_else(|error| {
+                    if error != MultipathError::NoSchedulablePath || excluded.is_none() {
+                        return Err(error);
+                    }
+                    self.multipath.retransmit_range(
+                        stream_id,
+                        offset,
+                        None,
+                        self.outbound_direction(),
+                        eligible.as_ref(),
+                    )
+                })?;
             self.send_message_on(plan.path_id, Message::StreamData(plan.data.clone()))
                 .await?;
             if let Some(stream) = self.streams.get_mut(&stream_id)
@@ -2048,7 +2226,41 @@ where
                     snapshot.retransmissions = snapshot.retransmissions.saturating_add(1);
                 }
             }
+            self.send_additional_replica(stream_id, offset, plan.path_id, eligible.as_ref())
+                .await?;
         }
+        Ok(())
+    }
+
+    async fn send_additional_replica(
+        &mut self,
+        stream_id: StreamId,
+        offset: u64,
+        primary_path: PathId,
+        eligible: Option<&BTreeMap<PathId, u32>>,
+    ) -> Result<(), SessionRuntimeError> {
+        if !self.multipath.retransmission_replication_enabled() {
+            return Ok(());
+        }
+        let direction = self.outbound_direction();
+        let plan = match self.multipath.replicate_range(
+            stream_id,
+            offset,
+            Some(primary_path),
+            direction,
+            eligible,
+        ) {
+            Ok(plan) => plan,
+            Err(MultipathError::ReplicationBudgetExhausted | MultipathError::NoSchedulablePath) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // The ordinary retransmission was already sent. Failure of this optional
+        // copy must not turn the Stream or Session into a failure.
+        let _ = self
+            .send_raw_message_on(plan.path_id, Message::StreamData(plan.data))
+            .await;
         Ok(())
     }
 
@@ -2135,6 +2347,11 @@ where
                 self.ingress_udp.remove(&close.association_id);
                 self.egress_udp_paths.remove(&close.association_id);
                 self.pending_udp.remove(&close.association_id);
+                if let Some(waiters) = self.closing_udp.remove(&close.association_id) {
+                    for waiter in waiters {
+                        let _ = waiter.send(Ok(()));
+                    }
+                }
                 self.udp_classes.remove(&close.association_id);
                 self.udp_send_sequences.remove(&close.association_id);
             }
@@ -2172,6 +2389,58 @@ where
             }
             for message in messages {
                 self.send_udp_message(association_id, message).await?;
+            }
+        }
+        if let Some(runtime) = self.udp_runtime.as_mut() {
+            self.retired_udp_associations
+                .extend(runtime.reap_draining());
+        }
+        Ok(())
+    }
+
+    fn retire_drained_udp(&mut self) {
+        self.retired_udp_associations.retain(|id| {
+            if self
+                .pending_udp
+                .get(id)
+                .is_some_and(|queue| !queue.is_empty())
+            {
+                return true;
+            }
+            self.pending_udp.remove(id);
+            self.egress_udp_paths.remove(id);
+            self.unrestricted_udp_paths.remove(id);
+            self.udp_classes.remove(id);
+            self.udp_send_sequences.remove(id);
+            false
+        });
+    }
+
+    async fn finish_pending_udp_closes(&mut self) -> Result<(), SessionRuntimeError> {
+        let ready: Vec<_> = self
+            .closing_udp
+            .keys()
+            .copied()
+            .filter(|id| self.pending_udp.get(id).is_none_or(VecDeque::is_empty))
+            .collect();
+        for id in ready {
+            self.send_udp_message(
+                id,
+                Message::UdpClose(UdpClose {
+                    association_id: id,
+                    error: ErrorClass::PathFailure,
+                    reason: b"UDP Association closed locally".to_vec(),
+                }),
+            )
+            .await?;
+            self.ingress_udp.remove(&id);
+            self.pending_udp.remove(&id);
+            self.udp_classes.remove(&id);
+            self.udp_send_sequences.remove(&id);
+            if let Some(waiters) = self.closing_udp.remove(&id) {
+                for waiter in waiters {
+                    let _ = waiter.send(Ok(()));
+                }
             }
         }
         Ok(())
@@ -2285,11 +2554,18 @@ where
             self.multipath.update_observation(
                 *path_id,
                 MultipathPathObservation {
-                    effective_capacity_bps: health.throughput_bps.max(1),
+                    effective_capacity_bps: health.effective_capacity_bps,
                     weight_basis_points: health.relationship_weight_basis_points,
                     rtt_ms: health.rtt_ms.max(1),
                     jitter_ms: health.jitter_ms,
                     loss_basis_points: (loss_ppm / 100).min(10_000) as u16,
+                    reordering_basis_points: (health.data_events > 0).then(|| {
+                        (health.reordering_events.saturating_mul(10_000) / health.data_events)
+                            .min(10_000) as u16
+                    }),
+                    congestion_window_bytes: health.congestion_window_bytes,
+                    incremental_capacity_bps: health.incremental_capacity_bps,
+                    scheduling_overhead_bps: health.scheduling_overhead_bps,
                 },
             )?;
         }
@@ -2407,6 +2683,233 @@ where
         }
         let message = Message::decode(frame.header().frame_type(), frame.payload(), self.limits)?;
         match message {
+            Message::SessionControl(control) => self.handle_session_control(path_id, control).await,
+            Message::SessionControlCancel(cancel) => {
+                self.queue_session_control(path_id, SessionControlEntry::Cancel(cancel))
+                    .await
+            }
+            Message::SessionControlAck(ack) => {
+                if ack.highest_contiguous >= self.session_control_sender.next_sequence()
+                    || ack
+                        .ranges
+                        .iter()
+                        .any(|range| range.end >= self.session_control_sender.next_sequence())
+                {
+                    return Err(SessionRuntimeError::InvalidRuntimeLimit);
+                }
+                self.session_control_sender
+                    .acknowledge(ack.highest_contiguous, &ack.ranges);
+                Ok(self.local_close_sequence.is_some_and(|sequence| {
+                    !self
+                        .session_control_sender
+                        .pending()
+                        .any(|(pending, _)| pending == sequence)
+                }))
+            }
+            other if other.frame_type().is_session_control() => {
+                Err(SessionRuntimeError::UnexpectedFrame(other.frame_type()))
+            }
+            other => self.handle_message(path_id, other).await,
+        }
+    }
+
+    async fn handle_session_control(
+        &mut self,
+        path_id: PathId,
+        control: SessionControl,
+    ) -> Result<bool, SessionRuntimeError> {
+        if !control.eligible_paths.is_empty() && !control.eligible_paths.contains(&path_id) {
+            return Err(SessionRuntimeError::InvalidRuntimeLimit);
+        }
+        self.queue_session_control(path_id, SessionControlEntry::Control(control))
+            .await
+    }
+
+    async fn queue_session_control(
+        &mut self,
+        path_id: PathId,
+        entry: SessionControlEntry,
+    ) -> Result<bool, SessionRuntimeError> {
+        let sequence = entry.sequence();
+        if sequence < self.next_session_control {
+            match entry {
+                SessionControlEntry::Control(control) => {
+                    self.note_duplicate_open_path(path_id, &control)?
+                }
+                SessionControlEntry::Cancel(cancel) => self.cancel_flow_local(cancel.flow).await?,
+            }
+            self.ack_session_controls(path_id).await?;
+            return Ok(false);
+        }
+        if self.remote_closing {
+            return Err(SessionRuntimeError::UnexpectedFrame(
+                FrameType::SessionControl,
+            ));
+        }
+        if sequence.saturating_sub(self.next_session_control) >= MAX_SESSION_CONTROL_MESSAGES as u64
+        {
+            return Err(SessionRuntimeError::InvalidRuntimeLimit);
+        }
+        if let Some((paths, prior)) = self.queued_session_controls.get_mut(&sequence) {
+            match (&*prior, &entry) {
+                (SessionControlEntry::Control(a), SessionControlEntry::Control(b)) if a == b => {}
+                (SessionControlEntry::Cancel(a), SessionControlEntry::Cancel(b)) if a == b => {}
+                (SessionControlEntry::Control(a), SessionControlEntry::Cancel(b))
+                    if session_control_flow(a, self.limits)? == Some(b.flow) =>
+                {
+                    *prior = entry
+                }
+                (SessionControlEntry::Cancel(a), SessionControlEntry::Control(b))
+                    if session_control_flow(b, self.limits)? == Some(a.flow) => {}
+                _ => return Err(SessionRuntimeError::InvalidRuntimeLimit),
+            }
+            paths.insert(path_id);
+        } else {
+            self.queued_session_controls
+                .insert(sequence, (BTreeSet::from([path_id]), entry));
+        }
+        while let Some((paths, entry)) = self
+            .queued_session_controls
+            .remove(&self.next_session_control)
+        {
+            let path = *paths.first().expect("a received control has a Path");
+            let close = match entry {
+                SessionControlEntry::Cancel(cancel) => {
+                    self.cancel_flow_local(cancel.flow).await?;
+                    false
+                }
+                SessionControlEntry::Control(control) => {
+                    let inner = Message::decode(control.frame_type, &control.payload, self.limits)?;
+                    if matches!(self.role, ActorRole::Egress { .. })
+                        && matches!(
+                            control.frame_type,
+                            FrameType::StreamOpen
+                                | FrameType::StreamOpenClass
+                                | FrameType::UdpOpen
+                                | FrameType::UdpOpenClass
+                        )
+                    {
+                        self.active_control_eligible =
+                            Some((!control.eligible_paths.is_empty()).then(|| {
+                                control.eligible_paths.iter().map(|id| (*id, 100)).collect()
+                            }));
+                    }
+                    let result = self.handle_message(path, inner).await;
+                    self.active_control_eligible = None;
+                    let close = result?;
+                    self.configure_open_paths(&control)?;
+                    for duplicate_path in paths.into_iter().skip(1) {
+                        self.note_duplicate_open_path(duplicate_path, &control)?;
+                    }
+                    close
+                }
+            };
+            self.next_session_control = self
+                .next_session_control
+                .checked_add(1)
+                .ok_or(SessionRuntimeError::FrameSequenceExhausted)?;
+            if close {
+                self.remote_closing = true;
+                break;
+            }
+        }
+        self.ack_session_controls(path_id).await?;
+        Ok(false)
+    }
+
+    fn configure_open_paths(
+        &mut self,
+        control: &SessionControl,
+    ) -> Result<(), SessionRuntimeError> {
+        if !matches!(self.role, ActorRole::Egress { .. }) {
+            return Ok(());
+        }
+        let message = Message::decode(control.frame_type, &control.payload, self.limits)?;
+        let unrestricted = control.eligible_paths.is_empty();
+        let paths = if unrestricted {
+            self.multipath.ready_path_ids()
+        } else {
+            control.eligible_paths.clone()
+        };
+        match message {
+            Message::StreamOpen(open) | Message::StreamOpenClass(StreamOpenClass { open, .. }) => {
+                if let Some(cached) = self.egress_requests.get_mut(&open.request_id) {
+                    cached.unrestricted_paths = unrestricted;
+                }
+            }
+            Message::UdpOpen(open) | Message::UdpOpenClass(UdpOpenClass { open, .. }) => {
+                if unrestricted {
+                    self.unrestricted_udp_paths.insert(open.association_id);
+                }
+            }
+            _ => return Ok(()),
+        }
+        for path in paths {
+            self.note_duplicate_open_path(path, control)?;
+        }
+        Ok(())
+    }
+
+    fn note_duplicate_open_path(
+        &mut self,
+        path_id: PathId,
+        control: &SessionControl,
+    ) -> Result<(), SessionRuntimeError> {
+        let message = Message::decode(control.frame_type, &control.payload, self.limits)?;
+        let request = match &message {
+            Message::StreamOpen(open) => Some((open, None)),
+            Message::StreamOpenClass(open) => Some((&open.open, Some(&open.traffic_class))),
+            _ => None,
+        };
+        if let Some((open, class)) = request
+            && let Some(cached) = self.egress_requests.get_mut(&open.request_id)
+            && cached.request == *open
+            && cached.traffic_class.as_ref() == class
+        {
+            cached.eligible_paths.entry(path_id).or_insert(100);
+            if let Some(stream) = self.streams.get_mut(&open.stream_id)
+                && let Some(eligible) = stream.eligible_paths.as_mut()
+            {
+                eligible.entry(path_id).or_insert(100);
+            }
+        }
+        let association_id = match message {
+            Message::UdpOpen(open) => Some(open.association_id),
+            Message::UdpOpenClass(open) => Some(open.open.association_id),
+            _ => None,
+        };
+        if let Some(id) = association_id
+            && let Some(paths) = self.egress_udp_paths.get_mut(&id)
+        {
+            paths.entry(path_id).or_insert(100);
+        }
+        Ok(())
+    }
+
+    async fn ack_session_controls(&mut self, path_id: PathId) -> Result<(), SessionRuntimeError> {
+        if let Some(highest_contiguous) = self.next_session_control.checked_sub(1) {
+            // A Path may fail after delivering the control record. A failed
+            // ACK must not kill the Session: the sender will retry on an
+            // eligible surviving Path and receive an ACK there.
+            let _ = self
+                .send_raw_message_on(
+                    path_id,
+                    Message::SessionControlAck(ControlAck {
+                        highest_contiguous,
+                        ranges: Vec::new(),
+                    }),
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn handle_message(
+        &mut self,
+        path_id: PathId,
+        message: Message,
+    ) -> Result<bool, SessionRuntimeError> {
+        match message {
             Message::StreamOpen(request) => self.handle_egress_open(path_id, request, None).await?,
             Message::StreamOpenClass(request) => {
                 if self.capabilities & CAPABILITY_TRAFFIC_CLASSES == 0 {
@@ -2448,7 +2951,7 @@ where
             Message::StreamData(data) => self.handle_stream_data(path_id, data).await?,
             Message::StreamAck(ack) => self.handle_stream_ack(ack).await?,
             Message::StreamWindow(window) => self.handle_stream_window(window).await?,
-            Message::StreamFin(fin) => self.handle_stream_fin(fin).await?,
+            Message::StreamFin(fin) => self.handle_stream_fin(fin, None).await?,
             Message::StreamRst(rst) => self.handle_stream_rst(rst).await,
             Message::PathDrain(_) => self.multipath.drain_path(path_id)?,
             Message::PathClose(_) => return self.handle_path_failure(path_id).await,
@@ -2456,13 +2959,22 @@ where
             Message::StatusReport(report) => {
                 let capacity_bps = report.capacity_bps;
                 let recommended_path_count = report.recommended_path_count;
-                if self.multipath.apply_status_report(path_id, report)?
+                if self
+                    .multipath
+                    .apply_status_report(path_id, report.clone())?
                     == StatusReportDisposition::Accepted
                     && let Some(health) = self.path_health.get_mut(&path_id)
                 {
                     health.last_status_received = Instant::now();
                     self.egress_aggregate_capacity_bps = capacity_bps.max(1);
                     self.recommended_path_count = recommended_path_count.max(1);
+                    if self
+                        .latest_egress_status
+                        .as_ref()
+                        .is_none_or(|(previous, _)| report.report_seqno > previous.report_seqno)
+                    {
+                        self.latest_egress_status = Some((report, Instant::now()));
+                    }
                 }
             }
             message @ (Message::UdpOpen(_)
@@ -2505,10 +3017,13 @@ where
             match cached.result.clone() {
                 CachedOpenResult::Pending => return Ok(()),
                 CachedOpenResult::Opened { metadata } => {
-                    self.send_message(Message::StreamOpenOk(StreamOpenOk {
-                        stream_id: request.stream_id,
-                        result_metadata: metadata,
-                    }))
+                    self.send_stream_message(
+                        request.stream_id,
+                        Message::StreamOpenOk(StreamOpenOk {
+                            stream_id: request.stream_id,
+                            result_metadata: metadata,
+                        }),
+                    )
                     .await?;
                     return Ok(());
                 }
@@ -2544,6 +3059,7 @@ where
                 request: request.clone(),
                 result: CachedOpenResult::Pending,
                 eligible_paths: BTreeMap::from([(received_path_id, 100)]),
+                unrestricted_paths: true,
             },
         );
         let result_tx = self.factory_result_tx.clone();
@@ -2578,16 +3094,11 @@ where
         if cached.request.stream_id != completion.stream_id {
             return Ok(());
         }
-        let eligible_paths = cached.eligible_paths.clone();
+        let eligible_paths = (!cached.unrestricted_paths).then(|| cached.eligible_paths.clone());
         let traffic_class = cached.traffic_class.clone();
         match completion.result {
             Ok(io) => {
-                self.spawn_active_stream(
-                    completion.stream_id,
-                    io,
-                    Some(eligible_paths),
-                    traffic_class,
-                )?;
+                self.spawn_active_stream(completion.stream_id, io, eligible_paths, traffic_class)?;
                 if let Some(cached) = self.egress_requests.get_mut(&completion.request_id) {
                     cached.result = CachedOpenResult::Opened {
                         metadata: Vec::new(),
@@ -2696,6 +3207,7 @@ where
                 local_receive_limit: self.buffer_limit as u64,
                 local_fin: false,
                 remote_fin: false,
+                remote_fin_offset: None,
                 eligible_paths,
             },
         );
@@ -2823,11 +3335,8 @@ where
             .and_then(|stream| stream.traffic_class.as_ref())
             .map_or("default", |class| class.name.as_str())
             .to_owned();
-        let retain_for_retransmission = self.multipath.retransmission_replication_enabled();
-        if retain_for_retransmission {
-            self.multipath
-                .retain_stream_data(data.clone(), traffic_class, path_id)?;
-        }
+        self.multipath
+            .retain_stream_data(data.clone(), traffic_class, path_id)?;
         let send_result = self
             .send_message_on(path_id, Message::StreamData(data))
             .await;
@@ -2836,7 +3345,7 @@ where
         if let Some(snapshot) = self.stream_observations.get_mut(&stream_id) {
             snapshot.bytes_sent = snapshot.bytes_sent.saturating_add(length as u64);
         }
-        if retain_for_retransmission && let Some(stream) = self.streams.get_mut(&stream_id) {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.retained.insert(
                 chunk.offset,
                 RetainedChunk {
@@ -2856,68 +3365,171 @@ where
         Ok(())
     }
 
-    async fn retry_class_opens(&mut self) -> Result<(), SessionRuntimeError> {
+    async fn retry_session_controls(&mut self) -> Result<(), SessionRuntimeError> {
+        self.cancel_unroutable_flows().await?;
         let now = Instant::now();
         let mut retry = Vec::new();
-        let mut expired = Vec::new();
-        for (id, pending) in &mut self.pending_ingress {
-            if let Some((message, sent, attempts)) = &mut pending.retry
-                && now.duration_since(*sent)
-                    >= MIN_RETRANSMISSION_TIMEOUT
-                        .saturating_mul(1_u32 << (*attempts).min(6))
-                        .min(MAX_RETRANSMISSION_TIMEOUT)
-            {
-                if *attempts >= MAX_CLASS_OPEN_ATTEMPTS {
-                    expired.push(*id);
-                } else {
-                    *attempts += 1;
-                    *sent = now;
-                    retry.push((message.clone(), pending.eligible_paths.clone()));
-                }
-            }
-        }
-        for id in expired {
-            if let Some(pending) = self.pending_ingress.remove(&id) {
-                let _ = pending.reply.send(Err(OpenStreamError::Rejected {
-                    error: ErrorClass::PathFailure,
-                    reason: b"class Stream admission timed out".to_vec(),
-                }));
-                self.observe_closed(id, "open_timeout", StreamState::Reset);
-            }
-        }
-        let mut expired = Vec::new();
-        for (id, pending) in &mut self.pending_ingress_udp {
-            if let Some((message, sent, attempts)) = &mut pending.retry
-                && now.duration_since(*sent)
-                    >= MIN_RETRANSMISSION_TIMEOUT
-                        .saturating_mul(1_u32 << (*attempts).min(6))
-                        .min(MAX_RETRANSMISSION_TIMEOUT)
-            {
-                if *attempts >= MAX_CLASS_OPEN_ATTEMPTS {
-                    expired.push(*id);
-                } else {
-                    *attempts += 1;
-                    *sent = now;
-                    retry.push((message.clone(), pending.eligible_paths.clone()));
-                }
-            }
-        }
-        for id in expired {
-            if let Some(pending) = self.pending_ingress_udp.remove(&id) {
-                let _ = pending.reply.send(Err(OpenUdpError::Rejected {
-                    error: ErrorClass::PathFailure,
-                    reason: b"class UDP admission timed out".to_vec(),
-                }));
+        for (_, pending) in self.session_control_sender.pending_mut() {
+            if now.duration_since(pending.last_sent_at) >= MIN_RETRANSMISSION_TIMEOUT {
+                pending.last_sent_at = now;
+                retry.push((pending.message.clone(), pending.eligible_paths.clone()));
             }
         }
         for (message, eligible) in retry {
-            if let Some(eligible) = eligible {
-                for id in eligible.keys() {
-                    let _ = self.send_message_on(*id, message.clone()).await;
+            self.send_control_copies(message.message(), eligible.as_ref())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Replace inaccessible controls with an opaque, sequenced cancellation.
+    /// No target, credentials, or business bytes cross another flow's Path.
+    fn cancel_pending_flow_controls(
+        &mut self,
+        flow: SessionControlFlow,
+    ) -> Result<bool, SessionRuntimeError> {
+        let mut replaced = false;
+        for (sequence, pending) in self.session_control_sender.pending_mut() {
+            match &pending.message {
+                SessionControlEntry::Control(control)
+                    if session_control_flow(control, self.limits)? == Some(flow) =>
+                {
+                    pending.message =
+                        SessionControlEntry::Cancel(SessionControlCancel { sequence, flow });
+                    pending.eligible_paths = None;
+                    pending.last_sent_at = Instant::now()
+                        .checked_sub(MIN_RETRANSMISSION_TIMEOUT)
+                        .unwrap_or_else(Instant::now);
+                    replaced = true;
                 }
-            } else {
-                let _ = self.send_message(message).await;
+                SessionControlEntry::Cancel(cancel) if cancel.flow == flow => replaced = true,
+                _ => {}
             }
+        }
+        Ok(replaced)
+    }
+
+    async fn cancel_flow_local(
+        &mut self,
+        flow: SessionControlFlow,
+    ) -> Result<(), SessionRuntimeError> {
+        self.cancel_pending_flow_controls(flow)?;
+        match flow {
+            SessionControlFlow::Stream(id) => {
+                self.observe_closed(id, "path_failure", StreamState::Reset);
+                if let Some(pending) = self.pending_ingress.remove(&id) {
+                    let _ = pending.reply.send(Err(OpenStreamError::Rejected {
+                        error: ErrorClass::PathFailure,
+                        reason: b"no eligible Path remains".to_vec(),
+                    }));
+                }
+                if let Some(task) = self.opening_tasks.remove(&id) {
+                    task.abort();
+                    let _ = task.await;
+                }
+                if let Some(request_id) = self.egress_streams.get(&id)
+                    && let Some(cached) = self.egress_requests.get_mut(request_id)
+                {
+                    cached.result = CachedOpenResult::Rejected {
+                        error: ErrorClass::PathFailure,
+                        reason: b"no eligible Path remains".to_vec(),
+                    };
+                }
+                if let Some(stream) = self.streams.remove(&id) {
+                    let _ = stream.commands.try_send(StreamIoCommand::Reset);
+                    stream.task.abort();
+                    let _ = stream.task.await;
+                }
+            }
+            SessionControlFlow::Udp(id) => {
+                if let Some(pending) = self.pending_ingress_udp.remove(&id) {
+                    let _ = pending.reply.send(Err(OpenUdpError::Rejected {
+                        error: ErrorClass::PathFailure,
+                        reason: b"no eligible Path remains".to_vec(),
+                    }));
+                }
+                if let Some(runtime) = self.udp_runtime.as_mut() {
+                    runtime.close(id)?;
+                }
+                self.ingress_udp.remove(&id);
+                self.egress_udp_paths.remove(&id);
+                self.unrestricted_udp_paths.remove(&id);
+                self.retired_udp_associations.remove(&id);
+                self.pending_udp.remove(&id);
+                self.udp_classes.remove(&id);
+                self.udp_send_sequences.remove(&id);
+                if let Some(waiters) = self.closing_udp.remove(&id) {
+                    for waiter in waiters {
+                        let _ = waiter.send(Err(OpenUdpError::SessionClosed));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn cancel_unroutable_flows(&mut self) -> Result<(), SessionRuntimeError> {
+        let ready: BTreeSet<_> = self.multipath.ready_path_ids().into_iter().collect();
+        if ready.is_empty() {
+            return Ok(());
+        }
+        let unavailable =
+            |paths: &BTreeMap<PathId, u32>| !paths.keys().any(|path| ready.contains(path));
+        let mut flows = BTreeSet::new();
+        for (_, pending) in self.session_control_sender.pending() {
+            if pending.eligible_paths.as_ref().is_some_and(&unavailable)
+                && let SessionControlEntry::Control(control) = &pending.message
+                && let Some(flow) = session_control_flow(control, self.limits)?
+            {
+                flows.insert(flow);
+            }
+        }
+        for (id, pending) in &self.pending_ingress {
+            if pending.eligible_paths.as_ref().is_some_and(&unavailable) {
+                flows.insert(SessionControlFlow::Stream(*id));
+            }
+        }
+        for (id, stream) in &self.streams {
+            if stream.eligible_paths.as_ref().is_some_and(&unavailable) {
+                flows.insert(SessionControlFlow::Stream(*id));
+            }
+        }
+        for (id, pending) in &self.pending_ingress_udp {
+            if pending.eligible_paths.as_ref().is_some_and(&unavailable) {
+                flows.insert(SessionControlFlow::Udp(*id));
+            }
+        }
+        for (id, association) in &self.ingress_udp {
+            if association
+                .eligible_paths
+                .as_ref()
+                .is_some_and(&unavailable)
+            {
+                flows.insert(SessionControlFlow::Udp(*id));
+            }
+        }
+        for (id, paths) in &self.egress_udp_paths {
+            if !self.unrestricted_udp_paths.contains(id)
+                && unavailable(paths)
+                && self
+                    .udp_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.target(*id).is_some())
+            {
+                flows.insert(SessionControlFlow::Udp(*id));
+            }
+        }
+        for flow in flows {
+            let replaced = self.cancel_pending_flow_controls(flow)?;
+            // A sender retains every Session control until its ACK, and an ACK
+            // means the peer has applied it. Therefore a flow with no pending
+            // opening control is already known remotely; creating a fresh
+            // cancel sequence here would introduce a strict-sequence hole if
+            // the old operation had only been observed through a stale view.
+            // Clean the local flow and let its normal RST/close control (if
+            // any) carry the peer-side cleanup.
+            let _ = replaced;
+            self.cancel_flow_local(flow).await?;
         }
         Ok(())
     }
@@ -3110,10 +3722,13 @@ where
         }
         if data.data.is_empty() {
             if data.flags & STREAM_FLAG_FIN != 0 {
-                self.handle_stream_fin(StreamFin {
-                    stream_id: data.stream_id,
-                    flags: data.flags,
-                })
+                self.handle_stream_fin(
+                    StreamFin {
+                        stream_id: data.stream_id,
+                        flags: data.flags,
+                    },
+                    Some(data.offset),
+                )
                 .await?;
             }
             return Ok(());
@@ -3137,8 +3752,37 @@ where
             .offset
             .checked_add(data.data.len() as u64)
             .ok_or(SessionRuntimeError::InvalidRuntimeLimit)?;
+        if stream.remote_fin_offset.is_some_and(|offset| end > offset)
+            || (stream.remote_fin && stream.remote_fin_offset.is_none())
+        {
+            self.reset_stream(
+                data.stream_id,
+                true,
+                b"data exceeds the final Stream offset".to_vec(),
+            )
+            .await?;
+            return Ok(());
+        }
+        let missing = match stream.receive.missing_ranges(data.offset, &data.data) {
+            Ok(missing) => missing,
+            Err(ReliabilityError::QueueFull { .. }) => {
+                self.reset_stream(
+                    data.stream_id,
+                    true,
+                    b"Stream receive buffer is full".to_vec(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let new_bytes: usize = missing
+            .iter()
+            .map(|(start, end)| (end - start) as usize)
+            .sum();
         if end > stream.local_receive_limit
-            || self.session_received_total + data.data.len() as u64 > self.local_session_limit
+            || self.session_received_total.saturating_add(new_bytes as u64)
+                > self.local_session_limit
         {
             self.reset_stream(
                 data.stream_id,
@@ -3148,9 +3792,11 @@ where
             .await?;
             return Ok(());
         }
-        let permit =
-            match Arc::clone(&self.inbound_budget).try_acquire_many_owned(data.data.len() as u32) {
-                Ok(permit) => permit,
+        let mut permit = if new_bytes == 0 {
+            None
+        } else {
+            match Arc::clone(&self.inbound_budget).try_acquire_many_owned(new_bytes as u32) {
+                Ok(permit) => Some(permit),
                 Err(_) => {
                     self.reset_stream(
                         data.stream_id,
@@ -3160,9 +3806,19 @@ where
                     .await?;
                     return Ok(());
                 }
-            };
+            }
+        };
         let result = stream.receive.insert(data.offset, &data.data)?;
-        stream.inbound_permits.push(InboundPermit { end, permit });
+        for (start, end) in missing {
+            let part = permit
+                .as_mut()
+                .expect("non-empty ranges have a permit")
+                .split((end - start) as usize)
+                .expect("reserved exact unique byte count");
+            stream
+                .inbound_permits
+                .push(InboundPermit { end, permit: part });
+        }
         let next_offset = stream.receive.next_offset();
         let mut permits = Vec::new();
         let mut remaining = Vec::new();
@@ -3181,13 +3837,8 @@ where
                 .bytes_received
                 .saturating_add(delivered.len() as u64);
         }
-        if result.duplicate {
-            self.session_received_total += delivered.len() as u64;
-            self.bytes_received += delivered.len() as u64;
-        } else {
-            self.session_received_total += data.data.len() as u64;
-            self.bytes_received += data.data.len() as u64;
-        }
+        self.session_received_total += new_bytes as u64;
+        self.bytes_received += new_bytes as u64;
         self.send_stream_message(
             data.stream_id,
             Message::StreamAck(StreamAck {
@@ -3216,11 +3867,16 @@ where
             .await?;
         }
         if data.flags & STREAM_FLAG_FIN != 0 {
-            self.handle_stream_fin(StreamFin {
-                stream_id: data.stream_id,
-                flags: data.flags,
-            })
+            self.handle_stream_fin(
+                StreamFin {
+                    stream_id: data.stream_id,
+                    flags: data.flags,
+                },
+                Some(end),
+            )
             .await?;
+        } else {
+            self.finish_pending_stream_fin(data.stream_id).await?;
         }
         Ok(())
     }
@@ -3293,25 +3949,90 @@ where
         Ok(())
     }
 
-    async fn handle_stream_fin(&mut self, fin: StreamFin) -> Result<(), SessionRuntimeError> {
+    async fn handle_stream_fin(
+        &mut self,
+        fin: StreamFin,
+        fin_offset: Option<u64>,
+    ) -> Result<(), SessionRuntimeError> {
         if fin.flags & STREAM_FLAG_FIN == 0 {
             return self
                 .reset_stream(fin.stream_id, true, b"invalid FIN flags".to_vec())
                 .await;
         }
-        let Some(stream) = self.streams.get_mut(&fin.stream_id) else {
-            return Ok(());
-        };
-        if !stream.remote_fin {
-            stream.remote_fin = true;
-            if stream.commands.try_send(StreamIoCommand::Fin).is_err() {
-                self.reset_stream(
-                    fin.stream_id,
-                    true,
-                    b"Stream target writer is unavailable".to_vec(),
-                )
-                .await?;
+        let invalid_offset = self.streams.get(&fin.stream_id).is_some_and(|stream| {
+            fin_offset.is_some_and(|offset| {
+                offset > stream.local_receive_limit
+                    || offset < stream.receive.next_offset()
+                    || stream
+                        .remote_fin_offset
+                        .is_some_and(|previous| previous != offset)
+            })
+        });
+        if invalid_offset {
+            return self
+                .reset_stream(fin.stream_id, true, b"invalid final Stream offset".to_vec())
+                .await;
+        }
+        let commands = {
+            let Some(stream) = self.streams.get_mut(&fin.stream_id) else {
+                return Ok(());
+            };
+            if let Some(offset) = fin_offset {
+                stream.remote_fin_offset = Some(offset);
             }
+            let ready = stream
+                .remote_fin_offset
+                .map_or(fin_offset.is_none(), |offset| {
+                    stream.receive.next_offset() >= offset
+                });
+            if stream.remote_fin || !ready {
+                None
+            } else {
+                stream.remote_fin = true;
+                Some(stream.commands.clone())
+            }
+        };
+        if let Some(commands) = commands
+            && commands.try_send(StreamIoCommand::Fin).is_err()
+        {
+            self.reset_stream(
+                fin.stream_id,
+                true,
+                b"Stream target writer is unavailable".to_vec(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn finish_pending_stream_fin(
+        &mut self,
+        stream_id: StreamId,
+    ) -> Result<(), SessionRuntimeError> {
+        let commands = {
+            let Some(stream) = self.streams.get_mut(&stream_id) else {
+                return Ok(());
+            };
+            let ready = !stream.remote_fin
+                && stream
+                    .remote_fin_offset
+                    .is_some_and(|offset| stream.receive.next_offset() >= offset);
+            if !ready {
+                None
+            } else {
+                stream.remote_fin = true;
+                Some(stream.commands.clone())
+            }
+        };
+        if let Some(commands) = commands
+            && commands.try_send(StreamIoCommand::Fin).is_err()
+        {
+            self.reset_stream(
+                stream_id,
+                true,
+                b"Stream target writer is unavailable".to_vec(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -3372,11 +4093,14 @@ where
         mut reason: Vec<u8>,
     ) -> Result<(), SessionRuntimeError> {
         reason.truncate(self.limits.max_control_payload());
-        self.send_message(Message::StreamOpenErr(StreamOpenErr {
+        self.send_stream_message(
             stream_id,
-            error,
-            reason,
-        }))
+            Message::StreamOpenErr(StreamOpenErr {
+                stream_id,
+                error,
+                reason,
+            }),
+        )
         .await
     }
 
@@ -3385,10 +4109,22 @@ where
         stream_id: StreamId,
         message: Message,
     ) -> Result<(), SessionRuntimeError> {
-        let eligible = self
-            .streams
-            .get(&stream_id)
-            .and_then(|stream| stream.eligible_paths.clone());
+        let eligible = self.active_control_eligible.clone().unwrap_or_else(|| {
+            match self.streams.get(&stream_id) {
+                Some(stream) => stream.eligible_paths.clone(),
+                None => self
+                    .egress_requests
+                    .values()
+                    .find(|cached| {
+                        cached.request.stream_id == stream_id && !cached.unrestricted_paths
+                    })
+                    .map(|cached| cached.eligible_paths.clone()),
+            }
+        });
+        if message.frame_type().is_session_control() {
+            self.send_session_control(message, eligible).await?;
+            return Ok(());
+        }
         if let Some(eligible) = eligible {
             let path_id = self
                 .multipath
@@ -3418,11 +4154,19 @@ where
         association_id: u64,
         message: Message,
     ) -> Result<(), SessionRuntimeError> {
-        let eligible = self
-            .ingress_udp
-            .get(&association_id)
-            .and_then(|association| association.eligible_paths.clone())
-            .or_else(|| self.egress_udp_paths.get(&association_id).cloned());
+        let eligible = self.active_control_eligible.clone().unwrap_or_else(|| {
+            if self.unrestricted_udp_paths.contains(&association_id) {
+                return None;
+            }
+            self.ingress_udp
+                .get(&association_id)
+                .and_then(|association| association.eligible_paths.clone())
+                .or_else(|| self.egress_udp_paths.get(&association_id).cloned())
+        });
+        if message.frame_type().is_session_control() {
+            self.send_session_control(message, eligible).await?;
+            return Ok(());
+        }
         if let Some(eligible) = eligible {
             let bytes = match &message {
                 Message::UdpDatagram(datagram) => datagram.payload.len(),
@@ -3439,6 +4183,10 @@ where
     }
 
     async fn send_message(&mut self, message: Message) -> Result<(), SessionRuntimeError> {
+        if message.frame_type().is_session_control() {
+            self.send_session_control(message, None).await?;
+            return Ok(());
+        }
         let bytes = match &message {
             Message::StreamData(data) => data.data.len(),
             Message::UdpDatagram(datagram) => datagram.payload.len(),
@@ -3453,6 +4201,103 @@ where
     }
 
     async fn send_message_on(
+        &mut self,
+        path_id: PathId,
+        message: Message,
+    ) -> Result<(), SessionRuntimeError> {
+        if message.frame_type().is_session_control() {
+            self.send_session_control(message, Some(BTreeMap::from([(path_id, 1)])))
+                .await?;
+            return Ok(());
+        }
+        self.send_raw_message_on(path_id, message).await
+    }
+
+    async fn send_session_control(
+        &mut self,
+        message: Message,
+        eligible_paths: Option<BTreeMap<PathId, u32>>,
+    ) -> Result<u64, SessionRuntimeError> {
+        let sequence = self.session_control_sender.next_sequence();
+        let control = SessionControl {
+            sequence,
+            depends_on: sequence.checked_sub(1),
+            frame_type: message.frame_type(),
+            eligible_paths: if matches!(
+                message.frame_type(),
+                FrameType::StreamOpen
+                    | FrameType::StreamOpenClass
+                    | FrameType::UdpOpen
+                    | FrameType::UdpOpenClass
+            ) {
+                eligible_paths
+                    .as_ref()
+                    .map_or_else(Vec::new, |paths| paths.keys().copied().collect())
+            } else {
+                Vec::new()
+            },
+            payload: message.encode(self.limits)?,
+        };
+        // Check the outer bound before consuming a sequence number.
+        Message::SessionControl(control.clone()).encode(self.limits)?;
+        let actual = self.session_control_sender.enqueue(PendingSessionControl {
+            message: SessionControlEntry::Control(control.clone()),
+            eligible_paths: eligible_paths.clone(),
+            last_sent_at: Instant::now(),
+        })?;
+        debug_assert_eq!(actual, sequence);
+        if let Err(error) = self
+            .send_control_copies(Message::SessionControl(control), eligible_paths.as_ref())
+            .await
+        {
+            if !matches!(
+                error,
+                SessionRuntimeError::PathClosed
+                    | SessionRuntimeError::Multipath(MultipathError::NoSchedulablePath)
+            ) {
+                return Err(error);
+            }
+            self.cancel_unroutable_flows().await?;
+        }
+        Ok(sequence)
+    }
+
+    async fn send_control_copies(
+        &mut self,
+        message: Message,
+        eligible: Option<&BTreeMap<PathId, u32>>,
+    ) -> Result<(), SessionRuntimeError> {
+        let paths: Vec<_> = self
+            .multipath
+            .ready_path_ids()
+            .into_iter()
+            .filter(|path| eligible.is_none_or(|eligible| eligible.contains_key(path)))
+            .collect();
+        if paths.is_empty() {
+            return Err(MultipathError::NoSchedulablePath.into());
+        }
+        let copy_size = message.encode(self.limits)?.len().saturating_add(128) as u64;
+        let mut sent = false;
+        for path in paths {
+            if sent && !self.multipath.charge_control_replication(copy_size) {
+                break;
+            }
+            if self
+                .send_raw_message_on(path, message.clone())
+                .await
+                .is_ok()
+            {
+                sent = true;
+            }
+        }
+        if sent {
+            Ok(())
+        } else {
+            Err(SessionRuntimeError::PathClosed)
+        }
+    }
+
+    async fn send_raw_message_on(
         &mut self,
         path_id: PathId,
         message: Message,
@@ -3532,7 +4377,10 @@ where
                         loss_ppm,
                         throughput_bps: health.throughput_bps,
                         reordering_events: health.reordering_events,
-                        exclusion_reason: health.exclusion_reason,
+                        exclusion_reason: health.exclusion_reason.or_else(|| self.multipath.quality_exclusion(*path_id).ok().flatten().map(|reason| match reason {
+                            crate::PathQualityExclusionReason::IncrementalCapacityBelowOverhead => PathExclusionReason::IncrementalCapacityBelowOverhead,
+                            crate::PathQualityExclusionReason::CongestionWindowExhausted => PathExclusionReason::CongestionWindowExhausted,
+                        })),
                     },
                 )
             })
@@ -3542,6 +4390,7 @@ where
             path_id: self.path_id,
             ready_paths: self.multipath.ready_path_count(),
             ready_path_ids: self.multipath.ready_path_ids(),
+            path_states: self.multipath.path_states(),
             degraded_paths: self.multipath.degraded_path_count(),
             effective_capacity_bps: self.multipath.effective_capacity_bps(),
             egress_aggregate_capacity_bps: self.egress_aggregate_capacity_bps,
@@ -3572,6 +4421,27 @@ where
                 })
                 .collect(),
             active_streams: self.streams.len(),
+            active_udp_associations: if matches!(self.role, ActorRole::Ingress) {
+                self.ingress_udp.len()
+            } else {
+                self.udp_runtime
+                    .as_ref()
+                    .map_or(0, |runtime| runtime.snapshot().active_associations)
+            },
+            pending_session_controls: self.session_control_sender.pending_len(),
+            egress_status: self
+                .latest_egress_status
+                .as_ref()
+                .map(|(report, received)| {
+                    let age_ms = report.sample_age_ms.saturating_add(
+                        received.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    );
+                    EgressStatusObservation {
+                        report: report.clone(),
+                        age_ms,
+                        fresh: age_ms <= report.expires_after_ms,
+                    }
+                }),
             pending_stream_opens: self.pending_ingress.len() + self.opening_tasks.len(),
             retained_outbound_bytes: self.retained_outbound_bytes(),
             bytes_sent: self.bytes_sent,
@@ -3589,6 +4459,11 @@ where
             self.observe_closed(id, "session_closed", StreamState::Closed);
         }
         self.pending_udp.clear();
+        for (_, waiters) in self.closing_udp.drain() {
+            for waiter in waiters {
+                let _ = waiter.send(Err(OpenUdpError::SessionClosed));
+            }
+        }
         for (_, pending) in self.pending_ingress.drain() {
             let _ = pending.reply.send(Err(OpenStreamError::SessionClosed));
         }
@@ -3695,6 +4570,29 @@ fn target_flags(target: &TargetEndpoint) -> u64 {
     flags
 }
 
+fn session_control_flow(
+    control: &SessionControl,
+    limits: ProtocolLimits,
+) -> Result<Option<SessionControlFlow>, SessionRuntimeError> {
+    let message = Message::decode(control.frame_type, &control.payload, limits)?;
+    Ok(match message {
+        Message::StreamOpen(value) => Some(SessionControlFlow::Stream(value.stream_id)),
+        Message::StreamOpenClass(value) => Some(SessionControlFlow::Stream(value.open.stream_id)),
+        Message::StreamOpenOk(value) => Some(SessionControlFlow::Stream(value.stream_id)),
+        Message::StreamOpenErr(value) => Some(SessionControlFlow::Stream(value.stream_id)),
+        Message::StreamAck(value) => Some(SessionControlFlow::Stream(value.stream_id)),
+        Message::StreamWindow(value) => Some(SessionControlFlow::Stream(value.stream_id)),
+        Message::StreamFin(value) => Some(SessionControlFlow::Stream(value.stream_id)),
+        Message::StreamRst(value) => Some(SessionControlFlow::Stream(value.stream_id)),
+        Message::UdpOpen(value) => Some(SessionControlFlow::Udp(value.association_id)),
+        Message::UdpOpenClass(value) => Some(SessionControlFlow::Udp(value.open.association_id)),
+        Message::UdpOpenOk(value) => Some(SessionControlFlow::Udp(value.association_id)),
+        Message::UdpOpenErr(value) => Some(SessionControlFlow::Udp(value.association_id)),
+        Message::UdpClose(value) => Some(SessionControlFlow::Udp(value.association_id)),
+        _ => None,
+    })
+}
+
 fn udp_association_id(message: &Message) -> u64 {
     match message {
         Message::UdpOpen(value) => value.association_id,
@@ -3747,7 +4645,7 @@ impl<R> RecordReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    async fn receive(&mut self) -> Result<Option<PathFrame>, SessionRuntimeError> {
+    async fn receive(&mut self) -> Result<Option<RecordRead>, SessionRuntimeError> {
         let mut header = [0_u8; RECORD_ENVELOPE_HEADER_LEN];
         let first = self.io.read(&mut header[..1]).await?;
         if first == 0 {
@@ -3771,7 +4669,10 @@ where
             .noise
             .lock()
             .map_err(|_| SessionRuntimeError::NoiseStatePoisoned)?;
-        Ok(Some(noise.open_encoded_frame(&encoded, self.limits)?))
+        match noise.open_encoded_frame_replay_aware(&encoded, self.limits)? {
+            ReplayAwareFrame::Accepted(frame) => Ok(Some(RecordRead::Frame(frame))),
+            ReplayAwareFrame::Dropped => Ok(Some(RecordRead::ReplayDropped)),
+        }
     }
 }
 
@@ -3784,7 +4685,8 @@ async fn record_reader_loop<R>(
 {
     loop {
         let event = match reader.receive().await {
-            Ok(Some(frame)) => ReaderEvent::Frame { path_id, frame },
+            Ok(Some(RecordRead::Frame(frame))) => ReaderEvent::Frame { path_id, frame },
+            Ok(Some(RecordRead::ReplayDropped)) => continue,
             Ok(None) => ReaderEvent::Closed { path_id },
             Err(error) => ReaderEvent::Failed { path_id, error },
         };
@@ -4012,6 +4914,340 @@ mod tests {
         EgressAdmittedPath<DuplexStream>,
     ) {
         admitted_pair_with_classes(false).await
+    }
+
+    #[tokio::test]
+    async fn duplicate_authenticated_record_does_not_stop_the_path_reader() {
+        let (ingress, egress) = admitted_pair().await;
+        let session_id = ingress.session_id();
+        let path_id = ingress.path_id();
+        let (mut ingress_io, mut send_noise) = ingress.into_transport().into_parts();
+        let (egress_io, receive_noise) = egress.into_transport().into_parts();
+        let limits = ProtocolLimits::default();
+        let (events_tx, mut events) = mpsc::channel(8);
+        let reader_task = tokio::spawn(record_reader_loop(
+            path_id,
+            RecordReader {
+                io: egress_io,
+                noise: Arc::new(Mutex::new(receive_noise)),
+                limits,
+            },
+            events_tx,
+        ));
+
+        let mut seal = |value: u64| {
+            let nonce = send_noise.next_send_nonce().unwrap();
+            let message = Message::Heartbeat(Heartbeat { control_seq: value });
+            let frame = PathFrame::new(
+                message.frame_type(),
+                FrameFlags::empty(),
+                session_id,
+                path_id,
+                nonce,
+                message.encode(limits).unwrap(),
+                limits,
+            )
+            .unwrap();
+            send_noise.seal_frame(&frame, limits).unwrap().encode()
+        };
+        let first = seal(10);
+        let second = seal(11);
+        ingress_io.write_all(&first).await.unwrap();
+        ingress_io.write_all(&first).await.unwrap();
+        ingress_io.write_all(&second).await.unwrap();
+        for expected in [10, 11] {
+            let Some(ReaderEvent::Frame { frame, .. }) = events.recv().await else {
+                panic!("duplicate unexpectedly stopped reader");
+            };
+            assert_eq!(
+                Message::decode(frame.header().frame_type(), frame.payload(), limits).unwrap(),
+                Message::Heartbeat(Heartbeat {
+                    control_seq: expected
+                })
+            );
+        }
+        drop(ingress_io);
+        assert!(matches!(
+            events.recv().await,
+            Some(ReaderEvent::Closed { .. })
+        ));
+        reader_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reordered_data_fin_waits_for_all_preceding_bytes() {
+        let (path, _peer) = admitted_pair().await;
+        let session_id = path.session_id();
+        let path_id = path.path_id();
+        let ready = path.limits().clone();
+        let initial = SessionSnapshot {
+            session_id,
+            path_id,
+            ready_paths: 1,
+            ready_path_ids: vec![path_id],
+            path_states: BTreeMap::from([(path_id, pathchord_core::PathState::Active)]),
+            degraded_paths: 0,
+            effective_capacity_bps: 0,
+            egress_aggregate_capacity_bps: 0,
+            recommended_path_count: 1,
+            path_quality: BTreeMap::new(),
+            active_streams: 0,
+            active_udp_associations: 0,
+            pending_session_controls: 0,
+            egress_status: None,
+            streams: BTreeMap::new(),
+            pending_stream_opens: 0,
+            retained_outbound_bytes: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            closed: false,
+        };
+        let (snapshots, _) = watch::channel(initial);
+        let mut actor = SessionActor::new(
+            path.into_transport(),
+            SessionActorInit {
+                role: ActorRole::Ingress,
+                udp_factory: None,
+                session_id,
+                path_id,
+                ready,
+                commands: None,
+                snapshots,
+                egress_status: Default::default(),
+                status_provider: None,
+                capabilities: 0,
+            },
+        )
+        .unwrap();
+        let stream_id = StreamId::new(1).unwrap();
+        let (io, mut target) = duplex(1024);
+        actor
+            .spawn_active_stream(stream_id, Box::new(io), None, None)
+            .unwrap();
+        actor
+            .handle_stream_data(
+                path_id,
+                StreamData {
+                    stream_id,
+                    offset: 3,
+                    flags: STREAM_FLAG_FIN,
+                    data: b"def".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), target.read(&mut byte))
+                .await
+                .is_err()
+        );
+        actor
+            .handle_stream_data(
+                path_id,
+                StreamData {
+                    stream_id,
+                    offset: 0,
+                    flags: 0,
+                    data: b"abc".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), target.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, b"abcdef");
+        actor.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_retransmissions_ack_only_after_all_unique_bytes_are_buffered() {
+        let (path, mut peer) = admitted_pair().await;
+        let session_id = path.session_id();
+        let path_id = path.path_id();
+        let ready = path.limits().clone();
+        let initial = SessionSnapshot {
+            session_id,
+            path_id,
+            ready_paths: 1,
+            ready_path_ids: vec![path_id],
+            path_states: BTreeMap::from([(path_id, pathchord_core::PathState::Active)]),
+            degraded_paths: 0,
+            effective_capacity_bps: 0,
+            egress_aggregate_capacity_bps: 0,
+            recommended_path_count: 1,
+            path_quality: BTreeMap::new(),
+            active_streams: 0,
+            active_udp_associations: 0,
+            pending_session_controls: 0,
+            egress_status: None,
+            streams: BTreeMap::new(),
+            pending_stream_opens: 0,
+            retained_outbound_bytes: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            closed: false,
+        };
+        let (snapshots, _) = watch::channel(initial);
+        let mut actor = SessionActor::new(
+            path.into_transport(),
+            SessionActorInit {
+                role: ActorRole::Ingress,
+                udp_factory: None,
+                session_id,
+                path_id,
+                ready,
+                commands: None,
+                snapshots,
+                egress_status: Default::default(),
+                status_provider: None,
+                capabilities: 0,
+            },
+        )
+        .unwrap();
+        actor.inbound_budget = Arc::new(Semaphore::new(10));
+        let id = StreamId::new(1).unwrap();
+        let (io, mut target) = duplex(1024);
+        actor
+            .spawn_active_stream(id, Box::new(io), None, None)
+            .unwrap();
+        for (offset, bytes, ack_end) in [
+            (2, b"cd".as_slice(), 3),
+            (6, b"gh".as_slice(), 7),
+            (2, b"cd".as_slice(), 3),
+            (0, b"abcdefghij".as_slice(), 9),
+        ] {
+            actor
+                .handle_stream_data(
+                    path_id,
+                    StreamData {
+                        stream_id: id,
+                        offset,
+                        flags: 0,
+                        data: bytes.to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+            let frame = peer.transport_mut().receive_frame().await.unwrap().unwrap();
+            let Message::SessionControl(control) = Message::decode(
+                frame.header().frame_type(),
+                frame.payload(),
+                ProtocolLimits::default(),
+            )
+            .unwrap() else {
+                panic!("expected reliable Stream ACK");
+            };
+            let Message::StreamAck(ack) = Message::decode(
+                control.frame_type,
+                &control.payload,
+                ProtocolLimits::default(),
+            )
+            .unwrap() else {
+                panic!("expected Stream ACK");
+            };
+            assert_eq!(
+                ack.ranges,
+                [AckRange {
+                    start: offset,
+                    end: ack_end
+                }]
+            );
+            if offset == 2 {
+                assert!(actor.inbound_budget.available_permits() >= 6);
+            }
+        }
+        assert_eq!(actor.session_received_total, 10);
+        assert!(actor.streams.contains_key(&id));
+        let mut bytes = [0_u8; 10];
+        tokio::time::timeout(Duration::from_secs(1), target.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes, b"abcdefghij");
+        actor.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn shared_session_keeps_the_strictest_replication_policy() {
+        for reverse in [false, true] {
+            let (path, _peer) = admitted_pair().await;
+            let session_id = path.session_id();
+            let path_id = path.path_id();
+            let ready = path.limits().clone();
+            let initial = SessionSnapshot {
+                session_id,
+                path_id,
+                ready_paths: 1,
+                ready_path_ids: vec![path_id],
+                path_states: BTreeMap::from([(path_id, pathchord_core::PathState::Active)]),
+                degraded_paths: 0,
+                effective_capacity_bps: 0,
+                egress_aggregate_capacity_bps: 0,
+                recommended_path_count: 1,
+                path_quality: BTreeMap::new(),
+                active_streams: 0,
+                active_udp_associations: 0,
+                pending_session_controls: 0,
+                egress_status: None,
+                streams: BTreeMap::new(),
+                pending_stream_opens: 0,
+                retained_outbound_bytes: 0,
+                bytes_sent: 0,
+                bytes_received: 0,
+                closed: false,
+            };
+            let (snapshots, _) = watch::channel(initial);
+            let mut actor = SessionActor::new(
+                path.into_transport(),
+                SessionActorInit {
+                    role: ActorRole::Ingress,
+                    udp_factory: None,
+                    session_id,
+                    path_id,
+                    ready,
+                    commands: None,
+                    snapshots,
+                    egress_status: Default::default(),
+                    status_provider: None,
+                    capabilities: 0,
+                },
+            )
+            .unwrap();
+            let small = MultipathConfig {
+                session_replication_budget_bytes: 1_000,
+                default_stream_replication_budget_bytes: 500,
+                class_replication_budget_bytes: BTreeMap::from([("a".to_owned(), 400)]),
+                ..Default::default()
+            };
+            let large = MultipathConfig {
+                session_replication_budget_bytes: 2_000,
+                default_stream_replication_budget_bytes: 1_000,
+                class_replication_budget_bytes: BTreeMap::from([
+                    ("a".to_owned(), 800),
+                    ("b".to_owned(), 1_700),
+                ]),
+                ..Default::default()
+            };
+            let (first, second) = if reverse {
+                (large, small)
+            } else {
+                (small, large)
+            };
+            actor.restrict_session_policy(first).unwrap();
+            actor.restrict_session_policy(second).unwrap();
+            let floor = actor.session_policy_floor.as_ref().unwrap();
+            assert_eq!(floor.session_replication_budget_bytes, 1_000);
+            assert_eq!(floor.default_stream_replication_budget_bytes, 500);
+            assert_eq!(floor.class_replication_budget_bytes["a"], 400);
+            assert_eq!(floor.class_replication_budget_bytes["b"], 1_000);
+            assert!(actor.multipath.charge_control_replication(500));
+            assert!(!actor.multipath.charge_control_replication(501));
+            actor.cleanup().await;
+        }
     }
     async fn admitted_pair_with_classes(
         classes: bool,
@@ -4463,6 +5699,7 @@ mod tests {
             rtt_ms: 5,
             jitter_ms: 1,
             loss_basis_points: 0,
+            ..Default::default()
         };
         egress_controller
             .add_path(egress_secondary, fast_path.clone())
@@ -4553,6 +5790,7 @@ mod tests {
             rtt_ms: 5,
             jitter_ms: 1,
             loss_basis_points: 0,
+            ..Default::default()
         };
         egress_controller
             .add_path(egress_secondary, preferred.clone())
@@ -4592,11 +5830,28 @@ mod tests {
         let (ingress_path, egress_path) = admitted_pair_with_partition(Arc::clone(&drop_all)).await;
         let egress = EgressSessionHandle::start(egress_path, EchoFactory::default()).unwrap();
         let ingress = IngressSessionHandle::start(ingress_path).unwrap();
+        assert!(ingress.snapshot().egress_status.is_none());
         tokio::time::advance(Duration::from_millis(2_100)).await;
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
         assert_eq!(ingress.snapshot().degraded_paths, 0);
+        for _ in 0..20 {
+            if ingress.snapshot().egress_status.is_some() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        let sample = ingress
+            .snapshot()
+            .egress_status
+            .expect("authenticated status report");
+        assert!(sample.fresh);
+        assert_eq!(
+            sample.report.capacity_bps,
+            EgressStatusConfig::default().capacity_bps
+        );
         assert!(ingress.snapshot().path_quality[&PathId::new(0x5678)].rtt_ms > 0);
 
         drop_all.store(true, Ordering::Release);
@@ -4693,6 +5948,7 @@ mod tests {
             rtt_ms: 1,
             jitter_ms: 0,
             loss_basis_points: 0,
+            ..Default::default()
         };
         egress_controller
             .add_path(egress_secondary, preferred.clone())
@@ -4781,6 +6037,599 @@ mod tests {
             let mut bytes = Vec::new();
             stream.read_to_end(&mut bytes).await.unwrap();
             assert_eq!(bytes, b"retry");
+            assert_eq!(factory.tasks.lock().unwrap().len(), 1);
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_stream_open_retries_a_lost_control_without_redialing() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ingress_key, egress_key) = keys();
+            let drop_next = Arc::new(AtomicBool::new(false));
+            let (i, e) = admitted_pair_for_with_dropped_ingress_write(
+                &ingress_key,
+                &egress_key,
+                77,
+                Arc::clone(&drop_next),
+            )
+            .await;
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e, factory.clone()).unwrap();
+            let ingress = IngressSessionHandle::start(i).unwrap();
+            drop_next.store(true, Ordering::Release);
+            let mut stream = ingress.open_tcp(target("retry.test")).await.unwrap();
+            assert!(!drop_next.load(Ordering::Acquire));
+            stream.write_all(b"once").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut echoed = Vec::new();
+            stream.read_to_end(&mut echoed).await.unwrap();
+            assert_eq!(echoed, b"once");
+            assert_eq!(factory.tasks.lock().unwrap().len(), 1);
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn losing_a_flow_only_path_cancels_its_control_and_other_flows_continue() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ik, ek) = keys();
+            let drop_next = Arc::new(AtomicBool::new(false));
+            let (i1, e1) =
+                admitted_pair_for_with_dropped_ingress_write(&ik, &ek, 201, drop_next.clone())
+                    .await;
+            let (i2, e2) = admitted_pair_for(&ik, &ek, 202).await;
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e1, factory.clone()).unwrap();
+            let ingress = IngressSessionHandle::start(i1).unwrap();
+            egress
+                .controller()
+                .add_path(e2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            ingress
+                .add_path(i2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            let mut healthy = ingress
+                .open_tcp_routed(
+                    target("healthy.test"),
+                    BTreeMap::from([(PathId::new(202), 1)]),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop_next.store(true, Ordering::Release);
+            let opening = ingress.open_tcp_routed(
+                target("private-lost.test"),
+                BTreeMap::from([(PathId::new(201), 1)]),
+            );
+            let fail = async {
+                for _ in 0..1000 {
+                    if !drop_next.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(!drop_next.load(Ordering::Acquire));
+                ingress.close_path(PathId::new(201)).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(opening, fail);
+            assert!(matches!(
+                result,
+                Err(OpenStreamError::Rejected {
+                    error: ErrorClass::PathFailure,
+                    ..
+                })
+            ));
+            healthy.write_all(b"still-live").await.unwrap();
+            let mut echoed = [0_u8; 10];
+            healthy.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"still-live");
+            let mut later = ingress
+                .open_tcp_routed(
+                    target("later.test"),
+                    BTreeMap::from([(PathId::new(202), 1)]),
+                )
+                .await
+                .unwrap();
+            later.write_all(b"later").await.unwrap();
+            let mut later_echo = [0_u8; 5];
+            later.read_exact(&mut later_echo).await.unwrap();
+            assert_eq!(&later_echo, b"later");
+            assert_eq!(
+                factory.tasks.lock().unwrap().len(),
+                2,
+                "lost target must never be opened"
+            );
+            healthy.shutdown().await.unwrap();
+            later.shutdown().await.unwrap();
+            healthy.read_to_end(&mut Vec::new()).await.unwrap();
+            later.read_to_end(&mut Vec::new()).await.unwrap();
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn losing_an_open_flow_path_closes_its_target_without_closing_other_flows() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ik, ek) = keys();
+            let (i1, e1) = admitted_pair_for(&ik, &ek, 203).await;
+            let (i2, e2) = admitted_pair_for(&ik, &ek, 204).await;
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e1, factory.clone()).unwrap();
+            let ingress = IngressSessionHandle::start(i1).unwrap();
+            egress
+                .controller()
+                .add_path(e2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            ingress
+                .add_path(i2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            let mut healthy = ingress
+                .open_tcp_routed(
+                    target("healthy.test"),
+                    BTreeMap::from([(PathId::new(204), 1)]),
+                )
+                .await
+                .unwrap();
+            let mut lost = ingress
+                .open_tcp_routed(target("lost.test"), BTreeMap::from([(PathId::new(203), 1)]))
+                .await
+                .unwrap();
+            ingress.close_path(PathId::new(203)).await.unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(lost.read(&mut byte).await.unwrap(), 0);
+            healthy.write_all(b"alive").await.unwrap();
+            let mut echoed = [0_u8; 5];
+            healthy.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"alive");
+            for _ in 0..100 {
+                if factory
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .get(1)
+                    .is_some_and(JoinHandle::is_finished)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                factory.tasks.lock().unwrap()[1].is_finished(),
+                "lost target must be closed"
+            );
+            healthy.shutdown().await.unwrap();
+            healthy.read_to_end(&mut Vec::new()).await.unwrap();
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_replication_budget_still_recovers_lost_tcp_data() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ik, ek) = keys();
+            let drop_next = Arc::new(AtomicBool::new(false));
+            let (i, e) =
+                admitted_pair_for_with_dropped_ingress_write(&ik, &ek, 78, Arc::clone(&drop_next))
+                    .await;
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e, factory.clone()).unwrap();
+            let ingress = IngressSessionHandle::start(i).unwrap();
+            let mut stream = ingress
+                .open_tcp_routed_with_config(
+                    target("no-replication.test"),
+                    BTreeMap::from([(PathId::new(78), 1)]),
+                    MultipathConfig {
+                        session_replication_budget_bytes: 0,
+                        default_stream_replication_budget_bytes: 0,
+                        retransmission_replication_enabled: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop_next.store(true, Ordering::Release);
+            stream.write_all(b"recover").await.unwrap();
+            let mut echoed = [0_u8; 7];
+            stream.read_exact(&mut echoed).await.unwrap();
+            assert!(!drop_next.load(Ordering::Acquire));
+            assert_eq!(&echoed, b"recover");
+            stream.shutdown().await.unwrap();
+            stream.read_to_end(&mut Vec::new()).await.unwrap();
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_replication_budget_preserves_eligible_failover() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ik, ek) = keys();
+            let drop_next = Arc::new(AtomicBool::new(false));
+            let (i1, e1) =
+                admitted_pair_for_with_dropped_ingress_write(&ik, &ek, 91, Arc::clone(&drop_next))
+                    .await;
+            let (i2, e2) = admitted_pair_for(&ik, &ek, 92).await;
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e1, factory.clone()).unwrap();
+            let ingress = IngressSessionHandle::start(i1).unwrap();
+            egress
+                .controller()
+                .add_path(e2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            ingress
+                .add_path(i2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            let mut stream = ingress
+                .open_tcp_routed_with_config(
+                    target("zero-budget-failover.test"),
+                    BTreeMap::from([(PathId::new(91), 1), (PathId::new(92), 1)]),
+                    MultipathConfig {
+                        session_replication_budget_bytes: 0,
+                        default_stream_replication_budget_bytes: 0,
+                        retransmission_replication_enabled: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop_next.store(true, Ordering::Release);
+            stream.write_all(b"recovered").await.unwrap();
+            for _ in 0..100 {
+                if !drop_next.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(!drop_next.load(Ordering::Acquire));
+            ingress.close_path(PathId::new(91)).await.unwrap();
+            let mut echoed = [0_u8; 9];
+            stream.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"recovered");
+            stream.shutdown().await.unwrap();
+            stream.read_to_end(&mut Vec::new()).await.unwrap();
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowed_replication_sends_an_extra_copy_on_another_eligible_path() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ik, ek) = keys();
+            let drop_a = Arc::new(AtomicBool::new(false));
+            let drop_b = Arc::new(AtomicBool::new(false));
+            let (i1, e1) =
+                admitted_pair_for_with_dropped_ingress_write(&ik, &ek, 101, drop_a.clone()).await;
+            let (i2, e2) =
+                admitted_pair_for_with_dropped_ingress_write(&ik, &ek, 102, drop_b.clone()).await;
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e1, factory.clone()).unwrap();
+            let ingress = IngressSessionHandle::start(i1).unwrap();
+            egress
+                .controller()
+                .add_path(e2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            ingress
+                .add_path(i2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            let mut stream = ingress
+                .open_tcp_routed_with_config(
+                    target("extra-replica.test"),
+                    BTreeMap::from([(PathId::new(101), 1), (PathId::new(102), 1)]),
+                    MultipathConfig {
+                        session_replication_budget_bytes: 10_000,
+                        default_stream_replication_budget_bytes: 10_000,
+                        retransmission_replication_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop_a.store(true, Ordering::Release);
+            drop_b.store(true, Ordering::Release);
+            stream.write_all(b"two-paths").await.unwrap();
+            let mut echoed = [0_u8; 9];
+            stream.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"two-paths");
+            assert!(!drop_a.load(Ordering::Acquire) && !drop_b.load(Ordering::Acquire));
+            assert_eq!(
+                ingress
+                    .snapshot()
+                    .streams
+                    .values()
+                    .next()
+                    .unwrap()
+                    .retransmissions,
+                1
+            );
+            stream.shutdown().await.unwrap();
+            stream.read_to_end(&mut Vec::new()).await.unwrap();
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_close_retries_after_lost_control_or_ack() {
+        for lose_ack in [false, true] {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let drop_next = Arc::new(AtomicBool::new(false));
+                if lose_ack {
+                    let (i, e) =
+                        admitted_pair_with_dropped_egress_write(Arc::clone(&drop_next)).await;
+                    let egress = EgressSessionHandle::start(e, EchoFactory::default()).unwrap();
+                    let ingress = IngressSessionHandle::start(i).unwrap();
+                    drop_next.store(true, Ordering::Release);
+                    ingress.shutdown().await.unwrap();
+                    assert!(!drop_next.load(Ordering::Acquire));
+                    egress.wait().await.unwrap();
+                } else {
+                    let (ik, ek) = keys();
+                    let (i, e) = admitted_pair_for_with_dropped_ingress_write(
+                        &ik,
+                        &ek,
+                        79,
+                        Arc::clone(&drop_next),
+                    )
+                    .await;
+                    let egress = EgressSessionHandle::start(e, EchoFactory::default()).unwrap();
+                    let ingress = IngressSessionHandle::start(i).unwrap();
+                    drop_next.store(true, Ordering::Release);
+                    ingress.shutdown().await.unwrap();
+                    assert!(!drop_next.load(Ordering::Acquire));
+                    egress.wait().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reordered_session_controls_wait_for_predecessors_and_deduplicate() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (i, e) = admitted_pair().await;
+            let session_id = i.session_id();
+            let path_id = i.path_id();
+            let (mut io, mut noise) = i.into_transport().into_parts();
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e, factory.clone()).unwrap();
+            async fn send(
+                io: &mut DuplexStream,
+                noise: &mut NoiseTransport,
+                session_id: SessionId,
+                path_id: PathId,
+                sequence: u64,
+                inner: Message,
+            ) {
+                let limits = ProtocolLimits::default();
+                let control = Message::SessionControl(SessionControl {
+                    sequence,
+                    depends_on: sequence.checked_sub(1),
+                    frame_type: inner.frame_type(),
+                    eligible_paths: Vec::new(),
+                    payload: inner.encode(limits).unwrap(),
+                });
+                let frame = PathFrame::new(
+                    control.frame_type(),
+                    FrameFlags::empty(),
+                    session_id,
+                    path_id,
+                    noise.next_send_nonce().unwrap(),
+                    control.encode(limits).unwrap(),
+                    limits,
+                )
+                .unwrap();
+                io.write_all(&noise.seal_frame(&frame, limits).unwrap().encode())
+                    .await
+                    .unwrap();
+            }
+            let open = |id| {
+                Message::StreamOpen(StreamOpen {
+                    stream_id: StreamId::new(id).unwrap(),
+                    request_id: RequestId::new(id as u128),
+                    target: target("ordered.test"),
+                })
+            };
+            send(&mut io, &mut noise, session_id, path_id, 1, open(2)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(factory.tasks.lock().unwrap().is_empty());
+            send(&mut io, &mut noise, session_id, path_id, 0, open(1)).await;
+            for _ in 0..100 {
+                if egress.controller().snapshot().active_streams == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(factory.tasks.lock().unwrap().len(), 2);
+            send(&mut io, &mut noise, session_id, path_id, 0, open(1)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(factory.tasks.lock().unwrap().len(), 2);
+            send(
+                &mut io,
+                &mut noise,
+                session_id,
+                path_id,
+                2,
+                Message::SessionClose(SessionClose {
+                    error: ErrorClass::PathFailure,
+                    reason: Vec::new(),
+                }),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(io);
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_original_control_prevents_late_open() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (i, e) = admitted_pair().await;
+            let session_id = i.session_id();
+            let path_id = i.path_id();
+            let (mut io, mut noise) = i.into_transport().into_parts();
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e, factory.clone()).unwrap();
+            async fn send(
+                io: &mut DuplexStream,
+                noise: &mut NoiseTransport,
+                session: SessionId,
+                path: PathId,
+                message: Message,
+            ) {
+                let limits = ProtocolLimits::default();
+                let frame = PathFrame::new(
+                    message.frame_type(),
+                    FrameFlags::empty(),
+                    session,
+                    path,
+                    noise.next_send_nonce().unwrap(),
+                    message.encode(limits).unwrap(),
+                    limits,
+                )
+                .unwrap();
+                io.write_all(&noise.seal_frame(&frame, limits).unwrap().encode())
+                    .await
+                    .unwrap();
+            }
+            let open = |sequence: u64, id: u64| {
+                let inner = Message::StreamOpen(StreamOpen {
+                    stream_id: StreamId::new(id).unwrap(),
+                    request_id: RequestId::new(u128::from(id)),
+                    target: target("never-open-cancelled.test"),
+                });
+                Message::SessionControl(SessionControl {
+                    sequence,
+                    depends_on: sequence.checked_sub(1),
+                    frame_type: inner.frame_type(),
+                    eligible_paths: Vec::new(),
+                    payload: inner.encode(ProtocolLimits::default()).unwrap(),
+                })
+            };
+            let cancel = Message::SessionControlCancel(SessionControlCancel {
+                sequence: 1,
+                flow: SessionControlFlow::Stream(StreamId::new(2).unwrap()),
+            });
+            send(&mut io, &mut noise, session_id, path_id, cancel).await;
+            send(&mut io, &mut noise, session_id, path_id, open(1, 2)).await;
+            send(&mut io, &mut noise, session_id, path_id, open(0, 1)).await;
+            for _ in 0..100 {
+                if egress.controller().snapshot().active_streams == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            send(&mut io, &mut noise, session_id, path_id, open(1, 2)).await;
+            send(&mut io, &mut noise, session_id, path_id, open(2, 3)).await;
+            for _ in 0..100 {
+                if egress.controller().snapshot().active_streams == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(factory.tasks.lock().unwrap().len(), 2);
+            let close = Message::SessionClose(SessionClose {
+                error: ErrorClass::PathFailure,
+                reason: Vec::new(),
+            });
+            send(
+                &mut io,
+                &mut noise,
+                session_id,
+                path_id,
+                Message::SessionControl(SessionControl {
+                    sequence: 3,
+                    depends_on: Some(2),
+                    frame_type: close.frame_type(),
+                    eligible_paths: Vec::new(),
+                    payload: close.encode(ProtocolLimits::default()).unwrap(),
+                }),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(io);
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn replicated_open_is_applied_once_and_survives_first_path_loss() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ingress_key, egress_key) = keys();
+            let (i1, e1) = admitted_pair_for(&ingress_key, &egress_key, 81).await;
+            let (i2, e2) = admitted_pair_for(&ingress_key, &egress_key, 82).await;
+            let factory = EchoFactory::default();
+            let egress = EgressSessionHandle::start(e1, factory.clone()).unwrap();
+            let ingress = IngressSessionHandle::start(i1).unwrap();
+            egress
+                .controller()
+                .add_path(e2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            ingress
+                .add_path(i2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            let mut stream = ingress
+                .open_tcp_routed(
+                    target("replicated.test"),
+                    BTreeMap::from([(PathId::new(81), 1), (PathId::new(82), 1)]),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(factory.tasks.lock().unwrap().len(), 1);
+            ingress.close_path(PathId::new(81)).await.unwrap();
+            stream.write_all(b"survived").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut echoed = Vec::new();
+            stream.read_to_end(&mut echoed).await.unwrap();
+            assert_eq!(echoed, b"survived");
             ingress.shutdown().await.unwrap();
             egress.wait().await.unwrap();
             factory.join().await;
@@ -4902,12 +6751,16 @@ mod tests {
                 path_id: path,
                 ready_paths: 1,
                 ready_path_ids: vec![path],
+                path_states: BTreeMap::from([(path, pathchord_core::PathState::Active)]),
                 degraded_paths: 0,
                 effective_capacity_bps: 0,
                 egress_aggregate_capacity_bps: 0,
                 recommended_path_count: 1,
                 path_quality: Default::default(),
                 active_streams: 0,
+                active_udp_associations: 0,
+                pending_session_controls: 0,
+                egress_status: None,
                 streams: Default::default(),
                 pending_stream_opens: 0,
                 retained_outbound_bytes: 0,
@@ -4997,6 +6850,101 @@ mod tests {
     struct EchoUdpFactory;
     struct EchoUdpSocket {
         pending: VecDeque<Vec<u8>>,
+    }
+
+    struct CountingUdpFactory(Arc<std::sync::atomic::AtomicUsize>);
+    struct CountingUdpSocket(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for CountingUdpSocket {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[async_trait]
+    impl crate::UdpTargetSocket for CountingUdpSocket {
+        fn target_visible_port(&self) -> u16 {
+            5353
+        }
+        async fn send_datagram(&mut self, _: &[u8]) -> Result<(), crate::UdpTargetError> {
+            Ok(())
+        }
+        async fn receive_datagram(&mut self, _: usize) -> Result<Vec<u8>, crate::UdpTargetError> {
+            pending().await
+        }
+    }
+    #[async_trait]
+    impl UdpTargetFactory for CountingUdpFactory {
+        async fn open(
+            &self,
+            _: TargetEndpoint,
+        ) -> Result<crate::BoxedUdpTargetSocket, crate::UdpTargetError> {
+            Ok(Box::new(CountingUdpSocket(self.0.clone())))
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_open_and_close_controls_recover_after_loss() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ik, ek) = keys();
+            let drop_next = Arc::new(AtomicBool::new(false));
+            let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (i, e) =
+                admitted_pair_for_with_dropped_ingress_write(&ik, &ek, 93, drop_next.clone()).await;
+            let egress = EgressSessionHandle::start_with_udp(
+                e,
+                EchoFactory::default(),
+                CountingUdpFactory(closed.clone()),
+            )
+            .unwrap();
+            let ingress = IngressSessionHandle::start(i).unwrap();
+            drop_next.store(true, Ordering::Release);
+            let udp = ingress.open_udp(target("udp-retry.test")).await.unwrap();
+            assert!(!drop_next.load(Ordering::Acquire));
+            for _ in 0..100 {
+                if ingress.snapshot().active_udp_associations == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(ingress.snapshot().active_udp_associations, 1);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop_next.store(true, Ordering::Release);
+            udp.close().await.unwrap();
+            assert!(!drop_next.load(Ordering::Acquire));
+            for _ in 0..50 {
+                if closed.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(closed.load(Ordering::SeqCst), 1);
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_open_result_retries_after_loss() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let drop_next = Arc::new(AtomicBool::new(false));
+            let (i, e) = admitted_pair_with_dropped_egress_write(drop_next.clone()).await;
+            let egress =
+                EgressSessionHandle::start_with_udp(e, EchoFactory::default(), EchoUdpFactory)
+                    .unwrap();
+            let ingress = IngressSessionHandle::start(i).unwrap();
+            drop_next.store(true, Ordering::Release);
+            let udp = ingress
+                .open_udp(target("udp-response-retry.test"))
+                .await
+                .unwrap();
+            assert!(!drop_next.load(Ordering::Acquire));
+            udp.close().await.unwrap();
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+        })
+        .await
+        .unwrap();
     }
     #[async_trait]
     impl crate::UdpTargetSocket for EchoUdpSocket {

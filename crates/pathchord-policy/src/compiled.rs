@@ -138,6 +138,9 @@ pub enum RoutePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     GlobalFallback,
+    /// A rule without an explicit traffic policy admitted more than one
+    /// Transit relationship for this flow.
+    MissingTrafficPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,7 +345,15 @@ impl CompiledPolicy {
                 break;
             }
 
-            let candidates = self.egress_candidates(&compiled.rule, context, runtime);
+            let candidates = match self.egress_candidates(&compiled.rule, context, runtime) {
+                Ok(candidates) => candidates,
+                Err(reason) => {
+                    return Evaluation::Reject {
+                        generation: self.generation,
+                        reason,
+                    };
+                }
+            };
             if !candidates.is_empty() {
                 return Evaluation::Route(RoutePlan::Egress(EgressRoutePlan {
                     generation: self.generation,
@@ -384,7 +395,7 @@ impl CompiledPolicy {
         rule: &EgressRule,
         context: &PolicyContext,
         runtime: &RuntimeCatalog,
-    ) -> Vec<EgressRouteCandidate> {
+    ) -> Result<Vec<EgressRouteCandidate>, RejectReason> {
         let egresses: Vec<_> = match &rule.egress {
             EgressSelection::Id(id) => self.egresses.get(id).into_iter().collect(),
             EgressSelection::Selector(selector) => self
@@ -399,16 +410,19 @@ impl CompiledPolicy {
             EgressSelection::None => Vec::new(),
         };
 
-        egresses
-            .into_iter()
-            .filter_map(|egress| {
-                let status = runtime.egress(&egress.id)?;
-                if !egress_is_usable(rule, egress, status, context.protocol) {
-                    return None;
-                }
-                self.transit_candidate(egress, context, runtime)
-            })
-            .collect()
+        let mut candidates = Vec::new();
+        for egress in egresses {
+            let Some(status) = runtime.egress(&egress.id) else {
+                continue;
+            };
+            if !egress_is_usable(rule, egress, status, context.protocol) {
+                continue;
+            }
+            if let Some(candidate) = self.transit_candidate(egress, context, runtime)? {
+                candidates.push(candidate);
+            }
+        }
+        Ok(candidates)
     }
 
     fn transit_candidate(
@@ -416,10 +430,12 @@ impl CompiledPolicy {
         egress: &EgressConfig,
         context: &PolicyContext,
         runtime: &RuntimeCatalog,
-    ) -> Option<EgressRouteCandidate> {
-        let compiled = self.transit_rules.iter().find(|compiled| {
+    ) -> Result<Option<EgressRouteCandidate>, RejectReason> {
+        let Some(compiled) = self.transit_rules.iter().find(|compiled| {
             compiled.rule.egress == egress.id && compiled.matches.matches(context)
-        })?;
+        }) else {
+            return Ok(None);
+        };
         let mut transit_proxies: Vec<_> = self
             .transit_proxy_configs(runtime)
             .filter_map(|proxy| {
@@ -435,16 +451,22 @@ impl CompiledPolicy {
             })
             .collect();
         if transit_proxies.is_empty() {
-            return None;
+            return Ok(None);
+        }
+        if transit_proxies.len() > 1
+            && compiled.rule.traffic_policy.as_str()
+                == crate::config::IMPLICIT_SINGLE_TRANSIT_POLICY
+        {
+            return Err(RejectReason::MissingTrafficPolicy);
         }
         transit_proxies.sort_by(|left, right| left.id.cmp(&right.id));
-        Some(EgressRouteCandidate {
+        Ok(Some(EgressRouteCandidate {
             egress_id: egress.id.clone(),
             transit_rule_id: compiled.rule.id.clone(),
             traffic_policy_id: compiled.rule.traffic_policy.clone(),
             traffic_class: compiled.rule.traffic_class.clone(),
             transit_proxies,
-        })
+        }))
     }
 
     fn ordinary_proxy_candidate(
@@ -807,6 +829,90 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap()
+    }
+
+    #[test]
+    fn implicit_transit_policy_allows_one_candidate_but_rejects_dynamic_multipath() {
+        let input = r#"
+apiVersion: pathchord.io/v1
+kind: Egress
+metadata: {name: edge}
+spec:
+  address: edge.example.test
+  port: 443
+  publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  capabilities: {tcp: true, udp: true}
+---
+apiVersion: pathchord.io/v1
+kind: TransitProxy
+metadata: {name: first}
+spec: {protocol: direct}
+---
+apiVersion: pathchord.io/v1
+kind: EgressRule
+metadata: {name: route}
+spec: {order: 10, catchAll: true, egressRef: edge}
+---
+apiVersion: pathchord.io/v1
+kind: TransitRule
+metadata: {name: paths}
+spec: {order: 20, catchAll: true, egressRef: edge}
+---
+apiVersion: pathchord.io/v1
+kind: DNSPolicy
+metadata: {name: dns}
+spec: {defaultRoute: blocked}
+---
+apiVersion: pathchord.io/v1
+kind: FallbackPolicy
+metadata: {name: fallback}
+spec: {action: direct}
+"#;
+        let implicit = crate::KubeConfig::from_yaml(input)
+            .unwrap()
+            .into_validated_snapshot(Generation::new(7))
+            .unwrap()
+            .compile()
+            .unwrap();
+        let mut runtime = RuntimeCatalog::default();
+        runtime.set_egress(EgressId::new("edge"), ready_egress(1));
+        runtime.set_transit_proxy(
+            TransitProxyId::new("first"),
+            ready_proxy(&[FlowProtocol::Tcp], 1),
+        );
+        assert!(matches!(
+            implicit.evaluate(&context(), &runtime),
+            Evaluation::Route(RoutePlan::Egress(_))
+        ));
+        // A subscription refresh may add a second matching relationship after
+        // validation. This must fail closed even when the fallback is direct.
+        runtime.set_dynamic_transit_proxy(
+            proxy("second", &[], &[], 100),
+            ready_proxy(&[FlowProtocol::Tcp], 1),
+        );
+        assert_eq!(
+            implicit.evaluate(&context(), &runtime),
+            Evaluation::Reject {
+                generation: Generation::new(7),
+                reason: RejectReason::MissingTrafficPolicy,
+            }
+        );
+
+        let explicit_input = input.replace(
+            "spec: {order: 20, catchAll: true, egressRef: edge}",
+            "spec: {order: 20, catchAll: true, egressRef: edge, trafficPolicyRef: default}\n---\napiVersion: pathchord.io/v1\nkind: TrafficPolicy\nmetadata: {name: default}\nspec: {}",
+        );
+        let explicit = crate::KubeConfig::from_yaml(&explicit_input)
+            .unwrap()
+            .into_validated_snapshot(Generation::new(7))
+            .unwrap()
+            .compile()
+            .unwrap();
+        let Evaluation::Route(RoutePlan::Egress(route)) = explicit.evaluate(&context(), &runtime)
+        else {
+            panic!("explicit traffic policy must allow the multipath route");
+        };
+        assert_eq!(route.candidates[0].transit_proxies.len(), 2);
     }
 
     #[test]

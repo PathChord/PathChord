@@ -54,7 +54,12 @@ control plane.
 
 The supported resource kinds are `Egress`, `TransitProxy`, `Subscription`,
 `EgressRule`, `TransitRule`, `ProxyRule`, `TrafficPolicy`, `Listener`,
-`DNSPolicy`, and `FallbackPolicy`. A namespace MUST contain at most one object
+`DNSPolicy`, `FallbackPolicy`, `EgressService`, and `NodeProbePolicy`. The
+last two are role-specific service resources: `EgressService` selects the
+Egress identity, listener, authorization store, and service limits for one
+Egress process; `NodeProbePolicy` configures the optional bounded Transit node
+probe. Ingress consumes `NodeProbePolicy` and Egress consumes `EgressService`;
+both may be present in the same validated resource bundle. A namespace MUST contain at most one object
 for each `(kind, metadata.name)`. A complete configuration MUST contain exactly
 one `DNSPolicy` and one `FallbackPolicy`; all other kinds are optional subject
 to reference and routing validation. A `List` with no listener is valid as a
@@ -132,6 +137,29 @@ operator labels are carried by `metadata`:
 At least one of `capabilities.tcp` or `capabilities.udp` MUST be true. An
 Egress reference MUST resolve to an Egress object. Egress topology and local key
 material are startup configuration and are not hot-reloaded.
+
+## EgressService and NodeProbePolicy
+
+`EgressService.spec` accepts `bind`, `egressId`, `identity`,
+`authorizationDb`, `controlSocket`, `maxConcurrentPaths`, `capacityBps`,
+`recommendedPathCount`, `maxStreamsPerIngress`, `quotaRemaining`,
+`trafficMultiplierBasisPoints`, `remoteDnsOnly`, `webBind`, `webTokenFile`,
+`webOrigins`, and `webProtectedTransport`. Paths in the resource are resolved
+relative to the selected configuration source. An Egress process selects at
+most one such resource. `identity` and an Egress ID are required after command
+line overrides; the resource name supplies the ID when `egressId` is absent.
+`remoteDnsOnly` defaults to false. When true and an original hostname is
+present, Egress resolves it using its own system resolver for TCP and UDP and
+does not use Ingress-provided candidates. A literal IP without a hostname is
+still a valid target. The option applies to target names, not the independent
+Ingress DNS routing policy.
+
+`NodeProbePolicy.spec.target` is an object containing `host` and `port`.
+`intervalSeconds` defaults to 30 and is bounded by 1..=86400;
+`timeoutSeconds` defaults to 5 and is bounded by 1..=30; `maxConcurrency`,
+`windowSize`, and `maxNodesPerBatch` default to 8, 32, and 128 and are bounded
+by 1..=64, 1..=128, and 1..=1024 respectively. At most one NodeProbePolicy
+may be present in the bundle.
 
 ## TransitProxy and Subscription
 
@@ -233,7 +261,9 @@ optional capability set. The first rule whose match, selector, capability, and
 current Egress usability all pass wins. `TransitRule` objects are evaluated after an
 Egress is selected; `egressRef` is an Egress name, `require` and `reject` are
 selectors, `weight` defaults to `100`, and `trafficPolicyRef` is required when
-more than one admitted relationship can carry the flow. `trafficClassRef` optionally selects a key in the selected TrafficPolicy class map; an unknown key is invalid. A rule with no admitted
+more than one admitted relationship can carry the flow. If a rule omits that
+reference and its runtime candidates grow beyond one, the flow is rejected
+without entering Proxy rules or fallback. `trafficClassRef` optionally selects a key in the selected TrafficPolicy class map; an unknown key is invalid. A rule with no admitted
 Transit Proxy causes the next Egress rule to be considered; it does not silently
 fall through to an arbitrary Proxy.
 
@@ -377,6 +407,13 @@ administrator labels/tags, DNS runtime health, and compiled dynamic rules may
 be hot-reloaded. Snapshot replacement is atomic. On any parse, validation,
 compilation, persistence, or cache-write failure, the last successful snapshot
 remains active and the failure is exposed through structured status.
+
+For a declared Subscription, management enable, disable, deletion, or explicit
+re-creation remains effective across reload and restart while its declaration is
+unchanged. Changing that declaration applies the new spec; removing it removes
+that declared subscription and drains its imported nodes. Subscriptions created
+only through management remain independent of unrelated declarations. These
+decisions and their configuration generation are persisted atomically.
 
 
 Directory create, modify, remove, and rename events trigger a full candidate

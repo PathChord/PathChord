@@ -101,6 +101,10 @@ frame_seq 等于该方向对应记录的出站 nonce。session_id 和 path_id �
 | 9 | STATUS_REPORT | control |
 | 10 | HEARTBEAT | control |
 | 11 | CONTROL_ACK | control |
+| 12 | PATH_READY_CAPABILITIES | control |
+| 13 | SESSION_CONTROL | control |
+| 14 | SESSION_CONTROL_ACK | control |
+| 15 | SESSION_CONTROL_CANCEL | control |
 | 32 | STREAM_OPEN | control |
 | 33 | STREAM_OPEN_OK | control |
 | 34 | STREAM_OPEN_ERR | control |
@@ -109,11 +113,13 @@ frame_seq 等于该方向对应记录的出站 nonce。session_id 和 path_id �
 | 37 | STREAM_WINDOW | control |
 | 38 | STREAM_FIN | control |
 | 39 | STREAM_RST | control |
+| 40 | STREAM_OPEN_CLASS | control |
 | 64 | UDP_OPEN | control |
 | 65 | UDP_OPEN_OK | control |
 | 66 | UDP_OPEN_ERR | control |
 | 67 | UDP_DATAGRAM | bulk |
 | 68 | UDP_CLOSE | control |
+| 69 | UDP_OPEN_CLASS | control |
 
 PATH_HELLO 携带的 v1 capability 位集合如下：
 
@@ -121,7 +127,7 @@ PATH_HELLO 携带的 v1 capability 位集合如下：
 |---:|---|
 | 0 | TCP_STREAM |
 | 1 | UDP_SESSION |
-| 2 | MULTIPATH |
+| 2 | TRAFFIC_CLASSES |
 | 3 | CONTROL_REPLICATION |
 | 4 | ADDRESS_CANDIDATES |
 | 5 | EXTENDED_STATUS_REPORT |
@@ -217,6 +223,24 @@ max_session_buffering    varint
 每个值 MUST 为正数且不超过 profile 限制。只有接受 PATH_READY 后才允许
 发送业务帧。
 
+PATH_READY_CAPABILITIES 在 PATH_READY 后附加一个 capability 位集合：
+
+~~~text
+max_frame_payload        varint
+max_control_payload      varint
+max_session_buffering    varint
+capabilities             varint bitset
+~~~
+
+协商 `TRAFFIC_CLASSES` 后，`STREAM_OPEN_CLASS` 和 `UDP_OPEN_CLASS` 会在旧的
+open payload 后附加：
+
+~~~text
+class_name               bytes(256)，非空 UTF-8
+class_priority           varint，0..=255
+class_share              varint，1..=1000000
+~~~
+
 PATH_DRAIN：
 
 ~~~text
@@ -248,8 +272,53 @@ range_count          varint, at most max_ack_ranges
 ranges               repeated inclusive [start, end] varint pairs
 ~~~
 
-范围 MUST 按顺序排列、互不重叠，并位于 Session 控制序列空间内。发送方 MUST
-保留控制消息，直到其序列被 ACK 覆盖或 Session 关闭。
+`CONTROL_ACK` 确认同一 Path 上的 Path 本地 `HEARTBEAT` 序号。其范围有序且不重叠。
+
+SESSION_CONTROL 承载一个 Session 范围的操作：
+
+~~~text
+control_seqno         varint
+dependency_present    varint（0 或 1）
+depends_on            varint，仅 dependency_present = 1 时存在
+inner_frame_type      varint
+eligible_path_count   varint，0..=256
+eligible_paths        重复的 PathID，按序排列且无重复
+inner_payload         bytes(max_control_payload)
+~~~
+
+`inner_frame_type` 为 SESSION_CLOSE、STREAM_OPEN、STREAM_OPEN_CLASS、
+STREAM_OPEN_OK、STREAM_OPEN_ERR、STREAM_ACK、STREAM_WINDOW、STREAM_FIN、
+STREAM_RST、UDP_OPEN、UDP_OPEN_CLASS、UDP_OPEN_OK、UDP_OPEN_ERR 或 UDP_CLOSE。
+`inner_payload` 是该帧类型不带帧头的规范 payload。完整的 SESSION_CONTROL payload
+（包括此封装）受 `max_control_payload` 限制。依赖序号 MUST 小于控制序号。
+只有 STREAM_OPEN、STREAM_OPEN_CLASS、UDP_OPEN 和 UDP_OPEN_CLASS 可以携带非空的
+eligible Path 列表。空列表表示没有显式 Path 限制；否则承载打开操作的 Path MUST 在列表内。
+Egress 将此列表应用于该 flow 的两个方向。列出的 Path 使用前仍必须独立加入同一 Session。
+每个发送方向拥有独立的 Session 范围控制序号，从零开始。接收方按序应用操作并
+丢弃重复项；应用操作前必须先应用其依赖。发送方保留并重传操作直到收到确认。
+在其他符合条件的 Path 上发送副本时，使用新的 Path 帧序号和 Noise nonce，同时保留
+控制序号和 payload。Path HELLO、attach、readiness、DRAIN、CLOSE、STATUS_REPORT、
+HEARTBEAT 和 CONTROL_ACK 仍属于 Path 本地消息，不进行此封装。
+
+SESSION_CONTROL_ACK 使用与 CONTROL_ACK 相同的 payload 编码，但其范围属于认证
+发送方对端方向的 Session 控制序号空间。`highest_contiguous` 确认直到该值的所有序号；
+选择性范围为可选项。接收方至少应用序号 0 后才发送 ACK。ACK 沿收到副本的 Path 发送。
+关闭 Session 时，接收方保留足够时间，以确认重传的 SESSION_CLOSE；发起方收到该 ACK
+或失去 Session transport 后关闭。
+
+当 flow 失去所有符合条件的 Path 时，SESSION_CONTROL_CANCEL 可用相同控制序号替换
+该 flow 尚未确认的操作；没有此类未确认操作时，也可使用新的序号：
+
+~~~text
+control_seqno         varint
+flow_kind             varint（0=TCP Stream，1=UDP Association）
+flow_id               varint
+~~~
+
+它只包含 Session 内的不透明 flow ID，绝不包含目标、凭据或业务数据，并可经该 Session
+任意 ready 且已认证的 Path 传递。接收方在同一序号空间内处理取消操作，并以它替换
+已排队的同序号同 flow 操作。如果原操作已被应用，取消操作会清理该 flow。重复取消
+操作是幂等的；ACK 对已取消序号的确认方式与其他操作相同。
 
 ### 状态报告
 

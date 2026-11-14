@@ -155,6 +155,23 @@ impl ResponseEnvelope {
     }
 }
 
+/// Trusted transport that accepted a management request. This value is supplied
+/// by the adapter, never by the serialized request envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagementSource {
+    Local,
+    Web,
+}
+
+impl ManagementSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Web => "web",
+        }
+    }
+}
+
 /// Synchronous request handler used behind local transport adapters.
 ///
 /// Dispatchers own validation, authorization, and response shaping. Transport
@@ -163,6 +180,14 @@ impl ResponseEnvelope {
 #[async_trait]
 pub trait ManagementDispatcher: Send + 'static {
     async fn dispatch(&mut self, request: RequestEnvelope) -> ResponseEnvelope;
+
+    async fn dispatch_from(
+        &mut self,
+        request: RequestEnvelope,
+        _source: ManagementSource,
+    ) -> ResponseEnvelope {
+        self.dispatch(request).await
+    }
 
     async fn record_authentication_failure(&mut self, _source: &str) {}
 }

@@ -63,6 +63,11 @@ pub enum FrameType {
     Heartbeat = 10,
     ControlAck = 11,
     PathReadyCapabilities = 12,
+    SessionControl = 13,
+    SessionControlAck = 14,
+    SessionControlCancel = 15,
+    PathRebind = 16,
+    PathRebindAck = 17,
 
     StreamOpen = 32,
     StreamOpenOk = 33,
@@ -83,7 +88,29 @@ pub enum FrameType {
 }
 
 impl FrameType {
-    pub const ALL: [Self; 27] = [
+    /// Control messages whose effects and acknowledgements belong to a Session.
+    #[must_use]
+    pub const fn is_session_control(self) -> bool {
+        matches!(
+            self,
+            Self::SessionClose
+                | Self::StreamOpen
+                | Self::StreamOpenClass
+                | Self::StreamOpenOk
+                | Self::StreamOpenErr
+                | Self::StreamAck
+                | Self::StreamWindow
+                | Self::StreamFin
+                | Self::StreamRst
+                | Self::UdpOpen
+                | Self::UdpOpenClass
+                | Self::UdpOpenOk
+                | Self::UdpOpenErr
+                | Self::UdpClose
+        )
+    }
+
+    pub const ALL: [Self; 32] = [
         Self::PathHello,
         Self::SessionAttach,
         Self::SessionAttachOk,
@@ -96,6 +123,11 @@ impl FrameType {
         Self::Heartbeat,
         Self::ControlAck,
         Self::PathReadyCapabilities,
+        Self::SessionControl,
+        Self::SessionControlAck,
+        Self::SessionControlCancel,
+        Self::PathRebind,
+        Self::PathRebindAck,
         Self::StreamOpen,
         Self::StreamOpenOk,
         Self::StreamOpenErr,
@@ -147,6 +179,11 @@ impl TryFrom<u64> for FrameType {
             10 => Self::Heartbeat,
             11 => Self::ControlAck,
             12 => Self::PathReadyCapabilities,
+            13 => Self::SessionControl,
+            14 => Self::SessionControlAck,
+            15 => Self::SessionControlCancel,
+            16 => Self::PathRebind,
+            17 => Self::PathRebindAck,
             32 => Self::StreamOpen,
             33 => Self::StreamOpenOk,
             34 => Self::StreamOpenErr,

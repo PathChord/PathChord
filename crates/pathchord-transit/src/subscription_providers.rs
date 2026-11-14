@@ -248,8 +248,11 @@ fn retain_previous(
     nodes: &mut Vec<NormalizedNode>,
 ) {
     let prefix = format!("{key}/");
+    let fingerprint = subscription_source_fingerprint(config);
     for previous in manager.snapshot.nodes.values().filter(|node| {
         node.source_subscription == config.id
+            && node.source_fingerprint == fingerprint
+            && node.state != DynamicNodeState::Draining
             && node
                 .config
                 .labels

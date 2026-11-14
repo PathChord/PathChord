@@ -22,7 +22,7 @@
 | Linux TUN | 通过 `PacketDevice` 封装 `tun-rs` 异步包设备，并使用直接的 `smoltcp` reactor | 安全、可替换的设备生命周期以及维护中的 TCP/UDP 状态机 |
 | Windows TUN | 通过同一接口封装 `tun-rs` Wintun 包设备，并使用直接的 `smoltcp` reactor | 无需平台专用 TCP 重建的标准 Windows 驱动集成方式 |
 | HTTP/SOCKS | Hyper HTTP/1 消息 codec，配合内部 HTTP 路由和 SOCKS4/4a/5 adapter | 维护中的 HTTP 解析、消息 framing、流式背压，以及显式的策略和认证边界 |
-| Transit 协议 | 带类型化 rustls TLS 选项的原生 direct/HTTP/SOCKS/SS/VLESS/Trojan adapter，以及使用 AES-128-GCM 的明文 TCP VMess | 复用聚焦的协议实现，同时保留节点参数、进程所有权和明确的不支持错误 |
+| Transit 协议 | 原生 direct/HTTP/SOCKS/SS/VLESS/Trojan、VMess TCP/TLS/WebSocket/UDP、AnyTLS、Hysteria2、TUIC 和 VLESS REALITY adapter，并提供类型化 rustls/QUIC TLS 选项 | 复用聚焦的协议实现，同时保留节点参数、进程所有权和明确的不支持错误 |
 | 订阅导入 | 有界节点规范化及 HTTP provider 展开，之后执行适配器验证 | 文档格式不等于协议可用性；错误节点保持可见且不丢弃有效兄弟节点 |
 | DNS 线协议处理 | 路由 adapter 后使用 `hickory-proto` | 使用成熟的 DNS 解析/编码，同时保持 local、Transit、Egress 和 blocked 路由可替换 |
 | 测试 | `cargo test`、确定性模拟传输、属性测试、数据包跟踪和故障注入 | 多路径正确性依赖可复现的丢包、重复、重排序和重启测试 |

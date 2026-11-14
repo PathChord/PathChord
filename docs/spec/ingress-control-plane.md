@@ -205,6 +205,13 @@ dynamic configuration generation; a failed refresh retains the last successful
 snapshot and returns a typed failure. Delete drains nodes imported solely from
 the source.
 
+For a Subscription declared in the resource bundle, an enable, disable,
+delete, or explicit re-creation through this API remains authoritative across
+reload and restart while the declaration is unchanged. A changed declaration
+replaces the declared spec; removing it removes only that declared resource.
+The decision and its configuration generation are committed atomically before
+the data plane releases or drains source visibility.
+
 The canonical `subscriptions.create` body is:
 
 ```json
@@ -235,7 +242,11 @@ or a documented input alias; `source.url` MUST be an
 HTTP(S) URL without embedded credentials; and `credentials_ref` MUST be an
 opaque reference rather than a secret value. Refresh and cache fields use the
 same bounds as the configuration schema. `cache` MAY be null. The list read
-model returns these fields, but never resolves or returns the referenced secret.
+model returns the source type and credential reference without resolving the
+secret. Since URL paths, queries, and fragments can contain credentials,
+`source.url` is returned as `null` with `source.url_redaction_reason` set to
+`sensitive_source`; `source.origin` contains only the scheme, host, and port.
+The complete URL is retained privately for refresh operations.
 
 The system-proxy switch is a runtime control-plane mutation, not a YAML
 resource. `system_proxy.enable` MUST include `listener_id`, which MUST resolve
@@ -338,7 +349,9 @@ The local socket/pipe uses OS ownership and ACLs as the primary boundary. The
 service assigns an actor and capabilities for every request. Standard
 capabilities are `status:read`, `metrics:read`, `nodes:read`, `nodes:write`,
 `listeners:read`, `subscriptions:write`, `authorization:write`, and
-`system_proxy:write`.
+`system_proxy:write`. An explicitly assigned `force` capability may satisfy a
+mutation's generation precondition when the caller cannot provide an expected
+generation; it is never granted to the default web actor.
 
 Every mutation and authentication failure emits an audit event containing:
 

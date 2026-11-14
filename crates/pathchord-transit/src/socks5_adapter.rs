@@ -95,6 +95,7 @@ impl Socks5TransitAdapter {
                 "SOCKS UDP over a TLS control connection is unsupported".into(),
             ));
         }
+        let udp_enabled = config.options.udp != Some(false) && tls.is_none();
         let username = credential.and_then(|value| value.field("username"));
         let password = credential.and_then(|value| value.field("password"));
         let credentials = match (username, password) {
@@ -127,7 +128,13 @@ impl Socks5TransitAdapter {
             credentials,
             connect_timeout,
             tls,
-            udp_enabled: config.options.udp != Some(false),
+            // SOCKS UDP ASSOCIATE is a separate plaintext UDP relay. A TLS
+            // control connection cannot safely imply TLS for that relay, so
+            // the native adapter disables UDP unless the control channel is
+            // also plaintext. An explicit `udp: true` with TLS is rejected
+            // above; an omitted value remains unavailable rather than
+            // silently downgrading the transport.
+            udp_enabled,
         })
     }
 }

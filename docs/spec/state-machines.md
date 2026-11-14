@@ -107,8 +107,9 @@ the manager to create a new `CONFIGURED` record with a new SessionID.
 Endpoint restart, Egress hard failure, or authorization disable/revoke closes
 the Session and all related target resources. Endpoint restart and
 authorization failure MUST NOT automatically resume the old SessionID.
-Heartbeat and control retransmission use any ready, non-revoked Path and are
-deduplicated by the Session control sequence.
+Heartbeats and their acknowledgements are Path-local. Session control
+retransmissions use ready, policy-compliant Paths and are deduplicated by the
+Session control sequence.
 
 ## TCP Stream
 

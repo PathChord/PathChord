@@ -24,11 +24,12 @@ pub use id::{IdError, PathId, RequestId, SessionId, StreamId};
 pub use limits::{LimitsError, ProtocolLimits};
 pub use messages::{
     CAPABILITY_TRAFFIC_CLASSES, ControlAck, Heartbeat, Message, MessageCodecError, PathClose,
-    PathDrain, PathHello, PathReady, PathReadyCapabilities, SessionAttach, SessionAttachOk,
-    SessionAttachReject, SessionClose, StatusReport, StatusReportDisposition, StatusReportTracker,
-    StreamAck, StreamData, StreamFin, StreamOpen, StreamOpenClass, StreamOpenErr, StreamOpenOk,
-    StreamRst, StreamWindow, TargetEndpoint, TrafficClassConfig, UdpClose, UdpDatagram, UdpOpen,
-    UdpOpenClass, UdpOpenErr, UdpOpenOk,
+    PathDrain, PathHello, PathReady, PathReadyCapabilities, PathRebind, SessionAttach,
+    SessionAttachOk, SessionAttachReject, SessionClose, SessionControl, SessionControlCancel,
+    SessionControlFlow, StatusReport, StatusReportDisposition, StatusReportTracker, StreamAck,
+    StreamData, StreamFin, StreamOpen, StreamOpenClass, StreamOpenErr, StreamOpenOk, StreamRst,
+    StreamWindow, TargetEndpoint, TrafficClassConfig, UdpClose, UdpDatagram, UdpOpen, UdpOpenClass,
+    UdpOpenErr, UdpOpenOk,
 };
 pub use reliability::{
     AckRange, ControlReceiver, ControlSender, ReliabilityError, StreamInsertResult,

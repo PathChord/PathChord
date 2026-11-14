@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use pathchord_core::management::ManagementDispatcher;
 use thiserror::Error;
@@ -38,6 +38,7 @@ pub struct LocalControlServer<D = LocalControlDispatcher> {
     listener: tokio::net::UnixListener,
     dispatcher: Arc<Mutex<D>>,
     path: PathBuf,
+    ownership: SocketOwnership,
 }
 
 #[cfg(unix)]
@@ -55,15 +56,29 @@ impl<D> LocalControlServer<D>
 where
     D: ManagementDispatcher,
 {
-    /// Binds one Unix socket, removing only an existing socket at `path`.
+    /// Binds one Unix socket, recovering a stale endpoint only while holding
+    /// its exclusive lifetime lock.
     pub fn bind(path: impl Into<PathBuf>, dispatcher: D) -> Result<Self, LocalServerError> {
         let path = path.into();
+        create_socket_parent(&path)?;
+        let lock = acquire_socket_lock(&path)?;
         prepare_socket_path(&path)?;
         let listener =
             std::os::unix::net::UnixListener::bind(&path).map_err(LocalServerError::Io)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(LocalServerError::Io)?;
+        if !metadata.file_type().is_socket() {
+            return Err(socket_error(
+                std::io::ErrorKind::AlreadyExists,
+                "control endpoint changed during binding",
+            ));
+        }
+        let ownership = SocketOwnership {
+            path: path.clone(),
+            identity: SocketIdentity::from_metadata(&metadata),
+            _lock: lock,
+        };
         if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         {
-            let _ = std::fs::remove_file(&path);
             return Err(LocalServerError::Io(error));
         }
         listener
@@ -75,6 +90,7 @@ where
             listener,
             dispatcher: Arc::new(Mutex::new(dispatcher)),
             path,
+            ownership,
         })
     }
 
@@ -163,14 +179,7 @@ where
 
     /// Explicitly removes the owned socket path.
     pub fn shutdown(self) -> Result<(), LocalServerError> {
-        remove_socket_path(&self.path)
-    }
-}
-
-#[cfg(unix)]
-impl<D> Drop for LocalControlServer<D> {
-    fn drop(&mut self) {
-        let _ = remove_socket_path(&self.path);
+        self.ownership.remove()
     }
 }
 
@@ -378,7 +387,11 @@ where
 {
     let mut request: RequestEnvelope = read_object(&mut stream).await?;
     request.actor = trusted_local_actor();
-    let response = dispatcher.lock().await.dispatch(request).await;
+    let response = dispatcher
+        .lock()
+        .await
+        .dispatch_from(request, pathchord_core::management::ManagementSource::Local)
+        .await;
     write_object(&mut stream, &response).await?;
     Ok(())
 }
@@ -428,31 +441,172 @@ async fn stop_tasks(tasks: &mut JoinSet<()>) {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl SocketIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct SocketOwnership {
+    path: PathBuf,
+    identity: SocketIdentity,
+    // Kept until after socket cleanup. The lock file itself deliberately
+    // remains on disk so another opener cannot lock a different inode.
+    _lock: std::fs::File,
+}
+
+#[cfg(unix)]
+impl SocketOwnership {
+    fn remove(&self) -> Result<(), LocalServerError> {
+        remove_owned_socket(&self.path, self.identity)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SocketOwnership {
+    fn drop(&mut self) {
+        let _ = self.remove();
+    }
+}
+
+#[cfg(unix)]
+fn create_socket_parent(path: &Path) -> Result<(), LocalServerError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(LocalServerError::Io)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn acquire_socket_lock(path: &Path) -> Result<std::fs::File, LocalServerError> {
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let before = match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.is_file() => Some(SocketIdentity::from_metadata(&metadata)),
+        Ok(_) => {
+            return Err(socket_error(
+                std::io::ErrorKind::AlreadyExists,
+                "control lock is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(LocalServerError::Io(error)),
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(LocalServerError::Io)?;
+    let opened = file.metadata().map_err(LocalServerError::Io)?;
+    let opened_identity = SocketIdentity::from_metadata(&opened);
+    let current = std::fs::symlink_metadata(&lock_path).map_err(LocalServerError::Io)?;
+    if !opened.is_file()
+        || !current.is_file()
+        || before.is_some_and(|identity| identity != opened_identity)
+        || SocketIdentity::from_metadata(&current) != opened_identity
+    {
+        return Err(socket_error(
+            std::io::ErrorKind::AlreadyExists,
+            "control lock changed during open",
+        ));
+    }
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(socket_error(
+                std::io::ErrorKind::AddrInUse,
+                "control endpoint is already owned",
+            ));
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(LocalServerError::Io(error)),
+    }
+    let current = std::fs::symlink_metadata(&lock_path).map_err(LocalServerError::Io)?;
+    if !current.is_file() || SocketIdentity::from_metadata(&current) != opened_identity {
+        return Err(socket_error(
+            std::io::ErrorKind::AlreadyExists,
+            "control lock changed during acquisition",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
 fn prepare_socket_path(path: &Path) -> Result<(), LocalServerError> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => remove_socket_path(path),
-        Ok(_) => Err(LocalServerError::Io(std::io::Error::new(
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            // The lock protects cooperating PathChord instances; also probe
+            // older or unrelated listeners which do not use this lock. A
+            // nonblocking connect never waits for a full accept backlog.
+            let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+                .map_err(LocalServerError::Io)?;
+            socket.set_nonblocking(true).map_err(LocalServerError::Io)?;
+            let address = socket2::SockAddr::unix(path).map_err(LocalServerError::Io)?;
+            match socket.connect(&address) {
+                Ok(()) => Err(socket_error(
+                    std::io::ErrorKind::AddrInUse,
+                    "control endpoint is already listening",
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    remove_owned_socket(path, SocketIdentity::from_metadata(&metadata))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                // Permission errors, EINPROGRESS and a full accept backlog do
+                // not prove that a listener is stale. Fail closed.
+                Err(error) => Err(LocalServerError::Io(error)),
+            }
+        }
+        Ok(_) => Err(socket_error(
             std::io::ErrorKind::AlreadyExists,
             "control endpoint exists and is not a Unix socket",
-        ))),
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(LocalServerError::Io(error)),
     }
 }
 
 #[cfg(unix)]
-fn remove_socket_path(path: &Path) -> Result<(), LocalServerError> {
+fn remove_owned_socket(path: &Path, identity: SocketIdentity) -> Result<(), LocalServerError> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
+        Ok(metadata)
+            if metadata.file_type().is_socket()
+                && SocketIdentity::from_metadata(&metadata) == identity =>
+        {
             std::fs::remove_file(path).map_err(LocalServerError::Io)
         }
-        Ok(_) => Err(LocalServerError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "control endpoint is not a Unix socket",
-        ))),
+        Ok(_) => Err(socket_error(
+            std::io::ErrorKind::AlreadyExists,
+            "control endpoint no longer belongs to this server",
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(LocalServerError::Io(error)),
     }
+}
+
+#[cfg(unix)]
+fn socket_error(kind: std::io::ErrorKind, message: &'static str) -> LocalServerError {
+    LocalServerError::Io(std::io::Error::new(kind, message))
 }
 
 #[cfg(all(test, unix))]
@@ -485,7 +639,14 @@ mod tests {
                     .map(|value| (*value).to_owned())
                     .collect(),
             },
-            expected_generation: None,
+            expected_generation: matches!(
+                operation,
+                "system_proxy.enable" | "system_proxy.disable"
+            )
+            .then(|| crate::GenerationExpectation {
+                scope: "configuration".into(),
+                value: 0,
+            }),
             body,
         }
     }
@@ -640,5 +801,90 @@ mod tests {
             server.run_concurrent(0).await,
             Err(LocalServerError::InvalidConcurrency)
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_servers_cannot_take_the_same_socket() {
+        let path = socket_path();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let runtime = tokio::runtime::Handle::current();
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let runtime = runtime.clone();
+            tasks.push(tokio::task::spawn_blocking(move || {
+                let _entered = runtime.enter();
+                barrier.wait();
+                let result = LocalControlServer::bind(
+                    path,
+                    LocalControlDispatcher::new(SystemProxyPlatform::Linux),
+                );
+                // Keep the winning server and its lock alive until both
+                // attempts have completed.
+                barrier.wait();
+                result
+            }));
+        }
+        let first = tasks.remove(0).await.unwrap();
+        let second = tasks.remove(0).await.unwrap();
+        let (server, error) = match (first, second) {
+            (Ok(server), Err(error)) | (Err(error), Ok(server)) => (server, error),
+            _ => panic!("exactly one socket owner must succeed"),
+        };
+        assert!(
+            matches!(error, LocalServerError::Io(ref error) if error.kind() == std::io::ErrorKind::AddrInUse)
+        );
+        let mut client = UnixStream::connect(&path).await.unwrap();
+        let request = request("status.get", &[], json!({}));
+        let (server_result, response) = tokio::join!(server.serve_once(), async {
+            write_object(&mut client, &request).await.unwrap();
+            read_object::<_, ResponseEnvelope>(&mut client)
+                .await
+                .unwrap()
+        });
+        server_result.unwrap();
+        assert!(response.ok);
+        drop(server);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn live_unlocked_socket_is_not_removed_and_stale_socket_recovers() {
+        let path = socket_path();
+        let legacy = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let result = LocalControlServer::bind(
+            &path,
+            LocalControlDispatcher::new(SystemProxyPlatform::Linux),
+        );
+        assert!(
+            matches!(result, Err(LocalServerError::Io(ref error)) if error.kind() == std::io::ErrorKind::AddrInUse)
+        );
+        assert!(path.exists());
+        drop(legacy);
+        let server = LocalControlServer::bind(
+            &path,
+            LocalControlDispatcher::new(SystemProxyPlatform::Linux),
+        )
+        .expect("stale endpoint can be recovered");
+        drop(server);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn dropping_old_server_preserves_replaced_socket_inode() {
+        let path = socket_path();
+        let server = LocalControlServer::bind(
+            &path,
+            LocalControlDispatcher::new(SystemProxyPlatform::Linux),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(server);
+        assert!(path.exists(), "old owner must not unlink the replacement");
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        drop(replacement);
+        std::fs::remove_file(&path).unwrap();
     }
 }
