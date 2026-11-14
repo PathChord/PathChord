@@ -5,7 +5,11 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use pathchord_policy::{CompiledPolicy, Generation, KubeConfig, PolicyConfig};
+use pathchord_policy::{
+    CompileError, CompiledPolicy, ConfigError, Generation, KubeConfig, PolicyConfig,
+    ValidationError,
+};
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -35,6 +39,17 @@ pub struct ReloadStatus {
     pub active_generation: u64,
     pub observed_at_ms: u64,
     pub reason: Option<String>,
+    pub diagnostic: Option<ReloadDiagnostic>,
+}
+
+/// Safe, stable reload diagnostics. The field path is a schema location,
+/// optionally qualified by a validated resource identity. Input values,
+/// filesystem paths, and third-party error text are never included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReloadDiagnostic {
+    pub code: &'static str,
+    pub field_path: String,
+    pub message: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +127,7 @@ impl ConfigReloadHandle {
                     active_generation: generation,
                     observed_at_ms: now_ms(),
                     reason: None,
+                    diagnostic: None,
                 },
                 runtime_managed: false,
                 next_generation: generation,
@@ -177,6 +193,7 @@ impl ConfigReloadHandle {
             active_generation: generation,
             observed_at_ms: now_ms(),
             reason: None,
+            diagnostic: None,
         };
         Ok(true)
     }
@@ -184,7 +201,7 @@ impl ConfigReloadHandle {
     pub fn reject_runtime_candidate(
         &self,
         generation: u64,
-        reason: impl Into<String>,
+        _reason: impl Into<String>,
     ) -> Result<(), ReloadError> {
         let mut state = self.state.write().map_err(|_| ReloadError::Lock)?;
         if state
@@ -197,7 +214,12 @@ impl ConfigReloadHandle {
                 state: ReloadState::Rejected,
                 active_generation: state.active.generation,
                 observed_at_ms: now_ms(),
-                reason: Some(reason.into()),
+                reason: Some("runtime rejected configuration candidate".to_owned()),
+                diagnostic: Some(reload_diagnostic(
+                    "CONFIG_RUNTIME_REJECTED",
+                    "$".to_owned(),
+                    "runtime rejected configuration candidate",
+                )),
             };
         }
         Ok(())
@@ -226,19 +248,25 @@ impl ConfigReloadHandle {
                 active_generation,
                 observed_at_ms: now_ms(),
                 reason: Some("configuration generation is exhausted".to_owned()),
+                diagnostic: Some(reload_diagnostic(
+                    "CONFIG_GENERATION_EXHAUSTED",
+                    "$".to_owned(),
+                    "configuration generation is exhausted",
+                )),
             };
             return ReloadOutcome::Rejected { active_generation };
         };
         state.next_generation = generation;
         let candidate = match compile_candidate_documents(inputs, generation) {
             Ok(candidate) => candidate,
-            Err(reason) => {
+            Err(diagnostic) => {
                 state.pending = None;
                 state.status = ReloadStatus {
                     state: ReloadState::Rejected,
                     active_generation,
                     observed_at_ms: now_ms(),
-                    reason: Some(reason.to_owned()),
+                    reason: Some(diagnostic.message.to_owned()),
+                    diagnostic: Some(diagnostic),
                 };
                 return ReloadOutcome::Rejected { active_generation };
             }
@@ -250,6 +278,7 @@ impl ConfigReloadHandle {
                 active_generation,
                 observed_at_ms: now_ms(),
                 reason: None,
+                diagnostic: None,
             };
             return ReloadOutcome::Applied {
                 generation: active_generation,
@@ -262,6 +291,7 @@ impl ConfigReloadHandle {
                 active_generation,
                 observed_at_ms: now_ms(),
                 reason: Some("static Egress/key, DNS or Listener fields changed".to_owned()),
+                diagnostic: None,
             };
             return ReloadOutcome::RestartRequired { active_generation };
         }
@@ -279,6 +309,7 @@ impl ConfigReloadHandle {
                 active_generation,
                 observed_at_ms: now_ms(),
                 reason: None,
+                diagnostic: None,
             };
             ReloadOutcome::Pending { generation }
         } else {
@@ -288,6 +319,7 @@ impl ConfigReloadHandle {
                 active_generation: generation,
                 observed_at_ms: now_ms(),
                 reason: None,
+                diagnostic: None,
             };
             ReloadOutcome::Applied { generation }
         }
@@ -380,6 +412,9 @@ impl ConfigHotReloader {
                                 active_generation: self.handle.status().active_generation,
                                 observed_at_ms: now_ms(),
                                 reason: Some("filesystem watcher error".to_owned()),
+                                diagnostic: Some(reload_diagnostic(
+                                    "CONFIG_WATCH_FAILED", "$".to_owned(), "filesystem watcher error",
+                                )),
                             });
                             continue;
                         }
@@ -402,6 +437,9 @@ impl ConfigHotReloader {
                             active_generation: self.handle.status().active_generation,
                             observed_at_ms: now_ms(),
                             reason: Some("configuration directory watcher could not be restored".to_owned()),
+                            diagnostic: Some(reload_diagnostic(
+                                "CONFIG_WATCH_FAILED", "$".to_owned(), "configuration directory watcher could not be restored",
+                            )),
                         });
                         continue;
                     }
@@ -420,6 +458,9 @@ impl ConfigHotReloader {
                                 active_generation: self.handle.status().active_generation,
                                 observed_at_ms: now_ms(),
                                 reason: Some("configuration bundle read failed".to_owned()),
+                                diagnostic: Some(reload_diagnostic(
+                                    "CONFIG_SOURCE_UNAVAILABLE", "$".to_owned(), "configuration bundle read failed",
+                                )),
                             });
                         }
                     }
@@ -474,23 +515,221 @@ impl ConfigHotReloader {
 fn compile_candidate_documents<'a>(
     inputs: impl IntoIterator<Item = &'a str>,
     generation: u64,
-) -> Result<ReloadSnapshot, &'static str> {
-    let kube = KubeConfig::from_documents(inputs)
-        .map_err(|_| "configuration parse or validation failed")?;
+) -> Result<ReloadSnapshot, ReloadDiagnostic> {
+    let kube = KubeConfig::from_documents(inputs).map_err(config_diagnostic)?;
     let validated = kube
         .into_validated_snapshot(Generation::new(generation))
-        .map_err(|_| "configuration conversion failed")?;
+        .map_err(config_diagnostic)?;
     let config = Arc::new(validated.config().clone());
-    let compiled = Arc::new(
-        validated
-            .compile()
-            .map_err(|_| "configuration policy compilation failed")?,
-    );
+    let compiled = Arc::new(validated.compile().map_err(compile_diagnostic)?);
     Ok(ReloadSnapshot {
         generation,
         config,
         compiled,
     })
+}
+
+fn reload_diagnostic(
+    code: &'static str,
+    field_path: String,
+    message: &'static str,
+) -> ReloadDiagnostic {
+    ReloadDiagnostic {
+        code,
+        field_path,
+        message,
+    }
+}
+
+fn config_diagnostic(error: ConfigError) -> ReloadDiagnostic {
+    match error {
+        ConfigError::Yaml(_) => reload_diagnostic(
+            "CONFIG_PARSE_ERROR",
+            "$".to_owned(),
+            "configuration document could not be parsed",
+        ),
+        ConfigError::InvalidEnvelope(_) => reload_diagnostic(
+            "CONFIG_INVALID_ENVELOPE",
+            "$".to_owned(),
+            "configuration resource envelope is invalid",
+        ),
+        ConfigError::UnsupportedApiVersion(_) => reload_diagnostic(
+            "CONFIG_UNSUPPORTED_API_VERSION",
+            "$.apiVersion".to_owned(),
+            "configuration API version is unsupported",
+        ),
+        ConfigError::UnsupportedKind(_) => reload_diagnostic(
+            "CONFIG_UNSUPPORTED_KIND",
+            "$.kind".to_owned(),
+            "configuration resource kind is unsupported",
+        ),
+        ConfigError::DuplicateResource { kind, name, .. } => reload_diagnostic(
+            "CONFIG_DUPLICATE_RESOURCE",
+            resource_field(&kind, &name, "metadata.name"),
+            "configuration resource identity is duplicated",
+        ),
+        ConfigError::InvalidSpec { kind, name, reason } => reload_diagnostic(
+            "CONFIG_INVALID_FIELD",
+            resource_field(&kind, &name, spec_error_field(&kind, &reason)),
+            "configuration field is invalid",
+        ),
+        ConfigError::Validation(error) => validation_diagnostic(error),
+    }
+}
+
+fn validation_diagnostic(error: ValidationError) -> ReloadDiagnostic {
+    let (code, field_path) = match error {
+        ValidationError::MissingFallback => ("CONFIG_MISSING_RESOURCE", "$.FallbackPolicy".into()),
+        ValidationError::EmptyId { .. } => {
+            ("CONFIG_INVALID_FIELD", "$.resources[].metadata.name".into())
+        }
+        ValidationError::DuplicateId { kind, id } => (
+            "CONFIG_DUPLICATE_RESOURCE",
+            resource_field(kind, &id, "metadata.name"),
+        ),
+        ValidationError::InvalidPort { kind, id } => (
+            "CONFIG_INVALID_FIELD",
+            resource_field(kind, &id, "spec.port"),
+        ),
+        ValidationError::ClassBudgetExceedsSession { id, .. } => (
+            "CONFIG_INVALID_FIELD",
+            resource_field("TrafficPolicy", &id, "spec.classReplicationBudgetBps"),
+        ),
+        ValidationError::ZeroMinUsablePaths { rule_id } => (
+            "CONFIG_INVALID_FIELD",
+            resource_field("EgressRule", &rule_id, "spec.requirements.minUsablePaths"),
+        ),
+        ValidationError::InvalidTransitOptions { proxy_id, .. } => (
+            "CONFIG_INVALID_FIELD",
+            resource_field("TransitProxy", &proxy_id, "spec.options"),
+        ),
+        ValidationError::ReservedImportedLabelNamespace { proxy_id, .. } => (
+            "CONFIG_INVALID_FIELD",
+            resource_field("TransitProxy", &proxy_id, "metadata.labels"),
+        ),
+        ValidationError::InvalidTransitCredentialReference { proxy_id } => (
+            "CONFIG_INVALID_FIELD",
+            resource_field("TransitProxy", &proxy_id, "spec.credentialsRef"),
+        ),
+        ValidationError::UnknownEgress { rule_id, .. } => (
+            "CONFIG_UNKNOWN_REFERENCE",
+            resource_field("Rule", &rule_id, "spec.egressRef"),
+        ),
+        ValidationError::UnknownTrafficPolicy { rule_id, .. } => (
+            "CONFIG_UNKNOWN_REFERENCE",
+            resource_field("TransitRule", &rule_id, "spec.trafficPolicyRef"),
+        ),
+        ValidationError::UnknownTrafficClass { rule_id, .. } => (
+            "CONFIG_UNKNOWN_REFERENCE",
+            resource_field("Resource", &rule_id, "spec"),
+        ),
+        ValidationError::UnknownSubscription { proxy_id, .. } => (
+            "CONFIG_UNKNOWN_REFERENCE",
+            resource_field("TransitProxy", &proxy_id, "spec.source.subscriptionRef"),
+        ),
+        ValidationError::InvalidSubscription {
+            subscription_id, ..
+        } => (
+            "CONFIG_INVALID_FIELD",
+            resource_field("Subscription", &subscription_id, "spec"),
+        ),
+        ValidationError::InvalidDnsPolicy { policy_id, .. } => (
+            "CONFIG_INVALID_FIELD",
+            resource_field("DNSPolicy", &policy_id, "spec"),
+        ),
+    };
+    reload_diagnostic(code, field_path, "configuration validation failed")
+}
+
+fn compile_diagnostic(error: CompileError) -> ReloadDiagnostic {
+    let (rule_id, field) = match error {
+        CompileError::InvalidSourceNetwork { rule_id, .. } => {
+            (rule_id, "spec.match.sourceNetworks")
+        }
+        CompileError::EmptySelector { rule_id } => (rule_id, "spec.selector"),
+    };
+    reload_diagnostic(
+        "CONFIG_COMPILE_ERROR",
+        resource_field("Rule", &rule_id, field),
+        "configuration policy compilation failed",
+    )
+}
+
+fn resource_field(kind: &str, name: &str, field: &'static str) -> String {
+    let kind = match kind {
+        "Egress" | "egress" => "Egress",
+        "TransitProxy" | "Transit Proxy" => "TransitProxy",
+        "Subscription" | "subscription" => "Subscription",
+        "EgressRule" => "EgressRule",
+        "TransitRule" => "TransitRule",
+        "ProxyRule" => "ProxyRule",
+        "TrafficPolicy" | "traffic policy" => "TrafficPolicy",
+        "Listener" | "listener" => "Listener",
+        "DNSPolicy" => "DNSPolicy",
+        "FallbackPolicy" => "FallbackPolicy",
+        "EgressService" => "EgressService",
+        "NodeProbePolicy" => "NodeProbePolicy",
+        "Rule" | "rule" => "Rule",
+        "metadata" => "Resource",
+        _ => "Resource",
+    };
+    // Resource identities are bounded and validated before they are used to
+    // qualify a path. Do not echo arbitrary parser input or control bytes.
+    let safe_name = !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if safe_name {
+        format!("$.resources.{kind}[{name}].{field}")
+    } else {
+        format!("$.resources.{kind}[].{field}")
+    }
+}
+
+fn spec_error_field(kind: &str, reason: &str) -> &'static str {
+    for (needle, field) in [
+        ("metadata.labels", "metadata.labels"),
+        ("metadata.annotations", "metadata.annotations"),
+        ("trafficPolicyRef", "spec.trafficPolicyRef"),
+        ("trafficClassRef", "spec.trafficClassRef"),
+        ("source.url", "spec.source.url"),
+        ("source.type", "spec.source.type"),
+        ("subscriptionRef", "spec.source.subscriptionRef"),
+        ("defaultRoute", "spec.defaultRoute"),
+        ("local.servers", "spec.local.servers"),
+        ("transit.servers", "spec.transit.servers"),
+        ("egress.servers", "spec.egress.servers"),
+        ("routeTable", "spec.routeTable"),
+        ("allowedSources", "spec.allowedSources"),
+        ("processMetadata", "spec.processMetadata"),
+        ("flowTags", "spec.flowTags"),
+        ("credentialsRef", "spec.credentialsRef"),
+        ("sourceNetworks", "spec.match.sourceNetworks"),
+        ("egressSelector", "spec.egressSelector"),
+        ("catchAll", "spec.catchAll"),
+        ("order", "spec.order"),
+        ("protocol", "spec.protocol"),
+        ("platform", "spec.platform"),
+        ("backend", "spec.backend"),
+        ("mtu", "spec.mtu"),
+        ("weight", "spec.weight"),
+        ("publicKey", "spec.publicKey"),
+        ("port is", "spec.port"),
+        ("port must", "spec.port"),
+        ("address", "spec.address"),
+        ("bind", "spec.bind"),
+        ("match", "spec.match"),
+    ] {
+        if reason.contains(needle) {
+            return if needle == "credentialsRef" && kind == "Listener" {
+                "spec.authentication.credentialsRef"
+            } else {
+                field
+            };
+        }
+    }
+    "spec"
 }
 
 fn startup_fields_changed(current: &PolicyConfig, candidate: &PolicyConfig) -> bool {
@@ -505,6 +744,11 @@ fn failed_lock_status() -> ReloadStatus {
         active_generation: 0,
         observed_at_ms: now_ms(),
         reason: Some("reload status lock failed".to_owned()),
+        diagnostic: Some(reload_diagnostic(
+            "CONFIG_STATUS_UNAVAILABLE",
+            "$".to_owned(),
+            "reload status lock failed",
+        )),
     }
 }
 
@@ -636,6 +880,80 @@ items:
         );
         assert_eq!(handle.snapshot().unwrap().generation, before.generation);
         assert_eq!(handle.status().state, ReloadState::Rejected);
+        let diagnostic = handle.status().diagnostic.unwrap();
+        assert_eq!(diagnostic.code, "CONFIG_PARSE_ERROR");
+        assert_eq!(diagnostic.field_path, "$");
+    }
+
+    #[test]
+    fn invalid_fields_produce_safe_structured_diagnostics_and_keep_last_good_snapshot() {
+        let handle = ConfigReloadHandle::from_yaml(VALID, 7).unwrap();
+        let invalid_key = VALID.replace(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "sensitive-key-value",
+        );
+        assert!(matches!(
+            handle.reload_text(&invalid_key),
+            ReloadOutcome::Rejected {
+                active_generation: 7
+            }
+        ));
+        let status = handle.status();
+        let diagnostic = status.diagnostic.as_ref().unwrap();
+        assert_eq!(diagnostic.code, "CONFIG_INVALID_FIELD");
+        assert_eq!(
+            diagnostic.field_path,
+            "$.resources.Egress[jp-1].spec.publicKey"
+        );
+        assert!(!format!("{status:?}").contains("sensitive-key-value"));
+        assert_eq!(handle.snapshot().unwrap().generation, 7);
+
+        let invalid_subscription = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: Subscription\nmetadata: {{name: provider}}\nspec:\n  source: {{type: clash, url: 'https://user:secret-password@example.invalid/sub'}}\n"
+        );
+        handle.reload_text(&invalid_subscription);
+        let status = handle.status();
+        let diagnostic = status.diagnostic.as_ref().unwrap();
+        assert_eq!(diagnostic.code, "CONFIG_INVALID_FIELD");
+        assert_eq!(
+            diagnostic.field_path,
+            "$.resources.Subscription[provider].spec.source.url"
+        );
+        assert!(!format!("{status:?}").contains("secret-password"));
+
+        handle.reload_text(VALID);
+        assert!(handle.status().diagnostic.is_none());
+    }
+
+    #[test]
+    fn unknown_reference_and_runtime_failure_have_stable_redacted_diagnostics() {
+        let handle = ConfigReloadHandle::from_yaml(VALID, 1).unwrap();
+        let candidate = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitRule\nmetadata: {{name: path}}\nspec: {{order: 2, catchAll: true, egressRef: jp-1, trafficPolicyRef: absent}}\n"
+        );
+        handle.reload_text(&candidate);
+        let diagnostic = handle.status().diagnostic.unwrap();
+        assert_eq!(diagnostic.code, "CONFIG_UNKNOWN_REFERENCE");
+        assert_eq!(
+            diagnostic.field_path,
+            "$.resources.TransitRule[path].spec.trafficPolicyRef"
+        );
+
+        handle.enable_runtime_commit().unwrap();
+        let changed = VALID.replace("action: reject", "action: direct");
+        let ReloadOutcome::Pending { generation } = handle.reload_text(&changed) else {
+            panic!("expected runtime candidate");
+        };
+        handle
+            .reject_runtime_candidate(generation, "secret token /private/path")
+            .unwrap();
+        let status = handle.status();
+        assert_eq!(
+            status.diagnostic.as_ref().unwrap().code,
+            "CONFIG_RUNTIME_REJECTED"
+        );
+        assert!(!format!("{status:?}").contains("secret token"));
+        assert!(!format!("{status:?}").contains("/private/path"));
     }
 
     #[test]

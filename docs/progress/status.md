@@ -49,7 +49,11 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 - The Session runtime supports TCP and UDP Streams, multiple Paths, per-Stream
   eligible Path sets, DATA/ACK/WINDOW/FIN/RST, bounded reordering and buffers,
   Path drain/close, bounded timer retransmission, cross-Path re-framing, and
-  supervised shutdown.
+  supervised shutdown. Session control messages use a separate ordered,
+  acknowledged and retransmitted envelope. Duplicate or stale authenticated
+  records are dropped without failing the Path, and UDP close drains accepted
+  queued datagrams within a deadline. The Session control envelope changes the
+  v1 wire exchange: Ingress and Egress must run matching revisions.
 - Ingress has ordinary HTTP forwarding and CONNECT, SOCKS4/4a/5 CONNECT,
   SOCKS5 UDP ASSOCIATE, Linux REDIRECT
   and TPROXY adapters, transparent UDP, a direct smoltcp TUN reactor, process
@@ -93,6 +97,8 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 - Egress has a real TCP Path listener, authorization-backed admission, target
   Stream/UDP forwarding, multiple Path attachment, global status inputs,
   authorization reconciliation, cleanup barriers, and bounded supervision.
+  `EgressService.spec.remoteDnsOnly` selects Egress system resolution for
+  supplied hostnames without trusting accompanying Ingress address candidates.
 - Ingress and Egress consume the same file/directory resource bundle. Egress
   selects one EgressService resource, resolves relative paths from its source,
   and applies command-line, environment, then account-default precedence while
@@ -169,6 +175,9 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   SSE replay/backpressure, bearer/origin checks, target redaction, and the
   documented query/mutation registry. Egress authorization routes are mounted
   only on the Egress-owned dispatcher; Ingress intentionally omits them.
+  Ingress exposes listener and resource events, authenticated Egress reports,
+  subscription refresh state, structured reload diagnostics, and replayable
+  management responses. Subscription URLs are redacted in read views.
 
 ## Remaining explicit-listener work
 
@@ -204,6 +213,28 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Shared implementation gaps
 
+- A Session containing flows admitted by different TrafficPolicies uses the
+  most restrictive budget observed during that Session; it does not restore a
+  larger budget after a flow ends. Egress does not yet receive a negotiated
+  replication budget, so it suppresses extra copies while retaining ordinary
+  reliable retransmission. Independent class budgets across multiple active
+  policies and bidirectional budget negotiation need further implementation.
+- Congestion-window, incremental-capacity, and scheduling-overhead measurements
+  are optional scheduler inputs. No platform source supplies them by default;
+  they remain unknown rather than being inferred from idle throughput.
+- Some management detail fields, including listener-independent connection
+  timing, Path admission timestamps and Transit identity, Session admission
+  timestamps, and source namespace after policy compilation, have no runtime
+  producer. The API exposes unavailable values as null; they still need typed
+  producers before the full observability contract is met.
+- Subscription enable/disable/delete and source replacement use a control/data
+  plane visibility barrier. Successful mutations block new selection before the
+  worker drains old imported nodes; stale refreshes and publications are
+  rejected by the control generation and full source specification. The worker
+  still performs physical draining asynchronously, and an update that changes
+  a source with an in-use node may wait for that node before promoting the new
+  adapter. SSE recovery snapshots are assembled from bounded resource queries
+  rather than a single atomic cross-resource transaction.
 - Native Windows/FreeBSD runtime matrices, provider soak tests, external
   monitoring deployment, and a broad real-provider protocol/parameter matrix
   remain validation work. SSR and other unregistered protocols stay explicitly

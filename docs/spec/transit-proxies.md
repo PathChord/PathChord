@@ -10,21 +10,21 @@ NOT be interpreted as support for the same outbound node protocol.
 
 ## Adapter selection and failure
 
-| Node protocol | Native transport | Current handling |
+| Node protocol | Native transport | Other parameters |
 | --- | --- | --- |
 | `direct` | TCP and UDP | Extended dialer options |
 | `http`, `https` | HTTP/1 CONNECT, Basic authentication, validated extra headers; HTTPS uses TLS | Supported extended node options |
 | `socks5` | CONNECT, username/password, UDP ASSOCIATE; optional TLS for TCP | Supported extended node options |
-| `ss` | TCP/UDP with AEAD and SS2022 ciphers; legacy stream ciphers are rejected | Built-in `obfs-local` and `v2ray-plugin` wrappers and supported extended options |
+| `ss` | TCP/UDP with AEAD and SS2022 ciphers; legacy stream ciphers are rejected | Native AEAD/SS2022 options; `obfs-local`, `v2ray-plugin`, and other plugin parameters produce unavailable diagnostics |
 | `socks4`, `socks4a` | No native outbound adapter | CONNECT |
 | `vless` | TCP, TLS, WebSocket, and WSS byte transports with typed TLS/transport validation | Extended transport and flow options |
 | `vmess` | TCP, TLS, WebSocket/WSS, AES-128-GCM or ChaCha20-Poly1305 body records, single-target UDP, `alter_id: 0` | mux, legacy non-AEAD security, and other unsupported extended options |
 | `trojan` | TLS-wrapped TCP, WebSocket, and WSS byte transports | Extended transport options |
 | `anytls` | TLS stream, authentication, settings, SYN/SYNACK, PUSH/FIN, heartbeat frames, and bounded UDP-over-TCP datagrams | Multiplexed session options outside the native frame contract |
-| `hysteria2` | Native QUIC/TLS + HTTP/3 authentication, TCP/UDP relay, Salamander or un-obfuscated transport, and bounded server-port hopping | Gecko-specific obfuscation and unsupported extended options |
+| `hysteria2` | Native QUIC/TLS + HTTP/3 authentication, TCP/UDP relay, Salamander or un-obfuscated transport, and bounded server-port hopping | Bandwidth limit fields, Gecko-specific obfuscation, and other unsupported extended options |
 | `tuic` | Native QUIC/TLS-exporter TCP CONNECT, UDP DATAGRAM relay, heartbeat, and optional replay-sensitive 0-RTT | Unsupported congestion controllers, UDP-over-stream, and other extended options |
 | `vless` + `tls.reality` | Native VLESS over REALITY TLS with X25519 ClientHello proof and certificate proof validation | Vision flow and unsupported outer transports |
-| `xtls`, `hysteria`, `ssh`, `shadowtls` | Native adapter under implementation | Typed unavailable diagnostic until the native adapter is registered |
+| `xtls`, `hysteria`, `ssh`, `shadowtls` | No native adapter | Typed unavailable diagnostic |
 | `wireguard` | No native adapter | Complete userspace WireGuard endpoint document |
 | `snell` | No native adapter | Typed unavailable diagnostic |
 | `ssr` and unregistered protocols | Unavailable | Explicitly unavailable |
@@ -77,9 +77,9 @@ values are rejected. Multiplex booleans default to `false`; its protocol is
 `smux`, `yamux`, or `h2mux`. Unsupported combinations fail validation.
 
 Native adapter credential fields are protocol-specific. HTTP/SOCKS use
-`username` and `password`; SS uses `cipher` and `password`, with plugin fields
-only on a registered native plugin path. Extra credential keys MUST NOT be silently
-discarded. Sensitive headers, private keys, passwords, UUIDs, and complete
+`username` and `password`; SS uses `cipher` and `password`. The native adapter
+rejects SS plugin fields and reports diagnostics. Extra credential
+keys MUST NOT be silently discarded. Sensitive headers, private keys, passwords, UUIDs, and complete
 imported documents remain private credential data, never administrator labels
 or public node diagnostics.
 
@@ -93,7 +93,7 @@ performs final protocol validation.
 | `vmess` | `uuid`, `security` or equivalent `cipher`, `alter_id` |
 | `trojan`, `anytls` | `password` |
 | `hysteria` | `auth` or `password`, `up_mbps`, `down_mbps`, `obfs`, `server_ports`, `hop_interval` |
-| `hysteria2` | `password`, `up_mbps`, `down_mbps`, `obfs`, `obfs_password`, `server_ports`, `hop_interval` |
+| `hysteria2` | `password`, `obfs`, `obfs_password`, `server_ports`, `hop_interval` |
 | `tuic` | `uuid`, `password`, `congestion_control`, `udp_relay_mode`, `heartbeat`, `zero_rtt_handshake`, `udp_over_stream` |
 | `ssh` | `username`, `password`, `private_key`, `private_key_passphrase`, `host_key` |
 | `shadowtls` | `password`, `version` |
@@ -106,8 +106,9 @@ until the corresponding native adapter supports them.
 The credential field `sing_box_outbound` is retained as an imported opaque
 document for diagnostics, but it has no native adapter and is not executable
 by PathChord. Imported documents cannot become an implicit process launch or
-direct fallback. SS plugin names are limited to the registered built-in
-wrappers; arbitrary plugin execution is not a node capability.
+direct fallback. SS plugin fields are retained for diagnostics and rejected by
+the native adapter; PathChord does not execute plugin processes or provide an
+implicit wrapper.
 
 ## Subscription document families
 
@@ -134,6 +135,12 @@ sanitized message. Raw node text, URLs containing secrets, and credential
 values MUST NOT appear in diagnostics. Private caches preserve options and
 diagnostics; reload MUST NOT turn an invalid or unsupported cached node into
 a usable node. Node count is bounded by 10,000 and document bytes by 4 MiB.
+
+Cached nodes MUST be bound to the subscription's source type, URL, and
+credential reference; a cache whose source cannot be verified MUST NOT be
+published. When any of these source fields changes, nodes from the previous
+source enter draining and MUST NOT be selected for new flows. Source URLs and
+credential values MUST NOT be exposed through the cache's source identifier.
 
 ## HTTP provider expansion
 

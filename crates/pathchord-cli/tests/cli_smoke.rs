@@ -226,6 +226,21 @@ spec: {{action: reject}}
         let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1]; packet.extend_from_slice(&target_address.port().to_be_bytes()); packet.extend_from_slice(b"datagram");
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap(); udp.send_to(&packet, relay).await.unwrap();
         let mut data = [0; 128]; let (count, _) = udp.recv_from(&mut data).await.unwrap(); assert_eq!(&data[..count], packet);
-        drop(control); drop(ingress); drop(egress); drop(transit_task); drop(origin_task); drop(udp_task);
+        drop(control);
+        for process in [&mut ingress, &mut egress] {
+            assert!(Command::new("kill").args(["-TERM", &process.0.id().to_string()]).status().unwrap().success());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = process.0.try_wait().unwrap() {
+                    assert!(status.success(), "service must complete graceful SIGTERM shutdown: {status}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "service shutdown timed out");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        assert!(!ingress_socket.exists());
+        assert!(!egress_socket.exists());
+        drop(transit_task); drop(origin_task); drop(udp_task);
     }).await.expect("bounded two-process CLI smoke test");
 }

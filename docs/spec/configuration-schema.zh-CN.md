@@ -43,7 +43,11 @@ items:
 `metadata.resourceVersion` 由服务端生成，不能由用户写入。运行时 `status` 只读，并由控制面单独暴露。
 
 支持的 kind 为 `Egress`、`TransitProxy`、`Subscription`、`EgressRule`、`TransitRule`、`ProxyRule`、
-`TrafficPolicy`、`Listener`、`DNSPolicy` 和 `FallbackPolicy`。一个 namespace 中同一 `(kind, name)`
+`TrafficPolicy`、`Listener`、`DNSPolicy`、`FallbackPolicy`、`EgressService` 和 `NodeProbePolicy`。
+后两者是角色专用的服务资源：`EgressService` 为一个 Egress 进程选择身份、监听器、授权存储和服务限制；
+`NodeProbePolicy` 配置可选的有界 Transit 节点探测。Ingress 消费 `NodeProbePolicy`，Egress 消费
+`EgressService`；两者都可以存在于同一已验证资源包中。
+一个 namespace 中同一 `(kind, name)`
 最多只能有一个对象。完整配置必须恰好包含一个 DNSPolicy 和一个 FallbackPolicy；其余资源按引用和
 路由验证决定是否需要。没有 Listener 的 List 可以作为库快照存在，但不能启动 Ingress。
 
@@ -99,6 +103,23 @@ mutation 写入。导入的 source、observed、quota 和 billing 值均由运�
 
 `capabilities.tcp` 或 `capabilities.udp` 至少一个必须为 true。所有 Egress 引用必须解析到 Egress
 对象。Egress 拓扑和本地密钥属于启动配置，不能热重载。
+
+## EgressService 和 NodeProbePolicy
+
+`EgressService.spec` 接受 `bind`、`egressId`、`identity`、`authorizationDb`、
+`controlSocket`、`maxConcurrentPaths`、`capacityBps`、`recommendedPathCount`、
+`maxStreamsPerIngress`、`quotaRemaining`、`trafficMultiplierBasisPoints`、
+`remoteDnsOnly`、`webBind`、`webTokenFile`、`webOrigins` 和 `webProtectedTransport`。
+资源中的相对路径相对于所选配置来源解析。一个 Egress 进程最多选择一个此类资源。
+应用命令行覆写后必须提供 `identity` 和 Egress ID；缺少 `egressId` 时使用资源名。
+`remoteDnsOnly` 默认 false。设为 true 且存在原始主机名时，Egress 对 TCP 和 UDP 使用自身系统
+解析器解析该名称，不使用 Ingress 提供的地址候选。没有主机名的字面 IP 仍是有效目标。
+该选项作用于目标名称，不改变独立的 Ingress DNS 路由策略。
+
+`NodeProbePolicy.spec.target` 是包含 `host` 和 `port` 的对象。`intervalSeconds` 默认 30、
+范围为 1..=86400；`timeoutSeconds` 默认 5、范围为 1..=30；`maxConcurrency`、`windowSize` 和
+`maxNodesPerBatch` 分别默认 8、32 和 128，范围分别为 1..=64、1..=128 和 1..=1024。
+资源包中最多允许一个 NodeProbePolicy。
 
 ## TransitProxy 和 Subscription
 
@@ -170,7 +191,9 @@ maxAgeSeconds 默认 86400 且范围 `60..=2592000`。URL 不得包含凭据。�
 
 EgressRule 的 spec 在 `egressRef`、`egressSelector` 或 `mode: none` 中选择一个。selector 至少一个条件；
 mode none 是普通 Proxy 模式，不得创建 Session。TransitRule 在选定 Egress 后求值，使用 egressRef、
-require、reject、weight（默认 100）和可选 trafficPolicyRef；可选 `trafficClassRef` 选择所选 TrafficPolicy 类别映射中的 key；未知 key 必须拒绝。没有准入 Proxy 时继续下一条 EgressRule，
+require、reject、weight（默认 100）；当多条准入的 Transit 关系可承载同一 flow 时必须提供
+`trafficPolicyRef`。规则省略该引用而其运行时候选超过一个时，必须拒绝该 flow，不得进入 Proxy 规则
+或 fallback。可选 `trafficClassRef` 选择所选 TrafficPolicy 类别映射中的 key；未知 key 必须拒绝。没有准入 Proxy 时继续下一条 EgressRule，
 不得隐式选择任意 Proxy。ProxyRule 的 select 默认 any，也可以使用 `proxy: direct`；proxy 与 select 互斥。
 规则求值必须确定、有界且无 I/O，编译器必须拒绝未知字段、无界表达式和无效引用，编译失败保留上一快照。
 
@@ -251,6 +274,10 @@ Ingress 接受一个资源文件或一棵目录树。配置来源按以下优先
 代次并使用到完整决策结束。运行时观测不能覆盖期望 spec。静态 Egress 拓扑、本地密钥、监听器绑定和平台
 路由需要重启；订阅、导入 Proxy、管理员 label、DNS 健康和编译后的动态规则可以热重载。替换必须原子化；
 解析、验证、编译、持久化或缓存失败时，上一成功代次保持生效并通过类型化 status 暴露错误。
+
+对于声明式 Subscription，管理接口的启用、禁用、删除或显式重新创建在声明未改变时必须跨重载
+和重启持续生效。修改声明会应用新的 spec；移除声明会移除该声明式订阅，并排空其导入的节点。
+仅通过管理接口创建的订阅独立于无关声明。这些决定及其配置代次必须原子持久化。
 
 目录中的创建、修改、删除和重命名事件触发完整候选重扫。单文件原子替换和根目录替换后必须
 保留监听能力。所有文件验证通过后才发布一个快照；非法、不完整或重复的候选保留上一份有效

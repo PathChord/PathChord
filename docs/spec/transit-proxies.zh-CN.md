@@ -9,21 +9,21 @@
 
 ## 适配器选择与失败
 
-| 节点协议 | 原生传输 | 当前处理 |
+| 节点协议 | 原生传输 | 其他参数 |
 | --- | --- | --- |
 | `direct` | TCP 和 UDP | 扩展拨号选项 |
 | `http`、`https` | HTTP/1 CONNECT、Basic 认证、经过验证的额外头；HTTPS 使用 TLS | 支持的扩展节点选项 |
 | `socks5` | CONNECT、用户名密码、UDP ASSOCIATE；TCP 可选 TLS | 支持的扩展节点选项 |
-| `ss` | 使用 AEAD 和 SS2022 算法的 TCP/UDP；旧 stream 算法会被拒绝 | 内置 `obfs-local`、`v2ray-plugin` wrapper 和支持的扩展选项 |
+| `ss` | 使用 AEAD 和 SS2022 算法的 TCP/UDP；旧 stream 算法会被拒绝 | 原生 AEAD/SS2022 选项；`obfs-local`、`v2ray-plugin` 及其他 plugin 参数产生不可用诊断 |
 | `socks4`、`socks4a` | 无原生出站适配器 | CONNECT |
 | `vless` | 带类型化 TLS/传输校验的 TCP、TLS、WebSocket 和 WSS 字节传输 | 扩展传输与 flow 选项 |
 | `vmess` | TCP、TLS、WebSocket/WSS、AES-128-GCM 或 ChaCha20-Poly1305 正文记录、单目标 UDP、`alter_id: 0` | mux、旧式非 AEAD 安全方式及其他不支持的扩展选项 |
 | `trojan` | TLS 封装的 TCP、WebSocket 和 WSS 字节传输 | 扩展传输选项 |
 | `anytls` | TLS 流、认证、settings、SYN/SYNACK、PUSH/FIN、heartbeat 帧及有界 UDP-over-TCP 数据报 | 原生帧契约之外的扩展 session 选项 |
-| `hysteria2` | 原生 QUIC/TLS + HTTP/3 认证、TCP/UDP relay、Salamander 或无混淆传输及有界 server-port 跳转 | Gecko 专用混淆和其他不支持的扩展选项 |
+| `hysteria2` | 原生 QUIC/TLS + HTTP/3 认证、TCP/UDP relay、Salamander 或无混淆传输及有界 server-port 跳转 | 带宽限制字段、Gecko 专用混淆和其他不支持的扩展选项 |
 | `tuic` | 原生 QUIC/TLS-exporter TCP CONNECT、UDP DATAGRAM relay、heartbeat 及可选的有重放风险 0-RTT | 不支持的拥塞控制器、UDP-over-stream 及其他扩展选项 |
 | `vless` + `tls.reality` | 使用 X25519 ClientHello proof 和证书 proof 校验的原生 VLESS over REALITY TLS | Vision flow 和不支持的外层传输 |
-| `xtls`、`hysteria`、`ssh`、`shadowtls` | 原生适配器实现中 | 注册原生适配器前返回类型化不可用诊断 |
+| `xtls`、`hysteria`、`ssh`、`shadowtls` | 无原生适配器 | 类型化不可用诊断 |
 | `wireguard` | 无原生适配器 | 完整的用户态 WireGuard endpoint 文档 |
 | `snell` | 无原生适配器 | 类型化不可用诊断 |
 | `ssr` 及未注册协议 | 不可用 | 明确不可用 |
@@ -66,7 +66,7 @@ TLS 布尔值默认 `false`；证书和 ALPN 列表默认空列表。`https` 隐
 `yamux` 或 `h2mux`。不支持的组合必须验证失败。
 
 原生适配器凭据字段按协议区分。HTTP/SOCKS 使用 `username` 和 `password`；SS 使用 `cipher`
-和 `password`，plugin 字段只能由已注册的原生 plugin 路径处理。额外凭据键不得静默丢弃。敏感头、私钥、
+和 `password`。原生适配器拒绝 SS plugin 字段并报告诊断。额外凭据键不得静默丢弃。敏感头、私钥、
 密码、UUID 和完整导入文档必须保留在私有凭据中，不能成为管理员 label 或公共节点诊断。
 
 类型化协议节点使用以下私有凭据字段；不在对应行中的字段必须拒绝，不得猜测或丢弃。
@@ -78,7 +78,7 @@ TLS 布尔值默认 `false`；证书和 ALPN 列表默认空列表。`https` 隐
 | `vmess` | `uuid`、`security` 或等价 `cipher`、`alter_id` |
 | `trojan`、`anytls` | `password` |
 | `hysteria` | `auth` 或 `password`、`up_mbps`、`down_mbps`、`obfs`、`server_ports`、`hop_interval` |
-| `hysteria2` | `password`、`up_mbps`、`down_mbps`、`obfs`、`obfs_password`、`server_ports`、`hop_interval` |
+| `hysteria2` | `password`、`obfs`、`obfs_password`、`server_ports`、`hop_interval` |
 | `tuic` | `uuid`、`password`、`congestion_control`、`udp_relay_mode`、`heartbeat`、`zero_rtt_handshake`、`udp_over_stream` |
 | `ssh` | `username`、`password`、`private_key`、`private_key_passphrase`、`host_key` |
 | `shadowtls` | `password`、`version` |
@@ -87,8 +87,8 @@ TLS 布尔值默认 `false`；证书和 ALPN 列表默认空列表。`https` 隐
 `clientKeyField` 将引用的私有字段加入允许集合。冲突别名无效。其他协议字段在对应原生适配器
 支持前保留为不可用诊断。完整 `sing_box_outbound` 文档
 只作为导入节点的 opaque 诊断数据保留，不提供原生适配器，也不会被 PathChord 执行。导入文档
-不得触发隐式进程启动或 direct 回退。SS plugin 名称仅限已注册的内置 wrapper；执行任意 plugin
-不是节点能力。
+不得触发隐式进程启动或 direct 回退。SS plugin 字段会保留用于诊断，并由原生适配器拒绝；
+PathChord 不执行 plugin 进程，也不提供隐式 wrapper。
 
 ## 订阅文档类型
 
@@ -111,6 +111,10 @@ TLS 布尔值默认 `false`；证书和 ALPN 列表默认空列表。`https` 隐
 兄弟节点。该节点必须保持不可选，并具有稳定错误码、字段名及脱敏消息。原始节点文本、包含
 秘密的 URL 和凭据值不得出现在诊断中。私有缓存必须保留选项与诊断；重载不得把无效或不支持的
 缓存节点变成可用节点。节点数量上限为 10,000，文档字节上限为 4 MiB。
+
+缓存节点必须绑定订阅的来源类型、URL 和凭据引用；无法验证来源的缓存不得发布。任一来源字段
+发生变化时，旧来源的节点进入排空，不得被新 flow 选择。缓存的来源标识不得暴露来源 URL 或
+凭据值。
 
 ## HTTP provider 展开
 

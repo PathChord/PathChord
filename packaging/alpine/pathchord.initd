@@ -3,7 +3,7 @@
 name="pathchord"
 description="PathChord Ingress proxy runtime"
 command="/usr/bin/pathchord"
-command_args="ingress --config-dir /etc/pathchord --data-dir /var/lib/pathchord --credentials-dir /etc/pathchord/secrets"
+command_args="--socket /run/pathchord/ingress.sock ingress --config-dir /etc/pathchord --data-dir /var/lib/pathchord --credentials-dir /etc/pathchord/secrets"
 command_user="pathchord:pathchord"
 command_background="yes"
 pidfile="/run/${RC_SVCNAME}.pid"

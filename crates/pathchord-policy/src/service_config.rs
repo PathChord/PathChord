@@ -20,6 +20,9 @@ pub struct EgressServiceSpec {
     pub capacity_bps: Option<u64>,
     pub recommended_path_count: Option<u64>,
     pub max_streams_per_ingress: Option<usize>,
+    /// Require names supplied by Ingress to be resolved on Egress instead of
+    /// preferring the accompanying address candidates.
+    pub remote_dns_only: Option<bool>,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: Option<u32>,
     pub web_bind: Option<SocketAddr>,

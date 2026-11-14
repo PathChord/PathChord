@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+orion.workspace = true
 pathchord-core = { path = "../pathchord-core" }
 pathchord-noise = { path = "../pathchord-noise" }
 pathchord-path = { path = "../pathchord-path" }

@@ -45,6 +45,14 @@ cargo build --locked --release -p pathchord-cli
 ./target/release/pathchord ingress --config examples/ingress-direct.yaml
 ```
 
+For a regular Unix user, the default Ingress control socket uses
+`$XDG_RUNTIME_DIR/pathchord/ingress.sock` when that directory is available, or
+`~/.config/pathchord/ingress.sock` otherwise. Root and packaged service accounts
+use `/run/pathchord/ingress.sock`; the service package creates that runtime
+directory before startup. An explicit `--socket` may be used when a different
+local endpoint is required. The `enroll` command defaults to the corresponding
+`egress.sock` endpoint; an explicitly selected socket takes precedence.
+
 The mixed listener binds to `127.0.0.1:7890`. Its unauthenticated example is
 restricted to loopback. Applications can select HTTP or SOCKS on that address:
 
@@ -172,7 +180,8 @@ opt-in through `--web-bind` and shares the local dispatcher. A configured
 `--web-token-file` supplies its bearer token. Prometheus scraping uses the
 same authentication, Origin checks, and `metrics:read` capability at `/metrics`.
 
-Each service accepts Ctrl-C shutdown and owns its task/connection cleanup.
+Each service accepts Ctrl-C and, on Unix, SIGTERM shutdown and owns its
+task/connection cleanup.
 Persistent configuration changes follow the reload contract; identity,
 listener topology, and other startup-only settings require a service restart
 when the reload response reports that requirement.

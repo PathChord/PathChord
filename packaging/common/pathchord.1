@@ -101,10 +101,14 @@ System configuration directory on Linux and Alpine service installations.
 System configuration directory on FreeBSD package installations.
 .TP
 .I /run/pathchord/ingress.sock
-Ingress local control socket on Unix.
+Ingress local control socket for root and service accounts on Unix.
 .TP
 .I /run/pathchord/egress.sock
-Egress local control socket on Unix.
+Egress local control socket for root and service accounts on Unix.
+.TP
+.I $XDG_RUNTIME_DIR/pathchord/
+Regular-user Unix control sockets; if XDG_RUNTIME_DIR is absent, the sockets
+are placed under ~/.config/pathchord/.
 .TP
 .I /var/run/pathchord/
 FreeBSD runtime directory for the local control sockets.

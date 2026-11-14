@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use pathchord_core::{
@@ -9,8 +10,12 @@ use pathchord_core::{
     UdpOpen, UdpOpenErr, UdpOpenOk,
 };
 use thiserror::Error;
+use tokio::time::Instant;
 
 const MAX_RECENT_DATAGRAM_SEQUENCES: usize = 256;
+/// Time allowed for outstanding UDP exchanges when the peer closes an Association.
+pub const DEFAULT_UDP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_UDP_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 #[error("UDP target failed with {error:?}")]
@@ -80,6 +85,7 @@ where
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UdpAssociationSnapshot {
     pub active_associations: usize,
+    pub draining_associations: usize,
     pub queued_datagrams: usize,
     pub queued_bytes: usize,
 }
@@ -102,11 +108,20 @@ pub enum UdpRuntimeError {
     SequenceExhausted,
     #[error("UDP target returned an invalid visible port")]
     InvalidVisiblePort,
+    #[error("UDP Association drain timeout is outside the allowed bounds")]
+    InvalidDrainTimeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssociationState {
+    Open,
+    Draining { deadline: Instant },
 }
 
 struct Association {
     target: TargetEndpoint,
     socket: BoxedUdpTargetSocket,
+    state: AssociationState,
     recent_ingress_sequences: BTreeSet<u64>,
     next_egress_sequence: u64,
     queued: VecDeque<UdpDatagram>,
@@ -164,6 +179,13 @@ where
     pub fn snapshot(&self) -> UdpAssociationSnapshot {
         UdpAssociationSnapshot {
             active_associations: self.associations.len(),
+            draining_associations: self
+                .associations
+                .values()
+                .filter(|association| {
+                    matches!(association.state, AssociationState::Draining { .. })
+                })
+                .count(),
             queued_datagrams: self
                 .associations
                 .values()
@@ -187,12 +209,68 @@ where
         ids
     }
 
+    #[must_use]
+    pub fn is_draining(&self, association_id: u64) -> bool {
+        self.associations
+            .get(&association_id)
+            .is_some_and(|association| {
+                matches!(association.state, AssociationState::Draining { .. })
+            })
+    }
+
+    /// Stops new datagrams while retaining already accepted exchanges until
+    /// they complete or the bounded grace period expires. Repeated requests
+    /// cannot extend a deadline. Closing an absent Association is idempotent.
+    pub fn begin_drain(
+        &mut self,
+        association_id: u64,
+        timeout: Duration,
+    ) -> Result<(), UdpRuntimeError> {
+        if timeout.is_zero() || timeout > MAX_UDP_DRAIN_TIMEOUT {
+            return Err(UdpRuntimeError::InvalidDrainTimeout);
+        }
+        let deadline = Instant::now() + timeout;
+        if let Some(association) = self.associations.get_mut(&association_id) {
+            association.state = match association.state {
+                AssociationState::Open => AssociationState::Draining { deadline },
+                AssociationState::Draining { deadline: current } => AssociationState::Draining {
+                    deadline: current.min(deadline),
+                },
+            };
+        }
+        Ok(())
+    }
+
+    /// Removes Associations whose accepted exchanges and queues are complete,
+    /// or whose drain deadline has elapsed. The owner calls this after handing
+    /// dequeued datagrams to its own sender; returned IDs may be used to retire
+    /// related scheduling metadata.
+    pub fn reap_draining(&mut self) -> Vec<u64> {
+        let now = Instant::now();
+        let mut closed = Vec::new();
+        self.associations.retain(|id, association| {
+            let finished = match association.state {
+                AssociationState::Open => false,
+                AssociationState::Draining { deadline } => {
+                    now >= deadline || association.queued.is_empty()
+                }
+            };
+            if finished {
+                self.queued_bytes -= association.queued_bytes;
+                closed.push(*id);
+            }
+            !finished
+        });
+        closed.sort_unstable();
+        closed
+    }
+
     pub async fn handle(&mut self, message: Message) -> Result<Vec<Message>, UdpRuntimeError> {
         match message {
             Message::UdpOpen(open) => self.open(open).await.map(|message| vec![message]),
             Message::UdpDatagram(datagram) => self.send(datagram).await,
             Message::UdpClose(close) => {
-                self.close(close.association_id)?;
+                self.begin_drain(close.association_id, DEFAULT_UDP_DRAIN_TIMEOUT)?;
                 Ok(Vec::new())
             }
             _ => Err(UdpRuntimeError::UnexpectedMessage),
@@ -208,6 +286,9 @@ where
                 .associations
                 .get_mut(&association_id)
                 .ok_or(UdpRuntimeError::UnknownAssociation(association_id))?;
+            if matches!(association.state, AssociationState::Draining { .. }) {
+                return Ok(Vec::new());
+            }
             association
                 .socket
                 .receive_datagram(self.limits.max_frame_payload())
@@ -255,6 +336,13 @@ where
     }
 
     pub fn dequeue(&mut self, association_id: u64) -> Result<Option<Message>, UdpRuntimeError> {
+        if self.associations.get(&association_id).is_some_and(|association| {
+            matches!(association.state, AssociationState::Draining { deadline } if Instant::now() >= deadline)
+        }) {
+            // The owner's next reap returns the closed ID so it can retire
+            // its corresponding scheduling state as well.
+            return Ok(None);
+        }
         let association = self
             .associations
             .get_mut(&association_id)
@@ -284,6 +372,13 @@ where
             return Err(UdpRuntimeError::SequenceExhausted);
         }
         if let Some(existing) = self.associations.get(&open.association_id) {
+            if matches!(existing.state, AssociationState::Draining { .. }) {
+                return Ok(Message::UdpOpenErr(UdpOpenErr {
+                    association_id: open.association_id,
+                    error: ErrorClass::EgressFailure,
+                    reason: b"UDP Association is draining".to_vec(),
+                }));
+            }
             if existing.target == open.target {
                 return Ok(Message::UdpOpenOk(UdpOpenOk {
                     association_id: open.association_id,
@@ -323,6 +418,7 @@ where
             Association {
                 target: open.target,
                 socket,
+                state: AssociationState::Open,
                 recent_ingress_sequences: BTreeSet::new(),
                 next_egress_sequence: 0,
                 queued: VecDeque::new(),
@@ -349,6 +445,11 @@ where
                 reason: b"UDP Association is not open".to_vec(),
             })]);
         };
+        if matches!(association.state, AssociationState::Draining { .. }) {
+            // UDP traffic is not reliable; refusing a new datagram must not
+            // terminate the surrounding Session while this Association drains.
+            return Ok(Vec::new());
+        }
         if association
             .recent_ingress_sequences
             .contains(&datagram.datagram_seq)
@@ -525,7 +626,123 @@ mod tests {
             }))
             .await
             .unwrap();
+        assert!(runtime.is_draining(7));
+        assert_eq!(runtime.reap_draining(), vec![7]);
         assert_eq!(runtime.snapshot().active_associations, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn draining_rejects_new_requests_and_delivers_accepted_responses() {
+        let state = Arc::new(Mutex::new(FakeSocketState::default()));
+        let mut runtime = UdpAssociationRuntime::new(
+            FakeFactory {
+                state: Arc::clone(&state),
+            },
+            ProtocolLimits::default(),
+            1,
+            1024,
+        )
+        .unwrap();
+        let open = UdpOpen {
+            association_id: 7,
+            target_flags: 3,
+            target: target(),
+        };
+        runtime
+            .handle(Message::UdpOpen(open.clone()))
+            .await
+            .unwrap();
+        runtime
+            .handle(Message::UdpDatagram(UdpDatagram {
+                association_id: 7,
+                datagram_seq: 1,
+                payload: b"accepted".to_vec(),
+            }))
+            .await
+            .unwrap();
+        state.lock().unwrap().incoming.push_back(b"reply".to_vec());
+        runtime.receive_from_target(7).await.unwrap();
+        runtime.begin_drain(7, Duration::from_secs(3)).unwrap();
+        assert_eq!(runtime.snapshot().draining_associations, 1);
+        runtime
+            .handle(Message::UdpDatagram(UdpDatagram {
+                association_id: 7,
+                datagram_seq: 2,
+                payload: b"too late".to_vec(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(state.lock().unwrap().sent, vec![b"accepted".to_vec()]);
+        assert!(matches!(
+            runtime
+                .handle(Message::UdpOpen(open))
+                .await
+                .unwrap()
+                .as_slice(),
+            [Message::UdpOpenErr(_)]
+        ));
+        assert!(runtime.reap_draining().is_empty());
+        // New target datagrams are not admitted after draining begins.
+        state
+            .lock()
+            .unwrap()
+            .incoming
+            .push_back(b"too late".to_vec());
+        runtime.receive_from_target(7).await.unwrap();
+        assert_eq!(state.lock().unwrap().incoming.len(), 1);
+        assert!(
+            runtime.reap_draining().is_empty(),
+            "queued response must be sent first"
+        );
+        assert!(matches!(
+            runtime.dequeue(7).unwrap(),
+            Some(Message::UdpDatagram(_))
+        ));
+        assert_eq!(runtime.reap_draining(), vec![7]);
+        assert_eq!(runtime.snapshot().queued_bytes, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_deadline_drops_remaining_work_and_cannot_be_extended() {
+        let state = Arc::new(Mutex::new(FakeSocketState::default()));
+        let mut runtime = UdpAssociationRuntime::new(
+            FakeFactory {
+                state: Arc::clone(&state),
+            },
+            ProtocolLimits::default(),
+            1,
+            1024,
+        )
+        .unwrap();
+        runtime
+            .handle(Message::UdpOpen(UdpOpen {
+                association_id: 1,
+                target_flags: 3,
+                target: target(),
+            }))
+            .await
+            .unwrap();
+        runtime
+            .handle(Message::UdpDatagram(UdpDatagram {
+                association_id: 1,
+                datagram_seq: 1,
+                payload: b"request".to_vec(),
+            }))
+            .await
+            .unwrap();
+        state.lock().unwrap().incoming.push_back(b"queued".to_vec());
+        runtime.receive_from_target(1).await.unwrap();
+        assert_eq!(runtime.snapshot().queued_bytes, 6);
+        runtime.begin_drain(1, Duration::from_secs(1)).unwrap();
+        runtime.begin_drain(1, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            runtime.begin_drain(1, Duration::ZERO),
+            Err(UdpRuntimeError::InvalidDrainTimeout)
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(runtime.reap_draining(), vec![1]);
+        assert_eq!(runtime.snapshot().active_associations, 0);
+        assert_eq!(runtime.snapshot().queued_bytes, 0);
     }
 
     #[tokio::test]

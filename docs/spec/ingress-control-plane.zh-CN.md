@@ -184,6 +184,10 @@ system_proxy.disable
 订阅创建/刷新正文包含来源引用、验证策略、启用状态和当前 revision。成功刷新原子发布一个
 动态配置代次；失败保留最近成功快照并返回类型化失败。删除会排空仅由该来源导入的节点。
 
+对于资源包中声明的 Subscription，通过此 API 启用、禁用、删除或显式重新创建后，只要声明未改变，
+该决定必须跨重载和重启保持权威。声明改变时替换声明式 spec；移除声明时只移除该声明式资源。
+该决定及其配置代次必须在数据面释放或排空来源可见性之前原子提交。
+
 规范的 `subscriptions.create` 正文如下：
 
 ```json
@@ -212,8 +216,10 @@ system_proxy.disable
 `source.type` 必须是规范[订阅类型](transit-proxies.zh-CN.md#订阅文档类型)或已定义输入别名；
 `source.url` 必须是不能包含内嵌凭据的
 HTTP(S) URL；`credentials_ref` 必须是不透明引用，不能是机密值。刷新和缓存字段使用配置
-schema 中相同的边界；`cache` 可以为 null。列表读模型返回这些字段，但绝不解析或返回引用的
-机密值。
+schema 中相同的边界；`cache` 可以为 null。列表读模型返回来源类型和凭据引用，但不解析或
+返回所引用的机密值。由于 URL 路径、查询参数和片段可能包含凭据，`source.url` 返回为
+`null`，`source.url_redaction_reason` 设置为 `sensitive_source`；`source.origin` 只包含
+scheme、主机和端口。完整 URL 私下保留供刷新操作使用。
 
 系统代理开关是控制面运行时 mutation，不是 YAML 资源。`system_proxy.enable` 必须包含 `listener_id`，
 且该 ID 必须引用 HTTP、SOCKS 或 Mixed Listener。Windows 将其应用到环境变量和操作系统代理配置；
@@ -300,6 +306,8 @@ REST 按情况映射为 `400`、`401/403`、`404`、`409`、`429` 和 `500/503`�
 本地 socket/pipe 使用操作系统所有权和 ACL 作为主要边界。服务为每个请求分配 actor 和
 capability。标准 capability 为 `status:read`、`metrics:read`、`nodes:read`、`nodes:write`、
 `listeners:read`、`subscriptions:write`、`authorization:write` 和 `system_proxy:write`。
+显式授予的 `force` capability 可以在调用方无法提供期望代次时满足 mutation 的代次前置条件；
+默认 Web actor 不会获得它。
 
 每次变更和身份验证失败都发出包含以下字段的审计事件：
 

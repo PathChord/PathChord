@@ -227,13 +227,14 @@ impl StreamReceiveBuffer {
         self.buffered
     }
 
-    /// Inserts a range, tolerating exact/overlapping retransmissions and
-    /// delivering every newly contiguous byte exactly once.
-    pub fn insert(
-        &mut self,
+    /// Validates overlapping bytes and returns the not-yet-received ranges as
+    /// half-open offsets. This lets the caller reserve exactly the memory that
+    /// insertion requires, including for partially overlapping retransmissions.
+    pub fn missing_ranges(
+        &self,
         offset: u64,
         data: &[u8],
-    ) -> Result<StreamInsertResult, ReliabilityError> {
+    ) -> Result<Vec<(u64, u64)>, ReliabilityError> {
         if offset > MAX_VARINT {
             return Err(ReliabilityError::OffsetOutOfRange { offset });
         }
@@ -243,99 +244,78 @@ impl StreamReceiveBuffer {
         if end > MAX_VARINT + 1 {
             return Err(ReliabilityError::OffsetOutOfRange { offset: end });
         }
-        if data.is_empty() {
-            return Ok(StreamInsertResult {
-                delivered: Vec::new(),
-                duplicate: true,
-            });
+        let start = offset.max(self.next_offset);
+        if start >= end {
+            return Ok(Vec::new());
         }
-
-        let mut start = offset;
-        let mut bytes = data.to_vec();
-        let mut duplicate = false;
-
-        if start < self.next_offset {
-            let trim = (self.next_offset - start) as usize;
-            if trim >= bytes.len() {
-                return Ok(StreamInsertResult {
-                    delivered: Vec::new(),
-                    duplicate: true,
-                });
+        let mut cursor = start;
+        let mut missing = Vec::new();
+        for (&existing_start, existing) in self.segments.range(..end) {
+            let existing_end = existing_start + existing.len() as u64;
+            if existing_end <= start {
+                continue;
             }
-            start = self.next_offset;
-            bytes.drain(..trim);
-            duplicate = true;
-        }
-
-        if let Some(existing) = self.segments.get(&start)
-            && existing == &bytes
-        {
-            return Ok(StreamInsertResult {
-                delivered: Vec::new(),
-                duplicate: true,
-            });
-        }
-
-        let end = start + bytes.len() as u64;
-        for (existing_start, existing_bytes) in &self.segments {
-            let existing_end = *existing_start + existing_bytes.len() as u64;
-            if start < existing_end && *existing_start < end {
-                let overlap_start = start.max(*existing_start);
-                let overlap_end = end.min(existing_end);
-                for position in overlap_start..overlap_end {
-                    let incoming = bytes[(position - start) as usize];
-                    let stored = existing_bytes[(position - *existing_start) as usize];
-                    if incoming != stored {
-                        return Err(ReliabilityError::ConflictingOverlap { offset: position });
-                    }
+            if cursor < existing_start {
+                missing.push((cursor, existing_start.min(end)));
+            }
+            let overlap_start = start.max(existing_start);
+            let overlap_end = end.min(existing_end);
+            if overlap_start < overlap_end {
+                let incoming_start = (overlap_start - offset) as usize;
+                let stored_start = (overlap_start - existing_start) as usize;
+                let length = (overlap_end - overlap_start) as usize;
+                if let Some(difference) = data[incoming_start..incoming_start + length]
+                    .iter()
+                    .zip(&existing[stored_start..stored_start + length])
+                    .position(|(incoming, stored)| incoming != stored)
+                {
+                    return Err(ReliabilityError::ConflictingOverlap {
+                        offset: overlap_start + difference as u64,
+                    });
                 }
-                duplicate = true;
+            }
+            cursor = cursor.max(existing_end);
+            if cursor >= end {
+                break;
             }
         }
-
-        if !duplicate && self.buffered.saturating_add(bytes.len()) > self.max_buffered {
+        if cursor < end {
+            missing.push((cursor, end));
+        }
+        let additional: usize = missing
+            .iter()
+            .map(|(start, end)| (end - start) as usize)
+            .sum();
+        if self.buffered.saturating_add(additional) > self.max_buffered {
             return Err(ReliabilityError::QueueFull {
                 capacity: self.max_buffered,
             });
         }
-        if duplicate {
-            // Reconstruct only bytes that are not already represented. For the
-            // Phase-1 buffer, overlapping retransmissions are accepted as a
-            // duplicate and do not increase the memory budget.
-            let mut missing = Vec::new();
-            for (index, value) in bytes.iter().copied().enumerate() {
-                let position = start + index as u64;
-                let covered = self.segments.iter().any(|(segment_start, segment)| {
-                    position >= *segment_start && position < *segment_start + segment.len() as u64
-                });
-                if !covered {
-                    missing.push((position, value));
-                }
-            }
-            if !missing.is_empty() {
-                let first = missing[0].0;
-                let contiguous = missing
-                    .iter()
-                    .enumerate()
-                    .all(|(index, (position, _))| *position == first + index as u64);
-                if contiguous {
-                    let values: Vec<u8> = missing.into_iter().map(|(_, value)| value).collect();
-                    if self.buffered.saturating_add(values.len()) > self.max_buffered {
-                        return Err(ReliabilityError::QueueFull {
-                            capacity: self.max_buffered,
-                        });
-                    }
-                    self.buffered += values.len();
-                    self.segments.insert(first, values);
-                }
-            }
-        } else {
-            self.segments.insert(start, bytes.clone());
-            self.buffered += bytes.len();
-        }
+        Ok(missing)
+    }
 
+    /// Inserts every missing subrange and returns the newly contiguous prefix.
+    /// Identical retransmissions do not consume capacity; conflicting buffered
+    /// overlaps are rejected before any state is changed.
+    pub fn insert(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<StreamInsertResult, ReliabilityError> {
+        let missing = self.missing_ranges(offset, data)?;
+        let additional: usize = missing
+            .iter()
+            .map(|(start, end)| (end - start) as usize)
+            .sum();
+        let duplicate = additional < data.len();
+        for (start, end) in missing {
+            let from = (start - offset) as usize;
+            let to = (end - offset) as usize;
+            self.segments.insert(start, data[from..to].to_vec());
+            self.buffered += to - from;
+        }
         let mut delivered = Vec::new();
-        while let Some((&segment_start, _segment)) = self.segments.first_key_value() {
+        while let Some((&segment_start, _)) = self.segments.first_key_value() {
             if segment_start != self.next_offset {
                 break;
             }
@@ -459,5 +439,35 @@ mod tests {
             bounded.insert(4, b"abc"),
             Err(ReliabilityError::QueueFull { capacity: 2 })
         ));
+    }
+
+    #[test]
+    fn overlapping_frame_fills_multiple_missing_ranges_without_losing_bytes() {
+        let mut buffer = StreamReceiveBuffer::new(10).unwrap();
+        assert!(buffer.insert(2, b"cd").unwrap().delivered.is_empty());
+        assert!(buffer.insert(6, b"gh").unwrap().delivered.is_empty());
+        assert_eq!(
+            buffer.missing_ranges(0, b"abcdefghij").unwrap(),
+            vec![(0, 2), (4, 6), (8, 10)]
+        );
+        let result = buffer.insert(0, b"abcdefghij").unwrap();
+        assert!(result.duplicate);
+        assert_eq!(result.delivered, b"abcdefghij");
+        assert_eq!(buffer.buffered_bytes(), 0);
+        assert_eq!(buffer.next_offset(), 10);
+    }
+
+    #[test]
+    fn duplicate_ranges_need_no_capacity_and_conflicts_preserve_state() {
+        let mut buffer = StreamReceiveBuffer::new(4).unwrap();
+        buffer.insert(4, b"abcd").unwrap();
+        assert!(buffer.missing_ranges(4, b"abcd").unwrap().is_empty());
+        assert!(buffer.insert(4, b"abcd").unwrap().duplicate);
+        assert_eq!(buffer.buffered_bytes(), 4);
+        assert!(matches!(
+            buffer.insert(4, b"abcx"),
+            Err(ReliabilityError::ConflictingOverlap { offset: 7 })
+        ));
+        assert_eq!(buffer.buffered_bytes(), 4);
     }
 }

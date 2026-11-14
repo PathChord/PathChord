@@ -1,14 +1,19 @@
 //! Transport-neutral multipath scheduling and cross-Path retransmission plans.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use pathchord_core::{
     EgressServiceState, PathId, PathState, SessionId, SessionState, StatusReport,
     StatusReportDisposition, StatusReportTracker, StreamAck, StreamData, StreamId,
 };
 use thiserror::Error;
+use tokio::time::Instant;
 
 const QUOTA_ZERO_WEIGHT_FLOOR_BASIS_POINTS: u128 = 1_000;
+// Bound Path frame, record and authentication overhead when charging a copy.
+const REPLICATION_COPY_OVERHEAD_BYTES: u64 = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultipathConfig {
@@ -43,6 +48,20 @@ pub struct MultipathPathObservation {
     pub rtt_ms: u64,
     pub jitter_ms: u64,
     pub loss_basis_points: u16,
+    /// Measured fraction of reordered data frames; unknown until a sample exists.
+    pub reordering_basis_points: Option<u16>,
+    /// Available congestion window from a transport that exposes it.
+    pub congestion_window_bytes: Option<u64>,
+    /// Measured marginal capacity contributed by this Path.
+    pub incremental_capacity_bps: Option<u64>,
+    /// Measured scheduling and protocol overhead for this Path.
+    pub scheduling_overhead_bps: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PathQualityExclusionReason {
+    IncrementalCapacityBelowOverhead,
+    CongestionWindowExhausted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +89,10 @@ impl Default for MultipathPathObservation {
             rtt_ms: 1,
             jitter_ms: 0,
             loss_basis_points: 0,
+            reordering_basis_points: None,
+            congestion_window_bytes: None,
+            incremental_capacity_bps: None,
+            scheduling_overhead_bps: None,
         }
     }
 }
@@ -152,6 +175,7 @@ pub struct MultipathSession {
     session_replication_used: u64,
     stream_replication_used: HashMap<StreamId, u64>,
     class_replication_used: HashMap<String, u64>,
+    replication_window_started: Instant,
 }
 
 impl std::fmt::Debug for MultipathSession {
@@ -170,8 +194,9 @@ impl std::fmt::Debug for MultipathSession {
 impl MultipathSession {
     pub fn new(session_id: SessionId, config: MultipathConfig) -> Result<Self, MultipathError> {
         if config.max_paths == 0
-            || config.session_replication_budget_bytes == 0
-            || config.default_stream_replication_budget_bytes == 0
+            || (config.retransmission_replication_enabled
+                && (config.session_replication_budget_bytes == 0
+                    || config.default_stream_replication_budget_bytes == 0))
         {
             return Err(MultipathError::ZeroCapacity);
         }
@@ -191,13 +216,15 @@ impl MultipathSession {
             session_replication_used: 0,
             stream_replication_used: HashMap::new(),
             class_replication_used: HashMap::new(),
+            replication_window_started: Instant::now(),
         })
     }
 
     pub fn reconfigure(&mut self, config: MultipathConfig) -> Result<(), MultipathError> {
         if config.max_paths == 0
-            || config.session_replication_budget_bytes == 0
-            || config.default_stream_replication_budget_bytes == 0
+            || (config.retransmission_replication_enabled
+                && (config.session_replication_budget_bytes == 0
+                    || config.default_stream_replication_budget_bytes == 0))
         {
             return Err(MultipathError::ZeroCapacity);
         }
@@ -207,12 +234,6 @@ impl MultipathSession {
             .any(|budget| *budget > config.session_replication_budget_bytes)
         {
             return Err(MultipathError::InvalidReplicationBudget);
-        }
-        if !config.retransmission_replication_enabled {
-            self.retained.clear();
-            self.session_replication_used = 0;
-            self.stream_replication_used.clear();
-            self.class_replication_used.clear();
         }
         self.config = config;
         Ok(())
@@ -253,13 +274,18 @@ impl MultipathSession {
     pub fn effective_capacity_bps(&self) -> u64 {
         self.paths
             .values()
-            .filter(|path| self.path_is_schedulable(path))
+            .filter(|path| {
+                self.path_is_schedulable(path) && quality_exclusion(&path.observation).is_none()
+            })
             .map(|path| {
-                let weighted = u128::from(path.observation.effective_capacity_bps)
+                let weighted = effective_capacity(&path.observation)
                     * u128::from(path.observation.weight_basis_points)
                     / 10_000;
                 let delivered =
                     weighted * u128::from(10_000 - path.observation.loss_basis_points) / 10_000;
+                let delivered = delivered
+                    * u128::from(10_000 - path.observation.reordering_basis_points.unwrap_or(0))
+                    / 10_000;
                 let adjusted =
                     delivered * u128::from(path.economics.traffic_multiplier_basis_points) / 10_000;
                 let adjusted = if path.economics.quota_remaining == Some(0) {
@@ -278,6 +304,14 @@ impl MultipathSession {
             .iter()
             .filter(|(_, path)| self.path_is_schedulable(path))
             .map(|(path_id, _)| *path_id)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn path_states(&self) -> BTreeMap<PathId, PathState> {
+        self.paths
+            .iter()
+            .map(|(id, path)| (*id, path.state))
             .collect()
     }
 
@@ -403,6 +437,19 @@ impl MultipathSession {
         Ok(())
     }
 
+    /// Reports only quality-based exclusion; control traffic can still use a
+    /// ready Path while business scheduling excludes it.
+    pub fn quality_exclusion(
+        &self,
+        path_id: PathId,
+    ) -> Result<Option<PathQualityExclusionReason>, MultipathError> {
+        let path = self
+            .paths
+            .get(&path_id)
+            .ok_or(MultipathError::UnknownPath(path_id))?;
+        Ok(quality_exclusion(&path.observation))
+    }
+
     pub fn update_economic_status(
         &mut self,
         path_id: PathId,
@@ -511,9 +558,6 @@ impl MultipathSession {
         if !self.paths.contains_key(&path_id) {
             return Err(MultipathError::UnknownPath(path_id));
         }
-        if !self.config.retransmission_replication_enabled {
-            return Ok(());
-        }
         let key = (data.stream_id, data.offset);
         if let Some(existing) = self.retained.get(&key) {
             if existing.data == data {
@@ -563,21 +607,14 @@ impl MultipathSession {
         direction: ScheduleDirection,
         eligible: Option<&BTreeMap<PathId, u32>>,
     ) -> Result<StreamRetransmission, MultipathError> {
-        if !self.config.retransmission_replication_enabled {
-            return Err(MultipathError::ReplicationBudgetExhausted);
-        }
         let key = (stream_id, offset);
-        let (length, traffic_class) = {
+        let length = {
             let retained = self
                 .retained
                 .get(&key)
                 .ok_or(MultipathError::ConflictingRetainedRange)?;
-            (
-                retained.data.data.len() as u64,
-                retained.traffic_class.clone(),
-            )
+            retained.data.data.len() as u64
         };
-        self.consume_replication_budget(stream_id, &traffic_class, length)?;
         let schedule =
             self.schedule_excluding(direction, length as usize, excluded_path, eligible)?;
         let retained = self
@@ -590,6 +627,46 @@ impl MultipathSession {
             path_id: schedule.path_id,
             data: retained.data.clone(),
             attempt: retained.attempts,
+        })
+    }
+
+    /// Plans an additional copy of a retained range. This is separate from
+    /// ordinary loss recovery and consumes the configured replication budget.
+    pub fn replicate_range(
+        &mut self,
+        stream_id: StreamId,
+        offset: u64,
+        excluded_path: Option<PathId>,
+        direction: ScheduleDirection,
+        eligible: Option<&BTreeMap<PathId, u32>>,
+    ) -> Result<StreamRetransmission, MultipathError> {
+        if !self.config.retransmission_replication_enabled {
+            return Err(MultipathError::ReplicationBudgetExhausted);
+        }
+        let (data, class, attempt) = {
+            let retained = self
+                .retained
+                .get(&(stream_id, offset))
+                .ok_or(MultipathError::ConflictingRetainedRange)?;
+            (
+                retained.data.clone(),
+                retained.traffic_class.clone(),
+                retained.attempts.saturating_add(1),
+            )
+        };
+        self.refresh_replication_window();
+        let charge = (data.data.len() as u64).saturating_add(REPLICATION_COPY_OVERHEAD_BYTES);
+        let (session_next, stream_next, class_next) =
+            self.replication_totals(stream_id, &class, charge)?;
+        let schedule =
+            self.schedule_excluding(direction, data.data.len(), excluded_path, eligible)?;
+        self.session_replication_used = session_next;
+        self.stream_replication_used.insert(stream_id, stream_next);
+        self.class_replication_used.insert(class, class_next);
+        Ok(StreamRetransmission {
+            path_id: schedule.path_id,
+            data,
+            attempt,
         })
     }
 
@@ -628,12 +705,12 @@ impl MultipathSession {
         Ok(plans)
     }
 
-    fn consume_replication_budget(
-        &mut self,
+    fn replication_totals(
+        &self,
         stream_id: StreamId,
         traffic_class: &str,
         bytes: u64,
-    ) -> Result<(), MultipathError> {
+    ) -> Result<(u64, u64, u64), MultipathError> {
         let session_next = self
             .session_replication_used
             .checked_add(bytes)
@@ -666,11 +743,45 @@ impl MultipathSession {
         {
             return Err(MultipathError::ReplicationBudgetExhausted);
         }
-        self.session_replication_used = session_next;
-        self.stream_replication_used.insert(stream_id, stream_next);
+        Ok((session_next, stream_next, class_next))
+    }
+
+    #[cfg(test)]
+    fn consume_replication_budget(
+        &mut self,
+        stream_id: StreamId,
+        class: &str,
+        bytes: u64,
+    ) -> Result<(), MultipathError> {
+        self.refresh_replication_window();
+        let (session, stream, class_used) = self.replication_totals(stream_id, class, bytes)?;
+        self.session_replication_used = session;
+        self.stream_replication_used.insert(stream_id, stream);
         self.class_replication_used
-            .insert(traffic_class.to_owned(), class_next);
+            .insert(class.to_owned(), class_used);
         Ok(())
+    }
+
+    /// Charges one additional control copy to the shared Session budget.
+    pub(crate) fn charge_control_replication(&mut self, bytes: u64) -> bool {
+        self.refresh_replication_window();
+        let Some(next) = self.session_replication_used.checked_add(bytes) else {
+            return false;
+        };
+        if next > self.config.session_replication_budget_bytes {
+            return false;
+        }
+        self.session_replication_used = next;
+        true
+    }
+
+    fn refresh_replication_window(&mut self) {
+        if self.replication_window_started.elapsed() >= Duration::from_secs(1) {
+            self.replication_window_started = Instant::now();
+            self.session_replication_used = 0;
+            self.stream_replication_used.clear();
+            self.class_replication_used.clear();
+        }
     }
 
     fn schedule_excluding(
@@ -690,24 +801,31 @@ impl MultipathSession {
                 Some(**path_id) != excluded
                     && eligible.is_none_or(|eligible| eligible.contains_key(path_id))
                     && self.path_is_schedulable(path)
+                    && quality_exclusion(&path.observation).is_none()
             })
             .map(|(path_id, path)| {
-                let relationship_weight = eligible
+                // An eligible map owns the relationship weight for this flow.
+                // Otherwise use the Path's default weight. Applying both would
+                // square the same relationship preference.
+                let weight = eligible
                     .and_then(|eligible| eligible.get(path_id))
                     .copied()
-                    .unwrap_or(100)
+                    .unwrap_or(u32::from(path.observation.weight_basis_points))
                     .max(1);
-                let score = path_score(&path.observation, &path.economics)
-                    .saturating_mul(u128::from(relationship_weight));
+                let score = path_score(&path.observation, &path.economics, weight);
                 let scheduled = match direction {
                     ScheduleDirection::Upstream => path.upstream_scheduled_bytes,
                     ScheduleDirection::Downstream => path.downstream_scheduled_bytes,
                 };
-                let normalized_load = (u128::from(scheduled) + 1) * 1_000_000 / score.max(1);
-                (*path_id, score, normalized_load)
+                (*path_id, score, u128::from(scheduled) + 1)
             })
             .collect();
-        candidates.sort_by_key(|(path_id, _, normalized)| (*normalized, *path_id));
+        candidates.sort_by(
+            |(left_id, left_score, left_scheduled), (right_id, right_score, right_scheduled)| {
+                compare_ratios(*left_scheduled, *left_score, *right_scheduled, *right_score)
+                    .then_with(|| left_id.cmp(right_id))
+            },
+        );
         let Some((path_id, score, _)) = candidates.first().copied() else {
             return Err(MultipathError::NoSchedulablePath);
         };
@@ -748,17 +866,24 @@ fn validate_observation(observation: &MultipathPathObservation) -> Result<(), Mu
         || observation.weight_basis_points == 0
         || observation.weight_basis_points > 10_000
         || observation.loss_basis_points > 10_000
+        || observation
+            .reordering_basis_points
+            .is_some_and(|ratio| ratio > 10_000)
     {
         return Err(MultipathError::InvalidObservation);
     }
     Ok(())
 }
 
-fn path_score(observation: &MultipathPathObservation, economics: &PathEconomicStatus) -> u128 {
-    let weighted_capacity = u128::from(observation.effective_capacity_bps)
-        * u128::from(observation.weight_basis_points)
-        / 10_000;
+fn path_score(
+    observation: &MultipathPathObservation,
+    economics: &PathEconomicStatus,
+    relationship_weight: u32,
+) -> u128 {
+    let weighted_capacity = effective_capacity(observation) * u128::from(relationship_weight);
     let delivered = weighted_capacity * u128::from(10_000 - observation.loss_basis_points) / 10_000;
+    let delivered =
+        delivered * u128::from(10_000 - observation.reordering_basis_points.unwrap_or(0)) / 10_000;
     let latency = u128::from(
         observation
             .rtt_ms
@@ -773,6 +898,62 @@ fn path_score(observation: &MultipathPathObservation, economics: &PathEconomicSt
         multiplier_adjusted
     };
     (quota_adjusted / latency).max(1)
+}
+
+fn effective_capacity(observation: &MultipathPathObservation) -> u128 {
+    let capacity = u128::from(observation.effective_capacity_bps);
+    observation
+        .congestion_window_bytes
+        .map_or(capacity, |window| {
+            // One congestion window per measured RTT is the transport's upper
+            // bound. Unknown windows never acquire an invented value.
+            let window_capacity =
+                u128::from(window).saturating_mul(8_000) / u128::from(observation.rtt_ms.max(1));
+            capacity.min(window_capacity)
+        })
+}
+
+fn quality_exclusion(observation: &MultipathPathObservation) -> Option<PathQualityExclusionReason> {
+    if observation.congestion_window_bytes == Some(0) {
+        return Some(PathQualityExclusionReason::CongestionWindowExhausted);
+    }
+    if let (Some(capacity), Some(overhead)) = (
+        observation.incremental_capacity_bps,
+        observation.scheduling_overhead_bps,
+    ) && capacity < overhead
+    {
+        return Some(PathQualityExclusionReason::IncrementalCapacityBelowOverhead);
+    }
+    None
+}
+
+/// Compare positive fractions exactly without overflow or quantizing busy
+/// high-capacity Paths to the same score.
+fn compare_ratios(mut a: u128, mut b: u128, mut c: u128, mut d: u128) -> Ordering {
+    let mut reverse = false;
+    loop {
+        let (left, right) = (a / b, c / d);
+        if left != right {
+            return if reverse {
+                right.cmp(&left)
+            } else {
+                left.cmp(&right)
+            };
+        }
+        let (left_remainder, right_remainder) = (a % b, c % d);
+        if left_remainder == 0 || right_remainder == 0 {
+            let order = match (left_remainder == 0, right_remainder == 0) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => unreachable!(),
+            };
+            return if reverse { order.reverse() } else { order };
+        }
+        (a, b) = (b, left_remainder);
+        (c, d) = (d, right_remainder);
+        reverse = !reverse;
+    }
 }
 
 #[cfg(test)]
@@ -791,6 +972,7 @@ mod tests {
             rtt_ms: rtt,
             jitter_ms: 1,
             loss_basis_points: loss,
+            ..MultipathPathObservation::default()
         }
     }
 
@@ -845,7 +1027,7 @@ mod tests {
         assert_eq!(outcome.retransmissions[0].path_id, PathId::new(2));
         assert_eq!(outcome.retransmissions[0].data, data);
         assert_eq!(outcome.retransmissions[0].attempt, 1);
-        assert!(session.replication_used() > 0);
+        assert_eq!(session.replication_used(), 0);
     }
 
     #[test]
@@ -906,13 +1088,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            session.fail_path(PathId::new(1)),
+            session.replicate_range(
+                stream_id(),
+                0,
+                Some(PathId::new(1)),
+                ScheduleDirection::Upstream,
+                None
+            ),
             Err(MultipathError::ReplicationBudgetExhausted)
         );
     }
 
     #[test]
-    fn disabled_retransmission_replication_does_not_retain_ranges() {
+    fn refused_replica_does_not_consume_path_scheduling_capacity() {
+        let mut session = MultipathSession::new(
+            SessionId::new(1),
+            MultipathConfig {
+                session_replication_budget_bytes: 4,
+                default_stream_replication_budget_bytes: 4,
+                ..MultipathConfig::default()
+            },
+        )
+        .unwrap();
+        for id in [1, 2] {
+            session
+                .add_path(PathId::new(id), observation(1_000, 10, 0))
+                .unwrap();
+        }
+        session
+            .retain_stream_data(
+                StreamData {
+                    stream_id: stream_id(),
+                    offset: 0,
+                    flags: 0,
+                    data: b"exceeds".to_vec(),
+                },
+                "default",
+                PathId::new(1),
+            )
+            .unwrap();
+        assert_eq!(
+            session.replicate_range(
+                stream_id(),
+                0,
+                Some(PathId::new(1)),
+                ScheduleDirection::Upstream,
+                None
+            ),
+            Err(MultipathError::ReplicationBudgetExhausted)
+        );
+        assert_eq!(
+            session
+                .schedule(ScheduleDirection::Upstream, 1)
+                .unwrap()
+                .path_id,
+            PathId::new(1)
+        );
+        assert_eq!(
+            session
+                .schedule(ScheduleDirection::Upstream, 1)
+                .unwrap()
+                .path_id,
+            PathId::new(2)
+        );
+    }
+
+    #[test]
+    fn disabled_replication_still_retransmits_lost_ranges() {
         let mut session = MultipathSession::new(
             SessionId::new(1),
             MultipathConfig {
@@ -941,9 +1183,24 @@ mod tests {
             .unwrap();
         assert_eq!(session.replication_used(), 0);
         assert_eq!(
-            session.fail_path(PathId::new(1)).unwrap().retransmissions,
-            Vec::new()
+            session.replicate_range(
+                stream_id(),
+                0,
+                Some(PathId::new(1)),
+                ScheduleDirection::Upstream,
+                None
+            ),
+            Err(MultipathError::ReplicationBudgetExhausted)
         );
+        assert_eq!(
+            session
+                .fail_path(PathId::new(1))
+                .unwrap()
+                .retransmissions
+                .len(),
+            1
+        );
+        assert_eq!(session.replication_used(), 0);
     }
 
     #[test]
@@ -977,9 +1234,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            session.fail_path(PathId::new(1)),
+            session.replicate_range(
+                stream_id(),
+                0,
+                Some(PathId::new(1)),
+                ScheduleDirection::Upstream,
+                None
+            ),
             Err(MultipathError::ReplicationBudgetExhausted)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn class_and_session_replication_budgets_are_independent_and_reset_each_second() {
+        let mut session = MultipathSession::new(
+            SessionId::new(1),
+            MultipathConfig {
+                session_replication_budget_bytes: 6,
+                default_stream_replication_budget_bytes: 6,
+                class_replication_budget_bytes: BTreeMap::from([
+                    ("policy:a".to_owned(), 2),
+                    ("policy:b".to_owned(), 2),
+                    ("policy:disabled".to_owned(), 0),
+                ]),
+                ..MultipathConfig::default()
+            },
+        )
+        .unwrap();
+        let a = StreamId::new(1).unwrap();
+        let b = StreamId::new(2).unwrap();
+        let disabled = StreamId::new(3).unwrap();
+        session
+            .consume_replication_budget(a, "policy:a", 2)
+            .unwrap();
+        assert_eq!(
+            session.consume_replication_budget(a, "policy:a", 1),
+            Err(MultipathError::ReplicationBudgetExhausted)
+        );
+        session
+            .consume_replication_budget(b, "policy:b", 2)
+            .unwrap();
+        assert_eq!(
+            session.consume_replication_budget(disabled, "policy:disabled", 1),
+            Err(MultipathError::ReplicationBudgetExhausted)
+        );
+        assert_eq!(session.replication_used(), 4);
+        assert!(session.charge_control_replication(1));
+        assert_eq!(
+            session.consume_replication_budget(disabled, "other", 2),
+            Err(MultipathError::ReplicationBudgetExhausted),
+            "business traffic cannot borrow the Session budget used by control"
+        );
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert_eq!(
+            session.consume_replication_budget(a, "policy:a", 1),
+            Err(MultipathError::ReplicationBudgetExhausted)
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        session
+            .consume_replication_budget(a, "policy:a", 2)
+            .unwrap();
+        assert_eq!(session.replication_used(), 2);
+        session
+            .consume_replication_budget(b, "policy:b", 2)
+            .unwrap();
+        assert_eq!(session.replication_used(), 4);
     }
 
     #[test]
@@ -1165,6 +1484,120 @@ mod tests {
                 .path_id,
             PathId::new(2)
         );
+    }
+
+    #[test]
+    fn per_flow_relationship_weight_is_applied_once_with_large_capacity() {
+        let mut session =
+            MultipathSession::new(SessionId::new(1), MultipathConfig::default()).unwrap();
+        let mut low = observation(1_000_000_000, 10, 0);
+        low.weight_basis_points = 2_500;
+        let high = observation(1_000_000_000, 10, 0);
+        session.add_path(PathId::new(1), low).unwrap();
+        session.add_path(PathId::new(2), high).unwrap();
+        let eligible = BTreeMap::from([(PathId::new(1), 1), (PathId::new(2), 4)]);
+        let mut counts = [0_usize; 2];
+        for _ in 0..1_000 {
+            let selected = session
+                .schedule_eligible(ScheduleDirection::Upstream, 4_096, &eligible)
+                .unwrap()
+                .path_id;
+            counts[usize::from(selected == PathId::new(2))] += 1;
+        }
+        assert_eq!(counts, [200, 800]);
+    }
+
+    #[test]
+    fn measured_reordering_and_congestion_window_reduce_score_without_fabricating_unknowns() {
+        let unknown = observation(100_000_000, 10, 0);
+        let economics = PathEconomicStatus::default();
+        let baseline = path_score(&unknown, &economics, 100);
+        let mut reordered = unknown.clone();
+        reordered.reordering_basis_points = Some(5_000);
+        let reordered_score = path_score(&reordered, &economics, 100);
+        assert!(reordered_score < baseline);
+        let mut limited_window = unknown.clone();
+        limited_window.congestion_window_bytes = Some(1_500);
+        assert!(path_score(&limited_window, &economics, 100) < baseline);
+        assert!(unknown.reordering_basis_points.is_none());
+        assert!(unknown.congestion_window_bytes.is_none());
+        reordered.reordering_basis_points = Some(10_001);
+        assert_eq!(
+            validate_observation(&reordered),
+            Err(MultipathError::InvalidObservation)
+        );
+    }
+
+    #[test]
+    fn path_below_overhead_is_excluded_from_business_but_remains_ready_for_control() {
+        let mut session =
+            MultipathSession::new(SessionId::new(1), MultipathConfig::default()).unwrap();
+        let mut inefficient = observation(10_000, 10, 0);
+        inefficient.incremental_capacity_bps = Some(99);
+        inefficient.scheduling_overhead_bps = Some(100);
+        session
+            .add_path(PathId::new(1), inefficient.clone())
+            .unwrap();
+        session
+            .add_path(PathId::new(2), observation(10_000, 10, 0))
+            .unwrap();
+        assert_eq!(session.ready_path_count(), 2);
+        assert_eq!(session.ready_path_ids(), [PathId::new(1), PathId::new(2)]);
+        assert_eq!(
+            session.quality_exclusion(PathId::new(1)),
+            Ok(Some(
+                PathQualityExclusionReason::IncrementalCapacityBelowOverhead
+            ))
+        );
+        assert_eq!(session.quality_exclusion(PathId::new(2)), Ok(None));
+        assert_eq!(
+            session
+                .schedule(ScheduleDirection::Upstream, 10)
+                .unwrap()
+                .path_id,
+            PathId::new(2)
+        );
+        assert!(matches!(
+            session.schedule_eligible(
+                ScheduleDirection::Upstream,
+                10,
+                &BTreeMap::from([(PathId::new(1), 100)])
+            ),
+            Err(MultipathError::NoSchedulablePath)
+        ));
+        inefficient.incremental_capacity_bps = Some(100);
+        session
+            .update_observation(PathId::new(1), inefficient.clone())
+            .unwrap();
+        assert_eq!(session.quality_exclusion(PathId::new(1)), Ok(None));
+        assert!(
+            session
+                .schedule_eligible(
+                    ScheduleDirection::Upstream,
+                    10,
+                    &BTreeMap::from([(PathId::new(1), 100)])
+                )
+                .is_ok()
+        );
+        inefficient.congestion_window_bytes = Some(0);
+        session
+            .update_observation(PathId::new(1), inefficient)
+            .unwrap();
+        assert_eq!(
+            session.quality_exclusion(PathId::new(1)),
+            Ok(Some(PathQualityExclusionReason::CongestionWindowExhausted))
+        );
+    }
+
+    #[test]
+    fn fraction_comparison_stays_exact_at_large_values() {
+        assert_eq!(
+            compare_ratios(u128::MAX - 1, u128::MAX, u128::MAX - 2, u128::MAX),
+            Ordering::Greater
+        );
+        assert_eq!(compare_ratios(2, 4, 1, 2), Ordering::Equal);
+        assert_eq!(compare_ratios(1, 3, 1, 2), Ordering::Less);
+        assert_eq!(compare_ratios(11, 10, 12, 10), Ordering::Less);
     }
 
     #[test]

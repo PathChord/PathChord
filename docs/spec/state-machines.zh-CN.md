@@ -89,8 +89,8 @@ Association，并等待已有工作；MAY 包含 ready 的 draining Path。最�
 SessionID 创建新的 `CONFIGURED` 记录。
 
 端点重启、Egress 硬故障或授权 disable/revoke 会关闭 Session 和所有相关目标资源。端点重启
-和授权失败MUST NOT 自动恢复旧 SessionID。心跳和控制重传使用任意 ready 且未撤销的 Path，并由
-Session 控制序列去重。
+和授权失败MUST NOT 自动恢复旧 SessionID。心跳及其确认属于 Path 本地消息。Session 控制重传
+使用 ready 且符合策略的 Path，并由 Session 控制序列去重。
 
 ## TCP Stream
 

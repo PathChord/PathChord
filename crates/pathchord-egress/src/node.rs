@@ -42,6 +42,7 @@ pub struct EgressNodeConfig {
     pub capacity_bps: u64,
     pub recommended_path_count: u64,
     pub max_streams_per_ingress: usize,
+    pub remote_dns_only: bool,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: u32,
 }
@@ -58,6 +59,7 @@ pub struct EgressNodeSnapshot {
     pub completed_sessions: u64,
     pub active_paths: usize,
     pub active_sessions: usize,
+    pub active_streams: usize,
     pub active_target_connections: u64,
     pub running: bool,
     pub quota_remaining: Option<u64>,
@@ -182,6 +184,9 @@ where
             ));
         }
         self.session_status = status;
+        Arc::get_mut(&mut self.status_provider)
+            .expect("status provider is not shared before starting the node")
+            .status = status;
         Ok(self)
     }
 
@@ -201,16 +206,93 @@ where
             duplicate_sessions: self.observations.duplicates.load(Ordering::Relaxed),
             completed_sessions: self.observations.completed.load(Ordering::Relaxed),
             active_paths: runtime
-                .paths
+                .sessions
                 .values()
-                .filter(|path| path.metadata.is_some())
+                .filter_map(|session| session.controller.as_ref())
+                .map(|controller| controller.snapshot().ready_paths)
+                .sum(),
+            active_sessions: runtime
+                .sessions
+                .values()
+                .filter_map(|session| session.controller.as_ref())
+                .filter(|controller| !controller.snapshot().closed)
                 .count(),
-            active_sessions: runtime.sessions.len(),
+            active_streams: runtime
+                .sessions
+                .values()
+                .filter_map(|session| session.controller.as_ref())
+                .map(|controller| controller.snapshot().active_streams)
+                .sum(),
             active_target_connections: self.observations.active_targets.load(Ordering::Relaxed),
             running: self.running.load(Ordering::Relaxed),
             quota_remaining: self.config.quota_remaining,
             traffic_multiplier_basis_points: self.config.traffic_multiplier_basis_points,
         })
+    }
+
+    /// Return live Path and Session counts by enrolled Ingress identity.
+    pub fn authorization_activity(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, (usize, usize)>, EgressNodeError> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| EgressNodeError::RuntimeStateLock)?;
+        let mut activity = std::collections::BTreeMap::<String, (usize, usize)>::new();
+        for ((ingress_id, _), session) in &runtime.sessions {
+            if let Some(controller) = &session.controller {
+                let snapshot = controller.snapshot();
+                if !snapshot.closed {
+                    let entry = activity.entry(ingress_id.clone()).or_default();
+                    entry.0 += snapshot.ready_paths;
+                    entry.1 += 1;
+                }
+            }
+        }
+        Ok(activity)
+    }
+
+    /// Snapshot live Session resources for the Egress management adapter.
+    pub fn management_resources(
+        &self,
+    ) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), EgressNodeError> {
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| EgressNodeError::RuntimeStateLock)?;
+        let mut paths = Vec::new();
+        let mut streams = Vec::new();
+        for ((_, session_id), session) in &runtime.sessions {
+            let Some(controller) = &session.controller else {
+                continue;
+            };
+            let snapshot = controller.snapshot();
+            for (path_id, quality) in snapshot.path_quality {
+                paths.push(serde_json::json!({
+                    "path_id": path_id.to_string(), "session_id": session_id.to_string(),
+                    "egress_id": self.config.egress_id,
+                    "state": snapshot.path_states.get(&path_id)
+                        .map(|state| format!("{state:?}").to_ascii_lowercase()),
+                    "rtt_ms": quality.rtt_ms, "jitter_ms": quality.jitter_ms,
+                    "loss_ppm": quality.loss_ppm, "throughput_bps": quality.throughput_bps,
+                    "reordering_events": quality.reordering_events,
+                    "exclusion_reason": quality.exclusion_reason.map(|value| format!("{value:?}").to_ascii_lowercase()),
+                }));
+            }
+            for stream in snapshot.streams.values() {
+                streams.push(serde_json::json!({
+                    "stream_id": stream.stream_id.to_string(), "session_id": session_id.to_string(),
+                    "egress_id": self.config.egress_id, "state": format!("{:?}", stream.state).to_ascii_lowercase(),
+                    "bytes_sent": stream.bytes_sent, "bytes_received": stream.bytes_received,
+                    "bytes_acked": stream.bytes_acked, "retransmissions": stream.retransmissions,
+                    "reorder_buffer_bytes": stream.reorder_buffer_bytes, "receive_window": stream.receive_window,
+                    "opened_at_ms": stream.opened_at_ms, "closed_at_ms": stream.closed_at_ms,
+                    "close_reason": stream.close_reason,
+                    "traffic_class": stream.traffic_class.as_ref().map(|class| &class.name),
+                }));
+            }
+        }
+        Ok((paths, streams))
     }
 
     pub fn reconcile_authorizations(&self) -> Result<AuthorizationCleanup, EgressNodeError> {
@@ -219,9 +301,6 @@ where
             tokens,
             targets,
         } = self.begin_authorization_cleanup()?;
-        if cleanup.paths == 0 {
-            return Ok(cleanup);
-        }
         if tokens.is_empty()
             && targets
                 .iter()
@@ -241,7 +320,7 @@ where
             tokens,
             targets,
         } = self.begin_authorization_cleanup()?;
-        if cleanup.paths == 0 {
+        if tokens.is_empty() && targets.is_empty() {
             return Ok(cleanup);
         }
         let wait = async {
@@ -267,17 +346,25 @@ where
     }
 
     fn begin_authorization_cleanup(&self) -> Result<CleanupBarrier, EgressNodeError> {
-        let snapshot = self.config.authorizations.snapshot()?;
         let runtime = self
             .runtime
             .lock()
             .map_err(|_| EgressNodeError::RuntimeStateLock)?;
+        // Claim registration takes the same lock before reading authorization.
+        // A mutation has committed before this cleanup begins; holding the lock
+        // across the snapshot fences both already-registered and pending Paths.
+        let snapshot = self.config.authorizations.snapshot()?;
         let mut cleanup = AuthorizationCleanup::default();
         let mut cleaned_sessions = HashSet::new();
         let mut tokens = HashSet::new();
         let mut targets = Vec::new();
         for (token, control) in &runtime.paths {
             let Some(metadata) = &control.metadata else {
+                // Its identity is not known yet. Abort and join the pending
+                // handshake so it cannot claim an authorization observed
+                // before this mutation committed.
+                tokens.insert(*token);
+                control.abort.abort();
                 continue;
             };
             let decision = snapshot.authorize(
@@ -353,8 +440,17 @@ where
                     };
                     let token = self.next_path_token.fetch_add(1, Ordering::Relaxed);
                     let active_targets = Arc::new(AtomicU64::new(0));
-                    let task = tasks.spawn(run_path_task(
+                    let mut runtime = self.runtime.lock()
+                        .map_err(|_| EgressNodeError::RuntimeStateLock)?;
+                    // Construct the guard before spawning so cancellation
+                    // before the task's first poll still publishes Finished.
+                    let guard = PathTaskGuard {
                         token,
+                        events: events_tx.clone(),
+                        _permit: permit,
+                    };
+                    let task = tasks.spawn(run_path_task(
+                        guard,
                         stream,
                         Arc::clone(&self.config.keypair),
                         self.admission.clone(),
@@ -363,15 +459,11 @@ where
                         Arc::clone(&self.observations),
                         Arc::clone(&active_targets),
                         self.session_status,
+                        self.config.remote_dns_only,
                         Arc::clone(&self.status_provider),
                         events_tx.clone(),
-                        permit,
                     ));
-                    self.runtime
-                        .lock()
-                        .map_err(|_| EgressNodeError::RuntimeStateLock)?
-                        .paths
-                        .insert(token, PathControl {
+                    runtime.paths.insert(token, PathControl {
                             abort: task,
                             metadata: None,
                         });
@@ -434,6 +526,16 @@ where
                     .runtime
                     .lock()
                     .map_err(|_| EgressNodeError::RuntimeStateLock)?;
+                let authorization = self.config.authorizations.snapshot()?;
+                if !matches!(
+                    authorization
+                        .authorize(&IngressId::new(ingress_id.clone()), &ingress_public_key),
+                    AuthorizationDecision::Authorized { .. }
+                ) {
+                    self.observations.rejected.fetch_add(1, Ordering::Relaxed);
+                    let _ = reply.send(ClaimDecision::Reject);
+                    return Ok(());
+                }
                 let key = (ingress_id.clone(), session_id);
                 let existing = runtime
                     .sessions
@@ -722,7 +824,7 @@ impl Drop for RunGuard<'_> {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_path_task<C>(
-    token: u64,
+    guard: PathTaskGuard,
     stream: TcpStream,
     keypair: Arc<StaticKeypair>,
     admission: EgressPathAdmissionConfig,
@@ -731,17 +833,14 @@ async fn run_path_task<C>(
     observations: Arc<NodeObservations>,
     active_targets: Arc<AtomicU64>,
     session_status: EgressStatusConfig,
+    remote_dns_only: bool,
     status_provider: Arc<NodeStatusProvider>,
     events: mpsc::UnboundedSender<NodeEvent>,
-    permit: OwnedSemaphorePermit,
 ) where
     C: TargetConnector + 'static,
 {
-    let _guard = PathTaskGuard {
-        token,
-        events: events.clone(),
-        _permit: permit,
-    };
+    let token = guard.token;
+    let _guard = guard;
     let authorizer = StorePathAuthorizer {
         store: Arc::clone(&authorizations),
     };
@@ -760,10 +859,7 @@ async fn run_path_task<C>(
         let _ = events.send(NodeEvent::Failed);
         return;
     };
-    let Some(ingress_public_key) = currently_authorized_key(&authorizations, &ingress_id) else {
-        let _ = events.send(NodeEvent::Rejected);
-        return;
-    };
+    let ingress_public_key = *path.authenticated_remote_key();
     let session_id = path.session_id();
     let path_id = path.path_id();
     let (claim, claimed) = oneshot::channel();
@@ -785,13 +881,14 @@ async fn run_path_task<C>(
         connector,
         session_targets: active_targets,
         global_targets: Arc::clone(&observations.active_targets),
+        remote_dns_only,
     };
     match claimed.await.unwrap_or(ClaimDecision::Reject) {
         ClaimDecision::New => {
             let handle = match EgressSessionHandle::start_with_udp_and_status_provider(
                 path,
                 factory,
-                TokioUdpTargetFactory,
+                TokioUdpTargetFactory { remote_dns_only },
                 session_status,
                 status_provider,
             ) {
@@ -837,18 +934,6 @@ async fn run_path_task<C>(
     }
 }
 
-fn currently_authorized_key(store: &AuthorizationStore, ingress_id: &str) -> Option<[u8; 32]> {
-    let snapshot = store.snapshot().ok()?;
-    let record = snapshot
-        .records()
-        .find(|record| record.ingress_id.as_str() == ingress_id)?;
-    matches!(
-        snapshot.authorize(&record.ingress_id, &record.ingress_public_key),
-        AuthorizationDecision::Authorized { .. }
-    )
-    .then_some(record.ingress_public_key)
-}
-
 struct StorePathAuthorizer {
     store: Arc<AuthorizationStore>,
 }
@@ -880,6 +965,7 @@ struct ConnectorStreamFactory<C> {
     connector: Arc<C>,
     session_targets: Arc<AtomicU64>,
     global_targets: Arc<AtomicU64>,
+    remote_dns_only: bool,
 }
 
 #[async_trait]
@@ -901,9 +987,14 @@ where
                 )
             })?)
         };
+        let resolved_ip_candidates = if self.remote_dns_only && original_hostname.is_some() {
+            Vec::new()
+        } else {
+            target.resolved_addresses
+        };
         let request = TargetRequest {
             original_hostname,
-            resolved_ip_candidates: target.resolved_addresses,
+            resolved_ip_candidates,
             port: target.port,
         };
         let connection = self.connector.connect(request).await.map_err(|error| {
@@ -967,67 +1058,64 @@ impl Drop for TrackedTargetStream {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TokioUdpTargetFactory;
+struct TokioUdpTargetFactory {
+    remote_dns_only: bool,
+}
 
 #[async_trait]
 impl UdpTargetFactory for TokioUdpTargetFactory {
     async fn open(&self, target: TargetEndpoint) -> Result<BoxedUdpTargetSocket, UdpTargetError> {
-        let mut addresses = target.resolved_addresses.into_iter().collect::<Vec<_>>();
-        let address = if let Some(address) = addresses.pop() {
-            SocketAddr::new(address, target.port)
-        } else {
+        let mut tried = HashSet::new();
+        if !self.remote_dns_only || target.hostname.is_empty() {
+            for ip in &target.resolved_addresses {
+                let address = SocketAddr::new(*ip, target.port);
+                if tried.insert(address)
+                    && let Some(socket) = connect_udp_target(address).await
+                {
+                    return Ok(Box::new(socket));
+                }
+            }
+        }
+        if !target.hostname.is_empty() {
             let hostname = std::str::from_utf8(&target.hostname).map_err(|_| {
                 UdpTargetError::new(
                     ErrorClass::TargetFailure,
                     b"UDP target hostname is not UTF-8".to_vec(),
                 )
             })?;
-            lookup_host((hostname, target.port))
-                .await
-                .map_err(|_| {
-                    UdpTargetError::new(
-                        ErrorClass::TargetFailure,
-                        b"UDP target resolution failed".to_vec(),
-                    )
-                })?
-                .next()
-                .ok_or_else(|| {
-                    UdpTargetError::new(
-                        ErrorClass::TargetFailure,
-                        b"UDP target has no addresses".to_vec(),
-                    )
-                })?
-        };
-        let bind = match address {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => "[::]:0",
-        };
-        let socket = UdpSocket::bind(bind).await.map_err(|_| {
-            UdpTargetError::new(
-                ErrorClass::TargetFailure,
-                b"UDP target socket bind failed".to_vec(),
-            )
-        })?;
-        socket.connect(address).await.map_err(|_| {
-            UdpTargetError::new(
-                ErrorClass::TargetFailure,
-                b"UDP target socket connect failed".to_vec(),
-            )
-        })?;
-        let visible_port = socket
-            .local_addr()
-            .map_err(|_| {
+            let addresses = lookup_host((hostname, target.port)).await.map_err(|_| {
                 UdpTargetError::new(
                     ErrorClass::TargetFailure,
-                    b"UDP target socket address unavailable".to_vec(),
+                    b"UDP target resolution failed".to_vec(),
                 )
-            })?
-            .port();
-        Ok(Box::new(TokioUdpTargetSocket {
-            socket,
-            visible_port,
-        }))
+            })?;
+            for address in addresses {
+                if tried.insert(address)
+                    && let Some(socket) = connect_udp_target(address).await
+                {
+                    return Ok(Box::new(socket));
+                }
+            }
+        }
+        Err(UdpTargetError::new(
+            ErrorClass::TargetFailure,
+            b"no usable UDP target address".to_vec(),
+        ))
     }
+}
+
+async fn connect_udp_target(address: SocketAddr) -> Option<TokioUdpTargetSocket> {
+    let bind = match address {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = UdpSocket::bind(bind).await.ok()?;
+    socket.connect(address).await.ok()?;
+    let visible_port = socket.local_addr().ok()?.port();
+    Some(TokioUdpTargetSocket {
+        socket,
+        visible_port,
+    })
 }
 
 struct TokioUdpTargetSocket {
@@ -1126,6 +1214,7 @@ mod tests {
             capacity_bps: 1_000_000_000,
             recommended_path_count: 1,
             max_streams_per_ingress: 256,
+            remote_dns_only: false,
             quota_remaining: None,
             traffic_multiplier_basis_points: 10_000,
         }
@@ -1211,6 +1300,252 @@ mod tests {
     }
 
     struct RejectConnector;
+
+    #[derive(Clone, Default)]
+    struct RecordingConnector(Arc<Mutex<Vec<TargetRequest>>>);
+
+    #[async_trait]
+    impl TargetConnector for RecordingConnector {
+        async fn connect(
+            &self,
+            request: TargetRequest,
+        ) -> Result<BoxedTargetConnection, TargetConnectError> {
+            self.0.lock().unwrap().push(request);
+            Ok(Box::new(duplex(1024).0))
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_dns_policy_does_not_trust_ingress_candidates_for_hostname() {
+        let connector = Arc::new(RecordingConnector::default());
+        let factory = ConnectorStreamFactory {
+            connector: Arc::clone(&connector),
+            session_targets: Arc::new(AtomicU64::new(0)),
+            global_targets: Arc::new(AtomicU64::new(0)),
+            remote_dns_only: true,
+        };
+        let stream = factory
+            .open(TargetEndpoint {
+                hostname: b"example.test".to_vec(),
+                port: 443,
+                resolved_addresses: vec!["192.0.2.1".parse().unwrap()],
+            })
+            .await
+            .unwrap();
+        drop(stream);
+        let requests = connector.0.lock().unwrap();
+        assert_eq!(
+            requests[0].original_hostname.as_deref(),
+            Some("example.test")
+        );
+        assert!(requests[0].resolved_ip_candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_config_updates_the_provider_used_by_sessions() {
+        let egress_key = Arc::new(generate_static_keypair().unwrap());
+        let store = Arc::new(
+            AuthorizationStore::open(
+                ":memory:",
+                EgressId::new("runtime-egress"),
+                *egress_key.public(),
+            )
+            .unwrap(),
+        );
+        let status = EgressStatusConfig {
+            capacity_bps: 42_000,
+            recommended_path_count: 3,
+            ..EgressStatusConfig::default()
+        };
+        let node = EgressNode::bind(node_config(egress_key, store), EchoConnector::default())
+            .await
+            .unwrap()
+            .with_status_config(status)
+            .unwrap();
+        let sample = node.status_provider.sample();
+        assert_eq!(sample.capacity_bps, 42_000);
+        assert_eq!(sample.recommended_path_count, 3);
+    }
+
+    #[tokio::test]
+    async fn udp_remote_dns_policy_uses_egress_resolver() {
+        let address = lookup_host(("localhost", 53))
+            .await
+            .unwrap()
+            .next()
+            .unwrap();
+        let bind = SocketAddr::new(address.ip(), 0);
+        let target = UdpSocket::bind(bind).await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let factory = TokioUdpTargetFactory {
+            remote_dns_only: true,
+        };
+        let mut socket = factory
+            .open(TargetEndpoint {
+                hostname: b"localhost".to_vec(),
+                port: target_address.port(),
+                resolved_addresses: vec!["192.0.2.1".parse().unwrap()],
+            })
+            .await
+            .unwrap();
+        socket.send_datagram(b"dns-policy").await.unwrap();
+        let mut data = [0; 16];
+        let (length, _) = tokio::time::timeout(Duration::from_secs(2), target.recv_from(&mut data))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&data[..length], b"dns-policy");
+    }
+
+    #[tokio::test]
+    async fn udp_target_tries_later_candidates_when_first_cannot_connect() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let factory = TokioUdpTargetFactory {
+            remote_dns_only: false,
+        };
+        let mut socket = factory
+            .open(TargetEndpoint {
+                hostname: Vec::new(),
+                port: target_address.port(),
+                resolved_addresses: vec!["fe80::1".parse().unwrap(), target_address.ip()],
+            })
+            .await
+            .unwrap();
+        socket.send_datagram(b"candidate").await.unwrap();
+        let mut data = [0; 16];
+        let (length, _) = tokio::time::timeout(Duration::from_secs(2), target.recv_from(&mut data))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&data[..length], b"candidate");
+    }
+
+    #[tokio::test]
+    async fn stale_handshake_cannot_claim_reenrolled_identity() {
+        let old_key = generate_static_keypair().unwrap();
+        let new_key = generate_static_keypair().unwrap();
+        let egress_key = Arc::new(generate_static_keypair().unwrap());
+        let store = Arc::new(
+            AuthorizationStore::open(
+                ":memory:",
+                EgressId::new("runtime-egress"),
+                *egress_key.public(),
+            )
+            .unwrap(),
+        );
+        enroll(&store, &old_key);
+        let node = EgressNode::bind(
+            node_config(egress_key, Arc::clone(&store)),
+            EchoConnector::default(),
+        )
+        .await
+        .unwrap();
+        let task = tokio::spawn(std::future::pending::<()>());
+        node.runtime.lock().unwrap().paths.insert(
+            99,
+            PathControl {
+                abort: task.abort_handle(),
+                metadata: None,
+            },
+        );
+        for (generation, operation, request_id) in [
+            (1, AuthorizationMutation::Disable, "disable"),
+            (2, AuthorizationMutation::Delete, "delete"),
+            (
+                3,
+                AuthorizationMutation::Enroll {
+                    public_key: *new_key.public(),
+                    administrator_labels: Default::default(),
+                },
+                "reenroll",
+            ),
+        ] {
+            store
+                .mutate(AuthorizationMutationRequest {
+                    actor_id: "admin".into(),
+                    request_id: request_id.into(),
+                    expected_generation: generation,
+                    ingress_id: IngressId::new("runtime-ingress"),
+                    mutation: operation,
+                })
+                .unwrap();
+        }
+        let (reply, decision) = oneshot::channel();
+        node.handle_event(NodeEvent::Claim {
+            token: 99,
+            ingress_id: "runtime-ingress".into(),
+            ingress_public_key: *old_key.public(),
+            session_id: SessionId::new(1),
+            path_id: pathchord_core::PathId::new(1),
+            active_targets: Arc::new(AtomicU64::new(0)),
+            reply,
+        })
+        .unwrap();
+        assert!(matches!(decision.await.unwrap(), ClaimDecision::Reject));
+        assert!(node.runtime.lock().unwrap().sessions.is_empty());
+        let barrier = node.begin_authorization_cleanup().unwrap();
+        assert!(barrier.tokens.contains(&99));
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn revocation_waits_for_pending_handshake_to_be_cancelled() {
+        let ingress_key = generate_static_keypair().unwrap();
+        let egress_key = Arc::new(generate_static_keypair().unwrap());
+        let store = Arc::new(
+            AuthorizationStore::open(
+                ":memory:",
+                EgressId::new("runtime-egress"),
+                *egress_key.public(),
+            )
+            .unwrap(),
+        );
+        enroll(&store, &ingress_key);
+        let node = Arc::new(
+            EgressNode::bind(
+                node_config(egress_key, Arc::clone(&store)),
+                EchoConnector::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let runner = tokio::spawn(run_node(Arc::clone(&node), shutdown_rx));
+        let mut pending = TcpStream::connect(node.local_addr()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if node.observations.accepted.load(Ordering::Relaxed) != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        store
+            .mutate(AuthorizationMutationRequest {
+                actor_id: "admin".into(),
+                request_id: "disable-pending".into(),
+                expected_generation: 1,
+                ingress_id: IngressId::new("runtime-ingress"),
+                mutation: AuthorizationMutation::Disable,
+            })
+            .unwrap();
+        node.reconcile_authorizations_until(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), pending.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        shutdown.send(()).unwrap();
+        runner.await.unwrap().unwrap();
+    }
 
     #[async_trait]
     impl TargetConnector for RejectConnector {

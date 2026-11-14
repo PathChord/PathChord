@@ -30,6 +30,9 @@ const MAX_MAP_ENTRIES: usize = 256;
 const MAX_MAP_KEY_BYTES: usize = 64;
 const MAX_MAP_VALUE_BYTES: usize = 256;
 const MAX_WEIGHT: u32 = 1_000_000;
+/// Internal marker for a rule without an explicit trafficPolicyRef. Its name
+/// cannot be authored as a Kubernetes-style resource name.
+pub(crate) const IMPLICIT_SINGLE_TRANSIT_POLICY: &str = "__pathchord_implicit_single_transit";
 
 fn default_namespace() -> String {
     "default".to_owned()
@@ -657,7 +660,7 @@ impl KubeConfig {
         let mut transit_rules = Vec::new();
         let mut proxy_rules = Vec::new();
         let mut rule_orders = HashSet::new();
-        let mut default_policy = false;
+        let mut implicit_single_transit_policy = false;
         for resource in self.resources {
             match resource {
                 KubeResource::Egress(value) => config.egresses.push(EgressConfig {
@@ -745,8 +748,8 @@ impl KubeConfig {
                         });
                     }
                     let policy = value.spec.traffic_policy_ref.unwrap_or_else(|| {
-                        default_policy = true;
-                        "default".to_owned()
+                        implicit_single_transit_policy = true;
+                        IMPLICIT_SINGLE_TRANSIT_POLICY.to_owned()
                     });
                     transit_rules.push((
                         value.spec.order,
@@ -1048,20 +1051,22 @@ impl KubeConfig {
                 KubeResource::NodeProbePolicy(value) => config.node_probe = Some(value.spec),
             }
         }
-        if default_policy
-            && config
+        if implicit_single_transit_policy {
+            let mut implicit = config
                 .traffic_policies
                 .iter()
-                .all(|policy| policy.id.as_str() != "default")
-        {
-            config.traffic_policies.push(TrafficPolicy {
-                id: TrafficPolicyId::new("default"),
-                scheduler: Scheduler::EffectiveCapacityWeighted,
-                session_replication_budget_bps: 0,
-                class_replication_budget_bps: None,
-                retransmission_replication: RetransmissionReplication::Disabled,
-                classes: BTreeMap::new(),
-            });
+                .find(|policy| policy.id.as_str() == "default")
+                .cloned()
+                .unwrap_or_else(|| TrafficPolicy {
+                    id: TrafficPolicyId::new(IMPLICIT_SINGLE_TRANSIT_POLICY),
+                    scheduler: Scheduler::EffectiveCapacityWeighted,
+                    session_replication_budget_bps: 0,
+                    class_replication_budget_bps: None,
+                    retransmission_replication: RetransmissionReplication::Disabled,
+                    classes: BTreeMap::new(),
+                });
+            implicit.id = TrafficPolicyId::new(IMPLICIT_SINGLE_TRANSIT_POLICY);
+            config.traffic_policies.push(implicit);
         }
         egress_rules.sort_by_key(|(order, _)| *order);
         transit_rules.sort_by_key(|(order, _)| *order);
@@ -1241,6 +1246,13 @@ fn validate_resource_set(
                     value.spec.matches.as_ref(),
                     value.spec.catch_all,
                 )?;
+                if value.spec.traffic_policy_ref.as_deref() == Some("") {
+                    return Err(invalid_spec(
+                        &value.kind,
+                        &value.metadata.name,
+                        "trafficPolicyRef cannot be empty",
+                    ));
+                }
             }
             KubeResource::ProxyRule(value) => {
                 validate_flow_match(
@@ -1811,6 +1823,18 @@ fn validate_listener_kind_for_platform(
             &value.kind,
             &value.metadata.name,
             "freebsd listeners support http, socks5, and mixed only",
+        ));
+    }
+    if platform == "windows"
+        && matches!(
+            value.spec.kind,
+            ListenerKind::Tproxy | ListenerKind::Redirect
+        )
+    {
+        return Err(invalid_spec(
+            &value.kind,
+            &value.metadata.name,
+            "windows listeners do not support tproxy or redirect",
         ));
     }
     Ok(())
@@ -2674,6 +2698,24 @@ spec:
             let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
             assert!(
                 error.contains("freebsd listeners support http, socks5, and mixed only"),
+                "{kind}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_windows_transparent_listener_specs_during_validation() {
+        for (kind, fields) in [
+            (
+                "tproxy",
+                "  bind: 127.0.0.1:15000\n  mark: 1\n  routeTable: 100\n",
+            ),
+            ("redirect", "  bind: 127.0.0.1:15000\n"),
+        ] {
+            let input = platform_listener_yaml(kind, "windows", fields);
+            let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("windows listeners do not support tproxy or redirect"),
                 "{kind}: {error}"
             );
         }

@@ -11,6 +11,9 @@ use crate::{
     EgressId, IngressId,
 };
 
+const MAX_FAILED_REQUESTS: u64 = 4096;
+const FAILED_REQUEST_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS authorization_metadata (
@@ -39,6 +42,15 @@ CREATE TABLE IF NOT EXISTS authorization_requests (
     cleanup_target_connections INTEGER NOT NULL DEFAULT 0 CHECK (cleanup_target_connections >= 0),
     PRIMARY KEY (actor_id, request_id)
 );
+CREATE TABLE IF NOT EXISTS authorization_failed_requests (
+    actor_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    owner_generation INTEGER NOT NULL CHECK (owner_generation >= 0),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    PRIMARY KEY (actor_id, request_id)
+);
 CREATE TABLE IF NOT EXISTS authorization_audit (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp_ms INTEGER NOT NULL,
@@ -48,7 +60,9 @@ CREATE TABLE IF NOT EXISTS authorization_audit (
     ingress_id TEXT NOT NULL,
     expected_generation INTEGER NOT NULL,
     applied_generation INTEGER NOT NULL,
-    result TEXT NOT NULL
+    result TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'local',
+    reason TEXT
 );
 "#;
 
@@ -88,7 +102,10 @@ impl AuthorizationMutation {
             ),
             _ => self.operation().to_owned(),
         };
-        Ok(format!("{}:{body}", ingress_id.as_str()))
+        Ok(fingerprint_digest(&format!(
+            "{}:{body}",
+            ingress_id.as_str()
+        )))
     }
 }
 
@@ -99,6 +116,17 @@ pub struct AuthorizationMutationRequest {
     pub expected_generation: u64,
     pub ingress_id: IngressId,
     pub mutation: AuthorizationMutation,
+}
+
+pub(crate) struct AuthorizationFailureAudit<'a> {
+    pub actor: &'a str,
+    pub operation: &'a str,
+    pub request_id: &'a str,
+    pub ingress_id: &'a str,
+    pub expected_generation: Option<u64>,
+    pub result: &'a str,
+    pub reason: &'a str,
+    pub source: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -136,6 +164,8 @@ pub enum AuthorizationStoreError {
     RevokedIsTerminal,
     #[error("authorization request ID was reused with different input")]
     IdempotencyConflict,
+    #[error("authorization failure cache is full")]
+    ResourceLimit,
     #[error("authorization snapshot is invalid: {0}")]
     Snapshot(#[from] AuthorizationSnapshotError),
     #[error("authorization label serialization failed")]
@@ -149,6 +179,7 @@ pub enum AuthorizationStoreError {
 #[derive(Debug)]
 pub struct AuthorizationStore {
     connection: Mutex<Connection>,
+    mutation_gate: tokio::sync::Mutex<()>,
 }
 
 impl AuthorizationStore {
@@ -178,6 +209,9 @@ impl AuthorizationStore {
         }
         connection.execute_batch(SCHEMA)?;
         migrate_request_cleanup_columns(&connection)?;
+        migrate_authorization_audit_columns(&connection)?;
+        migrate_failed_request_columns(&connection)?;
+        migrate_request_fingerprints(&connection)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = transaction
             .query_row(
@@ -203,7 +237,78 @@ impl AuthorizationStore {
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
+            mutation_gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    pub(crate) async fn lock_mutations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutation_gate.lock().await
+    }
+
+    pub(crate) fn replay_failed_request(
+        &self,
+        actor: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<Option<pathchord_core::management::ResponseEnvelope>, AuthorizationStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| AuthorizationStoreError::Lock)?;
+        let cutoff = now_ms()?.saturating_sub(FAILED_REQUEST_TTL_MS);
+        let row = connection.query_row("SELECT fingerprint, response_json FROM authorization_failed_requests WHERE actor_id = ?1 AND request_id = ?2 AND (created_at_ms >= ?3 OR owner_generation >= (SELECT generation FROM authorization_metadata WHERE singleton = 1))", params![actor, request_id, to_sql_i64(cutoff, "cutoff")?], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?;
+        match row {
+            None => Ok(None),
+            Some((stored, response)) if stored == fingerprint => {
+                Ok(Some(serde_json::from_str(&response)?))
+            }
+            Some(_) => Err(AuthorizationStoreError::IdempotencyConflict),
+        }
+    }
+
+    pub(crate) fn remember_failed_request(
+        &self,
+        actor: &str,
+        request_id: &str,
+        fingerprint: &str,
+        response: &pathchord_core::management::ResponseEnvelope,
+    ) -> Result<pathchord_core::management::ResponseEnvelope, AuthorizationStoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| AuthorizationStoreError::Lock)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms()?;
+        let cutoff = now.saturating_sub(FAILED_REQUEST_TTL_MS);
+        let current: i64 = transaction.query_row(
+            "SELECT generation FROM authorization_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        transaction.execute("DELETE FROM authorization_failed_requests WHERE created_at_ms < ?1 AND owner_generation < ?2", params![to_sql_i64(cutoff, "cutoff")?, current])?;
+        let succeeded: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM authorization_requests WHERE actor_id = ?1 AND request_id = ?2)", params![actor, request_id], |row| row.get(0))?;
+        if succeeded {
+            return Err(AuthorizationStoreError::IdempotencyConflict);
+        }
+        let stored = transaction.query_row("SELECT fingerprint, response_json FROM authorization_failed_requests WHERE actor_id = ?1 AND request_id = ?2", params![actor, request_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?;
+        if let Some((stored_fingerprint, stored_response)) = stored {
+            if stored_fingerprint != fingerprint {
+                return Err(AuthorizationStoreError::IdempotencyConflict);
+            }
+            return Ok(serde_json::from_str(&stored_response)?);
+        }
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM authorization_failed_requests",
+            [],
+            |row| row.get(0),
+        )?;
+        if from_sql_u64(count, "failed request count")? >= MAX_FAILED_REQUESTS {
+            return Err(AuthorizationStoreError::ResourceLimit);
+        }
+        let encoded = serde_json::to_string(response)?;
+        transaction.execute("INSERT INTO authorization_failed_requests(actor_id, request_id, fingerprint, response_json, owner_generation, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![actor, request_id, fingerprint, encoded, current, to_sql_i64(now, "timestamp")?])?;
+        transaction.commit()?;
+        Ok(response.clone())
     }
 
     pub fn snapshot(&self) -> Result<AuthorizationSnapshot, AuthorizationStoreError> {
@@ -251,6 +356,14 @@ impl AuthorizationStore {
         &self,
         request: AuthorizationMutationRequest,
     ) -> Result<AuthorizationMutationResult, AuthorizationStoreError> {
+        self.mutate_from(request, "local")
+    }
+
+    pub fn mutate_from(
+        &self,
+        request: AuthorizationMutationRequest,
+        source: &str,
+    ) -> Result<AuthorizationMutationResult, AuthorizationStoreError> {
         validate_request(&request)?;
         let fingerprint = request.mutation.fingerprint(&request.ingress_id)?;
         let mut connection = self
@@ -258,6 +371,12 @@ impl AuthorizationStore {
             .lock()
             .map_err(|_| AuthorizationStoreError::Lock)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let cutoff = now_ms()?.saturating_sub(FAILED_REQUEST_TTL_MS);
+        let failed: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM authorization_failed_requests WHERE actor_id = ?1 AND request_id = ?2 AND (created_at_ms >= ?3 OR owner_generation >= (SELECT generation FROM authorization_metadata WHERE singleton = 1)))", params![request.actor_id, request.request_id, to_sql_i64(cutoff, "cutoff")?], |row| row.get(0))?;
+        if failed {
+            return Err(AuthorizationStoreError::IdempotencyConflict);
+        }
 
         if let Some(result) = replay(&transaction, &request, &fingerprint)? {
             transaction.commit()?;
@@ -322,7 +441,7 @@ impl AuthorizationStore {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO authorization_audit(timestamp_ms, actor_id, operation, request_id, ingress_id, expected_generation, applied_generation, result) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'applied')",
+            "INSERT INTO authorization_audit(timestamp_ms, actor_id, operation, request_id, ingress_id, expected_generation, applied_generation, result, source) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'applied', ?8)",
             params![
                 to_sql_i64(now_ms()?, "timestamp_ms")?,
                 request.actor_id,
@@ -331,6 +450,7 @@ impl AuthorizationStore {
                 request.ingress_id.as_str(),
                 to_sql_i64(request.expected_generation, "expected_generation")?,
                 to_sql_i64(applied_generation, "generation")?,
+                source,
             ],
         )?;
         transaction.commit()?;
@@ -390,11 +510,99 @@ impl AuthorizationStore {
             |row| row.get(0),
         )?;
         connection.execute(
-            "INSERT INTO authorization_audit(timestamp_ms, actor_id, operation, request_id, ingress_id, expected_generation, applied_generation, result) VALUES (?1, 'unauthenticated', 'authentication.failure', '', ?2, ?3, ?3, 'denied')",
-            params![to_sql_i64(now_ms()?, "timestamp_ms")?, source, generation],
+            "INSERT INTO authorization_audit(timestamp_ms, actor_id, operation, request_id, ingress_id, expected_generation, applied_generation, result, source, reason) VALUES (?1, 'unauthenticated', 'authentication.failure', '', '', ?2, ?2, 'denied', ?3, 'AUTHENTICATION_REQUIRED')",
+            params![to_sql_i64(now_ms()?, "timestamp_ms")?, generation, source],
         )?;
         Ok(())
     }
+
+    pub(crate) fn record_mutation_failure(
+        &self,
+        audit: AuthorizationFailureAudit<'_>,
+    ) -> Result<(), AuthorizationStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| AuthorizationStoreError::Lock)?;
+        let generation: i64 = connection.query_row(
+            "SELECT generation FROM authorization_metadata WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        connection.execute(
+            "INSERT INTO authorization_audit(timestamp_ms, actor_id, operation, request_id, ingress_id, expected_generation, applied_generation, result, source, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![to_sql_i64(now_ms()?, "timestamp_ms")?, audit.actor, audit.operation, audit.request_id, audit.ingress_id,
+                audit.expected_generation.and_then(|value| i64::try_from(value).ok()).unwrap_or(-1),
+                generation, audit.result, audit.source, audit.reason],
+        )?;
+        Ok(())
+    }
+}
+
+fn migrate_failed_request_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let mut statement = connection.prepare("PRAGMA table_info(authorization_failed_requests)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    for (name, definition) in [
+        ("owner_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("created_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.contains(name) {
+            connection.execute_batch(&format!(
+                "ALTER TABLE authorization_failed_requests ADD COLUMN {name} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_request_fingerprints(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let legacy = {
+        let mut statement = connection.prepare("SELECT actor_id, request_id, fingerprint FROM authorization_requests WHERE fingerprint NOT LIKE 'sha256:%'")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (actor, request_id, fingerprint) in legacy {
+        connection.execute("UPDATE authorization_requests SET fingerprint = ?1 WHERE actor_id = ?2 AND request_id = ?3", params![fingerprint_digest(&fingerprint), actor, request_id])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn fingerprint_digest(value: &str) -> String {
+    use std::fmt::Write as _;
+    let digest = orion::hazardous::hash::sha2::sha256::Sha256::digest(value.as_bytes())
+        .expect("bounded authorization fingerprint");
+    let mut result = String::from("sha256:");
+    for byte in digest.as_ref() {
+        write!(result, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    result
+}
+
+fn migrate_authorization_audit_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let mut statement = connection.prepare("PRAGMA table_info(authorization_audit)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    for (name, definition) in [
+        ("source", "TEXT NOT NULL DEFAULT 'local'"),
+        ("reason", "TEXT"),
+    ] {
+        if !columns.contains(name) {
+            connection.execute(
+                &format!("ALTER TABLE authorization_audit ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn migrate_request_cleanup_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -673,6 +881,334 @@ fn now_ms() -> Result<u64, AuthorizationStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use pathchord_core::management::{
+        Actor, ErrorCode, GenerationExpectation, LOCAL_API_VERSION, RequestEnvelope,
+    };
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
+
+    fn management_request(
+        operation: &str,
+        request_id: &str,
+        expected: u64,
+        body: Value,
+    ) -> RequestEnvelope {
+        RequestEnvelope {
+            api_version: LOCAL_API_VERSION.into(),
+            operation: operation.into(),
+            request_id: request_id.into(),
+            actor: Actor {
+                id: "local-admin".into(),
+                capabilities: vec!["authorization:write".into()],
+            },
+            expected_generation: Some(GenerationExpectation {
+                scope: "authorization".into(),
+                value: expected,
+            }),
+            body,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_mutation_replays_across_generation_change_and_database_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "pathchord-egress-failure-{}-{}.db",
+            std::process::id(),
+            NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = {
+            let store = Arc::new(
+                AuthorizationStore::open(&path, EgressId::new("egress-a"), [9; 32]).unwrap(),
+            );
+            let dispatcher = crate::AuthorizationControlDispatcher::new(Arc::clone(&store));
+            let failed = management_request(
+                "authorizations.disable",
+                "same-id",
+                1,
+                json!({"ingress_id": "ingress-a"}),
+            );
+            let first = dispatcher.dispatch(failed).await;
+            assert_eq!(
+                first.error.as_ref().unwrap().code,
+                ErrorCode::GenerationConflict
+            );
+            let enroll = management_request(
+                "authorizations.enroll",
+                "advance",
+                0,
+                json!({"ingress_id":"ingress-a", "egress_id":"egress-a", "public_key": URL_SAFE_NO_PAD.encode([7; 32])}),
+            );
+            assert!(dispatcher.dispatch(enroll).await.ok);
+            first
+        };
+        let store =
+            Arc::new(AuthorizationStore::open(&path, EgressId::new("egress-a"), [9; 32]).unwrap());
+        let dispatcher = crate::AuthorizationControlDispatcher::new(Arc::clone(&store));
+        let same = management_request(
+            "authorizations.disable",
+            "same-id",
+            1,
+            json!({"ingress_id": "ingress-a"}),
+        );
+        assert_eq!(dispatcher.dispatch(same.clone()).await, first);
+        let mut different = same;
+        different.body = json!({"ingress_id": "other"});
+        assert_eq!(
+            dispatcher.dispatch(different).await.error.unwrap().code,
+            ErrorCode::IdempotencyConflict
+        );
+        assert_eq!(
+            store.snapshot().unwrap().records().next().unwrap().state,
+            AuthorizationState::Enabled
+        );
+        drop(dispatcher);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failure_cache_contains_no_private_request_fields_and_denials_do_not_reserve_ids() {
+        let store = Arc::new(
+            AuthorizationStore::open_in_memory(EgressId::new("egress-a"), [9; 32]).unwrap(),
+        );
+        let dispatcher = crate::AuthorizationControlDispatcher::new(Arc::clone(&store));
+        let mut invalid = management_request(
+            "authorizations.enroll",
+            "invalid-id",
+            0,
+            json!({"ingress_id":"ingress-a", "egress_id":"wrong", "public_key":"secret-key-value", "administrator_labels":{"note":"secret-label-value"}}),
+        );
+        let response = dispatcher.dispatch(invalid.clone()).await;
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            ErrorCode::ValidationFailed
+        );
+        let (fingerprint, stored): (String, String) = store.connection.lock().unwrap().query_row(
+            "SELECT fingerprint, response_json FROM authorization_failed_requests WHERE request_id = 'invalid-id'", [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(fingerprint.starts_with("sha256:"));
+        assert!(!fingerprint.contains("secret"));
+        assert!(!stored.contains("secret"));
+        invalid.body = json!({"ingress_id":"ingress-a", "egress_id":"egress-a", "public_key": URL_SAFE_NO_PAD.encode([7; 32])});
+        assert_eq!(
+            dispatcher.dispatch(invalid).await.error.unwrap().code,
+            ErrorCode::IdempotencyConflict
+        );
+
+        let mut denied = management_request(
+            "authorizations.enroll",
+            "auth-retry",
+            0,
+            json!({"ingress_id":"ingress-b", "egress_id":"egress-a", "public_key": URL_SAFE_NO_PAD.encode([8; 32])}),
+        );
+        denied.actor.capabilities.clear();
+        assert_eq!(
+            dispatcher
+                .dispatch(denied.clone())
+                .await
+                .error
+                .unwrap()
+                .code,
+            ErrorCode::CapabilityDenied
+        );
+        denied.actor.capabilities.push("authorization:write".into());
+        assert!(dispatcher.dispatch(denied).await.ok);
+    }
+
+    #[tokio::test]
+    async fn cache_storage_failure_does_not_block_same_id_retry() {
+        let store = Arc::new(
+            AuthorizationStore::open_in_memory(EgressId::new("egress-a"), [9; 32]).unwrap(),
+        );
+        let dispatcher = crate::AuthorizationControlDispatcher::new(Arc::clone(&store));
+        let enrollment = management_request(
+            "authorizations.enroll",
+            "storage-retry",
+            0,
+            json!({"ingress_id":"ingress-a", "egress_id":"egress-a", "public_key": URL_SAFE_NO_PAD.encode([7; 32])}),
+        );
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE authorization_failed_requests")
+            .unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(enrollment.clone())
+                .await
+                .error
+                .unwrap()
+                .code,
+            ErrorCode::PersistenceUnavailable
+        );
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(SCHEMA)
+            .unwrap();
+        assert!(dispatcher.dispatch(enrollment).await.ok);
+    }
+
+    #[test]
+    fn failure_retention_requires_time_and_superseded_generation() {
+        let store = AuthorizationStore::open_in_memory(EgressId::new("egress-a"), [9; 32]).unwrap();
+        let response = pathchord_core::management::ResponseEnvelope::failure(
+            "failure",
+            GenerationExpectation {
+                scope: "authorization".into(),
+                value: 0,
+            },
+            pathchord_core::management::ErrorBody {
+                code: ErrorCode::NotFound,
+                message: "missing".into(),
+                details: None,
+            },
+        );
+        store
+            .remember_failed_request("actor", "failure", "sha256:one", &response)
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE authorization_failed_requests SET created_at_ms = 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .replay_failed_request("actor", "failure", "sha256:one")
+                .unwrap(),
+            Some(response)
+        );
+        let enrollment = AuthorizationMutationRequest {
+            actor_id: "other".into(),
+            request_id: "advance".into(),
+            expected_generation: 0,
+            ingress_id: IngressId::new("ingress-a"),
+            mutation: AuthorizationMutation::Enroll {
+                public_key: [7; 32],
+                administrator_labels: BTreeMap::new(),
+            },
+        };
+        store.mutate(enrollment).unwrap();
+        assert_eq!(
+            store
+                .replay_failed_request("actor", "failure", "sha256:one")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn failure_cache_is_bounded_and_expired_records_are_reclaimed() {
+        let store = AuthorizationStore::open_in_memory(EgressId::new("egress-a"), [9; 32]).unwrap();
+        let response = pathchord_core::management::ResponseEnvelope::failure(
+            "failure",
+            GenerationExpectation {
+                scope: "authorization".into(),
+                value: 0,
+            },
+            pathchord_core::management::ErrorBody {
+                code: ErrorCode::NotFound,
+                message: "missing".into(),
+                details: None,
+            },
+        );
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for index in 0..MAX_FAILED_REQUESTS {
+                transaction.execute("INSERT INTO authorization_failed_requests(actor_id, request_id, fingerprint, response_json, owner_generation, created_at_ms) VALUES ('actor', ?1, 'sha256:x', '{}', 0, 1)", [index.to_string()]).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        assert!(matches!(
+            store.remember_failed_request("other", "failure", "sha256:y", &response),
+            Err(AuthorizationStoreError::ResourceLimit)
+        ));
+        store
+            .mutate(AuthorizationMutationRequest {
+                actor_id: "other".into(),
+                request_id: "advance".into(),
+                expected_generation: 0,
+                ingress_id: IngressId::new("ingress-a"),
+                mutation: AuthorizationMutation::Enroll {
+                    public_key: [7; 32],
+                    administrator_labels: BTreeMap::new(),
+                },
+            })
+            .unwrap();
+        assert!(
+            store
+                .remember_failed_request("other", "failure", "sha256:y", &response)
+                .is_ok()
+        );
+        let count: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM authorization_failed_requests",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn success_and_failure_records_cannot_share_a_request_identity() {
+        let store = AuthorizationStore::open_in_memory(EgressId::new("egress-a"), [9; 32]).unwrap();
+        let response = pathchord_core::management::ResponseEnvelope::failure(
+            "failed-first",
+            GenerationExpectation {
+                scope: "authorization".into(),
+                value: 0,
+            },
+            pathchord_core::management::ErrorBody {
+                code: ErrorCode::NotFound,
+                message: "missing".into(),
+                details: None,
+            },
+        );
+        store
+            .remember_failed_request("local-admin", "failed-first", "sha256:test", &response)
+            .unwrap();
+        let enrollment = request(
+            "failed-first",
+            0,
+            AuthorizationMutation::Enroll {
+                public_key: [7; 32],
+                administrator_labels: BTreeMap::new(),
+            },
+        );
+        assert!(matches!(
+            store.mutate(enrollment),
+            Err(AuthorizationStoreError::IdempotencyConflict)
+        ));
+        store
+            .mutate(request(
+                "success-first",
+                0,
+                AuthorizationMutation::Enroll {
+                    public_key: [7; 32],
+                    administrator_labels: BTreeMap::new(),
+                },
+            ))
+            .unwrap();
+        assert!(matches!(
+            store.remember_failed_request("local-admin", "success-first", "sha256:test", &response),
+            Err(AuthorizationStoreError::IdempotencyConflict)
+        ));
+    }
 
     fn request(
         request_id: &str,
@@ -716,6 +1252,70 @@ mod tests {
             snapshot.authorize(&IngressId::new("ingress-a"), &[7; 32]),
             crate::AuthorizationDecision::Authorized { generation: 1 }
         );
+    }
+
+    #[test]
+    fn legacy_success_fingerprint_is_hashed_and_still_replays() {
+        let store = AuthorizationStore::open_in_memory(EgressId::new("egress-a"), [9; 32]).unwrap();
+        let enrollment = request(
+            "legacy",
+            0,
+            AuthorizationMutation::Enroll {
+                public_key: [7; 32],
+                administrator_labels: BTreeMap::from([(
+                    "admin.note".into(),
+                    "private-label".into(),
+                )]),
+            },
+        );
+        store.mutate(enrollment.clone()).unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            let legacy = format!(
+                "{}:enroll:{}:{}",
+                enrollment.ingress_id.as_str(),
+                encode_key(&[7; 32]),
+                serde_json::to_string(&BTreeMap::from([("admin.note", "private-label")])).unwrap()
+            );
+            connection.execute("UPDATE authorization_requests SET fingerprint = ?1 WHERE request_id = 'legacy'", [legacy]).unwrap();
+            migrate_request_fingerprints(&connection).unwrap();
+            let stored: String = connection
+                .query_row(
+                    "SELECT fingerprint FROM authorization_requests WHERE request_id = 'legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(stored.starts_with("sha256:"));
+            assert!(!stored.contains("private-label"));
+        }
+        assert!(store.mutate(enrollment).unwrap().replayed);
+    }
+
+    #[test]
+    fn audit_uses_trusted_transport_source_instead_of_actor_name() {
+        let store = AuthorizationStore::open_in_memory(EgressId::new("egress-a"), [9; 32]).unwrap();
+        let mut enrollment = request(
+            "source-test",
+            0,
+            AuthorizationMutation::Enroll {
+                public_key: [7; 32],
+                administrator_labels: BTreeMap::new(),
+            },
+        );
+        enrollment.actor_id = "operator".into();
+        store.mutate_from(enrollment, "web").unwrap();
+        let source: String = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source FROM authorization_audit WHERE request_id = 'source-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "web");
     }
 
     #[test]

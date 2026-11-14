@@ -149,8 +149,8 @@ pub use process_metadata::{
     SystemProcessMetadataProvider, UnavailableProcessMetadataProvider,
 };
 pub use reload::{
-    ConfigHotReloader, ConfigReloadHandle, ReloadError, ReloadOutcome, ReloadSnapshot, ReloadState,
-    ReloadStatus,
+    ConfigHotReloader, ConfigReloadHandle, ReloadDiagnostic, ReloadError, ReloadOutcome,
+    ReloadSnapshot, ReloadState, ReloadStatus,
 };
 pub use runtime::{
     DEFAULT_MAX_CONNECTIONS, ListenerRuntime, ListenerRuntimeConfig, ListenerRuntimeEvent,

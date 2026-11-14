@@ -59,6 +59,13 @@ until its wire and obfuscation implementation is complete.
 
 ## Current sequence
 
+The Session scheduler applies the strictest replication budget seen during a
+Session and Egress disables additional copies until budget negotiation is
+available. Add independently accounted per-policy/class budgets and negotiate
+the Egress limit before relaxing this conservative behavior. Supply measured
+congestion-window, marginal-capacity, and scheduling-overhead observations from
+transports that expose them; do not infer these values from idle traffic.
+
 1. Complete native Windows and FreeBSD explicit-listener validation, then run
    privileged Linux transparent/TUN smoke coverage. Cover authentication,
    source restrictions, IPv4/IPv6 and domain targets, DNS, reload, bounded

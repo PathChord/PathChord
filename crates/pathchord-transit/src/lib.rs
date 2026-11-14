@@ -49,10 +49,10 @@ pub use socks5_adapter::Socks5TransitAdapter;
 pub use subscription::{
     CacheLoadOutcome, DynamicNodeState, DynamicTransitNode, DynamicTransitSnapshot,
     HttpSubscriptionFetcher, MAX_SUBSCRIPTION_BYTES, MAX_SUBSCRIPTION_NODES,
-    NoSubscriptionCredentials, NodeDiagnostic, NodeUnavailableReason, RefreshOutcome, SnapshotDiff,
-    SubscriptionCredential, SubscriptionCredentialProvider, SubscriptionDocument,
-    SubscriptionError, SubscriptionFetchRequest, SubscriptionFetcher, SubscriptionManager,
-    SubscriptionUsage,
+    NoSubscriptionCredentials, NodeDiagnostic, NodeUnavailableReason, PreparedSubscriptionRefresh,
+    RefreshOutcome, SnapshotDiff, SubscriptionCredential, SubscriptionCredentialProvider,
+    SubscriptionDocument, SubscriptionError, SubscriptionFetchRequest, SubscriptionFetcher,
+    SubscriptionManager, SubscriptionUsage,
 };
 
 pub trait TransitConnection: AsyncRead + AsyncWrite + Send + Unpin {}

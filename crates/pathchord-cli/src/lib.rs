@@ -88,9 +88,9 @@ const DEFAULT_MAX_CONCURRENT_PATHS: usize = 256;
 #[command(name = "pathchord", version, about = "PathChord management client")]
 pub struct Cli {
     /// Local Unix socket or platform control endpoint.
-    #[arg(long, global = true, default_value = DEFAULT_SOCKET_PATH)]
-    pub socket: PathBuf,
-    /// Actor identity attached to local control requests.
+    #[arg(long, global = true)]
+    pub socket: Option<PathBuf>,
+    /// Requested actor; local control assigns the authenticated OS owner instead.
     #[arg(long, global = true, default_value = "local-admin")]
     pub actor: String,
     #[command(subcommand)]
@@ -567,9 +567,21 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         actor,
         command,
     } = cli;
+    let explicit_socket = socket.clone();
+    let socket = socket.unwrap_or_else(|| match &command {
+        Command::Enroll(_) => {
+            configuration::default_control_socket("egress.sock", DEFAULT_EGRESS_SOCKET_PATH)
+        }
+        _ => configuration::default_control_socket("ingress.sock", DEFAULT_SOCKET_PATH),
+    });
     match command {
         Command::Ingress(args) => run_ingress(&socket, args).await,
-        Command::Egress(args) => run_egress(args).await,
+        Command::Egress(mut args) => {
+            if args.control_socket.is_none() {
+                args.control_socket = explicit_socket;
+            }
+            run_egress(args).await
+        }
         Command::Enroll(args) => run_enrollment(&socket, actor, args.command).await,
         Command::Keygen(args) => run_keygen(args),
         Command::Status => {
@@ -577,18 +589,49 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             print_response(response)
         }
         Command::SystemProxy(SystemProxyCommand::Enable(args)) => {
-            let response = call_local(
-                &socket,
-                system_proxy_enable_request(actor, args.listener_id),
-            )
-            .await?;
+            let generation = local_configuration_generation(&socket, &actor).await?;
+            let mut request = system_proxy_enable_request(actor, args.listener_id);
+            request.expected_generation = Some(pathchord_ingress::GenerationExpectation {
+                scope: "configuration".to_owned(),
+                value: generation,
+            });
+            let response = call_local(&socket, request).await?;
             print_response(response)
         }
         Command::SystemProxy(SystemProxyCommand::Disable) => {
-            let response = call_local(&socket, system_proxy_disable_request(actor)).await?;
+            let generation = local_configuration_generation(&socket, &actor).await?;
+            let mut request = system_proxy_disable_request(actor);
+            request.expected_generation = Some(pathchord_ingress::GenerationExpectation {
+                scope: "configuration".to_owned(),
+                value: generation,
+            });
+            let response = call_local(&socket, request).await?;
             print_response(response)
         }
     }
+}
+
+async fn local_configuration_generation(
+    socket: &std::path::Path,
+    actor: &str,
+) -> Result<u64, CliError> {
+    let response = call_local(socket, status_request(actor)).await?;
+    if let Some(error) = response.error {
+        return Err(CliError::Remote {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    response
+        .result
+        .and_then(|result| {
+            result
+                .get("configuration_generation")
+                .and_then(Value::as_u64)
+        })
+        .ok_or_else(|| {
+            CliError::Observation("local status lacks configuration generation".to_owned())
+        })
 }
 
 async fn run_enrollment(
@@ -682,6 +725,58 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
             )
             .await?;
     }
+    // Durable subscription mutations are authoritative before cache loading,
+    // Path warmup, or listener startup. Reconcile only actual declarative
+    // changes, then use the effective control snapshot for runtime sources.
+    let control_store = Arc::new(IngressControlStore::open(
+        args.data_dir.join("ingress-control.db"),
+    )?);
+    let mut control_service = IngressControlService::open_with_platform_proxy(
+        control_store,
+        platform_proxy_adapter(&args.data_dir),
+    )?;
+    control_service.set_reload_handle(reload_handle.clone());
+    let (configured_nodes, configured_subscriptions) =
+        declarative_control_resources(&policy_config)?;
+    control_service.reconcile_declarative_resources(
+        1,
+        configured_nodes,
+        configured_subscriptions,
+    )?;
+    let control_snapshot = control_service.snapshot();
+    let effective_subscriptions = control_snapshot
+        .subscriptions
+        .values()
+        .map(|subscription| subscription.spec.runtime_config())
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut subscription_ids = BTreeSet::new();
+    subscription_ids.extend(
+        policy_config
+            .subscriptions
+            .iter()
+            .map(|source| source.id.as_str().to_owned()),
+    );
+    subscription_ids.extend(policy_config.transit_proxies.iter().filter_map(|node| {
+        node.source
+            .as_ref()
+            .filter(|source| source.source_type != "static")
+            .map(|source| source.subscription.clone())
+    }));
+    subscription_ids.extend(
+        control_snapshot
+            .subscriptions
+            .keys()
+            .map(|id| id.as_str().to_owned()),
+    );
+    for id in subscription_ids {
+        let enabled = control_snapshot
+            .subscriptions
+            .iter()
+            .any(|(key, value)| key.as_str() == id && value.spec.enabled);
+        data_plane
+            .initialize_subscription_visibility(&id, enabled)
+            .await;
+    }
     let subscription_credentials: Arc<dyn SubscriptionCredentialProvider> = credentials.clone();
     let fetcher = Arc::new(HttpSubscriptionFetcher::with_credentials(
         subscription_credentials,
@@ -691,8 +786,8 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         args.data_dir.join("subscriptions"),
         adapter_registry.available_protocols(),
     );
-    subscription_manager.reconcile(&policy_config.subscriptions);
-    for subscription in &policy_config.subscriptions {
+    subscription_manager.reconcile(&effective_subscriptions);
+    for subscription in &effective_subscriptions {
         let _ = subscription_manager.load_cache(subscription).await;
     }
     let initial_adapter_diagnostics = publish_dynamic_transit(
@@ -746,29 +841,8 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         platform_factories,
     )
     .await?;
-    let control_store = Arc::new(IngressControlStore::open(
-        args.data_dir.join("ingress-control.db"),
-    )?);
-    let mut control_service = IngressControlService::open_with_platform_proxy(
-        control_store,
-        platform_proxy_adapter(&args.data_dir),
-    )?;
-    let (mut configured_nodes, configured_subscriptions) =
-        declarative_control_resources(&policy_config)?;
-    configured_nodes.extend(
-        subscription_manager
-            .snapshot()
-            .nodes
-            .keys()
-            .map(|id| NodeId::new(id.as_str()))
-            .collect::<Result<Vec<_>, _>>()?,
-    );
-    control_service.reconcile_declarative_resources(
-        1,
-        configured_nodes,
-        configured_subscriptions,
-    )?;
     let mut dispatcher = LocalControlDispatcher::with_service(platform, control_service);
+    dispatcher.set_subscription_data_plane(Arc::clone(&data_plane));
     for listener in &policy_config.listeners {
         // TUN and UDP-only TPROXY listeners have no TCP socket address, but
         // they are still runnable resources and must be visible to control
@@ -786,6 +860,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     sync_control_nodes(
         &control_dispatcher,
         data_plane.as_ref(),
+        &policy_config,
         subscription_manager.snapshot(),
         &initial_adapter_diagnostics,
     )
@@ -834,6 +909,11 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         }
     };
     let observation_plane = Arc::clone(&data_plane);
+    let observation_egresses: Vec<String> = policy_config
+        .egresses
+        .iter()
+        .map(|egress| egress.id.as_str().to_owned())
+        .collect();
     let observation_shutdown = shutdown.subscribe();
     let observation_future = async move {
         let mut shutdown = observation_shutdown;
@@ -856,6 +936,18 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                 _ = interval.tick() => {
                     let snapshot = observation_plane.snapshot().await;
                     let session_snapshots = observation_plane.session_snapshots().await;
+                    for egress_id in &observation_egresses {
+                        let session = session_snapshots.iter().find(|entry| &entry.egress_id == egress_id);
+                        let status = session.and_then(|entry| entry.session.egress_status.as_ref());
+                        observation_handle.set_egress_runtime(
+                            egress_id.clone(),
+                            status.map(|status| status.report.clone()),
+                            status.map_or(0, |status| status.age_ms),
+                            status.is_some_and(|status| status.fresh),
+                            session.map_or(0, |entry| entry.session.active_udp_associations),
+                            session.map_or(0, |entry| entry.session.pending_session_controls),
+                        ).map_err(|error| CliError::Observation(error.to_string()))?;
+                    }
                     let sessions = session_snapshots.iter().map(|entry| SessionObservation {
                         session_id: entry.session.session_id,
                         egress_id: entry.egress_id.clone(),
@@ -894,12 +986,12 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                                 path_id,
                                 session_id: entry.session.session_id,
                                 state,
-                                rtt_ms: quality.map_or(0, |quality| quality.rtt_ms),
-                                jitter_ms: quality.map_or(0, |quality| quality.jitter_ms),
-                                loss_ppm: quality.map_or(0, |quality| quality.loss_ppm),
-                                throughput_bps: quality.map_or(0, |quality| quality.throughput_bps),
+                                rtt_ms: quality.map(|quality| quality.rtt_ms),
+                                jitter_ms: quality.map(|quality| quality.jitter_ms),
+                                loss_ppm: quality.map(|quality| quality.loss_ppm),
+                                throughput_bps: quality.map(|quality| quality.throughput_bps),
                                 reordering_events: quality
-                                    .map_or(0, |quality| quality.reordering_events),
+                                    .map(|quality| quality.reordering_events),
                                 exclusion_reason,
                             }
                         })
@@ -920,6 +1012,8 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                                     .traffic_class
                                     .as_ref()
                                     .map(|class| class.name.clone()),
+                                traffic_class_priority: stream.traffic_class.as_ref().map(|class| class.priority),
+                                traffic_class_share: stream.traffic_class.as_ref().map(|class| class.share),
                                 bytes_sent: stream.bytes_sent,
                                 bytes_received: stream.bytes_received,
                                 bytes_acked: stream.bytes_acked,
@@ -940,7 +1034,9 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                             sessions: snapshot.sessions as u64,
                             ready_paths: snapshot.ready_paths as u64,
                             streams: snapshot.streams as u64,
-                            target_connections: snapshot.streams as u64,
+                            // Target connections are maintained from listener
+                            // lifecycle events by the observation service.
+                            target_connections: 0,
                         })
                         .map_err(|error| CliError::Observation(error.to_string()))?;
                     let transit_observations = observation_plane.transit_observations().await;
@@ -981,7 +1077,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     };
     let subscription_plane = Arc::clone(&data_plane);
     let subscription_registry = Arc::clone(&adapter_registry);
-    let subscription_configs = policy_config.subscriptions.clone();
+    let subscription_configs = effective_subscriptions;
     let subscription_future = SubscriptionWorker {
         adapter_diagnostics: initial_adapter_diagnostics,
         manager: subscription_manager,
@@ -1030,7 +1126,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     tokio::pin!(combined);
     let result = tokio::select! {
         result = &mut combined => result,
-        signal = tokio::signal::ctrl_c() => {
+        signal = service_shutdown_signal() => {
             signal.map_err(|error| CliError::ShutdownSignal(error.to_string()))?;
             let _ = shutdown.send(true);
             combined.await
@@ -1070,6 +1166,7 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
                 capacity_bps: args.capacity_bps,
                 recommended_path_count: args.recommended_path_count,
                 max_streams_per_ingress: args.max_streams_per_ingress,
+                remote_dns_only: args.remote_dns_only,
                 quota_remaining: args.quota_remaining,
                 traffic_multiplier_basis_points: args.traffic_multiplier_basis_points,
             },
@@ -1079,6 +1176,7 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
     );
     let cleanup_node = Arc::clone(&node);
     let status_node = Arc::clone(&node);
+    let resources_node = Arc::clone(&node);
     let dispatcher = AuthorizationControlDispatcher::new(authorizations)
         .with_cleanup_hook(move |_| {
             let cleanup_node = Arc::clone(&cleanup_node);
@@ -1093,6 +1191,9 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
             let status_node = Arc::clone(&status_node);
             async move {
                 let snapshot = status_node.snapshot().map_err(|error| error.to_string())?;
+                let activity = status_node
+                    .authorization_activity()
+                    .map_err(|error| error.to_string())?;
                 Ok(serde_json::json!({
                     "running": snapshot.running,
                     "local_addr": snapshot.local_addr.to_string(),
@@ -1100,10 +1201,19 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
                     "admitted_paths": snapshot.admitted_paths,
                     "active_paths": snapshot.active_paths,
                     "active_sessions": snapshot.active_sessions,
+                    "active_streams": snapshot.active_streams,
                     "active_target_connections": snapshot.active_target_connections,
+                    "authorization_activity": activity,
                     "quota_remaining": snapshot.quota_remaining,
                     "traffic_multiplier_basis_points": snapshot.traffic_multiplier_basis_points,
                 }))
+            }
+        })
+        .with_resources_hook(move || {
+            let resources_node = Arc::clone(&resources_node);
+            async move {
+                let (path_metrics, stream_metrics) = resources_node.management_resources().map_err(|error| error.to_string())?;
+                Ok(serde_json::json!({"path_metrics": path_metrics, "stream_metrics": stream_metrics}))
             }
         });
     let server = LocalControlServer::bind(args.control_socket, dispatcher)?;
@@ -1159,7 +1269,7 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
     tokio::pin!(combined);
     let result = tokio::select! {
         result = &mut combined => result,
-        signal = tokio::signal::ctrl_c() => {
+        signal = service_shutdown_signal() => {
             signal.map_err(|error| CliError::ShutdownSignal(error.to_string()))?;
             let _ = shutdown.send(true);
             combined.await
@@ -1174,6 +1284,22 @@ async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
         if shutdown.changed().await.is_err() {
             break;
         }
+    }
+}
+
+async fn service_shutdown_signal() -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
     }
 }
 
@@ -1286,31 +1412,41 @@ impl SubscriptionWorker {
                     let mut tick_shutdown = shutdown.clone();
                     let work = async {
                     let mut refreshed = false;
-                    let latest = control
-                        .lock()
-                        .await
-                        .service()
-                        .snapshot()
-                        .subscriptions
-                        .into_values()
+                    let mut releasable = BTreeSet::new();
+                    let snapshot = control.lock().await.service().snapshot();
+                    let mut observed_generation = snapshot.generation;
+                    let latest = snapshot.subscriptions.into_values()
                         .map(|state| state.spec.runtime_config())
                         .collect::<Result<Vec<_>, _>>()?;
                     if latest != configs {
+                        let changed_ids: BTreeSet<_> = latest.iter()
+                            .filter(|next| configs.iter().find(|old| old.id == next.id) != Some(*next))
+                            .map(|config| config.id.clone())
+                            .collect();
                         let previous_ids: BTreeSet<_> =
                             configs.iter().map(|config| config.id.clone()).collect();
+                        let next_ids: BTreeSet<_> = latest.iter().map(|config| config.id.clone()).collect();
                         manager.reconcile(&latest);
+                        let observations = control.lock().await.service().observation_handle();
+                        for id in previous_ids.difference(&next_ids) {
+                            observations.remove_subscription_runtime(&ControlSubscriptionId::new(id.as_str())?)?;
+                        }
                         for config in &latest {
-                            if !previous_ids.contains(&config.id) {
-                                let _ = manager.load_cache(config).await;
+                            if changed_ids.contains(&config.id)
+                                && matches!(manager.load_cache(config).await, Ok(pathchord_transit::CacheLoadOutcome::Loaded { .. }))
+                            {
+                                releasable.insert(config.id.clone());
                             }
                         }
                         configs = latest;
                         refreshed = true;
                         due.retain(|id, _| configs.iter().any(|config| &config.id == id));
                         for config in &configs {
-                            due.entry(config.id.clone()).or_insert_with(|| {
-                                tokio::time::Instant::now()
-                            });
+                            if changed_ids.contains(&config.id) {
+                                due.insert(config.id.clone(), tokio::time::Instant::now());
+                            } else {
+                                due.entry(config.id.clone()).or_insert_with(tokio::time::Instant::now);
+                            }
                         }
                     }
                     let now = tokio::time::Instant::now();
@@ -1324,24 +1460,24 @@ impl SubscriptionWorker {
                         let config = configs
                             .iter()
                             .find(|config| config.id.as_str() == requested.as_str());
-                        let (success, error) = if let Some(config) = config {
-                            let Some(outcome) = cancellable_subscription_refresh(
-                                &mut manager,
-                                config,
-                                &mut tick_shutdown,
-                            )
-                            .await else {
-                                return Ok(());
-                            };
-                            refresh_result(outcome)
-                        } else {
-                            (false, Some("subscription is not configured".to_owned()))
-                        };
-                        control
-                            .lock()
-                            .await
-                            .service_mut()
-                            .complete_subscription_refresh(&requested, success, error)?;
+                        let Some(config) = config else { return Ok(()); };
+                        let Some(candidate) = cancellable_subscription_refresh(
+                            &manager, config, observed_generation, &mut tick_shutdown,
+                        ).await else { return Ok(()); };
+                        let mut dispatcher = control.lock().await;
+                        let current = dispatcher.service().snapshot();
+                        if current.generation != observed_generation
+                            || current.subscriptions.get(&requested)
+                                .and_then(|state| state.spec.runtime_config().ok()).as_ref() != Some(config)
+                        {
+                            return Ok(());
+                        }
+                        let outcome = commit_subscription_refresh(
+                            &mut manager, candidate, observed_generation, &mut dispatcher, &requested,
+                        ).await?;
+                        observed_generation = dispatcher.service().snapshot().generation;
+                        if matches!(outcome, RefreshOutcome::Published { .. }) { releasable.insert(config.id.clone()); }
+                        drop(dispatcher);
                         refreshed = true;
                     }
                     for config in &configs {
@@ -1356,21 +1492,24 @@ impl SubscriptionWorker {
                         if now < *next {
                             continue;
                         }
-                        let Some(outcome) = cancellable_subscription_refresh(
-                            &mut manager,
-                            config,
-                            &mut tick_shutdown,
-                        )
-                        .await else {
-                            return Ok(());
-                        };
-                        let (success, error) = refresh_result(outcome);
+                        let Some(candidate) = cancellable_subscription_refresh(
+                            &manager, config, observed_generation, &mut tick_shutdown,
+                        ).await else { return Ok(()); };
                         let control_id = ControlSubscriptionId::new(config.id.as_str())?;
-                        control
-                            .lock()
-                            .await
-                            .service_mut()
-                            .complete_subscription_refresh(&control_id, success, error)?;
+                        let mut dispatcher = control.lock().await;
+                        let current = dispatcher.service().snapshot();
+                        if current.generation != observed_generation
+                            || current.subscriptions.get(&control_id)
+                                .and_then(|state| state.spec.runtime_config().ok()).as_ref() != Some(config)
+                        {
+                            return Ok(());
+                        }
+                        let outcome = commit_subscription_refresh(
+                            &mut manager, candidate, observed_generation, &mut dispatcher, &control_id,
+                        ).await?;
+                        observed_generation = dispatcher.service().snapshot().generation;
+                        if matches!(outcome, RefreshOutcome::Published { .. }) { releasable.insert(config.id.clone()); }
+                        drop(dispatcher);
                         *next = now + Duration::from_secs(config.refresh.interval_seconds);
                         refreshed = true;
                     }
@@ -1391,20 +1530,44 @@ impl SubscriptionWorker {
                         }
                     }
                     if !completed.is_empty() {
+                        let mut dispatcher = control.lock().await;
+                        let current = dispatcher.service().snapshot();
+                        let current_configs = current.subscriptions.values()
+                            .map(|state| state.spec.runtime_config())
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if current.generation != observed_generation || current_configs != configs {
+                            return Ok(());
+                        }
                         manager.complete_draining(&completed);
                         for id in &completed {
                             data_plane.remove_dynamic_transit(id).await;
-                            control
-                                .lock()
-                                .await
-                                .service_mut()
-                                .remove_node(&NodeId::new(id.as_str())?)?;
+                            // A new-source candidate may take over this ID as
+                            // soon as the old Path has drained. Preserve its
+                            // administrator metadata while replacing the adapter.
+                            if !manager.snapshot().nodes.contains_key(id) {
+                                let id = NodeId::new(id.as_str())?;
+                                dispatcher.service().observation_handle().remove_node_metadata(&id)?;
+                                dispatcher.service_mut().remove_node(&id)?;
+                            }
                         }
+                        observed_generation = dispatcher.service().snapshot().generation;
                         refreshed = true;
                     }
                     if refreshed {
-                    *dynamic_snapshot.write().await = manager.snapshot().clone();
+                        let dispatcher = control.lock().await;
+                        let current = dispatcher.service().snapshot();
+                        let current_configs = current.subscriptions.values()
+                            .map(|state| state.spec.runtime_config())
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if current.generation != observed_generation || current_configs != configs {
+                            return Ok(());
+                        }
+                        for id in &releasable {
+                            data_plane.allow_subscription_after_refresh(id.as_str()).await;
+                        }
+                        *dynamic_snapshot.write().await = manager.snapshot().clone();
                         adapter_diagnostics = publish_dynamic_transit(data_plane.as_ref(), registry.as_ref(), manager.snapshot()).await;
+                        drop(dispatcher);
                         data_plane.warmup().await;
                         let policy = reload.snapshot()?.config;
                         protected_endpoints.replace(
@@ -1416,7 +1579,23 @@ impl SubscriptionWorker {
                             .await,
                         );
                     }
-                    sync_control_nodes(&control, data_plane.as_ref(), manager.snapshot(), &adapter_diagnostics).await?;
+                    let policy = reload.snapshot()?.config;
+                    sync_control_nodes(&control, data_plane.as_ref(), &policy, manager.snapshot(), &adapter_diagnostics).await?;
+                    let observations = control.lock().await.service().observation_handle();
+                    for config in &configs {
+                        let count = manager.snapshot().nodes.values().filter(|node| {
+                            node.state != DynamicNodeState::Draining
+                                && node.config.source.as_ref().is_some_and(|source| source.subscription == config.id.as_str())
+                        }).count();
+                        let next = if config.enabled && config.source.source_type != SubscriptionSourceType::Static {
+                            due.get(&config.id).map(|deadline| {
+                                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+                                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default().saturating_add(wait).as_millis().min(u128::from(u64::MAX)) as u64
+                            })
+                        } else { None };
+                        observations.set_subscription_runtime(ControlSubscriptionId::new(config.id.as_str())?, next, count)?;
+                    }
                     Ok::<(), CliError>(())
                     };
                     match cancellable_ingress_work(shutdown.clone(), work).await {
@@ -1447,21 +1626,58 @@ async fn cancellable_ingress_work<T>(
 }
 
 async fn cancellable_subscription_refresh(
-    manager: &mut SubscriptionManager,
+    manager: &SubscriptionManager,
     config: &pathchord_policy::SubscriptionConfig,
+    generation: u64,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
-) -> Option<RefreshOutcome> {
+) -> Option<Result<pathchord_transit::PreparedSubscriptionRefresh, RefreshOutcome>> {
     tokio::select! {
         _ = shutdown.changed() => None,
-        outcome = manager.refresh(config) => Some(outcome),
+        outcome = manager.prepare_refresh(config, generation) => Some(outcome),
     }
 }
 
-fn refresh_result(outcome: RefreshOutcome) -> (bool, Option<String>) {
-    match outcome {
-        RefreshOutcome::Published { .. } | RefreshOutcome::Disabled { .. } => (true, None),
-        RefreshOutcome::Retained { error, .. } => (false, Some(error.to_string())),
+async fn commit_subscription_refresh(
+    manager: &mut SubscriptionManager,
+    candidate: Result<pathchord_transit::PreparedSubscriptionRefresh, RefreshOutcome>,
+    generation: u64,
+    dispatcher: &mut LocalControlDispatcher,
+    id: &ControlSubscriptionId,
+) -> Result<RefreshOutcome, CliError> {
+    let mut control_error = None;
+    let outcome = match candidate {
+        Ok(prepared) => {
+            manager
+                .commit_prepared_refresh_with(prepared, generation, || {
+                    match dispatcher
+                        .service_mut()
+                        .complete_subscription_refresh(id, true, None)
+                    {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            control_error = Some(error);
+                            Err(pathchord_transit::SubscriptionError::ControlCommit)
+                        }
+                    }
+                })
+                .await
+        }
+        Err(outcome) => outcome,
+    };
+    if let Some(error) = control_error {
+        return Err(error.into());
     }
+    if let RefreshOutcome::Retained { error, .. } = &outcome {
+        // Stale candidates never alter either the control state or cache.
+        if *error != pathchord_transit::SubscriptionError::StaleCandidate {
+            dispatcher.service_mut().complete_subscription_refresh(
+                id,
+                false,
+                Some(error.to_string()),
+            )?;
+        }
+    }
+    Ok(outcome)
 }
 
 async fn run_data_plane_maintenance(
@@ -1533,8 +1749,9 @@ async fn apply_reloaded_policies(
                 };
                 let (nodes, subscriptions) = declarative_control_resources(&snapshot.config)?;
                 let mut dispatcher = control.lock().await;
+                let previous_subscriptions = dispatcher.service().snapshot().subscriptions;
                 let handle_for_commit = handle.clone();
-                let outcome = data_plane.commit_static_snapshot(prepared, move || {
+                let outcome = data_plane.commit_static_snapshot_with_subscription_visibility(prepared, move || {
                     let committed = handle_for_commit
                         .commit_runtime_candidate(snapshot.generation, || {
                             dispatcher
@@ -1548,7 +1765,15 @@ async fn apply_reloaded_policies(
                         })
                         .map_err(|_| pathchord_ingress::DataPlaneError::ControlCommitRejected)?;
                     if committed {
-                        Ok(())
+                        let current = dispatcher.service().snapshot().subscriptions;
+                        let mut visibility: BTreeMap<String, (bool, bool)> = previous_subscriptions.keys()
+                            .map(|id| (id.as_str().to_owned(), (false, true)))
+                            .collect();
+                        for (id, state) in current {
+                            let changed = previous_subscriptions.get(&id).is_none_or(|previous| previous.spec != state.spec);
+                            visibility.insert(id.as_str().to_owned(), (state.spec.enabled, changed));
+                        }
+                        Ok(visibility)
                     } else {
                         Err(pathchord_ingress::DataPlaneError::ControlCommitRejected)
                     }
@@ -1734,6 +1959,7 @@ async fn publish_dynamic_transit(
 async fn sync_control_nodes(
     control: &Arc<tokio::sync::Mutex<LocalControlDispatcher>>,
     data_plane: &IngressDataPlane,
+    policy: &PolicyConfig,
     snapshot: &DynamicTransitSnapshot,
     adapter_diagnostics: &BTreeMap<
         pathchord_policy::TransitProxyId,
@@ -1742,6 +1968,23 @@ async fn sync_control_nodes(
 ) -> Result<(), CliError> {
     let admin = {
         let mut dispatcher = control.lock().await;
+        let observations = dispatcher.service().observation_handle();
+        for node in policy
+            .transit_proxies
+            .iter()
+            .chain(snapshot.nodes.values().map(|node| &node.config))
+        {
+            observations.set_node_metadata(
+                NodeId::new(node.id.as_str())?,
+                None,
+                Some(node.protocol.clone()),
+                Some(format!("{}:{}", node.endpoint.host, node.endpoint.port)),
+                node.source
+                    .as_ref()
+                    .map(|source| source.subscription.clone()),
+                node.labels.clone(),
+            )?;
+        }
         for node in snapshot.nodes.values() {
             let id = NodeId::new(node.config.id.as_str())?;
             dispatcher.service_mut().add_node(id.clone())?;
@@ -2240,7 +2483,7 @@ mod tests {
             "status",
         ])
         .expect("status args");
-        assert_eq!(cli.socket, PathBuf::from("/tmp/ingress.sock"));
+        assert_eq!(cli.socket, Some(PathBuf::from("/tmp/ingress.sock")));
         assert_eq!(cli.actor, "operator");
         assert_eq!(cli.command, Command::Status);
     }

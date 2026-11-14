@@ -102,6 +102,9 @@ PATH_CLOSE
 STATUS_REPORT
 HEARTBEAT
 CONTROL_ACK
+SESSION_CONTROL
+SESSION_CONTROL_ACK
+SESSION_CONTROL_CANCEL
 SESSION_CLOSE
 ```
 
@@ -111,9 +114,14 @@ canonical Egress-status name, and `HEARTBEAT` provides Path liveness. Operations
 with a result use their specific success and error frames, such as
 `STREAM_OPEN_OK` and `STREAM_OPEN_ERR`, rather than a generic `ERROR` frame.
 
-Control traffic has reserved capacity. A Session requires at least one active Path; loss of the last Path terminates the Session. Status reports, heartbeats, and Session control messages use the currently available Paths, with a Session control sequence number for duplicate suppression. Control messages MAY optionally carry a dependency sequence number when execution order matters. Any available Path MAY carry any control or data exchange.
+Control traffic has reserved capacity. A Session requires at least one active Path; loss of the last Path terminates the Session. Status reports and heartbeats use their own Path-local sequence. Session control messages use a Session-wide control sequence for duplicate suppression and MAY carry a dependency sequence number. Control and data exchanges use available, policy-compliant Paths.
 
-Control messages are replicated across multiple currently available Paths by default. The receiver applies each `control_seqno` at most once, so replication is safe. `CONTROL_ACK` reports the highest contiguous applied sequence and OPTIONAL selective ranges. The sender retains unacknowledged control messages and retransmits them until acknowledged or until the Session closes.
+Session control messages are replicated across multiple currently available, eligible Paths by default when the Session replication budget permits; the first copy and ordinary retransmissions do not consume that budget. The receiver applies each `control_seqno` at most once. `SESSION_CONTROL_ACK` reports the highest contiguous applied sequence and OPTIONAL selective ranges. The sender retains unacknowledged Session control messages and retransmits them until acknowledged or until the Session transport closes. `CONTROL_ACK` acknowledges Path-local heartbeats.
+
+When a flow loses its eligible Paths while other Session Paths survive,
+`SESSION_CONTROL_CANCEL` advances or replaces its control sequences using only
+the opaque flow ID. It tears down that flow without sending its target or data
+on another flow's Path. Other flows and Session control sequences continue.
 
 ## 5. TCP Streams
 
@@ -262,7 +270,10 @@ PATH_CLOSE       close this Path
 SESSION_CLOSE    close the Session and all related Streams
 STATUS_REPORT    Egress capacity and health report
 HEARTBEAT        liveness and control sequence exchange
-CONTROL_ACK      applied control sequence and selective ranges
+CONTROL_ACK      applied Path heartbeat sequence and selective ranges
+SESSION_CONTROL  Session-scoped control operation and sequence
+SESSION_CONTROL_ACK  applied Session control sequence and selective ranges
+SESSION_CONTROL_CANCEL  opaque cancellation of a flow's control sequence
 ```
 
 `PATH_DRAIN` is advisory and MAY be interrupted by an urgent failure. `PATH_CLOSE`

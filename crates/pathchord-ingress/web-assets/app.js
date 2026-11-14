@@ -218,7 +218,7 @@ function renderSubscriptions(result) {
     refresh.className = "button secondary small";
     refresh.type = "button";
     refresh.textContent = "Refresh";
-    refresh.addEventListener("click", () => mutateSubscription(item.id, "refresh"));
+    refresh.addEventListener("click", () => mutateSubscription(item.id, "refresh", item.revision));
     const remove = document.createElement("button");
     remove.className = "button danger small";
     remove.type = "button";
@@ -344,10 +344,10 @@ $("subscription-form").addEventListener("submit", async (event) => {
   } catch (error) { showNotice(error.message, "error"); }
 });
 
-async function mutateSubscription(id, action) {
+async function mutateSubscription(id, action, revision) {
   try {
     const path = `/api/v1/subscriptions/${encodeURIComponent(id)}${action === "refresh" ? "/refresh" : ""}`;
-    await api(path, { method: action === "refresh" ? "POST" : "DELETE", body: JSON.stringify({}) });
+    await api(path, { method: action === "refresh" ? "POST" : "DELETE", body: JSON.stringify(action === "refresh" ? { revision } : {}) });
     showNotice(`Subscription ${action === "refresh" ? "refresh queued" : "deleted"}`, "success");
     await refreshAll(true);
   } catch (error) { showNotice(error.message, "error"); }
@@ -356,13 +356,13 @@ async function mutateSubscription(id, action) {
 $("proxy-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
-    await api("/api/v1/system-proxy", { method: "PUT", body: JSON.stringify({ listener_id: $("proxy-listener-select").value }) });
+    await api("/api/v1/system-proxy/enable", { method: "POST", body: JSON.stringify({ listener_id: $("proxy-listener-select").value }) });
     showNotice("System proxy enabled", "success"); await refreshAll(true);
   } catch (error) { showNotice(error.message, "error"); }
 });
 $("proxy-disable").addEventListener("click", async () => {
   try {
-    await api("/api/v1/system-proxy", { method: "DELETE", body: JSON.stringify({}) });
+    await api("/api/v1/system-proxy/disable", { method: "POST", body: JSON.stringify({}) });
     showNotice("System proxy disabled", "success"); await refreshAll(true);
   } catch (error) { showNotice(error.message, "error"); }
 });

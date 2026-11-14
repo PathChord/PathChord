@@ -194,6 +194,7 @@ pub struct IngressDataPlane {
     configuration_gate: RwLock<()>,
     traffic_policies: RwLock<BTreeMap<TrafficPolicyId, TrafficPolicy>>,
     dynamic_transit_configs: RwLock<BTreeMap<TransitProxyId, TransitProxyConfig>>,
+    blocked_subscriptions: RwLock<BTreeSet<String>>,
     transit_adapters: RwLock<BTreeMap<TransitProxyId, Arc<dyn TransitAdapter>>>,
     runtime: RwLock<RuntimeCatalog>,
     sessions: BTreeMap<EgressId, Arc<SessionSlot>>,
@@ -298,6 +299,7 @@ impl IngressDataPlane {
             configuration_gate: RwLock::new(()),
             traffic_policies: RwLock::new(traffic_policies),
             dynamic_transit_configs: RwLock::new(BTreeMap::new()),
+            blocked_subscriptions: RwLock::new(BTreeSet::new()),
             transit_adapters: RwLock::new(transit_adapters),
             runtime: RwLock::new(runtime),
             sessions,
@@ -457,6 +459,32 @@ impl IngressDataPlane {
     where
         F: FnOnce() -> Result<(), DataPlaneError> + Send,
     {
+        self.commit_static_snapshot_inner(prepared, || before_commit().map(|()| None))
+            .await
+    }
+
+    /// Commits declarative subscription visibility in the same publication
+    /// barrier as the static graph and its durable control transaction.
+    pub async fn commit_static_snapshot_with_subscription_visibility<F>(
+        &self,
+        prepared: PreparedStaticReload,
+        before_commit: F,
+    ) -> Result<StaticReloadOutcome, DataPlaneError>
+    where
+        F: FnOnce() -> Result<BTreeMap<String, (bool, bool)>, DataPlaneError> + Send,
+    {
+        self.commit_static_snapshot_inner(prepared, || before_commit().map(Some))
+            .await
+    }
+
+    async fn commit_static_snapshot_inner<F>(
+        &self,
+        prepared: PreparedStaticReload,
+        before_commit: F,
+    ) -> Result<StaticReloadOutcome, DataPlaneError>
+    where
+        F: FnOnce() -> Result<Option<BTreeMap<String, (bool, bool)>>, DataPlaneError> + Send,
+    {
         let _configuration = self.configuration_gate.write().await;
         if self
             .shutting_down
@@ -480,6 +508,7 @@ impl IngressDataPlane {
         let mut retirement = self.retired_paths.lock().await;
         let mut next_adapters = adapters.clone();
         let mut next_runtime = runtime.clone();
+        let mut blocked_subscriptions = self.blocked_subscriptions.write().await;
         for id in configs.keys() {
             if !prepared.configs.contains_key(id) {
                 next_adapters.remove(id);
@@ -488,7 +517,15 @@ impl IngressDataPlane {
         }
         for (id, adapter) in &prepared.adapters {
             let mut status = next_runtime.transit_proxy(id).cloned().unwrap_or_default();
-            status.state = RuntimeNodeState::Ready;
+            status.state = if prepared.configs[id]
+                .source
+                .as_ref()
+                .is_some_and(|source| blocked_subscriptions.contains(&source.subscription))
+            {
+                RuntimeNodeState::Draining
+            } else {
+                RuntimeNodeState::Ready
+            };
             status.capabilities = adapter_capabilities(adapter.as_ref(), &prepared.configs[id]);
             status.selection_score = status.selection_score.max(1);
             next_runtime.set_transit_proxy(id.clone(), status);
@@ -514,7 +551,39 @@ impl IngressDataPlane {
                 ));
             }
         }
-        before_commit()?;
+        if let Some(visibility) = before_commit()? {
+            // An absent source is deleted. Mark it unavailable before the
+            // new graph is published; a concurrent old worker cannot revive it.
+            for (id, (enabled, changed)) in &visibility {
+                if !*enabled || *changed {
+                    blocked_subscriptions.insert(id.clone());
+                }
+            }
+            for config in prepared.configs.values().chain(dynamic.values()) {
+                let Some(source) = config
+                    .source
+                    .as_ref()
+                    .filter(|source| source.source_type != "static")
+                else {
+                    continue;
+                };
+                let enabled = visibility
+                    .get(&source.subscription)
+                    .is_some_and(|(enabled, _)| *enabled)
+                    && !blocked_subscriptions.contains(&source.subscription);
+                if !enabled {
+                    blocked_subscriptions.insert(source.subscription.clone());
+                }
+                if let Some(mut status) = next_runtime.transit_proxy(&config.id).cloned() {
+                    if !enabled {
+                        status.state = RuntimeNodeState::Draining;
+                    } else if prepared.adapters.contains_key(&config.id) {
+                        status.state = RuntimeNodeState::Ready;
+                    }
+                    next_runtime.set_transit_proxy(config.id.clone(), status);
+                }
+            }
+        }
         *configs = prepared.configs;
         *adapters = next_adapters;
         *runtime = next_runtime;
@@ -669,6 +738,9 @@ impl IngressDataPlane {
         if !adapter.supports_tcp() {
             status.capabilities.remove(&FlowProtocol::Tcp);
         }
+        if self.subscription_is_blocked(&config).await {
+            status.state = RuntimeNodeState::Draining;
+        }
         let id = config.id.clone();
         self.probes.lock().await.forget(&id);
         self.dynamic_transit_configs
@@ -685,11 +757,14 @@ impl IngressDataPlane {
     pub async fn publish_dynamic_transit_status(
         &self,
         config: TransitProxyConfig,
-        status: TransitProxyRuntimeStatus,
+        mut status: TransitProxyRuntimeStatus,
     ) {
         let _configuration = self.configuration_gate.read().await;
         if self.transit_configs.read().await.contains_key(&config.id) {
             return;
+        }
+        if self.subscription_is_blocked(&config).await {
+            status.state = RuntimeNodeState::Draining;
         }
         self.dynamic_transit_configs
             .write()
@@ -699,6 +774,84 @@ impl IngressDataPlane {
             .write()
             .await
             .set_dynamic_transit_proxy(config, status);
+    }
+
+    async fn subscription_is_blocked(&self, config: &TransitProxyConfig) -> bool {
+        let blocked = self.blocked_subscriptions.read().await;
+        config
+            .source
+            .as_ref()
+            .is_some_and(|source| blocked.contains(&source.subscription))
+    }
+
+    /// Runs a durable control mutation while new flow selection and dynamic
+    /// publication are fenced. All async locks are acquired before `commit`,
+    /// so cancellation cannot interrupt a successful commit before its new
+    /// visibility takes effect. The returned visibility must reflect current
+    /// durable state, including on idempotent replays.
+    pub(crate) async fn subscription_transaction<T>(
+        &self,
+        subscription: &str,
+        commit: impl FnOnce() -> (T, Option<bool>) + Send,
+    ) -> T {
+        let _configuration = self.configuration_gate.write().await;
+        let static_configs = self.transit_configs.read().await;
+        let dynamic_configs = self.dynamic_transit_configs.read().await;
+        let mut blocked = self.blocked_subscriptions.write().await;
+        let mut runtime = self.runtime.write().await;
+        let (result, enabled) = commit();
+        if let Some(enabled) = enabled
+            && !enabled
+        {
+            blocked.insert(subscription.to_owned());
+            for config in static_configs.values().chain(dynamic_configs.values()) {
+                if config
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.subscription == subscription)
+                    && let Some(mut status) = runtime.transit_proxy(&config.id).cloned()
+                {
+                    status.state = RuntimeNodeState::Draining;
+                    runtime.set_transit_proxy(config.id.clone(), status);
+                }
+            }
+        }
+        result
+    }
+
+    /// Releases a previously blocked source only after a worker has verified
+    /// and refreshed its current full specification while holding the control
+    /// dispatcher lock. Existing draining nodes are republished by the worker.
+    pub async fn allow_subscription_after_refresh(&self, subscription: &str) {
+        let _configuration = self.configuration_gate.write().await;
+        self.blocked_subscriptions
+            .write()
+            .await
+            .remove(subscription);
+        let static_configs = self.transit_configs.read().await;
+        let adapters = self.transit_adapters.read().await;
+        let mut runtime = self.runtime.write().await;
+        for config in static_configs.values() {
+            if config
+                .source
+                .as_ref()
+                .is_some_and(|source| source.subscription == subscription)
+                && adapters.contains_key(&config.id)
+                && let Some(mut status) = runtime.transit_proxy(&config.id).cloned()
+                && status.state == RuntimeNodeState::Draining
+            {
+                status.state = RuntimeNodeState::Ready;
+                runtime.set_transit_proxy(config.id.clone(), status);
+            }
+        }
+    }
+
+    /// Initializes visibility from durable control state before any listener
+    /// accepts business flows. Runtime control mutations use the transaction
+    /// above, not this startup convenience method.
+    pub async fn initialize_subscription_visibility(&self, subscription: &str, enabled: bool) {
+        self.subscription_transaction(subscription, || ((), Some(enabled)))
+            .await;
     }
 
     pub async fn apply_transit_admin_metadata(
@@ -720,6 +873,15 @@ impl IngressDataPlane {
 
     pub async fn drain_transit(&self, id: &TransitProxyId) {
         let _configuration = self.configuration_gate.read().await;
+        if !self
+            .runtime
+            .read()
+            .await
+            .transit_proxy(id)
+            .is_some_and(|status| status.state == RuntimeNodeState::Draining)
+        {
+            return;
+        }
         for slot in self.sessions.values() {
             let path_id = slot.transit_paths.lock().await.get(id).copied();
             let session = slot.session.lock().await.clone();
@@ -778,14 +940,23 @@ impl IngressDataPlane {
             let mut session = slot.session.lock().await.clone();
             if session.is_none() {
                 let minimum = (slot.egress.status_requirements.min_usable_paths as usize).max(1);
-                let candidates: Vec<_> = self
-                    .transit_adapters
-                    .read()
-                    .await
-                    .keys()
-                    .take(minimum)
-                    .cloned()
-                    .collect();
+                let candidates: Vec<_> = {
+                    let adapters = self.transit_adapters.read().await;
+                    let runtime = self.runtime.read().await;
+                    adapters
+                        .keys()
+                        .filter(|id| {
+                            runtime.transit_proxy(id).is_some_and(|status| {
+                                matches!(
+                                    status.state,
+                                    RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+                                )
+                            })
+                        })
+                        .take(minimum)
+                        .cloned()
+                        .collect()
+                };
                 for transit_id in candidates {
                     slot.eligible_transits
                         .lock()
@@ -832,6 +1003,8 @@ impl IngressDataPlane {
                 hard_available: true,
                 quota_remaining: None,
                 traffic_multiplier_basis_points: 10_000,
+                incremental_capacity_bps: None,
+                scheduling_overhead_bps: 0,
             };
             let now_ms = now
                 .duration_since(slot.maintenance_epoch)
@@ -980,27 +1153,21 @@ impl IngressDataPlane {
         let Some(policy) = policies.get(policy_id) else {
             return default;
         };
-        let bits_to_bytes = |bits_per_second: u64, fallback: u64| {
-            if bits_per_second == 0 {
-                fallback
-            } else {
-                bits_per_second.saturating_div(8).max(1)
-            }
-        };
-        let session_budget = bits_to_bytes(
-            policy.session_replication_budget_bps,
-            default.session_replication_budget_bytes,
-        );
+        // One fixed window lasts one second. Round down so a sub-byte budget
+        // cannot accidentally permit more bits than the configured limit.
+        let bits_to_bytes = |bits_per_second: u64| bits_per_second / 8;
+        let session_budget = bits_to_bytes(policy.session_replication_budget_bps);
         let class_budget = policy
             .class_replication_budget_bps
-            .map_or(session_budget, |budget| {
-                bits_to_bytes(budget, session_budget)
-            });
-        let class_replication_budget_bytes = policy
+            .map_or(session_budget, bits_to_bytes);
+        let mut class_replication_budget_bytes: BTreeMap<_, _> = policy
             .classes
             .keys()
-            .map(|class| (class.clone(), class_budget))
+            .map(|class| (format!("{}:{class}", policy_id.as_str()), class_budget))
             .collect();
+        if policy.class_replication_budget_bps.is_some() {
+            class_replication_budget_bytes.insert("default".to_owned(), class_budget);
+        }
         MultipathConfig {
             traffic_class: class_ref.and_then(|name| {
                 policy
@@ -1015,10 +1182,11 @@ impl IngressDataPlane {
             session_replication_budget_bytes: session_budget,
             default_stream_replication_budget_bytes: session_budget,
             class_replication_budget_bytes,
-            retransmission_replication_enabled: matches!(
-                policy.retransmission_replication,
-                pathchord_policy::RetransmissionReplication::Allowed
-            ),
+            retransmission_replication_enabled: session_budget > 0
+                && matches!(
+                    policy.retransmission_replication,
+                    pathchord_policy::RetransmissionReplication::Allowed
+                ),
             ..default
         }
     }
@@ -1089,20 +1257,6 @@ impl IngressDataPlane {
                 drop(paths);
                 if eligible.is_empty() {
                     return Err(DataPlaneError::NoUsableRoute);
-                }
-                let maximum_weight = eligible.values().copied().max().unwrap_or(1).max(1);
-                for (path_id, weight) in &eligible {
-                    session
-                        .update_path_observation(
-                            *path_id,
-                            MultipathPathObservation {
-                                weight_basis_points: (u64::from(*weight).saturating_mul(10_000)
-                                    / u64::from(maximum_weight))
-                                .max(1) as u16,
-                                ..MultipathPathObservation::default()
-                            },
-                        )
-                        .await?;
                 }
                 let stream = session
                     .open_tcp_routed_with_config(
@@ -1231,20 +1385,6 @@ impl IngressDataPlane {
         if eligible.is_empty() {
             return Err(DataPlaneError::NoUsableRoute);
         }
-        let maximum_weight = eligible.values().copied().max().unwrap_or(1).max(1);
-        for (path_id, weight) in &eligible {
-            session
-                .update_path_observation(
-                    *path_id,
-                    MultipathPathObservation {
-                        weight_basis_points: (u64::from(*weight).saturating_mul(10_000)
-                            / u64::from(maximum_weight))
-                        .max(1) as u16,
-                        ..MultipathPathObservation::default()
-                    },
-                )
-                .await?;
-        }
         Ok(Box::new(
             session
                 .open_udp_routed_with_config(
@@ -1362,6 +1502,22 @@ impl IngressDataPlane {
         egress_id: &EgressId,
         transit_id: &TransitProxyId,
     ) -> Result<Arc<IngressSessionHandle>, DataPlaneError> {
+        if !self
+            .runtime
+            .read()
+            .await
+            .transit_proxy(transit_id)
+            .is_some_and(|status| {
+                matches!(
+                    status.state,
+                    RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+                )
+            })
+        {
+            return Err(DataPlaneError::TransitUnavailable(
+                transit_id.as_str().to_owned(),
+            ));
+        }
         let slot = self
             .sessions
             .get(egress_id)
@@ -1766,6 +1922,10 @@ fn flow_error(error: DataPlaneError) -> FlowBridgeError {
 #[path = "data_plane_reload_tests.rs"]
 mod reload_tests;
 
+#[cfg(test)]
+#[path = "data_plane_subscription_tests.rs"]
+mod subscription_tests;
+
 async fn shutdown_session(session: Arc<IngressSessionHandle>) -> Result<(), DataPlaneError> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut session = session;
@@ -2130,12 +2290,134 @@ mod tests {
             .await;
         assert_eq!(config.session_replication_budget_bytes, 2_000);
         assert_eq!(config.default_stream_replication_budget_bytes, 2_000);
-        assert_eq!(config.class_replication_budget_bytes["interactive"], 1_000);
+        assert_eq!(
+            config.class_replication_budget_bytes["latency:interactive"],
+            1_000
+        );
         assert!(!config.retransmission_replication_enabled);
         let class = config.traffic_class.expect("selected traffic class");
         assert_eq!(class.name, "latency:interactive");
         assert_eq!(class.priority, 10);
         assert_eq!(class.share, 100);
+    }
+
+    #[tokio::test]
+    async fn zero_replication_budget_remains_zero_even_when_replication_is_allowed() {
+        let identity = pathchord_noise::generate_static_keypair().expect("identity");
+        let policy = ValidatedPolicySnapshot::new(
+            Generation::new(1),
+            PolicyConfig {
+                traffic_policies: vec![TrafficPolicy {
+                    id: TrafficPolicyId::new("none"),
+                    scheduler: Scheduler::EffectiveCapacityWeighted,
+                    session_replication_budget_bps: 0,
+                    class_replication_budget_bps: None,
+                    retransmission_replication: RetransmissionReplication::Allowed,
+                    classes: BTreeMap::new(),
+                }],
+                fallback: Some(FallbackAction::Reject),
+                ..PolicyConfig::default()
+            },
+        )
+        .expect("policy");
+        let plane =
+            IngressDataPlane::new(IngressDataPlaneConfig::new("ingress-a", identity, policy))
+                .expect("data plane");
+        let config = plane
+            .multipath_config_for(&TrafficPolicyId::new("none"), None)
+            .await;
+        assert_eq!(config.session_replication_budget_bytes, 0);
+        assert_eq!(config.default_stream_replication_budget_bytes, 0);
+        assert!(!config.retransmission_replication_enabled);
+    }
+
+    #[tokio::test]
+    async fn replication_budget_rounds_down_and_zero_class_is_never_bypassed() {
+        let identity = pathchord_noise::generate_static_keypair().expect("identity");
+        let policy = ValidatedPolicySnapshot::new(
+            Generation::new(1),
+            PolicyConfig {
+                traffic_policies: vec![
+                    TrafficPolicy {
+                        id: TrafficPolicyId::new("low-rate"),
+                        scheduler: Scheduler::EffectiveCapacityWeighted,
+                        session_replication_budget_bps: 7,
+                        class_replication_budget_bps: None,
+                        retransmission_replication: RetransmissionReplication::Allowed,
+                        classes: BTreeMap::new(),
+                    },
+                    TrafficPolicy {
+                        id: TrafficPolicyId::new("restricted"),
+                        scheduler: Scheduler::EffectiveCapacityWeighted,
+                        session_replication_budget_bps: 80,
+                        class_replication_budget_bps: Some(0),
+                        retransmission_replication: RetransmissionReplication::Allowed,
+                        classes: BTreeMap::from([(
+                            "interactive".to_owned(),
+                            TrafficClass {
+                                priority: 1,
+                                share: 1,
+                            },
+                        )]),
+                    },
+                ],
+                fallback: Some(FallbackAction::Reject),
+                ..PolicyConfig::default()
+            },
+        )
+        .unwrap();
+        let plane =
+            IngressDataPlane::new(IngressDataPlaneConfig::new("test", identity, policy)).unwrap();
+        let low = plane
+            .multipath_config_for(&TrafficPolicyId::new("low-rate"), None)
+            .await;
+        assert_eq!(low.session_replication_budget_bytes, 0);
+        assert!(!low.retransmission_replication_enabled);
+
+        let config = plane
+            .multipath_config_for(&TrafficPolicyId::new("restricted"), Some("interactive"))
+            .await;
+        assert_eq!(config.session_replication_budget_bytes, 10);
+        assert_eq!(
+            config.class_replication_budget_bytes["restricted:interactive"],
+            0
+        );
+        assert_eq!(config.class_replication_budget_bytes["default"], 0);
+        let class_name = config.traffic_class.as_ref().unwrap().name.clone();
+        let mut session =
+            pathchord_path::MultipathSession::new(pathchord_core::SessionId::new(1), config)
+                .unwrap();
+        for path_id in [
+            pathchord_core::PathId::new(1),
+            pathchord_core::PathId::new(2),
+        ] {
+            session
+                .add_path(path_id, MultipathPathObservation::default())
+                .unwrap();
+        }
+        let stream_id = pathchord_core::StreamId::new(1).unwrap();
+        session
+            .retain_stream_data(
+                pathchord_core::StreamData {
+                    stream_id,
+                    offset: 0,
+                    flags: 0,
+                    data: vec![1],
+                },
+                class_name,
+                pathchord_core::PathId::new(1),
+            )
+            .unwrap();
+        assert!(matches!(
+            session.replicate_range(
+                stream_id,
+                0,
+                Some(pathchord_core::PathId::new(1)),
+                pathchord_path::ScheduleDirection::Upstream,
+                None
+            ),
+            Err(pathchord_path::MultipathError::ReplicationBudgetExhausted)
+        ));
     }
 
     #[tokio::test]

@@ -31,14 +31,15 @@ pub use admission::{
 pub use autoscale::{AutoscaleDecision, AutoscaleInput, PathAutoscaler, PathAutoscalerConfig};
 pub use multipath::{
     MultipathConfig, MultipathError, MultipathPathObservation, MultipathSession,
-    PathEconomicStatus, PathFailureOutcome, PathSchedule, ScheduleDirection, StreamRetransmission,
+    PathEconomicStatus, PathFailureOutcome, PathQualityExclusionReason, PathSchedule,
+    ScheduleDirection, StreamRetransmission,
 };
 pub use runtime::{
     BoxedSessionStream, EgressSessionController, EgressSessionHandle, EgressStatusConfig,
-    EgressStatusProvider, EgressStatusSample, EgressStreamFactory, EgressStreamOpenError,
-    IngressSessionHandle, IngressUdpHandle, OpenStreamError, OpenUdpError, PathExclusionReason,
-    PathQualitySnapshot, SessionRuntimeError, SessionSnapshot, SessionStream, StreamSnapshot,
-    run_egress_session,
+    EgressStatusObservation, EgressStatusProvider, EgressStatusSample, EgressStreamFactory,
+    EgressStreamOpenError, IngressSessionHandle, IngressUdpHandle, OpenStreamError, OpenUdpError,
+    PathExclusionReason, PathQualitySnapshot, SessionRuntimeError, SessionSnapshot, SessionStream,
+    StreamSnapshot, run_egress_session,
 };
 pub use session::{EgressPathSession, IngressPathSession, PathSessionConfig, PathSessionError};
 pub use single_path::{

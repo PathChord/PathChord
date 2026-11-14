@@ -35,7 +35,7 @@ pub(crate) fn prometheus(snapshot: &Value) -> String {
         (
             "pathchord_observed_connections",
             "Connections in the observation snapshot.",
-            "/connections",
+            "/observed_connections",
         ),
         (
             "pathchord_observation_generation",
@@ -45,7 +45,7 @@ pub(crate) fn prometheus(snapshot: &Value) -> String {
         (
             "pathchord_observed_paths",
             "Paths represented in the observation snapshot.",
-            "/paths",
+            "/observed_paths",
         ),
         (
             "pathchord_observed_streams",
@@ -128,8 +128,8 @@ mod tests {
     fn exports_gauges_without_turning_targets_or_admin_tags_into_labels() {
         let result = super::prometheus(&serde_json::json!({
             "runtime": {"sessions": 3, "ready_paths": 2, "streams": 7, "target_connections": 8},
-            "nodes": 4, "connections": 8, "generation": 42,
-            "paths": 2, "streams_observed": 3,
+            "nodes": 4, "observed_connections": 8, "generation": 42,
+            "observed_paths": 2, "streams_observed": 3,
             "node_health": {"unknown": 1, "up": 2, "degraded": 1, "down": 0},
             "path_quality": {"rtt_ms_sum": 25, "jitter_ms_sum": 5, "loss_ppm_sum": 4000, "throughput_bps_sum": 1000, "reordering_events": 2},
             "stream_totals": {"bytes_sent": 10, "bytes_received": 11, "bytes_acked": 9, "retransmissions": 1},

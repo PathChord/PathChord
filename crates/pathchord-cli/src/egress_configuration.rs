@@ -21,6 +21,7 @@ pub(crate) struct EgressConfiguration {
     pub capacity_bps: u64,
     pub recommended_path_count: u64,
     pub max_streams_per_ingress: usize,
+    pub remote_dns_only: bool,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: u32,
     pub web_bind: Option<SocketAddr>,
@@ -109,6 +110,18 @@ fn merge(
             "identity or --identity is required",
         ));
     }
+    let control_socket = args
+        .control_socket
+        .or_else(|| {
+            spec.control_socket.as_ref().map(|value| {
+                if value.is_absolute() {
+                    value.clone()
+                } else {
+                    base.join(value)
+                }
+            })
+        })
+        .unwrap_or_else(default_egress_socket_path);
     let resolved = EgressConfiguration {
         bind: args
             .bind
@@ -121,11 +134,7 @@ fn merge(
             &spec.authorization_db,
             "pathchord-authorizations.db",
         ),
-        control_socket: path(
-            args.control_socket,
-            &spec.control_socket,
-            DEFAULT_EGRESS_SOCKET_PATH,
-        ),
+        control_socket,
         max_concurrent_paths: args
             .max_concurrent_paths
             .or(spec.max_concurrent_paths)
@@ -142,6 +151,7 @@ fn merge(
             .max_streams_per_ingress
             .or(spec.max_streams_per_ingress)
             .unwrap_or(4096),
+        remote_dns_only: spec.remote_dns_only.unwrap_or(false),
         quota_remaining: args.quota_remaining.or(spec.quota_remaining),
         traffic_multiplier_basis_points: args
             .traffic_multiplier_basis_points
@@ -183,6 +193,10 @@ fn merge(
     Ok(resolved)
 }
 
+fn default_egress_socket_path() -> PathBuf {
+    crate::configuration::default_control_socket("egress.sock", DEFAULT_EGRESS_SOCKET_PATH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +221,7 @@ mod tests {
             bind: Some("127.0.0.1:1234".parse().unwrap()),
             identity: Some("identity.json".into()),
             authorization_db: Some("auth.db".into()),
+            remote_dns_only: Some(true),
             web_protected_transport: Some(true),
             ..Default::default()
         };
@@ -227,6 +242,7 @@ mod tests {
         assert_eq!(config.egress_id, "edge");
         assert_eq!(config.identity, base.join("identity.json"));
         assert_eq!(config.authorization_db, Path::new("cli.db"));
+        assert!(config.remote_dns_only);
         assert!(!config.web_protected_transport);
     }
 

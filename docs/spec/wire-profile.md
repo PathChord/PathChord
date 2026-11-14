@@ -121,6 +121,10 @@ The frame type registry is:
 | 9 | STATUS_REPORT | control |
 | 10 | HEARTBEAT | control |
 | 11 | CONTROL_ACK | control |
+| 12 | PATH_READY_CAPABILITIES | control |
+| 13 | SESSION_CONTROL | control |
+| 14 | SESSION_CONTROL_ACK | control |
+| 15 | SESSION_CONTROL_CANCEL | control |
 | 32 | STREAM_OPEN | control |
 | 33 | STREAM_OPEN_OK | control |
 | 34 | STREAM_OPEN_ERR | control |
@@ -129,11 +133,13 @@ The frame type registry is:
 | 37 | STREAM_WINDOW | control |
 | 38 | STREAM_FIN | control |
 | 39 | STREAM_RST | control |
+| 40 | STREAM_OPEN_CLASS | control |
 | 64 | UDP_OPEN | control |
 | 65 | UDP_OPEN_OK | control |
 | 66 | UDP_OPEN_ERR | control |
 | 67 | UDP_DATAGRAM | bulk |
 | 68 | UDP_CLOSE | control |
+| 69 | UDP_OPEN_CLASS | control |
 
 The v1 capability bitset carried by PATH_HELLO assigns bits as follows:
 
@@ -141,7 +147,7 @@ The v1 capability bitset carried by PATH_HELLO assigns bits as follows:
 |---:|---|
 | 0 | TCP_STREAM |
 | 1 | UDP_SESSION |
-| 2 | MULTIPATH |
+| 2 | TRAFFIC_CLASSES |
 | 3 | CONTROL_REPLICATION |
 | 4 | ADDRESS_CANDIDATES |
 | 5 | EXTENDED_STATUS_REPORT |
@@ -242,6 +248,24 @@ max_session_buffering    varint
 Each value is positive and no greater than the profile limit. PATH_READY is the
 first state in which business frames are permitted.
 
+PATH_READY_CAPABILITIES extends PATH_READY with one capability bitset:
+
+~~~text
+max_frame_payload        varint
+max_control_payload      varint
+max_session_buffering    varint
+capabilities             varint bitset
+~~~
+
+When `TRAFFIC_CLASSES` is negotiated, `STREAM_OPEN_CLASS` and `UDP_OPEN_CLASS`
+carry the legacy open payload followed by:
+
+~~~text
+class_name               bytes(256), non-empty UTF-8
+class_priority           varint, 0..=255
+class_share              varint, 1..=1000000
+~~~
+
 PATH_DRAIN:
 
 ~~~text
@@ -273,9 +297,65 @@ range_count          varint, at most max_ack_ranges
 ranges               repeated inclusive [start, end] varint pairs
 ~~~
 
-Ranges are ordered, non-overlapping, and in the Session control sequence
-space. A sender retains a control message until its sequence is covered by an
-ACK or the Session closes.
+`CONTROL_ACK` acknowledges the Path-local `HEARTBEAT` sequence on the same
+Path. Its ranges are ordered and non-overlapping.
+
+SESSION_CONTROL carries one Session-scoped operation:
+
+~~~text
+control_seqno         varint
+dependency_present    varint (0 or 1)
+depends_on            varint, present only when dependency_present = 1
+inner_frame_type      varint
+eligible_path_count   varint, 0..=256
+eligible_paths        repeated PathID, sorted and unique
+inner_payload         bytes(max_control_payload)
+~~~
+
+`inner_frame_type` is one of SESSION_CLOSE, STREAM_OPEN, STREAM_OPEN_CLASS,
+STREAM_OPEN_OK, STREAM_OPEN_ERR, STREAM_ACK, STREAM_WINDOW, STREAM_FIN,
+STREAM_RST, UDP_OPEN, UDP_OPEN_CLASS, UDP_OPEN_OK, UDP_OPEN_ERR, or UDP_CLOSE.
+`inner_payload` is its canonical payload without a frame header. The complete
+SESSION_CONTROL payload, including this envelope, is bounded by
+`max_control_payload`. A dependency MUST be less than the control sequence.
+Only STREAM_OPEN, STREAM_OPEN_CLASS, UDP_OPEN, and UDP_OPEN_CLASS may carry a
+non-empty eligible Path list. An empty list means no explicit Path restriction;
+otherwise the Path carrying the opening operation MUST be in the list. The
+Egress applies the list to both directions of that flow. A listed Path must
+still have been independently admitted to the same Session before it is used.
+Each sender has an independent Session-wide control sequence starting at zero.
+The receiver applies operations in sequence order and discards duplicates;
+an operation is not applied before its dependency. The sender retains and
+retransmits the operation until acknowledged. Copies on other eligible Paths
+use new Path frame sequences and Noise nonces, while preserving the control
+sequence and payload. Path HELLO, attach, readiness, DRAIN, CLOSE, STATUS_REPORT,
+HEARTBEAT, and CONTROL_ACK remain Path-local and are never wrapped.
+
+SESSION_CONTROL_ACK has the same payload encoding as CONTROL_ACK, but ranges
+refer to the authenticated sender's peer direction and Session control sequence
+space. `highest_contiguous` acknowledges all sequences through that value;
+selective ranges are optional. A receiver does not send an ACK before it has
+applied at least sequence 0. ACKs are sent on a Path on which a copy arrived.
+Closing a Session retains the receiver long enough to acknowledge a retried
+SESSION_CLOSE, and the initiating endpoint closes after receiving its ACK or
+losing the Session transport.
+
+If a flow loses all its eligible Paths, SESSION_CONTROL_CANCEL may replace an
+unacknowledged operation for that flow at the same control sequence. It may also
+use a new sequence when no operation for that flow remains unacknowledged:
+
+~~~text
+control_seqno         varint
+flow_kind             varint (0=TCP Stream, 1=UDP Association)
+flow_id               varint
+~~~
+
+It contains only the Session-local opaque flow ID, never a target, credentials,
+or business bytes, and may travel on any ready authenticated Path of that
+Session. A receiver processes the cancellation in the same sequence space,
+replacing a queued operation of the same sequence and flow. If the original
+operation was already applied, cancellation tears down that flow. Duplicates
+are idempotent; ACKs cover canceled sequences just as for other operations.
 
 ### Status report
 

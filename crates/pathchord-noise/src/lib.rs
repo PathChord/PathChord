@@ -205,6 +205,17 @@ pub enum ReplayError {
     },
 }
 
+/// Result of opening an authenticated Path frame while applying the replay
+/// window. Duplicate and stale records are valid authenticated network
+/// traffic that must be discarded without terminating the Path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplayAwareFrame {
+    /// A new frame was authenticated and accepted by the replay window.
+    Accepted(PathFrame),
+    /// The authenticated record was a duplicate or fell outside the window.
+    Dropped,
+}
+
 /// A bounded sliding replay window for one authenticated transport direction.
 ///
 /// Authentication must happen before [`Self::accept`] is called. This prevents
@@ -867,6 +878,23 @@ impl NoiseTransport {
         self.open_frame(&record, limits)
     }
 
+    /// Opens an encoded frame and treats authenticated duplicate/stale records
+    /// as drops. Protocol callers that read an unreliable or replicated Path
+    /// should use this method so a replay cannot tear down the Path.
+    pub fn open_encoded_frame_replay_aware(
+        &mut self,
+        encoded: &[u8],
+        limits: ProtocolLimits,
+    ) -> Result<ReplayAwareFrame, NoiseError> {
+        match self.open_encoded_frame(encoded, limits) {
+            Ok(frame) => Ok(ReplayAwareFrame::Accepted(frame)),
+            Err(NoiseError::Replay(ReplayError::Duplicate { .. } | ReplayError::Stale { .. })) => {
+                Ok(ReplayAwareFrame::Dropped)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Opens one record and decodes a complete PathChord frame.
     ///
     /// The nonce/header equality check is part of the authenticated record
@@ -1425,6 +1453,40 @@ mod tests {
             responder.open_record(&record),
             Err(NoiseError::Replay(ReplayError::Duplicate { nonce: 0 }))
         ));
+    }
+
+    #[test]
+    fn replay_aware_frame_open_drops_authenticated_duplicates() {
+        use pathchord_core::{FrameFlags, FrameType, PathFrame, PathId, ProtocolLimits, SessionId};
+
+        let (mut initiator, mut responder) = establish_path([26; 32], [27; 32]);
+        let limits = ProtocolLimits::default();
+        let frame = PathFrame::new(
+            FrameType::Heartbeat,
+            FrameFlags::empty(),
+            SessionId::new(1),
+            PathId::new(2),
+            0,
+            Vec::new(),
+            limits,
+        )
+        .expect("frame");
+        let encoded = initiator
+            .seal_frame(&frame, limits)
+            .expect("record")
+            .encode();
+        assert_eq!(
+            responder
+                .open_encoded_frame_replay_aware(&encoded, limits)
+                .expect("first frame"),
+            ReplayAwareFrame::Accepted(frame)
+        );
+        assert_eq!(
+            responder
+                .open_encoded_frame_replay_aware(&encoded, limits)
+                .expect("duplicate is a drop"),
+            ReplayAwareFrame::Dropped
+        );
     }
 
     #[test]

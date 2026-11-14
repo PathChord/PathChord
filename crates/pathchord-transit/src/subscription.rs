@@ -11,6 +11,7 @@ use pathchord_policy::{
     TransitSource,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -65,6 +66,10 @@ pub enum SubscriptionError {
     CacheIo,
     #[error("subscription cache document is invalid")]
     InvalidCache,
+    #[error("subscription refresh candidate is no longer current")]
+    StaleCandidate,
+    #[error("subscription control commit failed")]
+    ControlCommit,
     #[error("subscription node identity conflicts with another source")]
     NodeIdentityConflict,
     #[error("system clock is before the Unix epoch")]
@@ -276,6 +281,8 @@ pub struct DynamicTransitNode {
     pub diagnostic: Option<NodeDiagnostic>,
     #[serde(default)]
     pub usage: Option<SubscriptionUsage>,
+    #[serde(default)]
+    source_fingerprint: String,
     credential: SubscriptionCredential,
 }
 
@@ -381,7 +388,34 @@ pub enum CacheLoadOutcome {
     NotConfigured,
     Missing,
     Expired,
+    SourceMismatch,
+    UnverifiedSource,
     Disabled { diff: SnapshotDiff },
+}
+
+/// Private staged candidate. Dropping it discards the temporary cache file.
+pub struct PreparedSubscriptionRefresh {
+    config: SubscriptionConfig,
+    source_fingerprint: String,
+    captured_control_generation: u64,
+    attempts: u32,
+    nodes: Vec<NormalizedNode>,
+    staged_cache: Option<atomic_write_file::AtomicWriteFile>,
+}
+
+impl fmt::Debug for PreparedSubscriptionRefresh {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSubscriptionRefresh")
+            .field("subscription_id", &self.config.id)
+            .field(
+                "captured_control_generation",
+                &self.captured_control_generation,
+            )
+            .field("attempts", &self.attempts)
+            .field("nodes", &self.nodes.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[async_trait]
@@ -405,6 +439,8 @@ pub struct SubscriptionManager {
     cache_root: PathBuf,
     available_adapters: BTreeSet<String>,
     snapshot: DynamicTransitSnapshot,
+    current_sources: BTreeMap<SubscriptionId, String>,
+    pending_nodes: BTreeMap<SubscriptionId, PendingSubscriptionNodes>,
 }
 
 impl fmt::Debug for SubscriptionManager {
@@ -431,6 +467,8 @@ impl SubscriptionManager {
             cache_root: cache_root.into(),
             available_adapters,
             snapshot: DynamicTransitSnapshot::default(),
+            current_sources: BTreeMap::new(),
+            pending_nodes: BTreeMap::new(),
         }
     }
 
@@ -447,6 +485,8 @@ impl SubscriptionManager {
             cache_root: cache_root.into(),
             available_adapters,
             snapshot: DynamicTransitSnapshot::default(),
+            current_sources: BTreeMap::new(),
+            pending_nodes: BTreeMap::new(),
         }
     }
 
@@ -461,14 +501,30 @@ impl SubscriptionManager {
                 diff: self.disable(&config.id),
             };
         }
-        if config.source.source_type == SubscriptionSourceType::Static {
-            return RefreshOutcome::Retained {
+        let fingerprint = subscription_source_fingerprint(config);
+        self.set_current_source(&config.id, &fingerprint);
+        match self.prepare_refresh(config, 0).await {
+            Ok(prepared) => self.commit_prepared_refresh(prepared, 0).await,
+            Err(outcome) => outcome,
+        }
+    }
+
+    /// Fetch and validate a candidate without publishing it or replacing the
+    /// live cache. The caller must fence the captured control generation.
+    #[allow(clippy::result_large_err)]
+    pub async fn prepare_refresh(
+        &self,
+        config: &SubscriptionConfig,
+        captured_control_generation: u64,
+    ) -> Result<PreparedSubscriptionRefresh, RefreshOutcome> {
+        if !config.enabled || config.source.source_type == SubscriptionSourceType::Static {
+            return Err(RefreshOutcome::Retained {
                 generation: self.snapshot.generation,
                 attempts: 0,
                 error: SubscriptionError::StaticSource,
-            };
+            });
         }
-
+        let source_fingerprint = subscription_source_fingerprint(config);
         let attempts = config.refresh.max_attempts.clamp(1, 10);
         let mut last_error = SubscriptionError::Fetch;
         for attempt in 1..=attempts {
@@ -487,40 +543,31 @@ impl SubscriptionManager {
             };
             match candidate {
                 Ok(nodes) => {
-                    if let Some(cache) = &config.cache {
-                        let published_at = match unix_seconds() {
-                            Ok(value) => value,
-                            Err(error) => {
-                                return RefreshOutcome::Retained {
-                                    generation: self.snapshot.generation,
-                                    attempts: attempt,
-                                    error,
-                                };
-                            }
-                        };
-                        if let Err(error) = self.write_cache(config, published_at, &nodes).await {
-                            return RefreshOutcome::Retained {
-                                generation: self.snapshot.generation,
-                                attempts: attempt,
-                                error,
-                            };
-                        }
-                        debug_assert!(!cache.path.is_empty());
+                    if let Err(error) = self.validate_candidate(&config.id, &nodes) {
+                        return Err(RefreshOutcome::Retained {
+                            generation: self.snapshot.generation,
+                            attempts: attempt,
+                            error,
+                        });
                     }
-                    let diff = match self.publish(&config.id, nodes) {
-                        Ok(diff) => diff,
+                    let staged_cache = match self.prepare_cache(config, &nodes).await {
+                        Ok(cache) => cache,
                         Err(error) => {
-                            return RefreshOutcome::Retained {
+                            return Err(RefreshOutcome::Retained {
                                 generation: self.snapshot.generation,
                                 attempts: attempt,
                                 error,
-                            };
+                            });
                         }
                     };
-                    return RefreshOutcome::Published {
+                    return Ok(PreparedSubscriptionRefresh {
+                        config: config.clone(),
+                        source_fingerprint,
+                        captured_control_generation,
                         attempts: attempt,
-                        diff,
-                    };
+                        nodes,
+                        staged_cache,
+                    });
                 }
                 Err(error) => last_error = error,
             }
@@ -530,10 +577,81 @@ impl SubscriptionManager {
                     .await;
             }
         }
-        RefreshOutcome::Retained {
+        Err(RefreshOutcome::Retained {
             generation: self.snapshot.generation,
             attempts,
             error: last_error,
+        })
+    }
+
+    pub async fn commit_prepared_refresh(
+        &mut self,
+        prepared: PreparedSubscriptionRefresh,
+        current_control_generation: u64,
+    ) -> RefreshOutcome {
+        self.commit_prepared_refresh_with(prepared, current_control_generation, || Ok(()))
+            .await
+    }
+
+    /// The caller holds its control lock across this call. `commit_control`
+    /// durably records success after validation, before cache replacement.
+    pub async fn commit_prepared_refresh_with<F>(
+        &mut self,
+        prepared: PreparedSubscriptionRefresh,
+        current_control_generation: u64,
+        commit_control: F,
+    ) -> RefreshOutcome
+    where
+        F: FnOnce() -> Result<(), SubscriptionError>,
+    {
+        let PreparedSubscriptionRefresh {
+            config,
+            source_fingerprint,
+            captured_control_generation,
+            attempts,
+            nodes,
+            staged_cache,
+        } = prepared;
+        if captured_control_generation != current_control_generation
+            || self.current_sources.get(&config.id) != Some(&source_fingerprint)
+        {
+            return RefreshOutcome::Retained {
+                generation: self.snapshot.generation,
+                attempts,
+                error: SubscriptionError::StaleCandidate,
+            };
+        }
+        if let Err(error) = self.validate_candidate(&config.id, &nodes) {
+            return RefreshOutcome::Retained {
+                generation: self.snapshot.generation,
+                attempts,
+                error,
+            };
+        }
+        if let Err(error) = commit_control() {
+            return RefreshOutcome::Retained {
+                generation: self.snapshot.generation,
+                attempts,
+                error,
+            };
+        }
+        if let Some(cache) = staged_cache {
+            let result = tokio::task::spawn_blocking(move || cache.commit()).await;
+            if !matches!(result, Ok(Ok(()))) {
+                return RefreshOutcome::Retained {
+                    generation: self.snapshot.generation,
+                    attempts,
+                    error: SubscriptionError::CacheIo,
+                };
+            }
+        }
+        match self.publish(&config.id, &source_fingerprint, nodes) {
+            Ok(diff) => RefreshOutcome::Published { attempts, diff },
+            Err(error) => RefreshOutcome::Retained {
+                generation: self.snapshot.generation,
+                attempts,
+                error,
+            },
         }
     }
 
@@ -546,6 +664,8 @@ impl SubscriptionManager {
                 diff: self.disable(&config.id),
             });
         }
+        let source_fingerprint = subscription_source_fingerprint(config);
+        self.set_current_source(&config.id, &source_fingerprint);
         let Some(cache) = &config.cache else {
             return Ok(CacheLoadOutcome::NotConfigured);
         };
@@ -565,14 +685,24 @@ impl SubscriptionManager {
             .map_err(|_| SubscriptionError::CacheIo)?;
         let cached: CacheEnvelope =
             serde_json::from_slice(&encoded).map_err(|_| SubscriptionError::InvalidCache)?;
+        if cached.version == 1 {
+            return Ok(CacheLoadOutcome::UnverifiedSource);
+        }
+        if cached.version != 2 || cached.subscription_id != config.id {
+            return Err(SubscriptionError::InvalidCache);
+        }
+        match cached.source_fingerprint.as_deref() {
+            None => return Ok(CacheLoadOutcome::UnverifiedSource),
+            Some(fingerprint) if fingerprint != source_fingerprint => {
+                return Ok(CacheLoadOutcome::SourceMismatch);
+            }
+            Some(_) => {}
+        }
         let now = unix_seconds()?;
         if now.saturating_sub(cached.published_at_unix_seconds) > cache.max_age_seconds {
             return Ok(CacheLoadOutcome::Expired);
         }
-        if cached.version != 1
-            || cached.subscription_id != config.id
-            || cached.nodes.len() > MAX_SUBSCRIPTION_NODES
-        {
+        if cached.nodes.len() > MAX_SUBSCRIPTION_NODES {
             return Err(SubscriptionError::InvalidCache);
         }
         for node in &cached.nodes {
@@ -594,25 +724,28 @@ impl SubscriptionManager {
                 usage: node.usage,
             })
             .collect();
-        let diff = self.publish(&config.id, nodes)?;
+        let diff = self.publish(&config.id, &source_fingerprint, nodes)?;
         Ok(CacheLoadOutcome::Loaded { diff })
     }
 
     pub fn reconcile(&mut self, configured: &[SubscriptionConfig]) -> SnapshotDiff {
-        let enabled: BTreeSet<_> = configured
+        let enabled: BTreeMap<_, _> = configured
             .iter()
             .filter(|config| config.enabled)
-            .map(|config| config.id.clone())
+            .map(|config| (config.id.clone(), subscription_source_fingerprint(config)))
             .collect();
+        self.pending_nodes
+            .retain(|id, pending| enabled.get(id) == Some(&pending.source_fingerprint));
         let mut draining = Vec::new();
         for (id, node) in &mut self.snapshot.nodes {
-            if !enabled.contains(&node.source_subscription)
+            if enabled.get(&node.source_subscription) != Some(&node.source_fingerprint)
                 && node.state != DynamicNodeState::Draining
             {
                 node.state = DynamicNodeState::Draining;
                 draining.push(id.clone());
             }
         }
+        self.current_sources = enabled;
         if !draining.is_empty() {
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
         }
@@ -632,17 +765,85 @@ impl SubscriptionManager {
             }
             !remove
         });
-        if !removed.is_empty() {
+        let removed_ids: BTreeSet<_> = removed.iter().cloned().collect();
+        let mut promoted = Vec::new();
+        for (subscription_id, pending) in &mut self.pending_nodes {
+            if self.current_sources.get(subscription_id) != Some(&pending.source_fingerprint) {
+                continue;
+            }
+            for id in &removed_ids {
+                if let Some(node) = pending.nodes.remove(id) {
+                    promoted.push((
+                        subscription_id.clone(),
+                        pending.source_fingerprint.clone(),
+                        id.clone(),
+                        node,
+                    ));
+                }
+            }
+        }
+        self.pending_nodes
+            .retain(|_, pending| !pending.nodes.is_empty());
+        let mut added = Vec::new();
+        let mut unavailable = Vec::new();
+        for (subscription_id, source_fingerprint, id, normalized) in promoted {
+            if matches!(normalized.state, DynamicNodeState::Unavailable(_)) {
+                unavailable.push(id.clone());
+            }
+            self.snapshot.nodes.insert(
+                id.clone(),
+                DynamicTransitNode {
+                    config: normalized.config,
+                    source_subscription: subscription_id,
+                    state: normalized.state,
+                    diagnostic: normalized.diagnostic,
+                    usage: normalized.usage,
+                    source_fingerprint,
+                    credential: normalized.credential,
+                },
+            );
+            added.push(id);
+        }
+        if !removed.is_empty() || !added.is_empty() {
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
         }
         SnapshotDiff {
             generation: self.snapshot.generation,
             removed,
+            added,
+            unavailable,
             ..SnapshotDiff::default()
         }
     }
 
+    fn set_current_source(&mut self, id: &SubscriptionId, fingerprint: &str) {
+        self.current_sources
+            .insert(id.clone(), fingerprint.to_owned());
+        if self
+            .pending_nodes
+            .get(id)
+            .is_some_and(|pending| pending.source_fingerprint != fingerprint)
+        {
+            self.pending_nodes.remove(id);
+        }
+        let mut changed = false;
+        for node in self.snapshot.nodes.values_mut() {
+            if &node.source_subscription == id
+                && node.source_fingerprint != fingerprint
+                && node.state != DynamicNodeState::Draining
+            {
+                node.state = DynamicNodeState::Draining;
+                changed = true;
+            }
+        }
+        if changed {
+            self.snapshot.generation = self.snapshot.generation.saturating_add(1);
+        }
+    }
+
     fn disable(&mut self, id: &SubscriptionId) -> SnapshotDiff {
+        self.current_sources.remove(id);
+        self.pending_nodes.remove(id);
         let mut draining = Vec::new();
         for (node_id, node) in &mut self.snapshot.nodes {
             if &node.source_subscription == id && node.state != DynamicNodeState::Draining {
@@ -660,13 +861,13 @@ impl SubscriptionManager {
         }
     }
 
-    fn publish(
-        &mut self,
+    fn validate_candidate(
+        &self,
         subscription_id: &SubscriptionId,
-        nodes: Vec<NormalizedNode>,
-    ) -> Result<SnapshotDiff, SubscriptionError> {
+        nodes: &[NormalizedNode],
+    ) -> Result<(), SubscriptionError> {
         let mut candidate_ids = BTreeSet::new();
-        for node in &nodes {
+        for node in nodes {
             if !candidate_ids.insert(node.config.id.clone()) {
                 return Err(SubscriptionError::NodeIdentityConflict);
             }
@@ -679,6 +880,17 @@ impl SubscriptionManager {
                 return Err(SubscriptionError::NodeIdentityConflict);
             }
         }
+        Ok(())
+    }
+
+    fn publish(
+        &mut self,
+        subscription_id: &SubscriptionId,
+        source_fingerprint: &str,
+        nodes: Vec<NormalizedNode>,
+    ) -> Result<SnapshotDiff, SubscriptionError> {
+        self.validate_candidate(subscription_id, &nodes)?;
+        let candidate_ids: BTreeSet<_> = nodes.iter().map(|node| node.config.id.clone()).collect();
 
         let mut diff = SnapshotDiff::default();
         let existing_ids: Vec<_> = self
@@ -697,14 +909,25 @@ impl SubscriptionManager {
                 }
             }
         }
+        let mut deferred = BTreeMap::new();
         for normalized in nodes {
             let id = normalized.config.id.clone();
+            if self
+                .snapshot
+                .nodes
+                .get(&id)
+                .is_some_and(|existing| existing.state == DynamicNodeState::Draining)
+            {
+                deferred.insert(id, normalized);
+                continue;
+            }
             let node = DynamicTransitNode {
                 config: normalized.config,
                 source_subscription: subscription_id.clone(),
                 state: normalized.state,
                 diagnostic: normalized.diagnostic,
                 usage: normalized.usage,
+                source_fingerprint: source_fingerprint.to_owned(),
                 credential: normalized.credential,
             };
             match self.snapshot.nodes.insert(id.clone(), node) {
@@ -721,21 +944,29 @@ impl SubscriptionManager {
                 diff.unavailable.push(id);
             }
         }
+        self.pending_nodes.remove(subscription_id);
+        if !deferred.is_empty() {
+            self.pending_nodes.insert(
+                subscription_id.clone(),
+                PendingSubscriptionNodes {
+                    source_fingerprint: source_fingerprint.to_owned(),
+                    nodes: deferred,
+                },
+            );
+        }
         self.snapshot.generation = self.snapshot.generation.saturating_add(1);
         diff.generation = self.snapshot.generation;
         Ok(diff)
     }
 
-    async fn write_cache(
+    async fn prepare_cache(
         &self,
         config: &SubscriptionConfig,
-        published_at_unix_seconds: u64,
         nodes: &[NormalizedNode],
-    ) -> Result<(), SubscriptionError> {
-        let cache = config
-            .cache
-            .as_ref()
-            .ok_or(SubscriptionError::InvalidCachePath)?;
+    ) -> Result<Option<atomic_write_file::AtomicWriteFile>, SubscriptionError> {
+        let Some(cache) = config.cache.as_ref() else {
+            return Ok(None);
+        };
         let path = resolve_cache_path(&self.cache_root, &cache.path)?;
         let cached_nodes = nodes
             .iter()
@@ -749,16 +980,17 @@ impl SubscriptionManager {
             })
             .collect();
         let envelope = CacheEnvelope {
-            version: 1,
-            published_at_unix_seconds,
+            version: 2,
+            published_at_unix_seconds: unix_seconds()?,
             subscription_id: config.id.clone(),
+            source_fingerprint: Some(subscription_source_fingerprint(config)),
             nodes: cached_nodes,
         };
         let encoded = serde_json::to_vec(&envelope).map_err(|_| SubscriptionError::InvalidCache)?;
         if encoded.len() as u64 > MAX_CACHE_BYTES {
             return Err(SubscriptionError::InvalidCache);
         }
-        atomic_write(&path, &encoded).await
+        stage_atomic_write(path, encoded).await.map(Some)
     }
 }
 
@@ -771,12 +1003,45 @@ struct NormalizedNode {
     usage: Option<SubscriptionUsage>,
 }
 
+#[derive(Debug)]
+struct PendingSubscriptionNodes {
+    source_fingerprint: String,
+    nodes: BTreeMap<TransitProxyId, NormalizedNode>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEnvelope {
     version: u8,
     published_at_unix_seconds: u64,
     subscription_id: SubscriptionId,
+    #[serde(default)]
+    source_fingerprint: Option<String>,
     nodes: Vec<CachedNode>,
+}
+
+fn subscription_source_fingerprint(config: &SubscriptionConfig) -> String {
+    use std::fmt::Write as _;
+    let mut digest = Sha256::new();
+    digest.update(b"PathChord/subscription-source/v2\0");
+    for value in [
+        Some(config.source.source_type.as_str()),
+        Some(config.source.url.as_str()),
+        config.source.credentials_ref.as_deref(),
+    ] {
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                digest.update((value.len() as u64).to_be_bytes());
+                digest.update(value.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+    let mut result = String::with_capacity(64);
+    for byte in digest.finalize() {
+        write!(result, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    result
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -947,11 +1212,20 @@ fn resolve_cache_path(root: &Path, configured: &str) -> Result<PathBuf, Subscrip
     Ok(root.join(path))
 }
 
+#[cfg(test)]
 async fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), SubscriptionError> {
-    use std::io::Write as _;
+    let file = stage_atomic_write(path.to_owned(), contents.to_vec()).await?;
+    tokio::task::spawn_blocking(move || file.commit())
+        .await
+        .map_err(|_| SubscriptionError::CacheIo)?
+        .map_err(|_| SubscriptionError::CacheIo)
+}
 
-    let path = path.to_owned();
-    let contents = contents.to_vec();
+async fn stage_atomic_write(
+    path: PathBuf,
+    contents: Vec<u8>,
+) -> Result<atomic_write_file::AtomicWriteFile, SubscriptionError> {
+    use std::io::Write as _;
     tokio::task::spawn_blocking(move || {
         let parent = path.parent().ok_or(SubscriptionError::InvalidCachePath)?;
         std::fs::create_dir_all(parent).map_err(|_| SubscriptionError::CacheIo)?;
@@ -968,7 +1242,8 @@ async fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), SubscriptionEr
             .map_err(|_| SubscriptionError::CacheIo)?;
         file.write_all(&contents)
             .map_err(|_| SubscriptionError::CacheIo)?;
-        file.commit().map_err(|_| SubscriptionError::CacheIo)
+        file.sync_all().map_err(|_| SubscriptionError::CacheIo)?;
+        Ok(file)
     })
     .await
     .map_err(|_| SubscriptionError::CacheIo)?
@@ -1047,6 +1322,46 @@ mod tests {
             },
             cache,
         }
+    }
+
+    #[tokio::test]
+    async fn stale_prepared_refresh_cannot_publish_after_source_replacement() {
+        let fetcher = Arc::new(ScriptedFetcher::new([
+            Ok(CLASH.as_bytes().to_vec()),
+            Ok(CLASH.as_bytes().to_vec()),
+        ]));
+        let mut manager = SubscriptionManager::new(
+            fetcher,
+            temp_directory("stale-prepared-refresh"),
+            BTreeSet::from(["http".into(), "ss".into()]),
+        );
+        let first = config(SubscriptionSourceType::Clash, None);
+        manager.reconcile(std::slice::from_ref(&first));
+        let prepared = manager
+            .prepare_refresh(&first, 0)
+            .await
+            .expect("first candidate");
+
+        let mut replacement = first.clone();
+        replacement.source.url = "https://subscription.example.test/replacement".into();
+        manager.reconcile(std::slice::from_ref(&replacement));
+        let stale = manager.commit_prepared_refresh(prepared, 1).await;
+        assert!(matches!(
+            stale,
+            RefreshOutcome::Retained {
+                error: SubscriptionError::StaleCandidate,
+                ..
+            }
+        ));
+        assert!(manager.snapshot().nodes.is_empty());
+
+        let prepared = manager
+            .prepare_refresh(&replacement, 1)
+            .await
+            .expect("replacement candidate");
+        let published = manager.commit_prepared_refresh(prepared, 1).await;
+        assert!(matches!(published, RefreshOutcome::Published { .. }));
+        assert!(!manager.snapshot().nodes.is_empty());
     }
 
     fn temp_directory(label: &str) -> PathBuf {
@@ -1236,6 +1551,142 @@ proxies:
         assert_eq!(
             expired.load_cache(&subscription).await.unwrap(),
             CacheLoadOutcome::Expired
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_is_bound_to_the_complete_subscription_source() {
+        let directory = temp_directory("source-fingerprint");
+        let cache = SubscriptionCache {
+            path: "provider.snapshot".into(),
+            max_age_seconds: 86_400,
+        };
+        let subscription = config(SubscriptionSourceType::Clash, Some(cache.clone()));
+        let mut manager = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([Ok(CLASH.as_bytes().to_vec())])),
+            &directory,
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        assert!(matches!(
+            manager.refresh(&subscription).await,
+            RefreshOutcome::Published { .. }
+        ));
+
+        let mut restored = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([])),
+            &directory,
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        assert!(matches!(
+            restored.load_cache(&subscription).await.unwrap(),
+            CacheLoadOutcome::Loaded { .. }
+        ));
+
+        let mut changed_url = subscription.clone();
+        changed_url.source.url = "https://subscription.example.test/changed?token=private".into();
+        let mut changed = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([])),
+            &directory,
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        assert_eq!(
+            changed.load_cache(&changed_url).await.unwrap(),
+            CacheLoadOutcome::SourceMismatch
+        );
+
+        let cache_path = directory.join(&cache.path);
+        let mut envelope: CacheEnvelope =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        envelope.version = 1;
+        envelope.source_fingerprint = None;
+        atomic_write(&cache_path, &serde_json::to_vec(&envelope).unwrap())
+            .await
+            .unwrap();
+        let mut legacy = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([])),
+            &directory,
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        assert_eq!(
+            legacy.load_cache(&subscription).await.unwrap(),
+            CacheLoadOutcome::UnverifiedSource
+        );
+    }
+
+    #[tokio::test]
+    async fn source_change_drains_old_nodes_and_promotes_new_nodes_after_release() {
+        let fetcher = Arc::new(ScriptedFetcher::new([
+            Ok(CLASH.as_bytes().to_vec()),
+            Ok(CLASH.as_bytes().to_vec()),
+        ]));
+        let mut manager = SubscriptionManager::new(
+            fetcher,
+            temp_directory("source-drain"),
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        let first = config(SubscriptionSourceType::Clash, None);
+        assert!(matches!(
+            manager.refresh(&first).await,
+            RefreshOutcome::Published { .. }
+        ));
+        let old_ids: BTreeSet<_> = manager.snapshot.nodes.keys().cloned().collect();
+        let mut changed = first.clone();
+        changed.source.url = "https://subscription.example.test/other".into();
+        changed.refresh.max_attempts = 1;
+        assert!(matches!(
+            manager.refresh(&changed).await,
+            RefreshOutcome::Published { .. }
+        ));
+        assert!(
+            manager
+                .snapshot
+                .nodes
+                .values()
+                .all(|node| node.state == DynamicNodeState::Draining)
+        );
+        let promoted = manager.complete_draining(&old_ids);
+        assert_eq!(promoted.added.len(), old_ids.len());
+        assert!(manager.snapshot.selectable_nodes().count() == old_ids.len());
+        assert!(
+            manager
+                .snapshot
+                .nodes
+                .values()
+                .all(|node| node.source_fingerprint == subscription_source_fingerprint(&changed))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_provider_refresh_does_not_resurrect_draining_nodes_from_an_old_source() {
+        let fetcher = Arc::new(ScriptedFetcher::new([
+            Ok(CLASH.as_bytes().to_vec()),
+            Err(SubscriptionError::Fetch),
+            Err(SubscriptionError::Fetch),
+            Err(SubscriptionError::Fetch),
+        ]));
+        let mut manager = SubscriptionManager::new(
+            fetcher,
+            temp_directory("source-provider-drain"),
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        let first = config(SubscriptionSourceType::Clash, None);
+        assert!(matches!(
+            manager.refresh(&first).await,
+            RefreshOutcome::Published { .. }
+        ));
+        let mut changed = first.clone();
+        changed.source.url = "https://subscription.example.test/other".into();
+        changed.refresh.max_attempts = 1;
+        assert!(matches!(
+            manager.refresh(&changed).await,
+            RefreshOutcome::Retained { .. }
+        ));
+        assert!(
+            manager
+                .snapshot
+                .nodes
+                .values()
+                .all(|node| node.state == DynamicNodeState::Draining)
         );
     }
 

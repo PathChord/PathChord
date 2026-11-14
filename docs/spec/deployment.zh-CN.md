@@ -36,6 +36,13 @@ cargo build --locked --release -p pathchord-cli
 ./target/release/pathchord ingress --config examples/ingress-direct.yaml
 ```
 
+普通 Unix 用户的 Ingress 控制 socket 默认使用
+`$XDG_RUNTIME_DIR/pathchord/ingress.sock`（该目录可用时），否则使用
+`~/.config/pathchord/ingress.sock`。root 和软件包服务账号使用
+`/run/pathchord/ingress.sock`；服务包会在启动前创建该运行目录。需要其他本地端点时，
+可以显式传入 `--socket`。`enroll` 命令默认使用对应的 `egress.sock` 端点；显式指定的
+socket 优先。
+
 Mixed 监听器绑定 `127.0.0.1:7890`。无认证示例限制在回环地址。应用可以对同一个地址选择
 HTTP 或 SOCKS：
 
@@ -139,5 +146,5 @@ Unix socket 的所有权/权限和 Windows Named Pipe ACL 保护本地管理接�
 启用，并共用本地 dispatcher；配置的 `--web-token-file` 提供 bearer token。Prometheus 在
 `/metrics` 抓取，使用相同的认证、Origin 检查和 `metrics:read` 能力。
 
-每个服务接受 Ctrl-C 关停，并拥有任务和连接清理责任。持久配置变更遵循重载契约；身份、
+每个服务接受 Ctrl-C 关停，在 Unix 上也接受 SIGTERM，并拥有任务和连接清理责任。持久配置变更遵循重载契约；身份、
 监听器拓扑和其他只在启动时加载的设置，在重载响应明确要求时需要重启服务。
