@@ -79,6 +79,10 @@ until its wire and obfuscation implementation is complete.
 5. Connect the Prometheus endpoint and structured observations to deployed
    monitoring, alerts, and dashboards. Keep live gauges distinct from
    historical counters, and measure production probe/autoscaler constants.
+6. Run the native package recipes for Debian, Alpine, Arch Linux, FreeBSD, and
+   Windows NSIS on their package hosts. Verify artifact metadata, installed
+   service definitions, default configuration paths, and upgrade/rollback
+   behavior before attaching packages to a release.
 
 ## Deferred work
 

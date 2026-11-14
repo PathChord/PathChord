@@ -1,0 +1,37 @@
+# Maintainer: PathChord contributors
+pkgname=pathchord
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Multipath proxy runtime with HTTP, SOCKS, and Egress listeners"
+url="https://github.com/KagurazakaNyaa/PathChord"
+arch="x86_64 aarch64 armv7 ppc64le s390x riscv64"
+license="GPL-3.0-only"
+depends=""
+makedepends="cargo"
+pkgusers="pathchord"
+pkggroups="pathchord"
+source="$pkgname-$pkgver.tar.gz::https://github.com/KagurazakaNyaa/PathChord/archive/refs/tags/v$pkgver.tar.gz"
+# Release automation should replace SKIP with the source archive digest.
+sha256sums="SKIP"
+
+build() {
+	cd "$srcdir/PathChord-$pkgver"
+	cargo build --release --locked --bin pathchord
+}
+
+package() {
+	cd "$srcdir/PathChord-$pkgver"
+
+	install -Dm0755 target/release/pathchord \
+		"$pkgdir/usr/bin/pathchord"
+	install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/pathchord/LICENSE"
+	install -Dm0644 packaging/common/pathchord.1 \
+		"$pkgdir/usr/share/man/man1/pathchord.1"
+	gzip -n -9 "$pkgdir/usr/share/man/man1/pathchord.1"
+	install -Dm0644 packaging/common/default-config.yaml \
+		"$pkgdir/etc/pathchord/ingress.yaml"
+	install -Dm0755 packaging/alpine/pathchord.initd \
+		"$pkgdir/etc/init.d/pathchord"
+	install -Dm0755 packaging/alpine/pathchord-egress.initd \
+		"$pkgdir/etc/init.d/pathchord-egress"
+}

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WinSW service definition. Keep this file beside the matching WinSW
+     executable (pathchord-ingress-service.exe) before installing it. -->
+<service>
+  <id>PathChordIngress</id>
+  <name>PathChord Ingress</name>
+  <description>PathChord local HTTP and SOCKS ingress listeners.</description>
+  <startmode>Manual</startmode>
+  <executable>%ProgramFiles%\PathChord\pathchord.exe</executable>
+  <arguments>ingress --config-dir "%ProgramData%\PathChord\config" --data-dir "%ProgramData%\PathChord\data" --credentials-dir "%ProgramData%\PathChord\credentials"</arguments>
+  <workingdirectory>%ProgramData%\PathChord</workingdirectory>
+  <logpath>%ProgramData%\PathChord\logs\ingress</logpath>
+  <log mode="roll" />
+  <onfailure action="restart" delay="10 sec" />
+  <stoptimeout>15 sec</stoptimeout>
+</service>

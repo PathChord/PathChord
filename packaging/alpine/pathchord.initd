@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+
+name="pathchord"
+description="PathChord Ingress proxy runtime"
+command="/usr/bin/pathchord"
+command_args="ingress --config-dir /etc/pathchord --data-dir /var/lib/pathchord --credentials-dir /etc/pathchord/secrets"
+command_user="pathchord:pathchord"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+retry="TERM/30/KILL/5"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	checkpath --directory --owner pathchord:pathchord --mode 0750 /var/lib/pathchord
+	checkpath --directory --owner pathchord:pathchord --mode 0750 /run/pathchord
+	checkpath --directory --owner root:pathchord --mode 0750 /etc/pathchord/secrets
+}

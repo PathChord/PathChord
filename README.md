@@ -107,6 +107,16 @@ socket; `status`, `system-proxy`, and `enroll` use the corresponding local
 control endpoint. The direct target bridge remains available only for an
 explicit policy with no Egress/Transit route.
 
+## Packages
+
+Native package recipes are kept under [`packaging/`](packaging/README.md) for
+Debian (`.deb`), Alpine (`.apk`), Arch Linux (`.pkg.tar.*`), FreeBSD (`.pkg`),
+and Windows NSIS (`.exe`). Each package carries the `pathchord(1)` manual,
+service definitions, and a loopback-only configuration template. Build the
+release binary and select a package target with `make -C packaging`; the
+package guide documents the required native host tools and cross-compiled
+artifact override.
+
 ## Development
 
 ```sh

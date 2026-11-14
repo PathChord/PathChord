@@ -1,0 +1,41 @@
+# Maintainer: PathChord contributors
+#
+# pkgver is kept in sync with the workspace package version by the release
+# tooling.  For a tagged source build, set pkgver to the tag without the v
+# prefix before running makepkg.
+pkgname=pathchord
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Multipath proxy runtime with HTTP, SOCKS, and Egress listeners'
+arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
+url='https://github.com/KagurazakaNyaa/PathChord'
+license=('GPL-3.0-only')
+depends=('glibc')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/KagurazakaNyaa/PathChord/archive/refs/tags/v$pkgver.tar.gz")
+# Release automation should replace SKIP with the source archive digest.
+sha256sums=('SKIP')
+
+build() {
+    cd "PathChord-$pkgver"
+    cargo build --release --locked --bin pathchord
+}
+
+package() {
+    cd "PathChord-$pkgver"
+
+    install -Dm0755 target/release/pathchord "$pkgdir/usr/bin/pathchord"
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/pathchord/LICENSE"
+    install -Dm0644 packaging/common/pathchord.1 \
+        "$pkgdir/usr/share/man/man1/pathchord.1"
+    install -Dm0644 packaging/common/default-config.yaml \
+        "$pkgdir/etc/pathchord/ingress.yaml"
+    install -Dm0644 packaging/arch/pathchord-ingress.service \
+        "$pkgdir/usr/lib/systemd/system/pathchord-ingress.service"
+    install -Dm0644 packaging/arch/pathchord-egress.service \
+        "$pkgdir/usr/lib/systemd/system/pathchord-egress.service"
+    install -Dm0644 packaging/arch/pathchord.sysusers \
+        "$pkgdir/usr/lib/sysusers.d/pathchord.conf"
+    install -Dm0644 packaging/arch/pathchord.tmpfiles \
+        "$pkgdir/usr/lib/tmpfiles.d/pathchord.conf"
+}

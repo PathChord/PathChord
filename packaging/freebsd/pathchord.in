@@ -1,0 +1,32 @@
+#!/bin/sh
+
+# PROVIDE: pathchord
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="pathchord"
+rcvar=pathchord_enable
+load_rc_config "$name"
+
+: "${pathchord_enable:=NO}"
+: "${pathchord_user:=pathchord}"
+: "${pathchord_config_dir:=/usr/local/etc/pathchord}"
+: "${pathchord_data_dir:=/var/db/pathchord}"
+: "${pathchord_credentials_dir:=${pathchord_config_dir}/secrets}"
+
+command="/usr/sbin/daemon"
+procname="/usr/local/bin/pathchord"
+pidfile="/var/run/${name}.pid"
+command_args="-f -p ${pidfile} -u ${pathchord_user} -- ${procname} --socket /var/run/pathchord/ingress.sock ingress --config-dir ${pathchord_config_dir} --data-dir ${pathchord_data_dir} --credentials-dir ${pathchord_credentials_dir}"
+
+start_precmd="pathchord_precmd"
+pathchord_precmd()
+{
+	install -d -o "${pathchord_user}" -g "${pathchord_user}" -m 0750 "${pathchord_data_dir}"
+	install -d -o root -g "${pathchord_user}" -m 0750 "${pathchord_credentials_dir}"
+	install -d -o "${pathchord_user}" -g "${pathchord_user}" -m 0750 /var/run/pathchord
+}
+
+run_rc_command "$1"

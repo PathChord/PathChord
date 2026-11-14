@@ -1,6 +1,6 @@
 # PathChord implementation status
 
-Status snapshot: 2026-11-13.
+Status snapshot: 2026-11-14.
 
 This document records the current implementation and validation state. Final
 architecture and behavioral contracts remain under `docs/design/` and
@@ -34,6 +34,12 @@ in the current scope.
   GNU and FreeBSD x86_64. Core frame/message codecs, state machines, bounded
   reliability buffers, wire vectors, and UDP/Path lifecycle payloads are
   implemented.
+- Native package recipes cover Debian, Alpine, Arch Linux, FreeBSD, and
+  Windows NSIS. They share the `pathchord(1)` manual and loopback-only default
+  configuration template; Linux and Alpine service definitions use
+  `/etc/pathchord`, the FreeBSD port uses `/usr/local/etc/pathchord`, and
+  packaged Windows services use `%ProgramData%\PathChord\config`. Package
+  assembly remains host-tool and native-service validation work.
 - Noise IK uses Clatter zeroizing key and cipher containers with an Orion
   SHA-256/HMAC adapter. Static, ephemeral, chaining, and traffic-key owners
   have explicit cleanup paths. Frozen vectors preserve the previous wire bytes.
@@ -275,3 +281,8 @@ crypto dependencies. The resulting x86_64 ELF uses `/libexec/ld-elf.so.1` and
 links against `libthr.so.3` and `libc.so.7`. This validates target compilation
 and linking; it does not execute FreeBSD tests. Native FreeBSD validation
 remains pending a host run.
+
+The package change's local rerun did not have those SDK wrappers configured;
+`aws-lc-sys` stopped while the host C compiler was checking FreeBSD headers.
+That failure is a toolchain limitation for this checkout and does not replace
+the configured SDK evidence above.
