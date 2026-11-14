@@ -121,7 +121,7 @@ pub use local_dispatch::LocalControlDispatcher;
 pub use local_protocol::{
     Actor, ErrorBody, ErrorCode, GenerationExpectation, LOCAL_API_VERSION, LocalProtocolError,
     MAX_ENVELOPE_BYTES, RequestEnvelope, ResponseEnvelope, decode_object, encode_object,
-    read_object, write_object,
+    read_object, read_object_with_deadlines, write_object,
 };
 pub use local_server::{
     DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS, LocalControlServer, LocalServerError,

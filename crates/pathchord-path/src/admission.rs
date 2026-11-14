@@ -32,6 +32,7 @@ pub struct IngressPathAdmissionConfig {
     pub path_id: PathId,
     pub offered_capabilities: u64,
     pub required_capabilities: u64,
+    pub replication_budget_bytes_per_second: u64,
     pub local_limits: ProtocolLimits,
 }
 
@@ -43,6 +44,7 @@ pub struct EgressPathAdmissionConfig {
     pub egress_id: Vec<u8>,
     pub required_capabilities: u64,
     pub supported_capabilities: u64,
+    pub max_replication_budget_bytes_per_second: u64,
     pub local_limits: ProtocolLimits,
     pub ready_limits: PathReady,
 }
@@ -72,6 +74,7 @@ pub struct IngressAdmittedPath<S> {
     path_id: PathId,
     authorization_generation: u64,
     negotiated_capabilities: u64,
+    replication_budget_bytes_per_second: u64,
     limits: PathReady,
 }
 
@@ -107,6 +110,10 @@ impl<S> IngressAdmittedPath<S> {
         self.authorization_generation
     }
 
+    pub const fn replication_budget_bytes_per_second(&self) -> u64 {
+        self.replication_budget_bytes_per_second
+    }
+
     pub fn limits(&self) -> &PathReady {
         &self.limits
     }
@@ -129,6 +136,7 @@ pub struct EgressAdmittedPath<S> {
     path_id: PathId,
     negotiated_capabilities: u64,
     authorization_generation: u64,
+    replication_budget_bytes_per_second: u64,
     limits: PathReady,
 }
 
@@ -176,6 +184,10 @@ impl<S> EgressAdmittedPath<S> {
 
     pub const fn authorization_generation(&self) -> u64 {
         self.authorization_generation
+    }
+
+    pub const fn replication_budget_bytes_per_second(&self) -> u64 {
+        self.replication_budget_bytes_per_second
     }
 
     pub fn limits(&self) -> &PathReady {
@@ -285,6 +297,7 @@ where
             session_id: config.session_id,
             egress_id: config.egress_id.clone(),
             control_seq: 0,
+            replication_budget_bytes_per_second: config.replication_budget_bytes_per_second,
         }),
         config.session_id,
         config.path_id,
@@ -295,21 +308,28 @@ where
 
     let attach_frame = receive_required(&mut records, "SESSION_ATTACH result").await?;
     validate_frame_ids(&attach_frame, config.session_id, config.path_id)?;
-    let authorization_generation = match decode_message(&attach_frame, config.local_limits)? {
-        Message::SessionAttachOk(value) => value.authorization_generation,
-        Message::SessionAttachReject(value) => {
-            return Ok(PathAdmissionOutcome::Rejected {
-                error: value.error,
-                reason: value.reason,
-            });
-        }
-        other => {
-            return Err(PathAdmissionError::UnexpectedMessage {
-                expected: "SESSION_ATTACH_OK or SESSION_ATTACH_REJECT",
-                actual: other.frame_type(),
-            });
-        }
-    };
+    let (authorization_generation, replication_budget_bytes_per_second) =
+        match decode_message(&attach_frame, config.local_limits)? {
+            Message::SessionAttachOk(value) => (
+                value.authorization_generation,
+                value.replication_budget_bytes_per_second,
+            ),
+            Message::SessionAttachReject(value) => {
+                return Ok(PathAdmissionOutcome::Rejected {
+                    error: value.error,
+                    reason: value.reason,
+                });
+            }
+            other => {
+                return Err(PathAdmissionError::UnexpectedMessage {
+                    expected: "SESSION_ATTACH_OK or SESSION_ATTACH_REJECT",
+                    actual: other.frame_type(),
+                });
+            }
+        };
+    if replication_budget_bytes_per_second > config.replication_budget_bytes_per_second {
+        return Err(PathAdmissionError::InvalidSessionAttach);
+    }
 
     let ready_frame = receive_required(&mut records, "PATH_READY").await?;
     validate_frame_ids(&ready_frame, config.session_id, config.path_id)?;
@@ -342,6 +362,7 @@ where
         path_id: config.path_id,
         authorization_generation,
         negotiated_capabilities,
+        replication_budget_bytes_per_second,
         limits,
     }))
 }
@@ -457,10 +478,14 @@ where
 
     let authorization = authorization.ok_or(PathAdmissionError::MissingResolvedAuthorization)?;
 
+    let accepted_replication_budget = attach
+        .replication_budget_bytes_per_second
+        .min(config.max_replication_budget_bytes_per_second);
     send_message(
         &mut records,
         Message::SessionAttachOk(pathchord_core::SessionAttachOk {
             authorization_generation: authorization.generation,
+            replication_budget_bytes_per_second: accepted_replication_budget,
         }),
         session_id,
         path_id,
@@ -488,6 +513,7 @@ where
         path_id,
         negotiated_capabilities,
         authorization_generation: authorization.generation,
+        replication_budget_bytes_per_second: accepted_replication_budget,
         limits: config.ready_limits.clone(),
     }))
 }
@@ -666,6 +692,7 @@ mod tests {
             path_id: PathId::new(9),
             offered_capabilities: 0b11,
             required_capabilities: 0b01,
+            replication_budget_bytes_per_second: 8 * 1024 * 1024,
             local_limits: ProtocolLimits::default(),
         }
     }
@@ -676,6 +703,7 @@ mod tests {
             egress_id: b"egress-a".to_vec(),
             required_capabilities: 0b01,
             supported_capabilities: 0b01,
+            max_replication_budget_bytes_per_second: 8 * 1024 * 1024,
             local_limits: ProtocolLimits::default(),
             ready_limits: PathReady {
                 max_frame_payload: 4096,
@@ -779,6 +807,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_replication_budget_negotiates_the_lower_peer_cap() {
+        let (initiator, responder) = keys();
+        let authorization = authorization(&initiator);
+        let mut ingress = ingress_config();
+        let mut egress = egress_config();
+        ingress.replication_budget_bytes_per_second = 1024;
+        egress.max_replication_budget_bytes_per_second = 512;
+        let (client, server) = duplex(64 * 1024);
+        let (left, right) = tokio::join!(
+            dial_path(client, initiator.private(), responder.public(), &ingress),
+            accept_path(server, responder.private(), &egress, &authorization),
+        );
+        let PathAdmissionOutcome::Ready(left) = left.expect("Ingress admission") else {
+            panic!("Ingress should be admitted");
+        };
+        let PathAdmissionOutcome::Ready(right) = right.expect("Egress admission") else {
+            panic!("Egress should be admitted");
+        };
+        assert_eq!(left.replication_budget_bytes_per_second(), 512);
+        assert_eq!(right.replication_budget_bytes_per_second(), 512);
+    }
+
+    #[tokio::test]
+    async fn zero_session_replication_budget_disables_optional_replication() {
+        let (initiator, responder) = keys();
+        let authorization = authorization(&initiator);
+        let mut ingress = ingress_config();
+        let mut egress = egress_config();
+        ingress.replication_budget_bytes_per_second = 1024;
+        egress.max_replication_budget_bytes_per_second = 0;
+        let (client, server) = duplex(64 * 1024);
+        let (left, right) = tokio::join!(
+            dial_path(client, initiator.private(), responder.public(), &ingress),
+            accept_path(server, responder.private(), &egress, &authorization),
+        );
+        let PathAdmissionOutcome::Ready(left) = left.expect("Ingress admission") else {
+            panic!("Ingress should be admitted");
+        };
+        let PathAdmissionOutcome::Ready(right) = right.expect("Egress admission") else {
+            panic!("Egress should be admitted");
+        };
+        assert_eq!(left.replication_budget_bytes_per_second(), 0);
+        assert_eq!(right.replication_budget_bytes_per_second(), 0);
+    }
+
+    #[tokio::test]
     async fn ingress_rejects_a_missing_required_optional_capability() {
         let (initiator, responder) = keys();
         let mut ingress = ingress_config();
@@ -830,6 +904,7 @@ mod tests {
                     &mut records,
                     Message::SessionAttachOk(pathchord_core::SessionAttachOk {
                         authorization_generation: 1,
+                        replication_budget_bytes_per_second: 0,
                     }),
                     config.session_id,
                     config.path_id,

@@ -42,11 +42,13 @@ pub struct SessionAttach {
     pub session_id: SessionId,
     pub egress_id: Vec<u8>,
     pub control_seq: u64,
+    pub replication_budget_bytes_per_second: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionAttachOk {
     pub authorization_generation: u64,
+    pub replication_budget_bytes_per_second: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,8 +66,6 @@ pub struct PathReady {
 
 pub const CAPABILITY_TCP_STREAM: u64 = 1;
 pub const CAPABILITY_UDP_SESSION: u64 = 1 << 1;
-/// Negotiated optional extension; legacy message bytes remain unchanged.
-pub const CAPABILITY_TRAFFIC_CLASSES: u64 = 1 << 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrafficClassConfig {
@@ -79,17 +79,52 @@ pub struct PathReadyCapabilities {
     pub limits: PathReady,
     pub capabilities: u64,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StreamOpenClass {
-    pub open: StreamOpen,
-    pub traffic_class: TrafficClassConfig,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UdpOpenClass {
-    pub open: UdpOpen,
-    pub traffic_class: TrafficClassConfig,
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum CapacityState {
+    Unknown = 0,
+    Provisional = 1,
+    Measured = 2,
+    Stale = 3,
 }
 
+impl CapacityState {
+    pub const fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Provisional),
+            2 => Some(Self::Measured),
+            3 => Some(Self::Stale),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AdmissionReason {
+    None = 0,
+    ResourceLimit = 1,
+    ConnectionLimit = 2,
+    BandwidthLimit = 3,
+    AdministrativeDrain = 4,
+    AuthorizationFailure = 5,
+}
+
+impl AdmissionReason {
+    pub const fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::ResourceLimit),
+            2 => Some(Self::ConnectionLimit),
+            3 => Some(Self::BandwidthLimit),
+            4 => Some(Self::AdministrativeDrain),
+            5 => Some(Self::AuthorizationFailure),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathDrain {
     pub drain_reason: u64,
@@ -106,14 +141,19 @@ pub struct PathClose {
 pub struct StatusReport {
     pub connected: bool,
     pub service_state: EgressServiceState,
+    pub admission_allowed: bool,
+    pub admission_reason: AdmissionReason,
     pub load_basis_points: u16,
     pub connection_utilization_basis_points: u16,
     pub bandwidth_utilization_basis_points: u16,
     pub active_sessions: u64,
     pub active_streams: u64,
     pub active_target_connections: u64,
-    pub capacity_bps: u64,
-    pub recommended_path_count: u64,
+    pub configured_capacity_bps: u64,
+    pub effective_capacity_bps: u64,
+    pub current_wire_rate_bps: u64,
+    pub replication_allowance_bps: u64,
+    pub capacity_state: CapacityState,
     pub report_seqno: u64,
     pub sample_age_ms: u64,
     pub expires_after_ms: u64,
@@ -200,12 +240,6 @@ pub enum SessionControlFlow {
 pub struct SessionControlCancel {
     pub sequence: u64,
     pub flow: SessionControlFlow,
-}
-
-/// An authenticated replacement Path's predecessor within the same Session.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PathRebind {
-    pub previous_path_id: PathId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -308,11 +342,7 @@ pub enum Message {
     SessionControl(SessionControl),
     SessionControlAck(ControlAck),
     SessionControlCancel(SessionControlCancel),
-    PathRebind(PathRebind),
-    PathRebindAck(PathRebind),
     PathReadyCapabilities(PathReadyCapabilities),
-    StreamOpenClass(StreamOpenClass),
-    UdpOpenClass(UdpOpenClass),
     PathHello(PathHello),
     SessionAttach(SessionAttach),
     SessionAttachOk(SessionAttachOk),
@@ -346,11 +376,7 @@ impl Message {
             Self::SessionControl(_) => FrameType::SessionControl,
             Self::SessionControlAck(_) => FrameType::SessionControlAck,
             Self::SessionControlCancel(_) => FrameType::SessionControlCancel,
-            Self::PathRebind(_) => FrameType::PathRebind,
-            Self::PathRebindAck(_) => FrameType::PathRebindAck,
             Self::PathReadyCapabilities(_) => FrameType::PathReadyCapabilities,
-            Self::StreamOpenClass(_) => FrameType::StreamOpenClass,
-            Self::UdpOpenClass(_) => FrameType::UdpOpenClass,
             Self::PathHello(_) => FrameType::PathHello,
             Self::SessionAttach(_) => FrameType::SessionAttach,
             Self::SessionAttachOk(_) => FrameType::SessionAttachOk,
@@ -424,16 +450,8 @@ impl Message {
             FrameType::SessionControlCancel => {
                 Self::SessionControlCancel(SessionControlCancel::decode(&mut reader)?)
             }
-            FrameType::PathRebind => Self::PathRebind(PathRebind::decode(&mut reader)?),
-            FrameType::PathRebindAck => Self::PathRebindAck(PathRebind::decode(&mut reader)?),
             FrameType::PathReadyCapabilities => {
                 Self::PathReadyCapabilities(PathReadyCapabilities::decode(&mut reader, limits)?)
-            }
-            FrameType::StreamOpenClass => {
-                Self::StreamOpenClass(StreamOpenClass::decode(&mut reader, limits)?)
-            }
-            FrameType::UdpOpenClass => {
-                Self::UdpOpenClass(UdpOpenClass::decode(&mut reader, limits)?)
             }
             FrameType::PathHello => Self::PathHello(PathHello::decode(&mut reader, limits)?),
             FrameType::SessionAttach => {
@@ -485,10 +503,7 @@ impl Message {
             Self::SessionControl(value) => value.encode(output, limits),
             Self::SessionControlAck(value) => value.encode(output),
             Self::SessionControlCancel(value) => value.encode(output),
-            Self::PathRebind(value) | Self::PathRebindAck(value) => value.encode(output),
             Self::PathReadyCapabilities(value) => value.encode(output, limits),
-            Self::StreamOpenClass(value) => value.encode(output, limits),
-            Self::UdpOpenClass(value) => value.encode(output, limits),
             Self::PathHello(value) => value.encode(output, limits),
             Self::SessionAttach(value) => value.encode(output, limits),
             Self::SessionAttachOk(value) => value.encode(output),
@@ -728,6 +743,22 @@ fn validate_status_report(value: &StatusReport) -> Result<(), MessageCodecError>
     if value.connected != expected_connected {
         return Err(MessageCodecError::InvalidField {
             field: "connected/service_state",
+        });
+    }
+    if value.admission_allowed != matches!(value.admission_reason, AdmissionReason::None) {
+        return Err(MessageCodecError::InvalidField {
+            field: "admission_allowed/reason",
+        });
+    }
+    if value.configured_capacity_bps == 0
+        || value.replication_allowance_bps > value.configured_capacity_bps
+        || (matches!(
+            value.capacity_state,
+            CapacityState::Measured | CapacityState::Provisional
+        ) && value.effective_capacity_bps == 0)
+    {
+        return Err(MessageCodecError::InvalidField {
+            field: "capacity_state/effective_capacity_bps",
         });
     }
     Ok(())
@@ -1013,7 +1044,8 @@ impl SessionAttach {
             "egress_id",
             output,
         )?;
-        put_varint(self.control_seq, output)
+        put_varint(self.control_seq, output)?;
+        put_varint(self.replication_budget_bytes_per_second, output)
     }
 
     fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
@@ -1041,6 +1073,8 @@ impl SessionAttach {
             session_id,
             egress_id,
             control_seq: reader.varint("control_seq")?,
+            replication_budget_bytes_per_second: reader
+                .varint("replication_budget_bytes_per_second")?,
         })
     }
 }
@@ -1050,10 +1084,15 @@ impl_simple_codec!(
     this,
     output,
     reader,
-    { put_varint(this.authorization_generation, output) },
+    {
+        put_varint(this.authorization_generation, output)?;
+        put_varint(this.replication_budget_bytes_per_second, output)
+    },
     {
         Ok(Self {
             authorization_generation: reader.varint("authorization_generation")?,
+            replication_budget_bytes_per_second: reader
+                .varint("replication_budget_bytes_per_second")?,
         })
     }
 );
@@ -1157,14 +1196,19 @@ impl StatusReport {
         validate_status_report(self)?;
         output.push(u8::from(self.connected));
         output.push(self.service_state.wire_code());
+        output.push(u8::from(self.admission_allowed));
+        output.push(self.admission_reason as u8);
         output.extend_from_slice(&self.load_basis_points.to_be_bytes());
         output.extend_from_slice(&self.connection_utilization_basis_points.to_be_bytes());
         output.extend_from_slice(&self.bandwidth_utilization_basis_points.to_be_bytes());
         put_varint(self.active_sessions, output)?;
         put_varint(self.active_streams, output)?;
         put_varint(self.active_target_connections, output)?;
-        put_varint(self.capacity_bps, output)?;
-        put_varint(self.recommended_path_count, output)?;
+        put_varint(self.configured_capacity_bps, output)?;
+        put_varint(self.effective_capacity_bps, output)?;
+        put_varint(self.current_wire_rate_bps, output)?;
+        put_varint(self.replication_allowance_bps, output)?;
+        output.push(self.capacity_state as u8);
         put_varint(self.report_seqno, output)?;
         put_varint(self.sample_age_ms, output)?;
         put_varint(self.expires_after_ms, output)
@@ -1176,17 +1220,31 @@ impl StatusReport {
             .ok_or(MessageCodecError::InvalidField {
                 field: "service_state",
             })?;
+        let admission_allowed = reader.bool("admission_allowed")?;
+        let admission_reason = AdmissionReason::from_wire_code(reader.byte("admission_reason")?)
+            .ok_or(MessageCodecError::InvalidField {
+                field: "admission_reason",
+            })?;
         let value = Self {
             connected,
             service_state,
+            admission_allowed,
+            admission_reason,
             load_basis_points: reader.u16("load_basis_points")?,
             connection_utilization_basis_points: reader.u16("connection_utilization_bp")?,
             bandwidth_utilization_basis_points: reader.u16("bandwidth_utilization_bp")?,
             active_sessions: reader.varint("active_sessions")?,
             active_streams: reader.varint("active_streams")?,
             active_target_connections: reader.varint("active_target_connections")?,
-            capacity_bps: reader.varint("capacity_bps")?,
-            recommended_path_count: reader.varint("recommended_path_count")?,
+            configured_capacity_bps: reader.varint("configured_capacity_bps")?,
+            effective_capacity_bps: reader.varint("effective_capacity_bps")?,
+            current_wire_rate_bps: reader.varint("current_wire_rate_bps")?,
+            replication_allowance_bps: reader.varint("replication_allowance_bps")?,
+            capacity_state: CapacityState::from_wire_code(reader.byte("capacity_state")?).ok_or(
+                MessageCodecError::InvalidField {
+                    field: "capacity_state",
+                },
+            )?,
             report_seqno: reader.varint("report_seqno")?,
             sample_age_ms: reader.varint("sample_age_ms")?,
             expires_after_ms: reader.varint("expires_after_ms")?,
@@ -1242,13 +1300,7 @@ impl SessionControl {
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
             || (!self.eligible_paths.is_empty()
-                && !matches!(
-                    self.frame_type,
-                    FrameType::StreamOpen
-                        | FrameType::StreamOpenClass
-                        | FrameType::UdpOpen
-                        | FrameType::UdpOpenClass
-                ))
+                && !matches!(self.frame_type, FrameType::StreamOpen | FrameType::UdpOpen))
         {
             return Err(MessageCodecError::InvalidField {
                 field: "session_control",
@@ -1319,13 +1371,7 @@ impl SessionControl {
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
             || (!value.eligible_paths.is_empty()
-                && !matches!(
-                    value.frame_type,
-                    FrameType::StreamOpen
-                        | FrameType::StreamOpenClass
-                        | FrameType::UdpOpen
-                        | FrameType::UdpOpenClass
-                ))
+                && !matches!(value.frame_type, FrameType::StreamOpen | FrameType::UdpOpen))
         {
             return Err(MessageCodecError::InvalidField {
                 field: "session_control",
@@ -1358,19 +1404,6 @@ impl SessionControlCancel {
             _ => return Err(MessageCodecError::InvalidField { field: "flow_kind" }),
         };
         Ok(Self { sequence, flow })
-    }
-}
-
-impl PathRebind {
-    fn encode(&self, output: &mut Vec<u8>) -> Result<(), MessageCodecError> {
-        put_id128(self.previous_path_id.to_be_bytes(), output);
-        Ok(())
-    }
-
-    fn decode(reader: &mut Reader<'_>) -> Result<Self, MessageCodecError> {
-        Ok(Self {
-            previous_path_id: PathId::from_be_bytes(reader.id128("previous_path_id")?),
-        })
     }
 }
 
@@ -1793,36 +1826,6 @@ impl TrafficClassConfig {
         }
         Ok(())
     }
-    fn encode(&self, output: &mut Vec<u8>) -> Result<(), MessageCodecError> {
-        self.validate()?;
-        put_bytes(self.name.as_bytes(), 256, "traffic_class", output)?;
-        put_varint(u64::from(self.priority), output)?;
-        put_varint(u64::from(self.share), output)
-    }
-    fn decode(reader: &mut Reader<'_>) -> Result<Self, MessageCodecError> {
-        let name = String::from_utf8(reader.bytes(256, "traffic_class")?).map_err(|_| {
-            MessageCodecError::InvalidField {
-                field: "traffic_class",
-            }
-        })?;
-        let priority = u8::try_from(reader.varint("class_priority")?).map_err(|_| {
-            MessageCodecError::InvalidField {
-                field: "class_priority",
-            }
-        })?;
-        let share = u32::try_from(reader.varint("class_share")?).map_err(|_| {
-            MessageCodecError::InvalidField {
-                field: "class_share",
-            }
-        })?;
-        let value = Self {
-            name,
-            priority,
-            share,
-        };
-        value.validate()?;
-        Ok(value)
-    }
 }
 impl PathReadyCapabilities {
     fn encode(
@@ -1840,39 +1843,6 @@ impl PathReadyCapabilities {
         })
     }
 }
-impl StreamOpenClass {
-    fn encode(
-        &self,
-        output: &mut Vec<u8>,
-        limits: ProtocolLimits,
-    ) -> Result<(), MessageCodecError> {
-        self.open.encode(output, limits)?;
-        self.traffic_class.encode(output)
-    }
-    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
-        Ok(Self {
-            open: StreamOpen::decode(reader, limits)?,
-            traffic_class: TrafficClassConfig::decode(reader)?,
-        })
-    }
-}
-impl UdpOpenClass {
-    fn encode(
-        &self,
-        output: &mut Vec<u8>,
-        limits: ProtocolLimits,
-    ) -> Result<(), MessageCodecError> {
-        self.open.encode(output, limits)?;
-        self.traffic_class.encode(output)
-    }
-    fn decode(reader: &mut Reader<'_>, limits: ProtocolLimits) -> Result<Self, MessageCodecError> {
-        Ok(Self {
-            open: UdpOpen::decode(reader, limits)?,
-            traffic_class: TrafficClassConfig::decode(reader)?,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1939,6 +1909,7 @@ mod tests {
             session_id: SessionId::new(1),
             egress_id: b"egress".to_vec(),
             control_seq: 0,
+            replication_budget_bytes_per_second: 0,
         });
         assert_eq!(
             invalid.encode(ProtocolLimits::default()),
@@ -1965,18 +1936,51 @@ mod tests {
     }
 
     #[test]
+    fn session_attach_replication_budget_has_a_golden_vector() {
+        let limits = ProtocolLimits::default();
+        let attach = Message::SessionAttach(SessionAttach {
+            ingress_id: b"ingress".to_vec(),
+            session_id: SessionId::new(5),
+            egress_id: b"egress".to_vec(),
+            control_seq: 6,
+            replication_budget_bytes_per_second: 7,
+        });
+        let mut expected = vec![7];
+        expected.extend_from_slice(b"ingress");
+        expected.extend_from_slice(&SessionId::new(5).to_be_bytes());
+        expected.push(6);
+        expected.extend_from_slice(b"egress");
+        expected.extend_from_slice(&[6, 7]);
+        assert_eq!(attach.encode(limits).unwrap(), expected);
+        assert_eq!(
+            Message::decode(FrameType::SessionAttach, &expected, limits).unwrap(),
+            attach
+        );
+        let attach_ok = Message::SessionAttachOk(SessionAttachOk {
+            authorization_generation: 7,
+            replication_budget_bytes_per_second: 8,
+        });
+        assert_eq!(attach_ok.encode(limits).unwrap(), vec![7, 8]);
+    }
+
+    #[test]
     fn status_reports_are_monotonic_and_freshness_bounded() {
         let report = |sequence, age| StatusReport {
             connected: true,
             service_state: EgressServiceState::Up,
+            admission_allowed: true,
+            admission_reason: AdmissionReason::None,
             load_basis_points: 0,
             connection_utilization_basis_points: 0,
             bandwidth_utilization_basis_points: 0,
             active_sessions: 0,
             active_streams: 0,
             active_target_connections: 0,
-            capacity_bps: 1,
-            recommended_path_count: 1,
+            configured_capacity_bps: 1,
+            effective_capacity_bps: 1,
+            current_wire_rate_bps: 0,
+            replication_allowance_bps: 1,
+            capacity_state: CapacityState::Measured,
             report_seqno: sequence,
             sample_age_ms: age,
             expires_after_ms: 100,
@@ -1999,49 +2003,80 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_class_extensions_round_trip_and_enforce_bounds() {
+    fn status_report_capacity_and_admission_fields_round_trip() {
+        let report = StatusReport {
+            connected: true,
+            service_state: EgressServiceState::Degraded,
+            admission_allowed: false,
+            admission_reason: AdmissionReason::ConnectionLimit,
+            load_basis_points: 9_000,
+            connection_utilization_basis_points: 10_000,
+            bandwidth_utilization_basis_points: 8_000,
+            active_sessions: 2,
+            active_streams: 4,
+            active_target_connections: 8,
+            configured_capacity_bps: 1_000_000,
+            effective_capacity_bps: 500_000,
+            current_wire_rate_bps: 480_000,
+            replication_allowance_bps: 100_000,
+            capacity_state: CapacityState::Measured,
+            report_seqno: 9,
+            sample_age_ms: 0,
+            expires_after_ms: 6_000,
+        };
+        for (capacity_state, effective_capacity_bps) in [
+            (CapacityState::Unknown, 0),
+            (CapacityState::Provisional, 500_000),
+            (CapacityState::Measured, 500_000),
+            (CapacityState::Stale, 500_000),
+        ] {
+            let report = StatusReport {
+                capacity_state,
+                effective_capacity_bps,
+                ..report.clone()
+            };
+            let encoded = Message::StatusReport(report.clone())
+                .encode(ProtocolLimits::default())
+                .unwrap();
+            assert_eq!(
+                Message::decode(FrameType::StatusReport, &encoded, ProtocolLimits::default())
+                    .unwrap(),
+                Message::StatusReport(report)
+            );
+        }
+        let invalid = StatusReport {
+            admission_allowed: true,
+            admission_reason: AdmissionReason::ConnectionLimit,
+            ..report
+        };
+        assert!(
+            Message::StatusReport(invalid)
+                .encode(ProtocolLimits::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn path_ready_capabilities_round_trip_and_class_config_stays_local() {
         let profile = TrafficClassConfig {
             name: "gaming:interactive".into(),
             priority: 255,
             share: 3,
         };
         let limits = ProtocolLimits::default();
-        let messages = [
-            Message::PathReadyCapabilities(PathReadyCapabilities {
-                limits: PathReady {
-                    max_frame_payload: 1024,
-                    max_control_payload: 512,
-                    max_session_buffering: 4096,
-                },
-                capabilities: 7,
-            }),
-            Message::StreamOpenClass(StreamOpenClass {
-                open: StreamOpen {
-                    stream_id: StreamId::new(1).unwrap(),
-                    request_id: RequestId::new(2),
-                    target: endpoint(),
-                },
-                traffic_class: profile.clone(),
-            }),
-            Message::UdpOpenClass(UdpOpenClass {
-                open: UdpOpen {
-                    association_id: 1,
-                    target_flags: 3,
-                    target: endpoint(),
-                },
-                traffic_class: profile.clone(),
-            }),
-        ];
-        for message in messages {
-            let encoded = message.encode(limits).unwrap();
-            assert_eq!(
-                Message::decode(message.frame_type(), &encoded, limits).unwrap(),
-                message
-            );
-            let mut trailing = encoded.clone();
-            trailing.push(0);
-            assert!(Message::decode(message.frame_type(), &trailing, limits).is_err());
-        }
+        let message = Message::PathReadyCapabilities(PathReadyCapabilities {
+            limits: PathReady {
+                max_frame_payload: 1024,
+                max_control_payload: 512,
+                max_session_buffering: 4096,
+            },
+            capabilities: 3,
+        });
+        let encoded = message.encode(limits).unwrap();
+        assert_eq!(
+            Message::decode(message.frame_type(), &encoded, limits).unwrap(),
+            message
+        );
         for bad in [
             TrafficClassConfig {
                 share: 0,
@@ -2075,9 +2110,11 @@ mod tests {
                 session_id: SessionId::new(5),
                 egress_id: b"egress".to_vec(),
                 control_seq: 6,
+                replication_budget_bytes_per_second: 7,
             }),
             Message::SessionAttachOk(SessionAttachOk {
                 authorization_generation: 7,
+                replication_budget_bytes_per_second: 8,
             }),
             Message::SessionAttachReject(SessionAttachReject {
                 error: ErrorClass::LocalPolicy,
@@ -2099,14 +2136,19 @@ mod tests {
             Message::StatusReport(StatusReport {
                 connected: true,
                 service_state: EgressServiceState::Up,
+                admission_allowed: true,
+                admission_reason: AdmissionReason::None,
                 load_basis_points: 100,
                 connection_utilization_basis_points: 200,
                 bandwidth_utilization_basis_points: 300,
                 active_sessions: 1,
                 active_streams: 2,
                 active_target_connections: 3,
-                capacity_bps: 4,
-                recommended_path_count: 5,
+                configured_capacity_bps: 4,
+                effective_capacity_bps: 4,
+                current_wire_rate_bps: 0,
+                replication_allowance_bps: 4,
+                capacity_state: CapacityState::Measured,
                 report_seqno: 6,
                 sample_age_ms: 7,
                 expires_after_ms: 1000,

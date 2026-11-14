@@ -37,6 +37,12 @@ cap is negotiated during attachment, while per-flow/class budgets remain local
 to Ingress and extra copies use only residual capacity after primary traffic,
 ordinary retransmission, and required control traffic.
 
+The Egress resource surface is intentionally small: authored configuration
+provides only the aggregate wire cap and global inbound target-connection cap.
+Path safety ceilings and reservations are computed in the runtime. The Egress
+wire budget uses a bounded token window with primary/retransmission/control
+priority; optional replication is admitted only from residual capacity.
+
 ## Architecture boundaries
 
 The implementation is divided into crates or equivalent modules:
@@ -85,6 +91,12 @@ state by parsing logs.
 Egress resource and admission state. It is not the management API, carries no
 Ingress rule or TrafficClass metadata, and is not the authoritative source for
 Path-local quality; Ingress derives directional Path observations locally.
+
+TLS construction loads system roots by default and accepts an ordered
+`truststore` list of `system` and local PEM/DER sources. Source validation is
+atomic and fail-closed, with bounded reads and symlink-to-regular-file checks.
+Local control transports use separate bounded deadlines for framing, dispatch,
+and response writes, keeping slow clients from holding a request permit.
 
 Prometheus export reads aggregate gauges from the same observation snapshot
 through the Web Gateway's authentication and capability boundary. Provider

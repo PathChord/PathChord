@@ -50,6 +50,8 @@ pub struct SinglePathHandshakeConfig {
     pub offered_capabilities: u64,
     /// Capability bits required by the selected Egress policy.
     pub required_capabilities: u64,
+    /// Session-wide extra replication cap negotiated by both endpoints.
+    pub replication_budget_bytes_per_second: u64,
     /// Capability bits supported by the Egress.
     pub supported_capabilities: u64,
     /// Local hard/negotiated limits used to validate the `PATH_READY` offer.
@@ -68,6 +70,7 @@ pub struct SinglePathReady {
     local_limits: ProtocolLimits,
     negotiated_capabilities: u64,
     authorization_generation: u64,
+    replication_budget_bytes_per_second: u64,
     limits: PathReady,
     stream_requests: HashMap<RequestId, CachedStreamOpen>,
     stream_ids: HashMap<StreamId, RequestId>,
@@ -99,6 +102,11 @@ impl SinglePathReady {
     #[must_use]
     pub const fn authorization_generation(&self) -> u64 {
         self.authorization_generation
+    }
+
+    #[must_use]
+    pub const fn replication_budget_bytes_per_second(&self) -> u64 {
+        self.replication_budget_bytes_per_second
     }
 
     #[must_use]
@@ -338,6 +346,7 @@ pub fn establish_single_path(
         session_id: config.session_id,
         egress_id: config.egress_id.clone(),
         control_seq: 0,
+        replication_budget_bytes_per_second: config.replication_budget_bytes_per_second,
     });
     let attach_frame = make_frame(
         attach,
@@ -393,6 +402,7 @@ pub fn establish_single_path(
     let attach_ok = make_frame(
         Message::SessionAttachOk(pathchord_core::SessionAttachOk {
             authorization_generation: authorization.generation,
+            replication_budget_bytes_per_second: config.replication_budget_bytes_per_second,
         }),
         config.session_id,
         config.path_id,
@@ -403,15 +413,21 @@ pub fn establish_single_path(
     let received_attach_ok =
         initiator_transport.open_frame(&sealed_attach_ok, config.local_limits)?;
     validate_frame_ids(&received_attach_ok, config)?;
-    match decode_message(&received_attach_ok, config.local_limits)? {
-        Message::SessionAttachOk(value)
-            if value.authorization_generation == authorization.generation => {}
-        _ => {
-            return Err(SinglePathError::Message(MessageCodecError::InvalidField {
-                field: "session_attach_ok",
-            }));
-        }
-    }
+    let accepted_replication_budget =
+        match decode_message(&received_attach_ok, config.local_limits)? {
+            Message::SessionAttachOk(value)
+                if value.authorization_generation == authorization.generation
+                    && value.replication_budget_bytes_per_second
+                        <= config.replication_budget_bytes_per_second =>
+            {
+                value.replication_budget_bytes_per_second
+            }
+            _ => {
+                return Err(SinglePathError::Message(MessageCodecError::InvalidField {
+                    field: "session_attach_ok",
+                }));
+            }
+        };
 
     let ready_frame = make_frame(
         Message::PathReadyCapabilities(pathchord_core::PathReadyCapabilities {
@@ -446,6 +462,7 @@ pub fn establish_single_path(
         local_limits: config.local_limits,
         negotiated_capabilities,
         authorization_generation: authorization.generation,
+        replication_budget_bytes_per_second: accepted_replication_budget,
         limits: ready,
         stream_requests: HashMap::new(),
         stream_ids: HashMap::new(),
@@ -679,6 +696,7 @@ mod tests {
             path_id: PathId::new(8),
             offered_capabilities: 0b11,
             required_capabilities: 0b01,
+            replication_budget_bytes_per_second: 8 * 1024 * 1024,
             supported_capabilities: 0b01,
             local_limits: ProtocolLimits::default(),
             ready_limits: PathReady {

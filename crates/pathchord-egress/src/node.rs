@@ -8,7 +8,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use pathchord_core::{ErrorClass, PathReady, ProtocolLimits, SessionId, TargetEndpoint};
+use pathchord_core::{
+    AdmissionReason, CapacityState, ErrorClass, PathReady, ProtocolLimits, SessionId,
+    TargetEndpoint,
+};
 use pathchord_noise::{StaticKeypair, WIRE_PROFILE_V1_PROLOGUE_PREFIX};
 use pathchord_path::{
     AuthorizationState as PathAuthorizationState, BoxedSessionStream, BoxedUdpTargetSocket,
@@ -43,6 +46,7 @@ pub struct EgressNodeConfig {
     pub supported_capabilities: u64,
     pub max_concurrent_paths: usize,
     pub capacity_bps: u64,
+    pub max_inbound_target_connections: usize,
     pub recommended_path_count: u64,
     pub max_streams_per_ingress: usize,
     pub remote_dns_only: bool,
@@ -102,6 +106,7 @@ pub struct EgressNode<C> {
     next_path_token: AtomicU64,
     session_status: EgressStatusConfig,
     status_provider: Arc<NodeStatusProvider>,
+    target_slots: Arc<Semaphore>,
 }
 
 impl<C> std::fmt::Debug for EgressNode<C> {
@@ -136,6 +141,7 @@ where
             egress_id: config.egress_id.as_bytes().to_vec(),
             required_capabilities: config.required_capabilities,
             supported_capabilities: config.supported_capabilities,
+            max_replication_budget_bytes_per_second: u64::MAX,
             local_limits: config.protocol_limits,
             ready_limits: config.ready_limits.clone(),
         };
@@ -143,6 +149,7 @@ where
         let local_addr = listener.local_addr()?;
         let session_status = EgressStatusConfig {
             capacity_bps: config.capacity_bps,
+            max_inbound_target_connections: config.max_inbound_target_connections,
             recommended_path_count: config.recommended_path_count,
             max_streams_per_ingress: config.max_streams_per_ingress,
             quota_remaining: config.quota_remaining,
@@ -155,6 +162,7 @@ where
             observations: Arc::clone(&observations),
             status: session_status,
         });
+        let target_slots = Arc::new(Semaphore::new(config.max_inbound_target_connections));
         Ok(Self {
             listener,
             local_addr,
@@ -168,6 +176,7 @@ where
             next_path_token: AtomicU64::new(1),
             session_status,
             status_provider,
+            target_slots,
         })
     }
 
@@ -436,7 +445,7 @@ where
             running: &self.running,
             runtime: Arc::clone(&self.runtime),
         };
-        let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_paths));
+        let semaphore = Arc::new(Semaphore::new(path_safety_ceiling(&self.config)));
         let (events_tx, mut events) = mpsc::unbounded_channel();
         let mut tasks = JoinSet::new();
         let mut shutdown = Box::pin(shutdown);
@@ -476,6 +485,7 @@ where
                         Arc::clone(&self.connector),
                         Arc::clone(&self.observations),
                         Arc::clone(&active_targets),
+                        Arc::clone(&self.target_slots),
                         self.session_status,
                         self.config.remote_dns_only,
                         Arc::clone(&self.status_provider),
@@ -655,12 +665,13 @@ fn validate_config(config: &EgressNodeConfig) -> Result<(), EgressNodeError> {
         ));
     }
     if config.capacity_bps == 0
+        || config.max_inbound_target_connections == 0
         || config.recommended_path_count == 0
         || config.max_streams_per_ingress == 0
         || config.traffic_multiplier_basis_points == 0
     {
         return Err(EgressNodeError::InvalidConfig(
-            "status capacity, limits, and traffic multiplier must be non-zero",
+            "status capacity, target-connection limit, and traffic multiplier must be non-zero",
         ));
     }
     if config.required_capabilities & config.supported_capabilities != config.required_capabilities
@@ -684,6 +695,15 @@ fn validate_config(config: &EgressNodeConfig) -> Result<(), EgressNodeError> {
         ));
     }
     Ok(())
+}
+
+fn path_safety_ceiling(config: &EgressNodeConfig) -> usize {
+    // Keep the authored path-admission bound, but constrain it by the amount
+    // of session buffering the selected profile can safely retain. A missing
+    // or unusably small profile falls back to one Path instead of opening an
+    // unbounded admission surface.
+    let profile_limit = (config.ready_limits.max_session_buffering / (16 * 1024)) as usize;
+    config.max_concurrent_paths.min(profile_limit.max(1)).max(1)
 }
 
 #[derive(Default)]
@@ -755,25 +775,45 @@ impl EgressStatusProvider for NodeStatusProvider {
             (runtime.sessions.len() as u64, streams)
         });
         let active_targets = self.observations.active_targets.load(Ordering::Relaxed);
-        let maximum_connections = active_sessions
-            .max(1)
-            .saturating_mul(self.status.max_streams_per_ingress as u64);
+        let maximum_connections = self.status.max_inbound_target_connections.max(1) as u64;
         let utilization = active_targets
             .saturating_mul(10_000)
             .checked_div(maximum_connections)
             .unwrap_or(0)
             .min(10_000) as u16;
+        let admission_allowed = active_targets < maximum_connections;
         EgressStatusSample {
             connected: true,
-            service_state: pathchord_core::EgressServiceState::Up,
+            service_state: if admission_allowed {
+                pathchord_core::EgressServiceState::Up
+            } else {
+                pathchord_core::EgressServiceState::Degraded
+            },
+            admission_allowed,
+            admission_reason: if admission_allowed {
+                AdmissionReason::None
+            } else {
+                AdmissionReason::ConnectionLimit
+            },
             load_basis_points: utilization,
             connection_utilization_basis_points: utilization,
             bandwidth_utilization_basis_points: 0,
             active_sessions,
             active_streams,
             active_target_connections: active_targets,
-            capacity_bps: self.status.capacity_bps,
-            recommended_path_count: self.status.recommended_path_count,
+            configured_capacity_bps: self.status.capacity_bps,
+            effective_capacity_bps: if active_targets > 0 {
+                self.status.capacity_bps
+            } else {
+                0
+            },
+            current_wire_rate_bps: 0,
+            replication_allowance_bps: self.status.capacity_bps,
+            capacity_state: if active_targets > 0 {
+                CapacityState::Provisional
+            } else {
+                CapacityState::Unknown
+            },
             quota_remaining: self.status.quota_remaining,
             traffic_multiplier_basis_points: self.status.traffic_multiplier_basis_points,
         }
@@ -851,6 +891,7 @@ async fn run_path_task<C>(
     connector: Arc<C>,
     observations: Arc<NodeObservations>,
     active_targets: Arc<AtomicU64>,
+    target_slots: Arc<Semaphore>,
     session_status: EgressStatusConfig,
     remote_dns_only: bool,
     status_provider: Arc<NodeStatusProvider>,
@@ -905,6 +946,7 @@ async fn run_path_task<C>(
         connector,
         session_targets: active_targets,
         global_targets: Arc::clone(&observations.active_targets),
+        target_slots,
         remote_dns_only,
     };
     match claimed.await.unwrap_or(ClaimDecision::Reject) {
@@ -989,6 +1031,7 @@ struct ConnectorStreamFactory<C> {
     connector: Arc<C>,
     session_targets: Arc<AtomicU64>,
     global_targets: Arc<AtomicU64>,
+    target_slots: Arc<Semaphore>,
     remote_dns_only: bool,
 }
 
@@ -1001,6 +1044,12 @@ where
         &self,
         target: TargetEndpoint,
     ) -> Result<BoxedSessionStream, EgressStreamOpenError> {
+        let permit = self.target_slots.clone().try_acquire_owned().map_err(|_| {
+            EgressStreamOpenError::new(
+                ErrorClass::ResourceLimit,
+                b"global inbound target-connection limit reached".to_vec(),
+            )
+        })?;
         let original_hostname = if target.hostname.is_empty() {
             None
         } else {
@@ -1028,6 +1077,7 @@ where
         self.global_targets.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(TrackedTargetStream {
             inner: connection,
+            _permit: permit,
             session_targets: Arc::clone(&self.session_targets),
             global_targets: Arc::clone(&self.global_targets),
         }))
@@ -1036,6 +1086,7 @@ where
 
 struct TrackedTargetStream {
     inner: BoxedTargetConnection,
+    _permit: OwnedSemaphorePermit,
     session_targets: Arc<AtomicU64>,
     global_targets: Arc<AtomicU64>,
 }
@@ -1237,12 +1288,32 @@ mod tests {
                 | pathchord_core::CAPABILITY_UDP_SESSION,
             max_concurrent_paths: 8,
             capacity_bps: 1_000_000_000,
+            max_inbound_target_connections: 256,
             recommended_path_count: 1,
             max_streams_per_ingress: 256,
             remote_dns_only: false,
             quota_remaining: None,
             traffic_multiplier_basis_points: 10_000,
         }
+    }
+
+    #[test]
+    fn path_safety_ceiling_is_constrained_by_profile_buffering() {
+        let keypair = generate_static_keypair().unwrap();
+        let store = Arc::new(
+            AuthorizationStore::open(
+                database_path(),
+                EgressId::new("runtime-egress"),
+                *keypair.public(),
+            )
+            .unwrap(),
+        );
+        let mut config = node_config(Arc::new(keypair), store);
+        config.max_concurrent_paths = 100;
+        config.ready_limits.max_session_buffering = 128 * 1024;
+        assert_eq!(path_safety_ceiling(&config), 8);
+        config.ready_limits.max_session_buffering = 0;
+        assert_eq!(path_safety_ceiling(&config), 1);
     }
 
     fn ingress_config(session: u128, path: u128) -> IngressPathAdmissionConfig {
@@ -1255,6 +1326,7 @@ mod tests {
             offered_capabilities: pathchord_core::CAPABILITY_TCP_STREAM
                 | pathchord_core::CAPABILITY_UDP_SESSION,
             required_capabilities: 1,
+            replication_budget_bytes_per_second: 8 * 1024 * 1024,
             local_limits: ProtocolLimits::default(),
         }
     }
@@ -1349,6 +1421,7 @@ mod tests {
             connector: Arc::clone(&connector),
             session_targets: Arc::new(AtomicU64::new(0)),
             global_targets: Arc::new(AtomicU64::new(0)),
+            target_slots: Arc::new(Semaphore::new(1)),
             remote_dns_only: true,
         };
         let stream = factory
@@ -1366,6 +1439,36 @@ mod tests {
             Some("example.test")
         );
         assert!(requests[0].resolved_ip_candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_target_connection_reservation_releases_after_stream_drop() {
+        let connector = Arc::new(RecordingConnector::default());
+        let factory = ConnectorStreamFactory {
+            connector,
+            session_targets: Arc::new(AtomicU64::new(0)),
+            global_targets: Arc::new(AtomicU64::new(0)),
+            target_slots: Arc::new(Semaphore::new(1)),
+            remote_dns_only: false,
+        };
+        let target = TargetEndpoint {
+            hostname: b"target.test".to_vec(),
+            port: 443,
+            resolved_addresses: Vec::new(),
+        };
+        let first = factory
+            .open(target.clone())
+            .await
+            .expect("first reservation");
+        assert!(matches!(
+            factory.open(target.clone()).await,
+            Err(EgressStreamOpenError {
+                error: ErrorClass::ResourceLimit,
+                ..
+            })
+        ));
+        drop(first);
+        factory.open(target).await.expect("released reservation");
     }
 
     #[tokio::test]
@@ -1390,8 +1493,9 @@ mod tests {
             .with_status_config(status)
             .unwrap();
         let sample = node.status_provider.sample();
-        assert_eq!(sample.capacity_bps, 42_000);
-        assert_eq!(sample.recommended_path_count, 3);
+        assert_eq!(sample.configured_capacity_bps, 42_000);
+        assert_eq!(sample.effective_capacity_bps, 0);
+        assert_eq!(sample.capacity_state, CapacityState::Unknown);
     }
 
     #[tokio::test]
@@ -2095,7 +2199,7 @@ mod tests {
         let status = node.status_provider.sample();
         assert_eq!(status.active_sessions, 1);
         assert_eq!(status.active_streams, 1);
-        assert_eq!(status.capacity_bps, 1_000_000_000);
+        assert_eq!(status.configured_capacity_bps, 1_000_000_000);
         first
             .close_path(pathchord_core::PathId::new(8))
             .await

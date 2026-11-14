@@ -1,6 +1,6 @@
 # PathChord implementation status
 
-Status snapshot: 2026-11-14.
+Status snapshot: 2026-11-15.
 
 This document records the current implementation and validation state. Final
 architecture remains under `docs/design/`; behavioral contracts live under
@@ -9,6 +9,36 @@ architecture remains under `docs/design/`; behavioral contracts live under
 this snapshot records evidence rather than a second implementation plan.
 
 ## Current focus
+
+The unreleased v1 session/resource contract is now implemented through the
+wire, lifecycle, scheduling, Egress-resource, TLS, and local-control slices.
+The implementation uses the finalized v1 registry without PathRebind or
+TrafficClass wire extensions; Session attachment negotiates a mandatory
+replication cap, ACKs are checked against emitted intervals, and a validated
+future ACK closes the whole Session before fresh-Session recovery. Lifecycle
+events are owned by the Session/Path owner, Transit relationships can carry
+multiple independent Paths, rule demand is bounded and EWMA-sampled, and
+candidate failover stops at target admission. Egress target reservations,
+global capacity/admission status, resource-limit errors, passive capacity
+confidence, truststore source validation, and local-control stage deadlines
+are present in the local implementation.
+
+The evidence below remains local Linux build/test evidence unless a section
+explicitly names a native host, external peer, cross-machine run, or soak.
+
+Final v1 contract validation in this checkout:
+
+- `cargo fmt --all -- --check` passed.
+- Locked workspace Clippy with `-D warnings` passed; Cargo still reports the
+  pre-existing unused `netsock` manifest dependency as a warning.
+- `cargo test --locked --workspace --all-targets` passed. The seven external
+  core/peer interoperability tests remain explicitly ignored unless their
+  external binaries are supplied.
+- `openspec validate --all --strict --no-interactive`, `git diff --check`, and
+  the repository heading/bilingual documentation audit passed.
+- Native Windows/FreeBSD execution, privileged Linux interception, external
+  peer runs, cross-machine behavior, and prolonged soak remain unverified on
+  this host; the local loopback tests must not be read as those evidence.
 
 Active work prioritizes HTTP forwarding/CONNECT, SOCKS4/4a/5 CONNECT, SOCKS5
 UDP ASSOCIATE, and same-port Mixed listeners on Linux, Windows, and FreeBSD.
@@ -252,11 +282,10 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 ## Shared implementation gaps
 
 - A Session containing flows admitted by different TrafficPolicies uses the
-  most restrictive budget observed during that Session; it does not restore a
-  larger budget after a flow ends. Egress does not yet receive a negotiated
-  replication budget, so it suppresses extra copies while retaining ordinary
-  reliable retransmission. Independent class budgets across multiple active
-  policies and bidirectional budget negotiation need further implementation.
+  most restrictive local policy floor while the negotiated Session replication
+  cap remains the hard ceiling. The current bounded wire-budget helper and
+  status allowance are deterministic local components; aggregate Egress wire
+  accounting still needs prolonged load evidence and cross-machine validation.
 - Congestion-window, incremental-capacity, and scheduling-overhead measurements
   are optional scheduler inputs. No platform source supplies them by default;
   they remain unknown rather than being inferred from idle throughput.

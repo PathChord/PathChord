@@ -75,6 +75,7 @@ async fn http_connect_through_egress(namespace: &str) {
                 supported_capabilities: 1,
                 max_concurrent_paths: 8,
                 capacity_bps: 1_000_000_000,
+                max_inbound_target_connections: 128,
                 recommended_path_count: 1,
                 max_streams_per_ingress: 128,
                 remote_dns_only: false,

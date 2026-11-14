@@ -1,5 +1,7 @@
 //! TLS options for native proxy transports. Unsupported extensions never downgrade.
 
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 use pathchord_policy::TransitTls;
@@ -9,6 +11,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 
 use crate::{TransitCredential, TransitError};
+
+const MAX_TRUSTSTORE_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(crate) fn client_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
     client_builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
@@ -23,12 +27,12 @@ pub(crate) fn client_builder_with_provider(
 }
 
 pub(crate) fn configure(
-    base: Arc<ClientConfig>,
+    _base: Arc<ClientConfig>,
     options: Option<&TransitTls>,
     credential: Option<&TransitCredential>,
 ) -> Result<Arc<ClientConfig>, TransitError> {
     let Some(options) = options else {
-        return Ok(base);
+        return Ok(_base);
     };
     if !options.enabled {
         return Err(TransitError::Unsupported(
@@ -40,16 +44,8 @@ pub(crate) fn configure(
             "TLS fingerprint and Reality require a native Reality adapter".into(),
         ));
     }
-    let mut config = if options.certificate.is_empty()
-        && options.client_certificate.is_empty()
-        && options.client_key_field.is_none()
-    {
-        (*base).clone()
-    } else {
-        let mut roots = RootCertStore::empty();
-        for certificate in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(certificate);
-        }
+    let mut roots = truststore(&options.truststore)?;
+    let mut config = {
         for certificate in certificates(&options.certificate)? {
             roots
                 .add(certificate)
@@ -88,6 +84,74 @@ pub(crate) fn configure(
             .set_certificate_verifier(Arc::new(ExplicitInsecureVerifier));
     }
     Ok(Arc::new(config))
+}
+
+fn truststore(sources: &[String]) -> Result<RootCertStore, TransitError> {
+    let mut roots = RootCertStore::empty();
+    for source in sources {
+        if source == "system" {
+            for certificate in rustls_native_certs::load_native_certs().certs {
+                roots
+                    .add(certificate)
+                    .map_err(|_| TransitError::Unsupported("system TLS root is invalid".into()))?;
+            }
+            continue;
+        }
+        let path = Path::new(source);
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| TransitError::Unsupported("TLS truststore source is unreadable".into()))?;
+        let target = if metadata.file_type().is_symlink() {
+            let target = fs::canonicalize(path).map_err(|_| {
+                TransitError::Unsupported("TLS truststore symlink target is invalid".into())
+            })?;
+            let target_metadata = fs::metadata(&target).map_err(|_| {
+                TransitError::Unsupported("TLS truststore symlink target is unreadable".into())
+            })?;
+            if !target_metadata.is_file() {
+                return Err(TransitError::Unsupported(
+                    "TLS truststore symlink target is not a regular file".into(),
+                ));
+            }
+            target
+        } else {
+            if !metadata.is_file() {
+                return Err(TransitError::Unsupported(
+                    "TLS truststore source is not a regular file".into(),
+                ));
+            }
+            path.to_owned()
+        };
+        let metadata = fs::metadata(&target)
+            .map_err(|_| TransitError::Unsupported("TLS truststore source is unreadable".into()))?;
+        if metadata.len() > MAX_TRUSTSTORE_SOURCE_BYTES {
+            return Err(TransitError::Unsupported(
+                "TLS truststore source exceeds the size limit".into(),
+            ));
+        }
+        let bytes = fs::read(&target)
+            .map_err(|_| TransitError::Unsupported("TLS truststore source is unreadable".into()))?;
+        let pem = CertificateDer::pem_slice_iter(&bytes).collect::<Result<Vec<_>, _>>();
+        let certificates = match pem {
+            Ok(certificates) if !certificates.is_empty() => certificates,
+            Ok(_) if bytes.starts_with(b"-----BEGIN") => {
+                return Err(TransitError::Unsupported(
+                    "TLS truststore PEM contains no certificates".into(),
+                ));
+            }
+            Err(_) if bytes.starts_with(b"-----BEGIN") => {
+                return Err(TransitError::Unsupported(
+                    "TLS truststore PEM is invalid".into(),
+                ));
+            }
+            _ => vec![CertificateDer::from(bytes)],
+        };
+        for certificate in certificates {
+            roots.add(certificate).map_err(|_| {
+                TransitError::Unsupported("TLS truststore certificate is invalid".into())
+            })?;
+        }
+    }
+    Ok(roots)
 }
 
 fn certificates(values: &[String]) -> Result<Vec<CertificateDer<'static>>, TransitError> {
@@ -167,4 +231,40 @@ pub(crate) fn server_name(
             .to_owned(),
     )
     .map_err(|_| TransitError::Unsupported("proxy TLS server name is invalid".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("pathchord-tls-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn empty_truststore_is_an_empty_root_set() {
+        assert!(truststore(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_truststore_source_fails_closed() {
+        let path = temp_path("invalid");
+        std::fs::write(&path, b"not a certificate").unwrap();
+        let result = truststore(&[path.to_string_lossy().into_owned()]);
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_a_directory_is_rejected() {
+        let directory = temp_path("directory");
+        let link = temp_path("directory-link");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        let result = truststore(&[link.to_string_lossy().into_owned()]);
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir(directory);
+        assert!(result.is_err());
+    }
 }

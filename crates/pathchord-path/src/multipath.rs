@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use pathchord_core::{
-    EgressServiceState, PathId, PathState, SessionId, SessionState, StatusReport,
+    EgressServiceState, LifecycleTransitionEvent, PathId, PathState, SessionId,
+    SessionPathLifecycle, SessionState, StateTransitionError, StatusReport,
     StatusReportDisposition, StatusReportTracker, StreamAck, StreamData, StreamId,
 };
 use thiserror::Error;
@@ -14,11 +15,22 @@ use tokio::time::Instant;
 const QUOTA_ZERO_WEIGHT_FLOOR_BASIS_POINTS: u128 = 1_000;
 // Bound Path frame, record and authentication overhead when charging a copy.
 const REPLICATION_COPY_OVERHEAD_BYTES: u64 = 128;
+pub const MAX_DEMAND_KEYS: usize = 128;
+
+pub const DEFAULT_SESSION_REPLICATION_BUDGET_BYTES_PER_SECOND: u64 = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DemandKey {
+    pub rule_id: String,
+    pub policy_id: String,
+    pub traffic_class: Option<String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultipathConfig {
     pub max_paths: usize,
     pub traffic_class: Option<pathchord_core::TrafficClassConfig>,
+    pub demand_key: Option<DemandKey>,
     pub session_replication_budget_bytes: u64,
     pub default_stream_replication_budget_bytes: u64,
     pub class_replication_budget_bytes: BTreeMap<String, u64>,
@@ -31,7 +43,8 @@ impl Default for MultipathConfig {
         Self {
             max_paths: 8,
             traffic_class: None,
-            session_replication_budget_bytes: 8 * 1024 * 1024,
+            demand_key: None,
+            session_replication_budget_bytes: DEFAULT_SESSION_REPLICATION_BUDGET_BYTES_PER_SECOND,
             default_stream_replication_budget_bytes: 2 * 1024 * 1024,
             class_replication_budget_bytes: BTreeMap::new(),
             retransmission_replication_enabled: true,
@@ -43,6 +56,10 @@ impl Default for MultipathConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultipathPathObservation {
     pub effective_capacity_bps: u64,
+    /// Optional directional measurements; absent values fall back to the
+    /// aggregate capacity until that direction has evidence.
+    pub upstream_effective_capacity_bps: Option<u64>,
+    pub downstream_effective_capacity_bps: Option<u64>,
     /// Administrative scheduling weight in basis points.
     pub weight_basis_points: u16,
     pub rtt_ms: u64,
@@ -85,6 +102,8 @@ impl Default for MultipathPathObservation {
     fn default() -> Self {
         Self {
             effective_capacity_bps: 1,
+            upstream_effective_capacity_bps: None,
+            downstream_effective_capacity_bps: None,
             weight_basis_points: 10_000,
             rtt_ms: 1,
             jitter_ms: 0,
@@ -147,10 +166,11 @@ pub enum MultipathError {
     ConflictingRetainedRange,
     #[error("Stream offset arithmetic overflowed")]
     OffsetOverflow,
+    #[error(transparent)]
+    Lifecycle(#[from] StateTransitionError),
 }
 
 struct ManagedPath {
-    state: PathState,
     observation: MultipathPathObservation,
     status: StatusReportTracker,
     status_elapsed_ms: u64,
@@ -168,7 +188,7 @@ struct RetainedRange {
 
 pub struct MultipathSession {
     session_id: SessionId,
-    state: SessionState,
+    lifecycle: SessionPathLifecycle,
     config: MultipathConfig,
     paths: BTreeMap<PathId, ManagedPath>,
     retained: BTreeMap<(StreamId, u64), RetainedRange>,
@@ -183,7 +203,7 @@ impl std::fmt::Debug for MultipathSession {
         formatter
             .debug_struct("MultipathSession")
             .field("session_id", &self.session_id)
-            .field("state", &self.state)
+            .field("state", &self.lifecycle.session_state())
             .field("path_count", &self.paths.len())
             .field("retained_range_count", &self.retained.len())
             .field("session_replication_used", &self.session_replication_used)
@@ -207,9 +227,11 @@ impl MultipathSession {
         {
             return Err(MultipathError::InvalidReplicationBudget);
         }
+        let mut lifecycle = SessionPathLifecycle::new();
+        lifecycle.transition_session(SessionState::Connecting)?;
         Ok(Self {
             session_id,
-            state: SessionState::Configured,
+            lifecycle,
             config,
             paths: BTreeMap::new(),
             retained: BTreeMap::new(),
@@ -250,35 +272,44 @@ impl MultipathSession {
     }
 
     #[must_use]
+    pub const fn session_replication_budget_bytes(&self) -> u64 {
+        self.config.session_replication_budget_bytes
+    }
+
+    #[must_use]
     pub const fn state(&self) -> SessionState {
-        self.state
+        self.lifecycle.session_state()
     }
 
     #[must_use]
     pub fn ready_path_count(&self) -> usize {
-        self.paths
-            .values()
-            .filter(|path| self.path_is_schedulable(path))
-            .count()
+        self.lifecycle.schedulable_path_count()
     }
 
     #[must_use]
     pub fn degraded_path_count(&self) -> usize {
         self.paths
-            .values()
-            .filter(|path| path.state == PathState::Degraded)
+            .keys()
+            .filter(|path_id| self.lifecycle.path_state(**path_id) == Some(PathState::Degraded))
             .count()
     }
 
     #[must_use]
     pub fn effective_capacity_bps(&self) -> u64 {
+        self.directional_effective_capacity_bps(ScheduleDirection::Upstream)
+            .max(self.directional_effective_capacity_bps(ScheduleDirection::Downstream))
+    }
+
+    #[must_use]
+    pub fn directional_effective_capacity_bps(&self, direction: ScheduleDirection) -> u64 {
         self.paths
-            .values()
-            .filter(|path| {
-                self.path_is_schedulable(path) && quality_exclusion(&path.observation).is_none()
+            .iter()
+            .filter(|(path_id, path)| {
+                self.path_is_schedulable_by_id(**path_id, path)
+                    && quality_exclusion(&path.observation).is_none()
             })
-            .map(|path| {
-                let weighted = effective_capacity(&path.observation)
+            .map(|(_, path)| {
+                let weighted = effective_capacity_for_direction(&path.observation, direction)
                     * u128::from(path.observation.weight_basis_points)
                     / 10_000;
                 let delivered =
@@ -302,17 +333,19 @@ impl MultipathSession {
     pub fn ready_path_ids(&self) -> Vec<PathId> {
         self.paths
             .iter()
-            .filter(|(_, path)| self.path_is_schedulable(path))
+            .filter(|(path_id, path)| self.path_is_schedulable_by_id(**path_id, path))
             .map(|(path_id, _)| *path_id)
             .collect()
     }
 
     #[must_use]
     pub fn path_states(&self) -> BTreeMap<PathId, PathState> {
-        self.paths
-            .iter()
-            .map(|(id, path)| (*id, path.state))
-            .collect()
+        self.lifecycle.path_states()
+    }
+
+    /// Drain lifecycle events emitted by the Session/Path owner.
+    pub fn take_lifecycle_events(&mut self) -> Vec<LifecycleTransitionEvent> {
+        self.lifecycle.take_events()
     }
 
     pub fn add_path(
@@ -320,7 +353,7 @@ impl MultipathSession {
         path_id: PathId,
         observation: MultipathPathObservation,
     ) -> Result<(), MultipathError> {
-        if self.state == SessionState::Closed {
+        if self.lifecycle.session_state() == SessionState::Closed {
             return Err(MultipathError::SessionClosed);
         }
         validate_observation(&observation)?;
@@ -330,10 +363,10 @@ impl MultipathSession {
         if self.paths.contains_key(&path_id) {
             return Err(MultipathError::DuplicatePath(path_id));
         }
+        self.lifecycle.register_path(path_id, PathState::Active)?;
         self.paths.insert(
             path_id,
             ManagedPath {
-                state: PathState::Active,
                 observation,
                 status: StatusReportTracker::new(),
                 status_elapsed_ms: 0,
@@ -342,21 +375,24 @@ impl MultipathSession {
                 economics: PathEconomicStatus::default(),
             },
         );
-        self.state = SessionState::Active;
+        self.lifecycle.transition_session(SessionState::Active)?;
         Ok(())
     }
 
     pub fn drain_path(&mut self, path_id: PathId) -> Result<(), MultipathError> {
-        let path = self
-            .paths
-            .get_mut(&path_id)
+        if !self.paths.contains_key(&path_id) {
+            return Err(MultipathError::UnknownPath(path_id));
+        }
+        let state = self
+            .lifecycle
+            .path_state(path_id)
             .ok_or(MultipathError::UnknownPath(path_id))?;
-        path.state = match path.state {
-            PathState::Active | PathState::Degraded => PathState::Draining,
-            state => state,
-        };
+        if matches!(state, PathState::Active | PathState::Degraded) {
+            self.lifecycle
+                .transition_path(path_id, PathState::Draining)?;
+        }
         if self.ready_path_count() == 0 {
-            self.state = SessionState::Draining;
+            self.lifecycle.transition_session(SessionState::Draining)?;
         }
         Ok(())
     }
@@ -365,6 +401,7 @@ impl MultipathSession {
         if !self.paths.contains_key(&path_id) {
             return Err(MultipathError::UnknownPath(path_id));
         }
+        self.lifecycle.unregister_path(path_id)?;
         self.paths.remove(&path_id);
         let remaining_ready_paths = self.ready_path_count();
         let session_closed = remaining_ready_paths == 0;
@@ -373,11 +410,11 @@ impl MultipathSession {
         } else {
             self.plan_retransmissions(path_id, ScheduleDirection::Upstream)?
         };
-        self.state = if session_closed {
-            SessionState::Closed
-        } else {
-            SessionState::Degraded
-        };
+        if session_closed {
+            self.lifecycle.transition_session(SessionState::Closed)?;
+        } else if self.lifecycle.session_state() != SessionState::Draining {
+            self.lifecycle.transition_session(SessionState::Degraded)?;
+        }
         Ok(PathFailureOutcome {
             session_closed,
             remaining_ready_paths,
@@ -420,23 +457,67 @@ impl MultipathSession {
         path_id: PathId,
         state: PathState,
     ) -> Result<PathFailureOutcome, MultipathError> {
-        let path = self
-            .paths
-            .get_mut(&path_id)
-            .ok_or(MultipathError::UnknownPath(path_id))?;
-        path.state = state;
+        if !self.paths.contains_key(&path_id) {
+            return Err(MultipathError::UnknownPath(path_id));
+        }
+        self.transition_path_terminal(path_id, state)?;
         let remaining_ready_paths = self.ready_path_count();
         let session_closed = remaining_ready_paths == 0;
-        self.state = if session_closed {
-            SessionState::Closed
-        } else {
-            SessionState::Degraded
-        };
+        if session_closed {
+            self.lifecycle.transition_session(SessionState::Closed)?;
+        } else if self.lifecycle.session_state() != SessionState::Draining {
+            self.lifecycle.transition_session(SessionState::Degraded)?;
+        }
         Ok(PathFailureOutcome {
             session_closed,
             remaining_ready_paths,
             retransmissions: Vec::new(),
         })
+    }
+
+    fn transition_path_terminal(
+        &mut self,
+        path_id: PathId,
+        target: PathState,
+    ) -> Result<(), MultipathError> {
+        let current = self
+            .lifecycle
+            .path_state(path_id)
+            .ok_or(MultipathError::UnknownPath(path_id))?;
+        match target {
+            PathState::Failed => match current {
+                PathState::Active | PathState::Degraded | PathState::Probing => {
+                    self.lifecycle.transition_path(path_id, PathState::Failed)?;
+                }
+                PathState::Draining => {
+                    self.lifecycle.transition_path(path_id, PathState::Closed)?;
+                }
+                PathState::Failed | PathState::Closed => {}
+                PathState::Discovered => {
+                    self.lifecycle
+                        .transition_path(path_id, PathState::Probing)?;
+                    self.lifecycle.transition_path(path_id, PathState::Failed)?;
+                }
+            },
+            PathState::Closed => match current {
+                PathState::Closed => {}
+                PathState::Draining | PathState::Failed => {
+                    self.lifecycle.transition_path(path_id, PathState::Closed)?;
+                }
+                PathState::Active | PathState::Degraded => {
+                    self.lifecycle
+                        .transition_path(path_id, PathState::Draining)?;
+                    self.lifecycle.transition_path(path_id, PathState::Closed)?;
+                }
+                PathState::Discovered | PathState::Probing => {
+                    self.lifecycle.transition_path(path_id, PathState::Closed)?;
+                }
+            },
+            _ => {
+                self.lifecycle.transition_path(path_id, target)?;
+            }
+        };
+        Ok(())
     }
 
     pub fn update_observation(
@@ -473,39 +554,51 @@ impl MultipathSession {
         if status.traffic_multiplier_basis_points == 0 {
             return Err(MultipathError::InvalidObservation);
         }
+        if !status.hard_available {
+            self.lifecycle.transition_path(path_id, PathState::Failed)?;
+        }
         let path = self
             .paths
             .get_mut(&path_id)
             .ok_or(MultipathError::UnknownPath(path_id))?;
-        if !status.hard_available {
-            path.state = PathState::Failed;
-        }
         path.economics = status;
         Ok(())
     }
 
     pub fn degrade_path(&mut self, path_id: PathId) -> Result<(), MultipathError> {
-        let path = self
-            .paths
-            .get_mut(&path_id)
+        let state = self
+            .lifecycle
+            .path_state(path_id)
             .ok_or(MultipathError::UnknownPath(path_id))?;
-        if path.state == PathState::Active {
-            path.state = PathState::Degraded;
+        if state == PathState::Active {
+            self.lifecycle
+                .transition_path(path_id, PathState::Degraded)?;
         }
-        self.state = SessionState::Degraded;
+        self.lifecycle.transition_session(SessionState::Degraded)?;
         Ok(())
     }
 
     pub fn activate_path(&mut self, path_id: PathId) -> Result<(), MultipathError> {
         let path = self
             .paths
-            .get_mut(&path_id)
+            .get(&path_id)
             .ok_or(MultipathError::UnknownPath(path_id))?;
-        if path.state == PathState::Degraded && path.economics.hard_available {
-            path.state = PathState::Active;
+        let state = self
+            .lifecycle
+            .path_state(path_id)
+            .ok_or(MultipathError::UnknownPath(path_id))?;
+        if state == PathState::Degraded && path.economics.hard_available {
+            self.lifecycle.transition_path(path_id, PathState::Active)?;
+        } else if state == PathState::Draining {
+            return Err(MultipathError::Lifecycle(
+                StateTransitionError::InvalidPath {
+                    from: PathState::Draining,
+                    to: PathState::Active,
+                },
+            ));
         }
         if self.ready_path_count() > 0 {
-            self.state = SessionState::Active;
+            self.lifecycle.transition_session(SessionState::Active)?;
         }
         Ok(())
     }
@@ -515,28 +608,47 @@ impl MultipathSession {
         path_id: PathId,
         report: StatusReport,
     ) -> Result<StatusReportDisposition, MultipathError> {
-        let path = self
-            .paths
-            .get_mut(&path_id)
-            .ok_or(MultipathError::UnknownPath(path_id))?;
-        let disposition = path.status.apply(report.clone());
-        if disposition == StatusReportDisposition::Accepted {
-            path.status_elapsed_ms = 0;
-            if report.capacity_bps > 0 {
-                path.observation.effective_capacity_bps = report.capacity_bps;
-            }
-            if matches!(path.state, PathState::Active | PathState::Degraded) {
-                path.state = match report.service_state {
-                    EgressServiceState::Up if report.connected => PathState::Active,
-                    EgressServiceState::Draining => PathState::Draining,
-                    _ => PathState::Degraded,
+        let disposition;
+        let next_state = {
+            let path = self
+                .paths
+                .get_mut(&path_id)
+                .ok_or(MultipathError::UnknownPath(path_id))?;
+            disposition = path.status.apply(report.clone());
+            if disposition == StatusReportDisposition::Accepted {
+                path.status_elapsed_ms = 0;
+                let effective_capacity = if report.effective_capacity_bps > 0 {
+                    report.effective_capacity_bps
+                } else {
+                    report.configured_capacity_bps
                 };
+                if effective_capacity > 0 {
+                    path.observation.effective_capacity_bps = effective_capacity;
+                }
+            } else if disposition == StatusReportDisposition::Expired {
+                path.status_elapsed_ms = path
+                    .status
+                    .latest()
+                    .map_or(0, |latest| latest.expires_after_ms.saturating_add(1));
             }
-        } else if disposition == StatusReportDisposition::Expired {
-            path.status_elapsed_ms = path
-                .status
-                .latest()
-                .map_or(0, |latest| latest.expires_after_ms.saturating_add(1));
+            if disposition == StatusReportDisposition::Accepted {
+                let current_state = self
+                    .lifecycle
+                    .path_state(path_id)
+                    .ok_or(MultipathError::UnknownPath(path_id))?;
+                matches!(current_state, PathState::Active | PathState::Degraded).then(|| {
+                    match report.service_state {
+                        EgressServiceState::Up if report.connected => PathState::Active,
+                        EgressServiceState::Draining => PathState::Draining,
+                        _ => PathState::Degraded,
+                    }
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(next_state) = next_state {
+            self.lifecycle.transition_path(path_id, next_state)?;
         }
         Ok(disposition)
     }
@@ -806,7 +918,7 @@ impl MultipathSession {
         excluded: Option<PathId>,
         eligible: Option<&BTreeMap<PathId, u32>>,
     ) -> Result<PathSchedule, MultipathError> {
-        if self.state == SessionState::Closed {
+        if self.lifecycle.session_state() == SessionState::Closed {
             return Err(MultipathError::SessionClosed);
         }
         let mut candidates: Vec<_> = self
@@ -815,7 +927,7 @@ impl MultipathSession {
             .filter(|(path_id, path)| {
                 Some(**path_id) != excluded
                     && eligible.is_none_or(|eligible| eligible.contains_key(path_id))
-                    && self.path_is_schedulable(path)
+                    && self.path_is_schedulable_by_id(**path_id, path)
                     && quality_exclusion(&path.observation).is_none()
             })
             .map(|(path_id, path)| {
@@ -827,7 +939,7 @@ impl MultipathSession {
                     .copied()
                     .unwrap_or(u32::from(path.observation.weight_basis_points))
                     .max(1);
-                let score = path_score(&path.observation, &path.economics, weight);
+                let score = path_score(&path.observation, &path.economics, weight, direction);
                 let scheduled = match direction {
                     ScheduleDirection::Upstream => path.upstream_scheduled_bytes,
                     ScheduleDirection::Downstream => path.downstream_scheduled_bytes,
@@ -856,8 +968,12 @@ impl MultipathSession {
         Ok(PathSchedule { path_id, score })
     }
 
-    fn path_is_schedulable(&self, path: &ManagedPath) -> bool {
-        if !path.state.can_admit_business() {
+    fn path_is_schedulable_by_id(&self, path_id: PathId, path: &ManagedPath) -> bool {
+        if !self
+            .lifecycle
+            .path_state(path_id)
+            .is_some_and(PathState::can_admit_business)
+        {
             return false;
         }
         if !path.economics.hard_available {
@@ -878,6 +994,12 @@ impl MultipathSession {
 
 fn validate_observation(observation: &MultipathPathObservation) -> Result<(), MultipathError> {
     if observation.effective_capacity_bps == 0
+        || observation
+            .upstream_effective_capacity_bps
+            .is_some_and(|capacity| capacity == 0)
+        || observation
+            .downstream_effective_capacity_bps
+            .is_some_and(|capacity| capacity == 0)
         || observation.weight_basis_points == 0
         || observation.weight_basis_points > 10_000
         || observation.loss_basis_points > 10_000
@@ -894,8 +1016,10 @@ fn path_score(
     observation: &MultipathPathObservation,
     economics: &PathEconomicStatus,
     relationship_weight: u32,
+    direction: ScheduleDirection,
 ) -> u128 {
-    let weighted_capacity = effective_capacity(observation) * u128::from(relationship_weight);
+    let weighted_capacity =
+        effective_capacity_for_direction(observation, direction) * u128::from(relationship_weight);
     let delivered = weighted_capacity * u128::from(10_000 - observation.loss_basis_points) / 10_000;
     let delivered =
         delivered * u128::from(10_000 - observation.reordering_basis_points.unwrap_or(0)) / 10_000;
@@ -915,8 +1039,18 @@ fn path_score(
     (quota_adjusted / latency).max(1)
 }
 
-fn effective_capacity(observation: &MultipathPathObservation) -> u128 {
-    let capacity = u128::from(observation.effective_capacity_bps);
+fn effective_capacity_for_direction(
+    observation: &MultipathPathObservation,
+    direction: ScheduleDirection,
+) -> u128 {
+    let capacity = u128::from(match direction {
+        ScheduleDirection::Upstream => observation
+            .upstream_effective_capacity_bps
+            .unwrap_or(observation.effective_capacity_bps),
+        ScheduleDirection::Downstream => observation
+            .downstream_effective_capacity_bps
+            .unwrap_or(observation.effective_capacity_bps),
+    });
     observation
         .congestion_window_bytes
         .map_or(capacity, |window| {
@@ -1347,14 +1481,19 @@ mod tests {
         let report = StatusReport {
             connected: true,
             service_state: EgressServiceState::Up,
+            admission_allowed: true,
+            admission_reason: pathchord_core::AdmissionReason::None,
             load_basis_points: 0,
             connection_utilization_basis_points: 0,
             bandwidth_utilization_basis_points: 0,
             active_sessions: 1,
             active_streams: 0,
             active_target_connections: 0,
-            capacity_bps: 10_000,
-            recommended_path_count: 1,
+            configured_capacity_bps: 10_000,
+            effective_capacity_bps: 10_000,
+            current_wire_rate_bps: 0,
+            replication_allowance_bps: 10_000,
+            capacity_state: pathchord_core::CapacityState::Measured,
             report_seqno: 1,
             sample_age_ms: 0,
             expires_after_ms: 100,
@@ -1502,6 +1641,77 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_owner_guards_draining_paths_and_emits_one_event_per_change() {
+        let mut session =
+            MultipathSession::new(SessionId::new(1), MultipathConfig::default()).unwrap();
+        let path_id = PathId::new(1);
+        session
+            .add_path(path_id, observation(10_000, 10, 0))
+            .unwrap();
+        let admitted = session.take_lifecycle_events();
+        assert_eq!(admitted.len(), 3);
+
+        session.drain_path(path_id).unwrap();
+        let drained = session.take_lifecycle_events();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().any(|event| {
+            event.entity == pathchord_core::LifecycleEntity::Path(path_id)
+                && event.to == pathchord_core::LifecycleState::Path(PathState::Draining)
+        }));
+        assert!(drained.iter().any(|event| {
+            event.entity == pathchord_core::LifecycleEntity::Session
+                && event.to == pathchord_core::LifecycleState::Session(SessionState::Draining)
+        }));
+        assert!(matches!(
+            session.activate_path(path_id),
+            Err(MultipathError::Lifecycle(
+                StateTransitionError::InvalidPath {
+                    from: PathState::Draining,
+                    to: PathState::Active,
+                }
+            ))
+        ));
+        assert!(session.take_lifecycle_events().is_empty());
+    }
+
+    #[test]
+    fn directional_capacity_keeps_upstream_and_downstream_observations_separate() {
+        let mut session =
+            MultipathSession::new(SessionId::new(1), MultipathConfig::default()).unwrap();
+        let mut upstream = observation(1_000, 10, 0);
+        upstream.upstream_effective_capacity_bps = Some(10_000);
+        upstream.downstream_effective_capacity_bps = Some(1_000);
+        let mut downstream = observation(1_000, 10, 0);
+        downstream.upstream_effective_capacity_bps = Some(1_000);
+        downstream.downstream_effective_capacity_bps = Some(10_000);
+        session.add_path(PathId::new(1), upstream).unwrap();
+        session.add_path(PathId::new(2), downstream).unwrap();
+
+        assert_eq!(
+            session.directional_effective_capacity_bps(ScheduleDirection::Upstream),
+            11_000
+        );
+        assert_eq!(
+            session.directional_effective_capacity_bps(ScheduleDirection::Downstream),
+            11_000
+        );
+        assert_eq!(
+            session
+                .schedule(ScheduleDirection::Upstream, 1)
+                .unwrap()
+                .path_id,
+            PathId::new(1)
+        );
+        assert_eq!(
+            session
+                .schedule(ScheduleDirection::Downstream, 1)
+                .unwrap()
+                .path_id,
+            PathId::new(2)
+        );
+    }
+
+    #[test]
     fn per_flow_relationship_weight_is_applied_once_with_large_capacity() {
         let mut session =
             MultipathSession::new(SessionId::new(1), MultipathConfig::default()).unwrap();
@@ -1526,14 +1736,21 @@ mod tests {
     fn measured_reordering_and_congestion_window_reduce_score_without_fabricating_unknowns() {
         let unknown = observation(100_000_000, 10, 0);
         let economics = PathEconomicStatus::default();
-        let baseline = path_score(&unknown, &economics, 100);
+        let baseline = path_score(&unknown, &economics, 100, ScheduleDirection::Upstream);
         let mut reordered = unknown.clone();
         reordered.reordering_basis_points = Some(5_000);
-        let reordered_score = path_score(&reordered, &economics, 100);
+        let reordered_score = path_score(&reordered, &economics, 100, ScheduleDirection::Upstream);
         assert!(reordered_score < baseline);
         let mut limited_window = unknown.clone();
         limited_window.congestion_window_bytes = Some(1_500);
-        assert!(path_score(&limited_window, &economics, 100) < baseline);
+        assert!(
+            path_score(
+                &limited_window,
+                &economics,
+                100,
+                ScheduleDirection::Upstream
+            ) < baseline
+        );
         assert!(unknown.reordering_basis_points.is_none());
         assert!(unknown.congestion_window_bytes.is_none());
         reordered.reordering_basis_points = Some(10_001);

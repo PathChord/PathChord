@@ -172,13 +172,9 @@ pub struct EgressArgs {
     #[arg(long)]
     pub control_socket: Option<PathBuf>,
     #[arg(long)]
-    pub max_concurrent_paths: Option<usize>,
+    pub max_wire_bandwidth_bps: Option<u64>,
     #[arg(long)]
-    pub capacity_bps: Option<u64>,
-    #[arg(long)]
-    pub recommended_path_count: Option<u64>,
-    #[arg(long)]
-    pub max_streams_per_ingress: Option<usize>,
+    pub max_inbound_target_connections: Option<usize>,
     #[arg(long)]
     pub quota_remaining: Option<u64>,
     #[arg(long)]
@@ -1161,11 +1157,12 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
                     max_session_buffering: ProtocolLimits::HARD_MAX_SESSION_BUFFERING as u64,
                 },
                 required_capabilities: 1,
-                supported_capabilities: 0b11 | pathchord_core::CAPABILITY_TRAFFIC_CLASSES,
+                supported_capabilities: 0b11,
                 max_concurrent_paths: args.max_concurrent_paths,
-                capacity_bps: args.capacity_bps,
-                recommended_path_count: args.recommended_path_count,
-                max_streams_per_ingress: args.max_streams_per_ingress,
+                capacity_bps: args.max_wire_bandwidth_bps,
+                max_inbound_target_connections: args.max_inbound_target_connections,
+                recommended_path_count: 1,
+                max_streams_per_ingress: 4096,
                 remote_dns_only: args.remote_dns_only,
                 quota_remaining: args.quota_remaining,
                 traffic_multiplier_basis_points: args.traffic_multiplier_basis_points,

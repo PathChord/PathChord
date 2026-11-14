@@ -25,6 +25,7 @@ fn admitted_transports() -> (
         offered_capabilities: 1,
         required_capabilities: 1,
         supported_capabilities: 1,
+        replication_budget_bytes_per_second: 8 * 1024 * 1024,
         local_limits: ProtocolLimits::default(),
         ready_limits: PathReady {
             max_frame_payload: 60 * 1024,

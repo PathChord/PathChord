@@ -23,21 +23,22 @@ pub use frame::{
 pub use id::{IdError, PathId, RequestId, SessionId, StreamId};
 pub use limits::{LimitsError, ProtocolLimits};
 pub use messages::{
-    CAPABILITY_TCP_STREAM, CAPABILITY_TRAFFIC_CLASSES, CAPABILITY_UDP_SESSION, ControlAck,
+    AdmissionReason, CAPABILITY_TCP_STREAM, CAPABILITY_UDP_SESSION, CapacityState, ControlAck,
     Heartbeat, Message, MessageCodecError, PathClose, PathDrain, PathHello, PathReady,
-    PathReadyCapabilities, PathRebind, SessionAttach, SessionAttachOk, SessionAttachReject,
-    SessionClose, SessionControl, SessionControlCancel, SessionControlFlow, StatusReport,
+    PathReadyCapabilities, SessionAttach, SessionAttachOk, SessionAttachReject, SessionClose,
+    SessionControl, SessionControlCancel, SessionControlFlow, StatusReport,
     StatusReportDisposition, StatusReportTracker, StreamAck, StreamData, StreamFin, StreamOpen,
-    StreamOpenClass, StreamOpenErr, StreamOpenOk, StreamRst, StreamWindow, TargetEndpoint,
-    TrafficClassConfig, UdpClose, UdpDatagram, UdpOpen, UdpOpenClass, UdpOpenErr, UdpOpenOk,
+    StreamOpenErr, StreamOpenOk, StreamRst, StreamWindow, TargetEndpoint, TrafficClassConfig,
+    UdpClose, UdpDatagram, UdpOpen, UdpOpenErr, UdpOpenOk,
 };
 pub use reliability::{
     AckRange, ControlReceiver, ControlSender, ReliabilityError, StreamInsertResult,
     StreamReceiveBuffer,
 };
 pub use state::{
-    EgressRelationshipState, EgressRuntime, EgressServiceState, PathState, SessionState,
-    StateTransitionError, StreamState,
+    EgressRelationshipState, EgressRuntime, EgressServiceState, LifecycleEntity, LifecycleState,
+    LifecycleTransitionEvent, PathState, SessionPathLifecycle, SessionState, StateTransitionError,
+    StreamState,
 };
 pub use varint::{
     MAX_VARINT, VarIntError, decode_varint, decode_varint_exact, encode_varint, encoded_varint_len,
