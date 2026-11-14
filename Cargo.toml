@@ -1,11 +1,15 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["vendor/netlink-packet-utils"]
 resolver = "3"
 
 [patch.crates-io]
 # REALITY needs a narrowly scoped ClientHello hook that upstream rustls does
 # not expose. The local fork only adds that callback and X25519 secret seam.
 rustls = { path = "vendor/rustls" }
+# netsock's Netlink dependencies require the 0.5 API. Keep its source intact
+# while replacing the unmaintained paste macro dependency with pastey.
+netlink-packet-utils = { path = "vendor/netlink-packet-utils" }
 
 [workspace.package]
 version = "0.1.0"
