@@ -707,6 +707,10 @@ impl MultipathSession {
         Ok(())
     }
 
+    pub fn forget_retained(&mut self, stream_id: StreamId, offset: u64) {
+        self.retained.remove(&(stream_id, offset));
+    }
+
     pub fn acknowledge(&mut self, ack: &StreamAck) -> usize {
         let before = self.retained.len();
         self.retained.retain(|(stream_id, offset), retained| {

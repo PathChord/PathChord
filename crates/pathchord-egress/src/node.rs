@@ -18,7 +18,7 @@ use pathchord_path::{
     EgressPathAdmissionConfig, EgressSessionController, EgressSessionHandle, EgressStatusConfig,
     EgressStatusProvider, EgressStatusSample, EgressStreamFactory, EgressStreamOpenError,
     MultipathPathObservation, PathAdmissionOutcome, PathAuthorization, PathAuthorizer,
-    UdpTargetError, UdpTargetFactory, UdpTargetSocket, accept_path,
+    UdpTargetError, UdpTargetFactory, UdpTargetSocket, WireBudget, WirePriority, accept_path,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -157,10 +157,14 @@ where
         };
         let runtime = Arc::new(Mutex::new(NodeRuntimeState::default()));
         let observations = Arc::new(NodeObservations::default());
+        let wire_budget = Arc::new(WireBudget::new(config.capacity_bps).ok_or(
+            EgressNodeError::InvalidConfig("capacity is below one byte per second"),
+        )?);
         let status_provider = Arc::new(NodeStatusProvider {
             runtime: Arc::clone(&runtime),
             observations: Arc::clone(&observations),
             status: session_status,
+            wire_budget,
         });
         let target_slots = Arc::new(Semaphore::new(config.max_inbound_target_connections));
         Ok(Self {
@@ -752,6 +756,7 @@ struct NodeStatusProvider {
     runtime: Arc<Mutex<NodeRuntimeState>>,
     observations: Arc<NodeObservations>,
     status: EgressStatusConfig,
+    wire_budget: Arc<WireBudget>,
 }
 
 impl std::fmt::Debug for NodeStatusProvider {
@@ -764,6 +769,10 @@ impl std::fmt::Debug for NodeStatusProvider {
 }
 
 impl EgressStatusProvider for NodeStatusProvider {
+    fn try_reserve_wire(&self, priority: WirePriority, bytes: u64) -> bool {
+        self.wire_budget.try_reserve(priority, bytes)
+    }
+
     fn sample(&self) -> EgressStatusSample {
         let (active_sessions, active_streams) = self.runtime.lock().map_or((0, 0), |runtime| {
             let mut streams = 0_u64;
@@ -808,7 +817,7 @@ impl EgressStatusProvider for NodeStatusProvider {
                 0
             },
             current_wire_rate_bps: 0,
-            replication_allowance_bps: self.status.capacity_bps,
+            replication_allowance_bps: self.wire_budget.remaining_bytes().saturating_mul(8),
             capacity_state: if active_targets > 0 {
                 CapacityState::Provisional
             } else {

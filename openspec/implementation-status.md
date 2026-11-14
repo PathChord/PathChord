@@ -19,7 +19,8 @@ future ACK closes the whole Session before fresh-Session recovery. Lifecycle
 events are owned by the Session/Path owner, Transit relationships can carry
 multiple independent Paths, rule demand is bounded and EWMA-sampled, and
 candidate failover stops at target admission. Egress target reservations,
-global capacity/admission status, resource-limit errors, passive capacity
+global capacity/admission status, actual global wire-budget enforcement with
+residual optional replication, resource-limit errors, passive capacity
 confidence, truststore source validation, and local-control stage deadlines
 are present in the local implementation.
 
