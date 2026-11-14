@@ -153,9 +153,13 @@ async fn run_protocol(core: CoreKind, protocol: Protocol) {
         port,
         extension
     ));
-    let extra_files = write_server_config(core, protocol, &config_path, port).await;
-    let mut server = spawn_server(core, &binary, &config_path).await;
-    wait_until_ready(port, &mut server, protocol).await;
+    let ready_file = matches!(core, CoreKind::Mihomo).then(|| config_path.with_extension("ready"));
+    let mut extra_files = write_server_config(core, protocol, &config_path, port).await;
+    if let Some(path) = &ready_file {
+        extra_files.push(path.clone());
+    }
+    let mut server = spawn_server(core, &binary, &config_path, ready_file.as_deref()).await;
+    wait_until_ready(port, &mut server, ready_file.as_deref()).await;
 
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_address = target.local_addr().unwrap();
@@ -235,13 +239,27 @@ async fn run_protocol(core: CoreKind, protocol: Protocol) {
             protocol.label()
         )
     });
-    connection.write_all(payload).await.unwrap();
-    connection.flush().await.unwrap();
+    connection.write_all(payload).await.unwrap_or_else(|error| {
+        panic!(
+            "{} {} client write: {error}",
+            core.label(),
+            protocol.label()
+        )
+    });
+    connection.flush().await.unwrap_or_else(|error| {
+        panic!(
+            "{} {} client flush: {error}",
+            core.label(),
+            protocol.label()
+        )
+    });
     let mut echoed = vec![0_u8; payload.len()];
     tokio::time::timeout(Duration::from_secs(10), connection.read_exact(&mut echoed))
         .await
         .unwrap_or_else(|_| panic!("{} {} client read timeout", core.label(), protocol.label()))
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!("{} {} client read: {error}", core.label(), protocol.label())
+        });
     assert_eq!(&echoed, payload);
     drop(connection);
     target_task.await.unwrap();
@@ -417,14 +435,40 @@ async fn write_server_config(
     extra_files
 }
 
-async fn spawn_server(core: CoreKind, binary: &Path, config: &Path) -> Child {
+async fn spawn_server(
+    core: CoreKind,
+    binary: &Path,
+    config: &Path,
+    ready_file: Option<&Path>,
+) -> Child {
+    if let Some(path) = ready_file {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove stale readiness marker {path:?}: {error}"),
+        }
+    }
     let mut command = Command::new(binary);
     match core {
-        CoreKind::Mihomo => command
-            .arg("-d")
-            .arg(config.parent().unwrap())
-            .arg("-f")
-            .arg(config),
+        CoreKind::Mihomo => {
+            // Listeners open before Mihomo allows forwarding. Its post-up
+            // hook runs after the tunnel has entered the Running state.
+            command
+                .arg("-d")
+                .arg(config.parent().unwrap())
+                .arg("-f")
+                .arg(config)
+                .arg("--post-up")
+                .arg(if cfg!(windows) {
+                    r#"echo ready > "%PATHCHORD_TEST_CORE_READY_FILE%""#
+                } else {
+                    r#"echo ready > "$PATHCHORD_TEST_CORE_READY_FILE""#
+                })
+                .env(
+                    "PATHCHORD_TEST_CORE_READY_FILE",
+                    ready_file.expect("Mihomo readiness marker"),
+                )
+        }
         CoreKind::Xray | CoreKind::V2Fly => command.arg("run").arg("-c").arg(config),
     };
     let verbose = std::env::var_os("PATHCHORD_TEST_CORE_VERBOSE").is_some();
@@ -445,22 +489,24 @@ async fn spawn_server(core: CoreKind, binary: &Path, config: &Path) -> Child {
         .unwrap_or_else(|error| panic!("start {} server: {error}", core.label()))
 }
 
-async fn wait_until_ready(port: u16, server: &mut Child, protocol: Protocol) {
-    if matches!(protocol, Protocol::Hysteria2 | Protocol::Tuic) {
-        sleep(Duration::from_millis(300)).await;
-        if let Ok(Some(status)) = server.try_wait() {
-            panic!("external server exited before readiness: {status}");
-        }
-        return;
-    }
+async fn wait_until_ready(port: u16, server: &mut Child, ready_file: Option<&Path>) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
-            drop(stream);
-            return;
-        }
         if let Ok(Some(status)) = server.try_wait() {
             panic!("external server exited before readiness: {status}");
+        }
+        let ready = if let Some(path) = ready_file {
+            tokio::fs::try_exists(path)
+                .await
+                .unwrap_or_else(|error| panic!("check readiness marker {path:?}: {error}"))
+        } else if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
+            drop(stream);
+            true
+        } else {
+            false
+        };
+        if ready {
+            return;
         }
         assert!(
             Instant::now() < deadline,
@@ -468,4 +514,39 @@ async fn wait_until_ready(port: u16, server: &mut Child, protocol: Protocol) {
         );
         sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_listener_does_not_replace_post_up_readiness() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ready_file = std::env::temp_dir().join(format!(
+        "pathchord-core-readiness-{}-{port}.ready",
+        std::process::id()
+    ));
+    let _ = tokio::fs::remove_file(&ready_file).await;
+    let mut server = Command::new("sh")
+        .args(["-c", "read -r _"])
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    {
+        let ready = wait_until_ready(port, &mut server, Some(&ready_file));
+        tokio::pin!(ready);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut ready)
+                .await
+                .is_err(),
+            "an open listener must not bypass the post-up signal"
+        );
+        tokio::fs::write(&ready_file, b"ready\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut ready)
+            .await
+            .expect("post-up signal must release readiness");
+    }
+    server.kill().await.unwrap();
+    server.wait().await.unwrap();
+    tokio::fs::remove_file(ready_file).await.unwrap();
 }

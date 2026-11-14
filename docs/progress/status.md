@@ -279,6 +279,11 @@ respective test matrices. Each core is launched as the server and the matching
 PathChord native Transit adapter is the client under test. All matrix entries
 pass when the corresponding `PATHCHORD_TEST_MIHOMO`, `PATHCHORD_TEST_XRAY`, or
 `PATHCHORD_TEST_V2FLY` variable is supplied.
+The external-core cases are ignored in standard workspace runs and execute
+explicitly in the CI core matrix. Mihomo readiness waits for a post-up marker
+written after its tunnel accepts traffic; an open TCP listener alone is not
+sufficient. A non-ignored Unix regression checks that an open port cannot
+bypass that marker.
 The portable
 explicit-listener integration
 test binds listeners for the actual host platform and checks HTTP
