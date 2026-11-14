@@ -31,8 +31,9 @@ and Session/Path data plane. Privileged host routing, real TUN device smoke,
 and platform-specific packaging validation remain separate acceptance steps.
 Linux TPROXY also accepts `backend: ebpf` for an interface-bound TC classifier;
 the ordinary `tproxy` backend remains the default and fallback.
-See the [implementation plan](docs/progress/implementation-plan.md) for
-platform validation, shared runtime gaps, and subsequent adapter work.
+See the [active OpenSpec changes](#active-changes) for pending platform,
+runtime, and adapter work and the [implementation status](openspec/implementation-status.md)
+for recorded capabilities and validation evidence.
 
 Node imports support automatic detection, Clash/Mihomo providers, SIP008,
 URI/Base64 lists, sing-box JSON, and supported Surge/Quantumult X/Loon node
@@ -44,8 +45,8 @@ heartbeats and optional 0-RTT. Direct/SOCKS5/Shadowsocks UDP, including SS2022,
 remain available. Unsupported protocols and parameters remain explicit
 diagnostics.
 Unsupported nodes and parameters expose individual diagnostics. See the
-[Transit Proxy and subscription contract](docs/spec/transit-proxies.md) for
-the exact compatibility boundaries and [deployment guide](docs/spec/deployment.md)
+[Transit Proxy and subscription contract](openspec/specs/transit-proxies/spec.md) for
+the exact compatibility boundaries and [deployment guide](docs/guides/deployment.md)
 for runnable configurations.
 
 ## Terminology
@@ -59,36 +60,76 @@ for runnable configurations.
 
 ## Documentation
 
-Design documents describe the intended architecture and durable decisions.
-Specifications define the final behavioral and format contracts. The maintained
-progress documents contain only current implementation status and the active
-implementation plan; superseded process history is kept in Git history.
-Every design and specification document is available in both English and
-Simplified Chinese. Progress documents use English as their single maintained
-source.
+`docs/` contains design documents and user guides. OpenSpec owns the behavior
+contracts, implementation status, and change tracking. Each document has one
+maintained home: guides link to exact contracts rather than duplicating their
+schemas, and pending work lives in change tasks rather than a parallel plan.
+Designs, guides, and capability specs have English and Simplified Chinese
+versions; planning artifacts and the implementation-status snapshot use English.
+
+### User guides
+
+- [Configuration guide](docs/guides/configuration.md)
+- [Deployment and local operation](docs/guides/deployment.md)
+- [Native packages](packaging/README.md)
 
 ### Design
 
 - [Architecture](docs/design/architecture.md)
 - [Technology selection](docs/design/technology-selection.md)
 
-### Specifications
+### Capability specifications
 
-- [Protocol](docs/spec/protocol.md)
-- [Wire profile v1](docs/spec/wire-profile.md)
-- [Configuration model](docs/spec/configuration.md)
-- [Configuration schema](docs/spec/configuration-schema.md)
-- [Platform and DNS](docs/spec/platform-and-dns.md)
-- [State machines](docs/spec/state-machines.md)
-- [Ingress control plane](docs/spec/ingress-control-plane.md)
-- [Ingress observability](docs/spec/observability.md)
-- [Transit Proxies and subscriptions](docs/spec/transit-proxies.md)
-- [Deployment and local operation](docs/spec/deployment.md)
+- [Protocol](openspec/specs/protocol/spec.md)
+- [Wire profile v1](openspec/specs/wire-profile/spec.md)
+- [Configuration model](openspec/specs/configuration/spec.md)
+- [Configuration schema](openspec/specs/configuration-schema/spec.md)
+- [Platform and DNS](openspec/specs/platform-and-dns/spec.md)
+- [State machines](openspec/specs/state-machines/spec.md)
+- [Ingress control plane](openspec/specs/ingress-control-plane/spec.md)
+- [Ingress observability](openspec/specs/observability/spec.md)
+- [Transit Proxies and subscriptions](openspec/specs/transit-proxies/spec.md)
+- [Deployment behavior](openspec/specs/deployment/spec.md)
 
-### Progress
+### Implementation evidence
 
-- [Implementation status](docs/progress/status.md)
-- [Implementation plan](docs/progress/implementation-plan.md)
+- [Implementation and validation status](openspec/implementation-status.md)
+
+### Active changes
+
+The following task lists carry the remaining work. Unchecked tasks do not imply
+implementation or native-host validation.
+
+| Change | Scope |
+| --- | --- |
+| [Native platforms](openspec/changes/validate-native-platforms/tasks.md) | Windows/FreeBSD listeners and local control; privileged Linux transparent/TUN/eBPF checks. |
+| [Providers and runtime reliability](openspec/changes/validate-provider-and-runtime-reliability/tasks.md) | Real provider exports, independent peers, cross-machine flows, and failure/restart soak tests. |
+| [Scheduling and observability](openspec/changes/complete-scheduling-and-observability/tasks.md) | Policy/class budgets, Egress coordination, typed observations, and deployed monitoring. |
+| [Native packages](openspec/changes/validate-native-packages/tasks.md) | Debian, Alpine, Arch Linux, FreeBSD, and NSIS package-host acceptance. |
+
+## OpenSpec workflow
+
+Use OpenSpec to discover the existing contracts and current changes:
+
+```sh
+openspec list --specs
+openspec list
+openspec status --change organize-documentation-with-openspec
+openspec validate --all --strict --no-interactive
+```
+
+Start a focused change with `openspec new change <name>`, then author its
+proposal, design, and task checklist. Changes to behavior include canonical
+English deltas under `specs/<capability>/spec.md`; work that only implements,
+validates, or reorganizes an existing contract uses `skip_specs: true` in
+`.openspec.yaml`. The [OpenSpec project configuration](openspec/config.yaml)
+records the artifact rules.
+
+Implement and verify the tracked tasks, keeping the implementation-status
+snapshot accurate. Before archiving with `openspec archive <name>`, synchronize
+the main English specs, their complete technical contracts, matching Chinese
+specs, and affected design/user documents. Completed change history belongs in
+`openspec/changes/archive/`.
 
 ## Command surface
 
