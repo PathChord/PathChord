@@ -68,6 +68,12 @@ confidence, service state, and global admission state. It does not report or
 evaluate Ingress rules. Ingress owns per-Path directional observations and
 per-Session rule demand. Cross-Ingress fairness is not guaranteed.
 
+The authored Egress resource has only global resource ceilings: the configured
+wire bandwidth cap (`maxWireBandwidthBps`) and maximum inbound target
+connections (`maxInboundTargetConnections`). Path safety ceilings, pending
+reservations, measured capacity, and admission reason are runtime-owned facts;
+desired Path counts and per-Ingress quotas are not configuration inputs.
+
 ## 6. Failure semantics
 
 - Transit Path failure: remove that Path; existing Streams may continue over other compliant Paths.
@@ -100,6 +106,9 @@ cap. The first copy and ordinary reliable retransmissions remain available
 when optional replication is exhausted. Egress applies global resource limits
 and strict priority for primary traffic, ordinary retransmission, and required
 control; it does not interpret Ingress rules or promise cross-Ingress fairness.
+An authenticated future ACK is a Session trust failure: every Path and business
+resource is closed, the SessionID is retired, and recovery uses a fresh SessionID
+with bounded backoff and circuit breaking.
 
 ## 8. Dynamic scheduling
 
@@ -127,6 +136,11 @@ bounded by the configured wire cap and is derived passively from aggregate
 wire rate, queues, retransmission, and resource feedback; idle throughput does
 not fabricate a measured capacity. Egress does not perform rule-level demand
 calculation or cross-Ingress fairness.
+
+TLS-capable Transit adapters load system roots by default. An ordered
+`truststore` source list may add local PEM/DER files; invalid, oversized, or
+non-regular sources fail adapter preparation atomically. Local control bounds
+prefix read, payload read, dispatch, and response write independently.
 
 Subscription quota and traffic multiplier are optional reference metadata. They may produce tags or affect weight; they are not hard limits and do not directly change Egress connectivity.
 

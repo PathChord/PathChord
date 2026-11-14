@@ -16,10 +16,8 @@ pub struct EgressServiceSpec {
     pub identity: Option<PathBuf>,
     pub authorization_db: Option<PathBuf>,
     pub control_socket: Option<PathBuf>,
-    pub max_concurrent_paths: Option<usize>,
-    pub capacity_bps: Option<u64>,
-    pub recommended_path_count: Option<u64>,
-    pub max_streams_per_ingress: Option<usize>,
+    pub max_wire_bandwidth_bps: Option<u64>,
+    pub max_inbound_target_connections: Option<usize>,
     /// Require names supplied by Ingress to be resolved on Egress instead of
     /// preferring the accompanying address candidates.
     pub remote_dns_only: Option<bool>,
@@ -50,13 +48,11 @@ impl EgressServiceSpec {
         {
             return Err("EgressService contains an invalid identity or path");
         }
-        if self.max_concurrent_paths == Some(0)
-            || self.max_streams_per_ingress == Some(0)
-            || self.recommended_path_count == Some(0)
+        if self.max_wire_bandwidth_bps == Some(0)
+            || self.max_inbound_target_connections == Some(0)
             || self.traffic_multiplier_basis_points == Some(0)
-            || self.max_concurrent_paths.is_some_and(|value| value > 65536)
             || self
-                .max_streams_per_ingress
+                .max_inbound_target_connections
                 .is_some_and(|value| value > 1_000_000)
             || self.web_origins.len() > 256
         {

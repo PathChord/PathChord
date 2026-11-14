@@ -3,6 +3,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::{Duration, timeout};
 
 use pathchord_core::management::decode_length_prefix;
 pub use pathchord_core::management::{
@@ -35,6 +36,29 @@ where
     writer.write_all(&encoded).await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Reads one object with independent prefix and payload deadlines.
+pub async fn read_object_with_deadlines<R, T>(
+    reader: &mut R,
+    prefix_deadline: Duration,
+    payload_deadline: Duration,
+) -> Result<T, LocalProtocolError>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    let (length, prefix) = timeout(prefix_deadline, read_prefix(reader))
+        .await
+        .map_err(|_| LocalProtocolError::Io("length-prefix read deadline exceeded".into()))??;
+    let mut payload = vec![0_u8; length];
+    timeout(payload_deadline, reader.read_exact(&mut payload))
+        .await
+        .map_err(|_| LocalProtocolError::Io("payload read deadline exceeded".into()))??;
+    let mut framed = Vec::with_capacity(prefix.len() + payload.len());
+    framed.extend_from_slice(&prefix);
+    framed.extend_from_slice(&payload);
+    decode_object(&framed)
 }
 
 async fn read_prefix<R>(reader: &mut R) -> Result<(usize, Vec<u8>), LocalProtocolError>

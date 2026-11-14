@@ -29,6 +29,8 @@
 
 调度器使用有效容量加权。配置的关系权重提供基线；Ingress 分别观测上行和下行 Path 的容量、拥塞、RTT、抖动、丢包和重传，以调整即时分配。Egress 执行全局 wire 硬上限，并报告聚合的配置/有效容量和准入状态；它不解释 Ingress 规则，也不提供期望 Path 数。Session 建立时必须协商复制硬上限；逐流量/类别预算只保留在 Ingress，额外副本只能使用主流量、普通重传和必要控制流量之后的剩余容量。
 
+Egress 资源面保持刻意简单：authored 配置只提供 aggregate wire 上限和全局入站目标连接上限。Path 安全上限与 reservation 由运行时计算。Egress wire budget 使用有界 token 窗口，并优先保障主流量、重传和控制流量；可选复制只能使用剩余容量。
+
 ## 架构边界
 
 实现划分为以下 crate 或等效模块：
@@ -55,6 +57,8 @@ Ingress 拥有一个类型化 command/query service，用于节点元数据、�
 节点 tag/label 修改、订阅创建/删除/刷新及其他变更都是带代次检查、幂等和审计的 command。动态快照原子替换；订阅刷新失败时保留最近一次成功快照。观测 provider 发布类型化的节点、Path、Session、Stream、目标连接、订阅和策略 metric。Web Gateway 暴露这些快照和有界事件流；运维人员不能依靠解析日志重建当前状态。
 
 `STATUS_REPORT` 仍然是用于 Egress 全局资源和准入状态的紧凑认证 data-Path 消息。它不是管理 API，不携带 Ingress 规则或 TrafficClass 元数据，也不是 Path-local 质量的权威来源；Ingress 在本地推导方向性 Path 观测。
+
+TLS 构造默认加载系统根证书，并接受由 `system` 和本地 PEM/DER 来源组成的有序 `truststore` 列表。来源校验是原子且 fail-closed 的，读取有界，并检查符号链接目标必须是普通文件。本地控制传输分别限制 framing、dispatch 和响应写入时间，避免慢客户端长期占用 request permit。
 
 Prometheus 导出通过 Web Gateway 的认证与 capability 边界，从同一份观测快照读取聚合 gauge。
 提供方用量是可选的显式元数据，与私有订阅快照共同持久化，并由调度器消费；不得变成硬性限制。

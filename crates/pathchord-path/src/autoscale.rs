@@ -94,6 +94,15 @@ impl PathAutoscaler {
         self.overhead_excluded
     }
 
+    /// Reset all hysteresis and candidate observations for a new Session.
+    pub fn reset(&mut self) {
+        self.scale_out_streak = 0;
+        self.recovery_streak = 0;
+        self.low_utilization_streak = 0;
+        self.last_scale_in_ms = None;
+        self.overhead_excluded = false;
+    }
+
     pub fn evaluate(&mut self, input: AutoscaleInput, now_ms: u64) -> AutoscaleDecision {
         if !input.hard_available {
             self.scale_out_streak = 0;
@@ -333,6 +342,20 @@ mod tests {
             scaler.evaluate(sample, 0),
             AutoscaleDecision::Add { .. }
         ));
+        assert!(!scaler.overhead_excluded());
+    }
+
+    #[test]
+    fn reset_discards_hysteresis_for_a_new_session() {
+        let mut scaler = PathAutoscaler::new(PathAutoscalerConfig {
+            scale_out_samples: 2,
+            ..PathAutoscalerConfig::default()
+        })
+        .unwrap();
+        let shortfall = input(1_100, 1_000, 1);
+        assert_eq!(scaler.evaluate(shortfall, 0), AutoscaleDecision::Hold);
+        scaler.reset();
+        assert_eq!(scaler.evaluate(shortfall, 1), AutoscaleDecision::Hold);
         assert!(!scaler.overhead_excluded());
     }
 }

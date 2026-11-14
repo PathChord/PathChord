@@ -66,8 +66,6 @@ pub enum FrameType {
     SessionControl = 13,
     SessionControlAck = 14,
     SessionControlCancel = 15,
-    PathRebind = 16,
-    PathRebindAck = 17,
 
     StreamOpen = 32,
     StreamOpenOk = 33,
@@ -77,14 +75,12 @@ pub enum FrameType {
     StreamWindow = 37,
     StreamFin = 38,
     StreamRst = 39,
-    StreamOpenClass = 40,
 
     UdpOpen = 64,
     UdpOpenOk = 65,
     UdpOpenErr = 66,
     UdpDatagram = 67,
     UdpClose = 68,
-    UdpOpenClass = 69,
 }
 
 impl FrameType {
@@ -95,7 +91,6 @@ impl FrameType {
             self,
             Self::SessionClose
                 | Self::StreamOpen
-                | Self::StreamOpenClass
                 | Self::StreamOpenOk
                 | Self::StreamOpenErr
                 | Self::StreamAck
@@ -103,14 +98,13 @@ impl FrameType {
                 | Self::StreamFin
                 | Self::StreamRst
                 | Self::UdpOpen
-                | Self::UdpOpenClass
                 | Self::UdpOpenOk
                 | Self::UdpOpenErr
                 | Self::UdpClose
         )
     }
 
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 28] = [
         Self::PathHello,
         Self::SessionAttach,
         Self::SessionAttachOk,
@@ -126,8 +120,6 @@ impl FrameType {
         Self::SessionControl,
         Self::SessionControlAck,
         Self::SessionControlCancel,
-        Self::PathRebind,
-        Self::PathRebindAck,
         Self::StreamOpen,
         Self::StreamOpenOk,
         Self::StreamOpenErr,
@@ -136,13 +128,11 @@ impl FrameType {
         Self::StreamWindow,
         Self::StreamFin,
         Self::StreamRst,
-        Self::StreamOpenClass,
         Self::UdpOpen,
         Self::UdpOpenOk,
         Self::UdpOpenErr,
         Self::UdpDatagram,
         Self::UdpClose,
-        Self::UdpOpenClass,
     ];
 
     pub const fn code(self) -> u64 {
@@ -182,8 +172,6 @@ impl TryFrom<u64> for FrameType {
             13 => Self::SessionControl,
             14 => Self::SessionControlAck,
             15 => Self::SessionControlCancel,
-            16 => Self::PathRebind,
-            17 => Self::PathRebindAck,
             32 => Self::StreamOpen,
             33 => Self::StreamOpenOk,
             34 => Self::StreamOpenErr,
@@ -192,13 +180,11 @@ impl TryFrom<u64> for FrameType {
             37 => Self::StreamWindow,
             38 => Self::StreamFin,
             39 => Self::StreamRst,
-            40 => Self::StreamOpenClass,
             64 => Self::UdpOpen,
             65 => Self::UdpOpenOk,
             66 => Self::UdpOpenErr,
             67 => Self::UdpDatagram,
             68 => Self::UdpClose,
-            69 => Self::UdpOpenClass,
             code => return Err(FrameCodecError::UnknownFrameType { code }),
         };
         Ok(frame_type)

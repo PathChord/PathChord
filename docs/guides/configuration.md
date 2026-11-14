@@ -56,6 +56,24 @@ Store private identities, node/listener credential JSON, subscription caches, an
 
 The [deployment guide](deployment.md) explains credential-file setup. The [Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md) defines which adapter consumes each option and how unsupported nodes are reported. Check individual node diagnostics after importing a subscription; an imported protocol name alone does not establish that the node is usable.
 
+## Configure Egress resource ceilings
+
+An `EgressService` authors only the global resource limits
+`maxWireBandwidthBps` and `maxInboundTargetConnections`. The Egress runtime
+computes its Path safety ceiling and pending reservations from these limits and
+the local profile. Do not add `recommendedPathCount`, `maxConcurrentPaths`, or
+`maxStreamsPerIngress`; Path targets belong to Ingress rules and runtime
+observations. STATUS_REPORT exposes configured/effective/current capacity,
+capacity confidence, admission state, and the current replication allowance;
+it does not expose rule or TrafficClass metadata.
+
+TLS-capable Transit nodes use system roots by default. Set the ordered
+`truststore` list to `system` and/or local PEM/DER files when custom roots are
+needed. Relative files resolve from the selected configuration source. An
+empty list deliberately disables trust anchors, and `insecure: true` is the
+only certificate-verification bypass. Invalid, oversized, directory, or bad
+symlink sources reject the node instead of downgrading its transport.
+
 ## Reload configuration and handle failures
 
 The service watches additions, edits, removals, and renames in a selected resource directory and validates the entire candidate before publishing it. Atomic file replacement is supported. If parsing, graph validation, rule compilation, persistence, or cache writing fails, the last successful configuration remains active; inspect structured status for the failure, fix the candidate, and let it reload.

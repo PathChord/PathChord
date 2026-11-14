@@ -18,9 +18,8 @@ pub(crate) struct EgressConfiguration {
     pub authorization_db: PathBuf,
     pub control_socket: PathBuf,
     pub max_concurrent_paths: usize,
-    pub capacity_bps: u64,
-    pub recommended_path_count: u64,
-    pub max_streams_per_ingress: usize,
+    pub max_wire_bandwidth_bps: u64,
+    pub max_inbound_target_connections: usize,
     pub remote_dns_only: bool,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: u32,
@@ -135,21 +134,14 @@ fn merge(
             "pathchord-authorizations.db",
         ),
         control_socket,
-        max_concurrent_paths: args
-            .max_concurrent_paths
-            .or(spec.max_concurrent_paths)
-            .unwrap_or(DEFAULT_MAX_CONCURRENT_PATHS),
-        capacity_bps: args
-            .capacity_bps
-            .or(spec.capacity_bps)
+        max_concurrent_paths: DEFAULT_MAX_CONCURRENT_PATHS,
+        max_wire_bandwidth_bps: args
+            .max_wire_bandwidth_bps
+            .or(spec.max_wire_bandwidth_bps)
             .unwrap_or(1_000_000_000),
-        recommended_path_count: args
-            .recommended_path_count
-            .or(spec.recommended_path_count)
-            .unwrap_or(1),
-        max_streams_per_ingress: args
-            .max_streams_per_ingress
-            .or(spec.max_streams_per_ingress)
+        max_inbound_target_connections: args
+            .max_inbound_target_connections
+            .or(spec.max_inbound_target_connections)
             .unwrap_or(4096),
         remote_dns_only: spec.remote_dns_only.unwrap_or(false),
         quota_remaining: args.quota_remaining.or(spec.quota_remaining),
@@ -182,9 +174,8 @@ fn merge(
         identity: Some(resolved.identity.clone()),
         authorization_db: Some(resolved.authorization_db.clone()),
         control_socket: Some(resolved.control_socket.clone()),
-        max_concurrent_paths: Some(resolved.max_concurrent_paths),
-        recommended_path_count: Some(resolved.recommended_path_count),
-        max_streams_per_ingress: Some(resolved.max_streams_per_ingress),
+        max_wire_bandwidth_bps: Some(resolved.max_wire_bandwidth_bps),
+        max_inbound_target_connections: Some(resolved.max_inbound_target_connections),
         traffic_multiplier_basis_points: Some(resolved.traffic_multiplier_basis_points),
         ..EgressServiceSpec::default()
     }

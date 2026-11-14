@@ -66,6 +66,11 @@ Egress 通过现有 Path 上报聚合资源事实：配置的 wire 容量上限�
 Egress 不上报或解释 Ingress 规则。Ingress 拥有每条 Path 的方向性观测和
 每个 Session 的规则 demand。系统不保证跨 Ingress 的公平性。
 
+Egress 资源的 authored 配置只有全局资源上限：wire 带宽上限
+(`maxWireBandwidthBps`) 和入站目标连接上限
+(`maxInboundTargetConnections`)。Path 安全上限、pending reservation、测得的容量
+和准入原因都由运行时拥有；desired Path 数量和 per-Ingress 配额不是配置输入。
+
 ## 6. 故障语义
 
 - Transit Path 故障：移除该 Path；现有 Stream 可以继续通过其他合规 Path 传输。
@@ -92,6 +97,8 @@ Ingress 创建、扩展、排空和关闭 Path。Stream 和 UDP 会话独立于 
 Session 控制和可选额外复制使用协商出的 Session 硬上限。即使可选复制耗尽，
 第一份副本和普通可靠重传仍然可用。Egress 执行全局资源上限，并优先保障业务
 主流量、普通重传和必要控制流量；它不解释 Ingress 规则，也不承诺跨 Ingress 公平性。
+经过认证的 future ACK 属于 Session 信任失败：关闭全部 Path 和业务资源，废弃旧
+SessionID，并通过有界退避和断路器使用新的 SessionID 恢复。
 
 ## 8. 动态调度
 
@@ -113,6 +120,10 @@ demand 窗口以低频运行；数据路径只更新有界 counter。
 Egress 的有效容量是全局 scheduler/resource 估计值，受配置 wire 上限约束，
 并通过 aggregate wire 速率、队列、重传和资源反馈被动计算；空闲吞吐不能伪造
 测得容量。Egress 不计算规则级 demand，也不执行跨 Ingress 公平调度。
+
+支持 TLS 的 Transit 适配器默认加载系统根证书。按顺序排列的 `truststore` 来源列表
+可以追加本地 PEM/DER 文件；来源无效、过大或不是普通文件时，适配器准备以原子方式失败。
+本地控制分别限制前缀读取、payload 读取、dispatch 和响应写入时间。
 
 订阅配额和流量倍率是可选的参考元数据。它们可以生成标签或影响权重；它们不是硬性限制，也不会直接改变 Egress 连通性。
 

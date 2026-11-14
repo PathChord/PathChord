@@ -9,6 +9,7 @@ pub enum ErrorClass {
     PathFailure = 2,
     EgressFailure = 3,
     TargetFailure = 4,
+    ResourceLimit = 5,
 }
 
 impl ErrorClass {
@@ -26,6 +27,7 @@ impl TryFrom<u8> for ErrorClass {
             2 => Ok(Self::PathFailure),
             3 => Ok(Self::EgressFailure),
             4 => Ok(Self::TargetFailure),
+            5 => Ok(Self::ResourceLimit),
             code => Err(UnknownErrorClass { code }),
         }
     }
@@ -38,6 +40,7 @@ impl fmt::Display for ErrorClass {
             Self::PathFailure => "PATH_FAILURE",
             Self::EgressFailure => "EGRESS_FAILURE",
             Self::TargetFailure => "TARGET_FAILURE",
+            Self::ResourceLimit => "RESOURCE_LIMIT",
         };
         formatter.write_str(name)
     }
@@ -67,6 +70,7 @@ mod tests {
             ErrorClass::PathFailure,
             ErrorClass::EgressFailure,
             ErrorClass::TargetFailure,
+            ErrorClass::ResourceLimit,
         ] {
             assert_eq!(ErrorClass::try_from(class.code()), Ok(class));
         }

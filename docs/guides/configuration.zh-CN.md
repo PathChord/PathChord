@@ -56,6 +56,20 @@ pathchord ingress
 
 凭据文件的设置方法见[部署指南](deployment.zh-CN.md)。[Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)定义各选项由哪个适配器消费，以及如何报告不支持的节点。导入订阅后应检查单节点诊断；仅导入了协议名称并不代表节点可用。
 
+## 配置 Egress 资源上限
+
+`EgressService` authored 配置只提供全局资源上限
+`maxWireBandwidthBps` 和 `maxInboundTargetConnections`。Egress 运行时结合这些上限和本地
+profile 计算 Path 安全上限及 pending reservation。不要再配置
+`recommendedPathCount`、`maxConcurrentPaths` 或 `maxStreamsPerIngress`；Path target 属于
+Ingress 规则和运行时观测。STATUS_REPORT 提供配置/有效/当前容量、容量可信度、准入状态和当前复制
+allowance，不携带规则或 TrafficClass 元数据。
+
+支持 TLS 的 Transit 节点默认使用系统根证书。需要自定义根时，将有序 `truststore` 列表设置为
+`system` 和/或本地 PEM/DER 文件。相对路径从选定的配置来源解析。空列表表示明确不加载信任锚点，
+只有 `insecure: true` 才能绕过证书校验。无效、过大、目录或错误符号链接来源会拒绝节点，不会降级
+为其他传输方式。
+
 ## 重载配置与处理失败
 
 服务会监听选定资源目录中的新增、编辑、移除和重命名，并在发布前验证完整候选配置。支持原子替换文件。解析、资源图验证、规则编译、持久化或缓存写入失败时，最近一次成功配置继续生效；通过结构化 status 查看失败，修正候选后等待重新加载。

@@ -44,7 +44,7 @@ impl std::fmt::Debug for TransitOptions {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TransitTls {
     #[serde(default)]
@@ -53,6 +53,8 @@ pub struct TransitTls {
     pub server_name: Option<String>,
     #[serde(default)]
     pub insecure: bool,
+    #[serde(default = "default_truststore_sources")]
+    pub truststore: Vec<String>,
     #[serde(default)]
     pub alpn: Vec<String>,
     #[serde(default)]
@@ -66,6 +68,27 @@ pub struct TransitTls {
     pub fingerprint: Option<String>,
     #[serde(default)]
     pub reality: Option<TransitReality>,
+}
+
+impl Default for TransitTls {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_name: None,
+            insecure: false,
+            truststore: default_truststore_sources(),
+            alpn: Vec::new(),
+            certificate: Vec::new(),
+            client_certificate: Vec::new(),
+            client_key_field: None,
+            fingerprint: None,
+            reality: None,
+        }
+    }
+}
+
+fn default_truststore_sources() -> Vec<String> {
+    vec!["system".to_owned()]
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

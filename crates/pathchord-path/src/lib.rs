@@ -23,6 +23,7 @@ mod session;
 mod single_path;
 mod traffic_queue;
 mod udp;
+mod wire_budget;
 
 pub use admission::{
     EgressAdmittedPath, EgressPathAdmissionConfig, IngressAdmittedPath, IngressPathAdmissionConfig,
@@ -30,16 +31,17 @@ pub use admission::{
 };
 pub use autoscale::{AutoscaleDecision, AutoscaleInput, PathAutoscaler, PathAutoscalerConfig};
 pub use multipath::{
-    MultipathConfig, MultipathError, MultipathPathObservation, MultipathSession,
-    PathEconomicStatus, PathFailureOutcome, PathQualityExclusionReason, PathSchedule,
-    ScheduleDirection, StreamRetransmission,
+    DEFAULT_SESSION_REPLICATION_BUDGET_BYTES_PER_SECOND, DemandKey, MultipathConfig,
+    MultipathError, MultipathPathObservation, MultipathSession, PathEconomicStatus,
+    PathFailureOutcome, PathQualityExclusionReason, PathSchedule, ScheduleDirection,
+    StreamRetransmission,
 };
 pub use runtime::{
-    BoxedSessionStream, EgressSessionController, EgressSessionHandle, EgressStatusConfig,
-    EgressStatusObservation, EgressStatusProvider, EgressStatusSample, EgressStreamFactory,
-    EgressStreamOpenError, IngressSessionHandle, IngressUdpHandle, OpenStreamError, OpenUdpError,
-    PathExclusionReason, PathQualitySnapshot, SessionRuntimeError, SessionSnapshot, SessionStream,
-    StreamSnapshot, run_egress_session,
+    BoxedSessionStream, DemandSnapshot, EgressSessionController, EgressSessionHandle,
+    EgressStatusConfig, EgressStatusObservation, EgressStatusProvider, EgressStatusSample,
+    EgressStreamFactory, EgressStreamOpenError, IngressSessionHandle, IngressUdpHandle,
+    OpenStreamError, OpenUdpError, PathExclusionReason, PathQualitySnapshot, SessionRuntimeError,
+    SessionSnapshot, SessionStream, StreamSnapshot, run_egress_session,
 };
 pub use session::{EgressPathSession, IngressPathSession, PathSessionConfig, PathSessionError};
 pub use single_path::{
@@ -50,6 +52,7 @@ pub use udp::{
     BoxedUdpTargetSocket, SessionUdpError, SessionUdpHandle, UdpAssociationRuntime,
     UdpAssociationSnapshot, UdpRuntimeError, UdpTargetError, UdpTargetFactory, UdpTargetSocket,
 };
+pub use wire_budget::{WireBudget, WirePriority};
 
 /// An asynchronous transport whose smallest delivery unit is one complete
 /// PathChord frame.

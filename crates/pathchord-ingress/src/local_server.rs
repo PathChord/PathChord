@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -12,9 +13,13 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
+use tokio::time::timeout;
 
+#[cfg(test)]
+use crate::read_object;
 use crate::{
-    LocalControlDispatcher, LocalProtocolError, RequestEnvelope, read_object, write_object,
+    LocalControlDispatcher, LocalProtocolError, RequestEnvelope, read_object_with_deadlines,
+    write_object,
 };
 
 #[derive(Debug, Error)]
@@ -32,6 +37,10 @@ pub enum LocalServerError {
 }
 
 pub const DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS: usize = 64;
+const CONTROL_PREFIX_READ_DEADLINE: Duration = Duration::from_secs(5);
+const CONTROL_PAYLOAD_READ_DEADLINE: Duration = Duration::from_secs(10);
+const CONTROL_DISPATCH_DEADLINE: Duration = Duration::from_secs(30);
+const CONTROL_RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
 #[cfg(unix)]
 pub struct LocalControlServer<D = LocalControlDispatcher> {
@@ -385,14 +394,28 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     D: ManagementDispatcher,
 {
-    let mut request: RequestEnvelope = read_object(&mut stream).await?;
+    let mut request: RequestEnvelope = read_object_with_deadlines(
+        &mut stream,
+        CONTROL_PREFIX_READ_DEADLINE,
+        CONTROL_PAYLOAD_READ_DEADLINE,
+    )
+    .await?;
     request.actor = trusted_local_actor();
-    let response = dispatcher
-        .lock()
-        .await
-        .dispatch_from(request, pathchord_core::management::ManagementSource::Local)
-        .await;
-    write_object(&mut stream, &response).await?;
+    let response = timeout(CONTROL_DISPATCH_DEADLINE, async {
+        dispatcher
+            .lock()
+            .await
+            .dispatch_from(request, pathchord_core::management::ManagementSource::Local)
+            .await
+    })
+    .await
+    .map_err(|_| LocalProtocolError::Io("dispatcher deadline exceeded".into()))?;
+    timeout(
+        CONTROL_RESPONSE_WRITE_DEADLINE,
+        write_object(&mut stream, &response),
+    )
+    .await
+    .map_err(|_| LocalProtocolError::Io("response write deadline exceeded".into()))??;
     Ok(())
 }
 

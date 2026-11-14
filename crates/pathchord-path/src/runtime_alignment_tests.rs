@@ -217,7 +217,7 @@ async fn wait_for_retired_path(
             let snapshot = ingress.snapshot();
             assert!(
                 !snapshot.closed,
-                "a second healthy Path must keep the Session live"
+                "a second healthy Path must keep the Session live: {snapshot:?}"
             );
             if snapshot.path_states.get(&path) == Some(&terminal) {
                 assert_eq!(snapshot.ready_paths, 1);
