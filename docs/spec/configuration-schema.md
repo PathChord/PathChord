@@ -296,6 +296,14 @@ ordinary `http://` forwarding and CONNECT with per-request authentication and
 policy evaluation. Message framing, limits, credential/header filtering, and
 upgrade behavior follow the [HTTP and SOCKS contract](platform-and-dns.md#http-and-socks-listeners).
 
+`spec.backend` defaults to `tproxy`. `backend: ebpf` is a Linux-only backend
+for `type: tproxy`; it requires `platform: linux`, a non-empty ingress
+`interface`, and at least one `allowedSources` CIDR. It marks TCP/UDP packets
+on that interface for the existing TPROXY policy route. The transparent
+listener, original-target handling, UDP associations, and Path/Session policy
+remain in userspace. Other listener kinds reject `backend: ebpf` during
+validation.
+
 `spec.type: mixed` shares one TCP endpoint between HTTP and SOCKS. Its default
 `protocols` are `[tcp, udp]`; TCP is required and UDP is optional. Both parsers
 share the same credentials, source restrictions, and listener identity.

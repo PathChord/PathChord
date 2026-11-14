@@ -29,6 +29,7 @@ pub enum TransparentUdpRuntimeError {
 pub struct TransparentUdpRuntimeConfig {
     pub listener_id: ListenerId,
     pub flow_tags: std::collections::BTreeSet<String>,
+    pub allowed_sources: Vec<String>,
     pub process_metadata: pathchord_policy::ProcessMetadataRequest,
     pub process_metadata_provider: Arc<dyn ProcessMetadataProvider>,
     pub max_associations: usize,
@@ -73,7 +74,7 @@ where
 {
     config.validate()?;
     let mut associations = BTreeMap::<AssociationKey, mpsc::Sender<Vec<u8>>>::new();
-    let mut tasks = JoinSet::<Result<AssociationKey, TransparentUdpRuntimeError>>::new();
+    let mut tasks = JoinSet::<AssociationTaskResult>::new();
     let mut report = TransparentUdpRuntimeReport::default();
     let sent_datagrams = Arc::new(AtomicU64::new(0));
     let mut shutdown = Box::pin(shutdown);
@@ -87,16 +88,35 @@ where
                         associations.remove(&key);
                         report.expired_associations = report.expired_associations.saturating_add(1);
                     }
-                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Ok(Err((key, _error)))) => {
+                        associations.remove(&key);
+                        report.rejected_datagrams = report.rejected_datagrams.saturating_add(1);
+                    }
                     Some(Err(error)) => return Err(TransparentUdpRuntimeError::Task(error.to_string())),
                     None => {}
                 }
             }
             received = adapter.receive() => {
-                let datagram = received.map_err(|error| {
-                    TransparentUdpRuntimeError::Adapter(error.to_string())
-                })?;
+                let datagram = match received {
+                    Ok(datagram) => datagram,
+                    Err(
+                        crate::TransparentUdpError::MissingOriginalDestination
+                        | crate::TransparentUdpError::MissingSource
+                        | crate::TransparentUdpError::ProtectedTarget
+                        | crate::TransparentUdpError::Oversized,
+                    ) => {
+                        report.rejected_datagrams = report.rejected_datagrams.saturating_add(1);
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(TransparentUdpRuntimeError::Adapter(error.to_string()));
+                    }
+                };
                 report.received_datagrams = report.received_datagrams.saturating_add(1);
+                if !crate::source_allowed(&config.allowed_sources, datagram.source.ip()) {
+                    report.rejected_datagrams = report.rejected_datagrams.saturating_add(1);
+                    continue;
+                }
                 let key = AssociationKey {
                     source: datagram.source,
                     target: datagram.target,
@@ -173,6 +193,8 @@ where
     Ok(report)
 }
 
+type AssociationTaskResult = Result<AssociationKey, (AssociationKey, TransparentUdpRuntimeError)>;
+
 async fn run_association<A>(
     key: AssociationKey,
     mut handle: BoxedUdpFlowHandle,
@@ -180,7 +202,7 @@ async fn run_association<A>(
     adapter: Arc<A>,
     sent_datagrams: Arc<AtomicU64>,
     idle_timeout: Duration,
-) -> Result<AssociationKey, TransparentUdpRuntimeError>
+) -> AssociationTaskResult
 where
     A: TransparentUdpAdapter + ?Sized + 'static,
 {
@@ -189,15 +211,21 @@ where
         tokio::pin!(idle);
         tokio::select! {
             () = &mut idle => {
-                handle.close().await.map_err(|error| TransparentUdpRuntimeError::Task(error.to_string()))?;
+                handle.close().await.map_err(|error| {
+                    (key.clone(), TransparentUdpRuntimeError::Task(error.to_string()))
+                })?;
                 return Ok(key);
             }
             request = requests.recv() => {
                 let Some(request) = request else {
-                    handle.close().await.map_err(|error| TransparentUdpRuntimeError::Task(error.to_string()))?;
+                    handle.close().await.map_err(|error| {
+                        (key.clone(), TransparentUdpRuntimeError::Task(error.to_string()))
+                    })?;
                     return Ok(key);
                 };
-                handle.send(request).await.map_err(|error| TransparentUdpRuntimeError::Task(error.to_string()))?;
+                handle.send(request).await.map_err(|error| {
+                    (key.clone(), TransparentUdpRuntimeError::Task(error.to_string()))
+                })?;
             }
             response = handle.receive() => {
                 let Some(payload) = response else {
@@ -208,7 +236,7 @@ where
                     target: key.target,
                     payload,
                 }).await.map_err(|error| {
-                    TransparentUdpRuntimeError::Adapter(error.to_string())
+                    (key.clone(), TransparentUdpRuntimeError::Adapter(error.to_string()))
                 })?;
                 sent_datagrams.fetch_add(1, Ordering::Relaxed);
             }
@@ -269,6 +297,56 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ScriptedAdapter {
+        inbound: tokio::sync::Mutex<
+            mpsc::Receiver<Result<TransparentDatagram, crate::TransparentUdpError>>,
+        >,
+        injector: mpsc::Sender<Result<TransparentDatagram, crate::TransparentUdpError>>,
+        sent: Mutex<Vec<TransparentDatagram>>,
+    }
+
+    impl ScriptedAdapter {
+        fn new(capacity: usize) -> Arc<Self> {
+            let (injector, inbound) = mpsc::channel(capacity.max(1));
+            Arc::new(Self {
+                inbound: tokio::sync::Mutex::new(inbound),
+                injector,
+                sent: Mutex::new(Vec::new()),
+            })
+        }
+
+        async fn inject(&self, result: Result<TransparentDatagram, crate::TransparentUdpError>) {
+            self.injector.send(result).await.unwrap();
+        }
+
+        fn sent(&self) -> Vec<TransparentDatagram> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TransparentUdpAdapter for ScriptedAdapter {
+        async fn receive(&self) -> Result<TransparentDatagram, crate::TransparentUdpError> {
+            self.inbound
+                .lock()
+                .await
+                .recv()
+                .await
+                .unwrap_or(Err(crate::TransparentUdpError::Io(
+                    "scripted adapter closed".to_owned(),
+                )))
+        }
+
+        async fn send(
+            &self,
+            datagram: &TransparentDatagram,
+        ) -> Result<(), crate::TransparentUdpError> {
+            self.sent.lock().unwrap().push(datagram.clone());
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn maps_transparent_datagrams_to_one_udp_association() {
         let adapter = crate::FakeTransparentUdpAdapter::new(4);
@@ -280,6 +358,7 @@ mod tests {
             TransparentUdpRuntimeConfig {
                 listener_id: ListenerId::new("tproxy-udp"),
                 flow_tags: std::collections::BTreeSet::from(["dns".to_owned()]),
+                allowed_sources: Vec::new(),
                 process_metadata: pathchord_policy::ProcessMetadataRequest::default(),
                 process_metadata_provider: Arc::new(crate::NoopProcessMetadataProvider),
                 max_associations: 4,
@@ -312,5 +391,100 @@ mod tests {
         }
         shutdown.send(()).unwrap();
         runtime.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_restrictions_reject_transparent_udp_without_stopping_the_listener() {
+        let adapter = crate::FakeTransparentUdpAdapter::new(4);
+        let opener = Arc::new(FakeOpener::default());
+        let (shutdown, signal) = oneshot::channel();
+        let runtime = tokio::spawn(run_transparent_udp(
+            Arc::clone(&adapter),
+            Arc::clone(&opener),
+            TransparentUdpRuntimeConfig {
+                listener_id: ListenerId::new("tproxy-udp"),
+                flow_tags: std::collections::BTreeSet::new(),
+                allowed_sources: vec!["192.0.2.0/24".to_owned()],
+                process_metadata: pathchord_policy::ProcessMetadataRequest::default(),
+                process_metadata_provider: Arc::new(crate::NoopProcessMetadataProvider),
+                max_associations: 4,
+                association_queue: 4,
+                idle_timeout: Duration::from_secs(60),
+            },
+            async move {
+                let _ = signal.await;
+            },
+        ));
+        adapter
+            .inject(TransparentDatagram {
+                source: "198.51.100.10:12345".parse().unwrap(),
+                target: "198.51.100.20:53".parse().unwrap(),
+                payload: vec![1],
+            })
+            .await
+            .unwrap();
+        adapter
+            .inject(TransparentDatagram {
+                source: "192.0.2.10:12345".parse().unwrap(),
+                target: "198.51.100.20:53".parse().unwrap(),
+                payload: vec![2],
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if !adapter.sent().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        shutdown.send(()).unwrap();
+        let report = runtime.await.unwrap().unwrap();
+        assert_eq!(report.rejected_datagrams, 1);
+        assert_eq!(adapter.sent().len(), 1);
+        assert_eq!(opener.contexts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_transparent_datagram_is_rejected_without_stopping_the_listener() {
+        let adapter = ScriptedAdapter::new(4);
+        let opener = Arc::new(FakeOpener::default());
+        let (shutdown, signal) = oneshot::channel();
+        let runtime = tokio::spawn(run_transparent_udp(
+            Arc::clone(&adapter),
+            Arc::clone(&opener),
+            TransparentUdpRuntimeConfig {
+                listener_id: ListenerId::new("tproxy-udp"),
+                flow_tags: std::collections::BTreeSet::new(),
+                allowed_sources: Vec::new(),
+                process_metadata: pathchord_policy::ProcessMetadataRequest::default(),
+                process_metadata_provider: Arc::new(crate::NoopProcessMetadataProvider),
+                max_associations: 4,
+                association_queue: 4,
+                idle_timeout: Duration::from_secs(60),
+            },
+            async move {
+                let _ = signal.await;
+            },
+        ));
+        adapter
+            .inject(Err(crate::TransparentUdpError::MissingOriginalDestination))
+            .await;
+        adapter
+            .inject(Ok(TransparentDatagram {
+                source: "192.0.2.10:12345".parse().unwrap(),
+                target: "198.51.100.20:53".parse().unwrap(),
+                payload: vec![1, 2],
+            }))
+            .await;
+        for _ in 0..100 {
+            if !adapter.sent().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        shutdown.send(()).unwrap();
+        let report = runtime.await.unwrap().unwrap();
+        assert_eq!(report.rejected_datagrams, 1);
+        assert_eq!(report.sent_datagrams, 1);
     }
 }

@@ -15,11 +15,11 @@ identity, and Unix local control are integrated. FreeBSD x86_64 target
 compilation and CLI linking pass; native host tests remain outstanding.
 Portable listener regressions run in the existing Rust CI job.
 
-TPROXY, REDIRECT, transparent UDP interception, TUN integration, privileged
-routing validation, and Wintun packaging follow the explicit-listener
-baseline. Existing transparent/TUN modules remain implementation facts below;
-they are outside the active acceptance scope. SOCKS5 UDP forwarding remains
-in the current scope.
+TPROXY, REDIRECT, transparent UDP interception, and TUN integration are wired
+into the Ingress platform runtime with configuration, rollback, protected
+endpoint handling, source restrictions, and bounded TCP/UDP flow supervision.
+Privileged route/TUN host validation and Wintun packaging remain separate
+acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Implemented
 
@@ -55,6 +55,10 @@ in the current scope.
   and TPROXY adapters, transparent UDP, a direct smoltcp TUN reactor, process
   metadata lookup, listener flow tags, listener-local Basic/username-password
   verification, and protected endpoint replacement.
+- Linux TPROXY listeners accept `backend: tproxy` (the default) or the
+  interface-bound `backend: ebpf` classifier. The eBPF path embeds a TC object,
+  pins/configures its mark map through `bpftool`, attaches with `tc`, and
+  removes its filter, qdisc ownership, pins, and policy routes on shutdown.
 - HTTP forwarding uses Hyper's HTTP/1 codec for bounded headers, streaming
   bodies, request-by-request authentication and routing, hop-header and trailer
   filtering, redirects, and validated Upgrade. Each ordinary request opens its
@@ -178,6 +182,10 @@ in the current scope.
   resources, shutdown, reload, and local control. Existing automated loopback
   tests are recorded below; they do not establish native Windows or FreeBSD
   coverage.
+- Linux transparent TCP/UDP and TUN need privileged host smoke validation of
+  `ip` rule/table ownership, IPv4/IPv6 interception, real `/dev/net/tun`
+  operation, host routes, and cleanup after restart. Fake route/device tests
+  cover rollback and packet semantics but do not establish that host evidence.
 - Windows registry, WinINet refresh, Named Pipe ACL, and system-proxy crash
   recovery still need validation on a real Windows host. Cross-compiling and
   fake adapters are not equivalent to host evidence.
@@ -207,10 +215,15 @@ in the current scope.
 ## Deferred work
 
 - Linux TPROXY mark/routing behavior, IPv4/IPv6 transparent UDP, and TUN
-  integration need privileged host validation after the explicit-listener
-  baseline. Route ownership journals are designed to fail closed and never
-  remove foreign rules. Wintun packaging and native TUN validation are also
-  deferred.
+  integration are implemented, but privileged host validation remains
+  deferred. Route ownership journals are designed to fail closed and never
+  remove foreign rules. Wintun packaging and native Windows TUN validation are
+  also deferred.
+- An optional Linux eBPF interception backend is implemented as an explicit,
+  interface-bound TC classifier switch. The ordinary TPROXY backend remains
+  the supported fallback; root-level kernel/privilege smoke and failure
+  recovery validation remain outstanding. The staged decision and prerequisites
+  are recorded in [the dae/eBPF research note](../research/dae-ebpf-transparent-proxy.md).
 - Protocols outside the registered native set remain
   unavailable with node diagnostics. Further native implementations need
   protocol-specific interoperability fixtures.
@@ -241,9 +254,24 @@ Netlink dependencies of `netsock`; the upstream Rust source and public API
 are preserved. CI tests the exported buffer macros separately, and
 `cargo-deny` 0.20.2 passes the same advisory check used by GitHub Actions.
 
-The Linux workspace run passes every non-ignored workspace test. The Transit
-unit set reports 75 passed and 2 ignored without an external proxy executable.
-The ignored tests use independent reference peers when explicitly requested.
+The Linux workspace run passes every non-ignored workspace test. The normal
+Transit unit run does not require an external proxy executable and leaves the
+reference-peer tests ignored. With
+`PATHCHORD_TEST_SING_BOX` pointing to the external sing-box 1.14.4 binary,
+`scripts/test-with-sing-box.sh` ran all seven ignored protocol tests
+successfully: VLESS/Trojan, VMess TCP/TLS/WebSocket/UDP, AnyTLS TCP/UDP,
+Hysteria2 TCP, TUIC TCP, and Reality/VLESS. The binary is a test-only peer and
+is not part of the PathChord runtime or dependency graph. Each fixture starts
+sing-box with an inbound server and exercises the PathChord native Transit
+adapter as the client; the compatibility direction is intentional.
+The external-core fixture covers native Shadowsocks, VMess, VLESS, and Trojan
+server compatibility with Mihomo 1.19.34, Xray 26.11.9, and V2Fly 5.53.0.
+Mihomo additionally covers AnyTLS, Hysteria2, and TUIC server compatibility;
+those protocols are not registered as Xray/V2Fly server protocols in their
+respective test matrices. Each core is launched as the server and the matching
+PathChord native Transit adapter is the client under test. All matrix entries
+pass when the corresponding `PATHCHORD_TEST_MIHOMO`, `PATHCHORD_TEST_XRAY`, or
+`PATHCHORD_TEST_V2FLY` variable is supplied.
 The portable
 explicit-listener integration
 test binds listeners for the actual host platform and checks HTTP

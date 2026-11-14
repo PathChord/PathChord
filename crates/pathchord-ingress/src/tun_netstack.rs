@@ -31,6 +31,7 @@ use crate::{
 pub struct TunFlowRuntimeConfig {
     pub listener_id: ListenerId,
     pub flow_tags: std::collections::BTreeSet<String>,
+    pub allowed_sources: Vec<String>,
     pub process_metadata: pathchord_policy::ProcessMetadataRequest,
     pub process_metadata_provider: Arc<dyn ProcessMetadataProvider>,
     pub addresses: Vec<(IpAddr, u8)>,
@@ -52,6 +53,7 @@ impl TunFlowRuntimeConfig {
         Self {
             listener_id,
             flow_tags: std::collections::BTreeSet::new(),
+            allowed_sources: Vec::new(),
             process_metadata: pathchord_policy::ProcessMetadataRequest::default(),
             process_metadata_provider: Arc::new(crate::NoopProcessMetadataProvider),
             addresses: vec![(config.address, config.prefix)],
@@ -420,6 +422,10 @@ impl Reactor {
             return;
         };
         if self.protected.contains(&tuple.target) {
+            self.report.packets_rejected = self.report.packets_rejected.saturating_add(1);
+            return;
+        }
+        if !crate::source_allowed(&self.config.allowed_sources, tuple.source.ip()) {
             self.report.packets_rejected = self.report.packets_rejected.saturating_add(1);
             return;
         }
@@ -916,6 +922,7 @@ async fn run_udp_association(args: UdpAssociationArgs) -> Result<(), TunFlowRunt
 #[derive(Debug, Clone, Copy)]
 struct PacketTuple {
     protocol: FlowProtocol,
+    source: SocketAddr,
     target: SocketAddr,
 }
 
@@ -923,11 +930,12 @@ fn packet_tuple(packet: &[u8]) -> Option<PacketTuple> {
     if packet.is_empty() {
         return None;
     }
-    let (protocol, destination, payload) = match IpVersion::of_packet(packet).ok()? {
+    let (protocol, source, destination, payload) = match IpVersion::of_packet(packet).ok()? {
         IpVersion::Ipv4 => {
             let packet = Ipv4Packet::new_checked(packet).ok()?;
             (
                 packet.next_header(),
+                IpAddr::V4(packet.src_addr()),
                 IpAddr::V4(packet.dst_addr()),
                 packet.payload(),
             )
@@ -936,25 +944,27 @@ fn packet_tuple(packet: &[u8]) -> Option<PacketTuple> {
             let packet = Ipv6Packet::new_checked(packet).ok()?;
             (
                 packet.next_header(),
+                IpAddr::V6(packet.src_addr()),
                 IpAddr::V6(packet.dst_addr()),
                 packet.payload(),
             )
         }
     };
-    let (protocol, port) = match protocol {
-        IpProtocol::Tcp => (
-            FlowProtocol::Tcp,
-            TcpPacket::new_checked(payload).ok()?.dst_port(),
-        ),
-        IpProtocol::Udp => (
-            FlowProtocol::Udp,
-            UdpPacket::new_checked(payload).ok()?.dst_port(),
-        ),
+    let (protocol, source_port, target_port) = match protocol {
+        IpProtocol::Tcp => {
+            let packet = TcpPacket::new_checked(payload).ok()?;
+            (FlowProtocol::Tcp, packet.src_port(), packet.dst_port())
+        }
+        IpProtocol::Udp => {
+            let packet = UdpPacket::new_checked(payload).ok()?;
+            (FlowProtocol::Udp, packet.src_port(), packet.dst_port())
+        }
         _ => return None,
     };
     Some(PacketTuple {
         protocol,
-        target: SocketAddr::new(destination, port),
+        source: SocketAddr::new(source, source_port),
+        target: SocketAddr::new(destination, target_port),
     })
 }
 
@@ -1030,6 +1040,7 @@ mod tests {
         TunFlowRuntimeConfig {
             listener_id: ListenerId::new("tun"),
             flow_tags: std::collections::BTreeSet::new(),
+            allowed_sources: Vec::new(),
             process_metadata: pathchord_policy::ProcessMetadataRequest::default(),
             process_metadata_provider: Arc::new(crate::NoopProcessMetadataProvider),
             addresses: vec![
@@ -1345,6 +1356,39 @@ mod tests {
             })),
             Arc::new(FakeUdpOpener::default()),
             protected,
+        )
+        .unwrap();
+        let (shutdown, signal) = oneshot::channel();
+        let task = tokio::spawn(runtime.run(device.clone(), async move {
+            let _ = signal.await;
+        }));
+        device
+            .inject(build_udp_v4(
+                (Ipv4Address::new(10, 0, 0, 2), 40_000),
+                (Ipv4Address::new(198, 51, 100, 20), 53),
+                &[1],
+            ))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        shutdown.send(()).unwrap();
+        let report = task.await.unwrap().unwrap();
+        assert_eq!(report.packets_rejected, 1);
+        assert!(device.outbound().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_restrictions_reject_tun_packets_before_socket_creation() {
+        let device = crate::FakePacketDevice::new(1500, 4);
+        let mut runtime_config = config();
+        runtime_config.allowed_sources = vec!["192.0.2.0/24".to_owned()];
+        let runtime = TunFlowRuntime::new(
+            runtime_config,
+            Arc::new(crate::FixedTargetDialer::new(|_| {
+                Err::<tokio::io::DuplexStream, _>(crate::FlowBridgeError::Dial("unused".to_owned()))
+            })),
+            Arc::new(FakeUdpOpener::default()),
+            ProtectedEndpointSet::default(),
         )
         .unwrap();
         let (shutdown, signal) = oneshot::channel();

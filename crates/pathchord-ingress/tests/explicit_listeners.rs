@@ -93,6 +93,7 @@ fn listener(id: &str, kind: ListenerKind) -> ListenerConfig {
         }),
         allowed_sources: vec!["127.0.0.1/32".to_owned()],
         authentication: AuthenticationMode::Disabled,
+        backend: Default::default(),
         credentials_ref: None,
         mark: None,
         route_table: None,

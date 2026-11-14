@@ -1,0 +1,30 @@
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata:
+  name: linux-tproxy-ebpf
+spec:
+  type: tproxy
+  backend: ebpf
+  platform: linux
+  bind: 0.0.0.0:15001
+  interface: lan0
+  allowedSources: [192.168.1.0/24]
+  mark: 1
+  routeTable: 100
+  protocols: [tcp, udp]
+---
+apiVersion: pathchord.io/v1
+kind: DNSPolicy
+metadata:
+  name: dns
+spec:
+  defaultRoute: local
+  local:
+    servers: [9.9.9.9:53]
+---
+apiVersion: pathchord.io/v1
+kind: FallbackPolicy
+metadata:
+  name: fallback
+spec:
+  action: direct

@@ -230,6 +230,12 @@ spec:
 适配器保留原始目标地址和端口，并使用内核透明套接字元数据。TCP 和 UDP 按 `protocols` 独立准入，
 默认值为 `[tcp, udp]`。
 
+可选的 `spec.backend: ebpf` 选择 Linux TC classifier 后端。它要求 `platform: linux`、ingress
+`spec.interface` 和非空的 `allowedSources`。classifier 为该接口进入的 TCP/UDP 数据包设置标记，
+再由现有策略路由和透明 listener 负责交付。它不会替代原目标提取、UDP association 管理、受保护
+端点检查或用户态 Path/Session runtime。该后端是显式开关；嵌入的 BPF 对象、`bpftool`、`tc` 或
+所需内核特权不可用时必须返回类型化平台诊断。普通 `tproxy` 仍是回退配置。
+
 当 PathChord 管理策略路由时，IPv4 和 IPv6 必须使用专用的规则优先级、路由协议和路由表所有权组合。
 添加规则或路由之前，必须对四个目标槽位制作快照并原子写入恢复 journal。恢复时只能删除仍与 journal
 中的 mark、路由表、优先级、协议、地址族、本地路由和 loopback 设备完全一致的对象；已变化或预先存在的

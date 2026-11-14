@@ -746,7 +746,6 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         platform_factories,
     )
     .await?;
-    let listener_addresses = runtime.listener_addresses()?;
     let control_store = Arc::new(IngressControlStore::open(
         args.data_dir.join("ingress-control.db"),
     )?);
@@ -771,11 +770,12 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     )?;
     let mut dispatcher = LocalControlDispatcher::with_service(platform, control_service);
     for listener in &policy_config.listeners {
-        if listener_addresses.contains_key(&listener.id) {
-            dispatcher
-                .service_mut()
-                .register_listener(listener_descriptor(listener.clone())?);
-        }
+        // TUN and UDP-only TPROXY listeners have no TCP socket address, but
+        // they are still runnable resources and must be visible to control
+        // inventory/status just like ordinary listeners.
+        dispatcher
+            .service_mut()
+            .register_listener(listener_descriptor(listener.clone())?);
     }
     let observation_handle = dispatcher.service().observation_handle();
     let (runtime_events, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2354,6 +2354,7 @@ mod tests {
                 }),
                 allowed_sources: Vec::new(),
                 authentication: AuthenticationMode::Required,
+                backend: Default::default(),
                 credentials_ref: Some("listener-users".to_owned()),
                 flow_tags: std::collections::BTreeSet::new(),
                 process_metadata: pathchord_policy::ProcessMetadataRequest::default(),

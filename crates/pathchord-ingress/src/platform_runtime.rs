@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pathchord_policy::{
     AuthenticationMode, FlowProtocol, ListenerConfig, ListenerKind as PolicyListenerKind,
-    PolicyConfig,
+    PolicyConfig, TransparentBackend,
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -27,9 +27,10 @@ use crate::{
 
 #[cfg(target_os = "linux")]
 use crate::{
-    IpCommandRouteAdapter, LinuxRouteAdapter, LinuxRoutingEffect, LinuxTproxyUdpSocket,
-    LinuxTransparentRouteConfig, LinuxTransparentRouteManager, TransparentUdpAdapter,
-    TransparentUdpRuntimeConfig, TransparentUdpRuntimeReport, run_transparent_udp,
+    IpCommandRouteAdapter, LinuxEbpfInterception, LinuxRouteAdapter, LinuxRoutingEffect,
+    LinuxTproxyUdpSocket, LinuxTransparentRouteConfig, LinuxTransparentRouteManager,
+    TransparentUdpAdapter, TransparentUdpRuntimeConfig, TransparentUdpRuntimeReport,
+    run_transparent_udp,
 };
 
 #[derive(Debug, Clone)]
@@ -235,6 +236,8 @@ pub struct IngressPlatformRuntime {
         pathchord_policy::ListenerId,
         Arc<LinuxTransparentRouteManager>,
     )>,
+    #[cfg(target_os = "linux")]
+    ebpf: Vec<(pathchord_policy::ListenerId, LinuxEbpfInterception)>,
 }
 
 impl std::fmt::Debug for IngressPlatformRuntime {
@@ -368,6 +371,8 @@ impl IngressPlatformRuntime {
 
         #[cfg(target_os = "linux")]
         let mut route_index = 0_u32;
+        #[cfg(target_os = "linux")]
+        let mut ebpf = Vec::new();
         for listener in listeners {
             match listener.kind {
                 PolicyListenerKind::Http | PolicyListenerKind::Redirect => {
@@ -450,6 +455,30 @@ impl IngressPlatformRuntime {
                             return Err(adapter_error(listener, error));
                         }
                         routes.push((listener.id.clone(), manager));
+                        if listener.backend == TransparentBackend::Ebpf {
+                            let interface = listener.interface.as_deref().ok_or_else(|| {
+                                invalid_listener(listener, "eBPF interface is missing")
+                            })?;
+                            let mark = listener.mark.ok_or_else(|| {
+                                invalid_listener(listener, "eBPF mark is missing")
+                            })?;
+                            let backend = match LinuxEbpfInterception::attach(
+                                &config.data_dir,
+                                listener.id.as_str(),
+                                interface,
+                                mark,
+                                priority,
+                            ) {
+                                Ok(backend) => backend,
+                                Err(error) => {
+                                    if let Some(rollback) = restore_routes(&routes) {
+                                        return Err(rollback);
+                                    }
+                                    return Err(adapter_error(listener, error));
+                                }
+                            };
+                            ebpf.push((listener.id.clone(), backend));
+                        }
                         if listener.protocols.contains(&FlowProtocol::Tcp) {
                             tcp_descriptors.push(listener_descriptor(listener)?);
                         }
@@ -477,6 +506,7 @@ impl IngressPlatformRuntime {
                                 config: TransparentUdpRuntimeConfig {
                                     listener_id: listener.id.clone(),
                                     flow_tags: listener.flow_tags.clone(),
+                                    allowed_sources: listener.allowed_sources.clone(),
                                     process_metadata: listener.process_metadata,
                                     process_metadata_provider: Arc::clone(
                                         &factories.process_metadata,
@@ -523,11 +553,16 @@ impl IngressPlatformRuntime {
                     let mut runtime_config =
                         TunFlowRuntimeConfig::from_tun(listener.id.clone(), &tun_config);
                     runtime_config.flow_tags = listener.flow_tags.clone();
+                    runtime_config.allowed_sources = listener.allowed_sources.clone();
                     runtime_config.process_metadata = listener.process_metadata;
                     runtime_config.process_metadata_provider =
                         Arc::clone(&factories.process_metadata);
                     runtime_config.tcp_enabled = listener.protocols.contains(&FlowProtocol::Tcp);
                     runtime_config.udp_enabled = listener.protocols.contains(&FlowProtocol::Udp);
+                    runtime_config.max_tcp_flows = config.listener_runtime.max_connections;
+                    runtime_config.max_udp_associations = config.maximum_udp_associations;
+                    runtime_config.udp_packet_queue = config.udp_association_queue;
+                    runtime_config.idle_timeout = config.udp_idle_timeout;
                     let runtime = match TunFlowRuntime::new(
                         runtime_config,
                         Arc::clone(&tcp_opener),
@@ -555,11 +590,12 @@ impl IngressPlatformRuntime {
         let listeners = if tcp_descriptors.is_empty() {
             None
         } else {
-            match ListenerRuntime::bind_descriptors_with_credentials(
+            match ListenerRuntime::bind_descriptors_with_credentials_and_protected(
                 SharedTcpOpener(tcp_opener),
                 config.listener_runtime,
                 tcp_descriptors,
                 listener_credentials,
+                protected.clone(),
             )
             .await
             {
@@ -604,6 +640,8 @@ impl IngressPlatformRuntime {
             udp,
             #[cfg(target_os = "linux")]
             routes,
+            #[cfg(target_os = "linux")]
+            ebpf,
         })
     }
 
@@ -744,6 +782,15 @@ impl IngressPlatformRuntime {
             });
         }
         #[cfg(target_os = "linux")]
+        for (listener_id, mut backend) in self.ebpf.drain(..) {
+            if let Err(error) = backend.detach() {
+                first_error.get_or_insert_with(|| IngressPlatformError::Adapter {
+                    listener_id: listener_id.as_str().to_owned(),
+                    message: error.to_string(),
+                });
+            }
+        }
+        #[cfg(target_os = "linux")]
         for (listener_id, route) in &self.routes {
             match route.restore() {
                 Ok(LinuxRoutingEffect {
@@ -876,6 +923,10 @@ fn validate_listener_platforms(listeners: &[ListenerConfig]) -> Result<(), Ingre
             listener.kind,
             PolicyListenerKind::Tproxy | PolicyListenerKind::Redirect
         ) {
+            return Err(unsupported(listener));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if listener.backend == TransparentBackend::Ebpf {
             return Err(unsupported(listener));
         }
         #[cfg(target_os = "freebsd")]
@@ -1234,6 +1285,7 @@ mod tests {
             }),
             allowed_sources: Vec::new(),
             authentication: AuthenticationMode::Disabled,
+            backend: Default::default(),
             credentials_ref: None,
             flow_tags: BTreeSet::new(),
             process_metadata: pathchord_policy::ProcessMetadataRequest::default(),

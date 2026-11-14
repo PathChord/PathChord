@@ -256,6 +256,11 @@ fn transparent_datagram_socket(address: SocketAddr) -> Result<Socket, Transparen
         .map_err(|error| TransparentUdpError::Io(error.to_string()))?;
     setsockopt(&socket, IpTransparent, &true)
         .map_err(|error| TransparentUdpError::Io(error.to_string()))?;
+    if address.is_ipv6() {
+        socket
+            .set_ip_transparent_v6(true)
+            .map_err(|error| TransparentUdpError::Io(error.to_string()))?;
+    }
     Ok(socket)
 }
 

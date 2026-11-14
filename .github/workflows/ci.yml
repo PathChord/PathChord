@@ -49,3 +49,77 @@ jobs:
         with:
           command: check advisories
           arguments: --all-features --locked
+
+  protocol-interoperability:
+    name: External protocol interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+
+      - name: Download test-only sing-box peer
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz \
+            --output /tmp/sing-box.tar.gz
+          mkdir -p /tmp/sing-box
+          tar -xzf /tmp/sing-box.tar.gz --strip-components=1 -C /tmp/sing-box
+
+      - name: Run PathChord client against sing-box servers
+        env:
+          PATHCHORD_TEST_SING_BOX: /tmp/sing-box/sing-box
+        run: scripts/test-with-sing-box.sh
+
+  external-core-interoperability:
+    name: PathChord client against ${{ matrix.kind }} server
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: mihomo
+            url: https://github.com/MetaCubeX/mihomo/releases/download/v1.19.34/mihomo-linux-amd64-v1-v1.19.34.gz
+            archive: gz
+            binary: mihomo
+          - kind: xray
+            url: https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip
+            archive: zip
+            binary: xray
+          - kind: v2fly
+            url: https://github.com/v2fly/v2ray-core/releases/download/v5.53.0/v2ray-linux-64.zip
+            archive: zip
+            binary: v2ray
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+
+      - name: Download external server core
+        env:
+          CORE_URL: ${{ matrix.url }}
+          CORE_ARCHIVE: ${{ matrix.archive }}
+          CORE_BINARY: ${{ matrix.binary }}
+        run: |
+          curl --fail --silent --show-error --location "$CORE_URL" --output /tmp/core.download
+          mkdir -p /tmp/external-core
+          if [ "$CORE_ARCHIVE" = gz ]; then
+            gzip -dc /tmp/core.download > "/tmp/external-core/$CORE_BINARY"
+          else
+            unzip -oq /tmp/core.download "$CORE_BINARY" -d /tmp/external-core
+          fi
+          chmod +x "/tmp/external-core/$CORE_BINARY"
+
+      - name: Run PathChord client against external server
+        env:
+          PATHCHORD_TEST_CORE_KIND: ${{ matrix.kind }}
+          PATHCHORD_TEST_MIHOMO: /tmp/external-core/mihomo
+          PATHCHORD_TEST_XRAY: /tmp/external-core/xray
+          PATHCHORD_TEST_V2FLY: /tmp/external-core/v2ray
+        run: scripts/test-with-external-core.sh

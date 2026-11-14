@@ -338,6 +338,20 @@ impl IpCommandRouteAdapter {
             .map_err(|error| LinuxRoutingError::Command(error.to_string()))
     }
 
+    fn query_route(&self, arguments: &[String]) -> Result<Vec<Value>, LinuxRoutingError> {
+        match self.query(arguments) {
+            Ok(values) => Ok(values),
+            Err(LinuxRoutingError::Command(message)) if missing_route_table(&message) => {
+                // `ip route show table N` returns status 2 when N has never
+                // been created, even though that is the empty state needed by
+                // the ownership preflight. Treat only this exact condition as
+                // an absent table; permission and syntax failures remain fatal.
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn mutate(&self, arguments: &[String]) -> Result<(), LinuxRoutingError> {
         let output = Command::new(&self.program)
             .args(arguments)
@@ -433,7 +447,7 @@ impl LinuxRouteAdapter for IpCommandRouteAdapter {
         config: LinuxTransparentRouteConfig,
     ) -> Result<RouteObjectState, LinuxRoutingError> {
         Ok(classify_route(
-            &self.query(&Self::route_query_args(family, config))?,
+            &self.query_route(&Self::route_query_args(family, config))?,
             family,
             config,
         ))
@@ -470,6 +484,11 @@ impl LinuxRouteAdapter for IpCommandRouteAdapter {
     ) -> Result<(), LinuxRoutingError> {
         self.mutate(&Self::route_mutation_args("del", family, config))
     }
+}
+
+fn missing_route_table(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("fib table does not exist") || message.contains("table does not exist")
 }
 
 fn classify_rule(values: &[Value], config: LinuxTransparentRouteConfig) -> RouteObjectState {
@@ -808,5 +827,16 @@ mod tests {
             classify_route(route.as_array().unwrap(), IpFamily::Ipv4, config()),
             RouteObjectState::Exact
         );
+    }
+
+    #[test]
+    fn missing_route_table_errors_are_treated_as_absent() {
+        assert!(missing_route_table(
+            "Error: ipv4: FIB table does not exist.\nDump terminated"
+        ));
+        assert!(missing_route_table("table does not exist"));
+        assert!(!missing_route_table(
+            "RTNETLINK answers: Operation not permitted"
+        ));
     }
 }

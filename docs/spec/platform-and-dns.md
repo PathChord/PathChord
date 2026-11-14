@@ -305,6 +305,16 @@ original destination address and port and uses the kernel's transparent socket
 metadata. TCP and UDP are admitted independently according to `protocols`,
 which defaults to `[tcp, udp]`.
 
+The optional `spec.backend: ebpf` selects the Linux TC classifier backend. It
+requires `platform: linux`, an ingress `spec.interface`, and non-empty
+`allowedSources`. The classifier marks TCP/UDP packets arriving on that
+interface and leaves the existing policy route and transparent listener to
+deliver them. It does not replace original-destination extraction, UDP
+association management, protected endpoint checks, or the userspace Path/Session
+runtime. The backend is explicit and fails with a typed platform diagnostic when
+the embedded BPF object, `bpftool`, `tc`, or required kernel privileges are
+unavailable. Ordinary `tproxy` remains the fallback configuration.
+
 When PathChord manages policy routing, it MUST use a dedicated rule priority,
 route protocol, and table ownership tuple for both IPv4 and IPv6. Before adding
 rules or routes it snapshots all four target slots and atomically writes a

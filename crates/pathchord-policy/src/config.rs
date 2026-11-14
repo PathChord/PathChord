@@ -21,7 +21,7 @@ use crate::{
     RetransmissionReplication, RuleId, Scheduler, Selector, SubscriptionCache, SubscriptionConfig,
     SubscriptionId, SubscriptionRefresh, SubscriptionSource, SubscriptionSourceType, TrafficPolicy,
     TrafficPolicyId, TransitProxyConfig, TransitProxyId, TransitRule, TransitSource,
-    ValidatedPolicySnapshot,
+    TransparentBackend, ValidatedPolicySnapshot,
 };
 
 pub const API_VERSION: &str = "pathchord.io/v1";
@@ -356,6 +356,8 @@ pub struct ListenerSpec {
     bind: Option<BindSpec>,
     #[serde(default)]
     allowed_sources: Vec<String>,
+    #[serde(default)]
+    backend: TransparentBackend,
     #[serde(default = "default_authentication_value")]
     authentication: AuthenticationValue,
     #[serde(default)]
@@ -909,6 +911,7 @@ impl KubeConfig {
                         bind,
                         allowed_sources: value.spec.allowed_sources,
                         authentication,
+                        backend: value.spec.backend,
                         credentials_ref,
                         mark: value.spec.mark,
                         route_table: value.spec.route_table,
@@ -1628,8 +1631,24 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
         ));
     }
     validate_listener_kind_for_platform(value, &value.spec.platform)?;
+    if value.spec.backend == TransparentBackend::Ebpf
+        && (!matches!(value.spec.kind, ListenerKind::Tproxy) || value.spec.platform != "linux")
+    {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "ebpf backend requires a Linux tproxy listener",
+        ));
+    }
     match value.spec.kind {
         ListenerKind::Tun => {
+            if value.spec.backend != TransparentBackend::Tproxy {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "tun listeners do not accept an interception backend",
+                ));
+            }
             if value.spec.interface.as_deref().is_none_or(str::is_empty)
                 || value.spec.address.as_deref().is_none_or(str::is_empty)
             {
@@ -1660,8 +1679,31 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
             if value.spec.route_table == Some(0) {
                 return Err(invalid_spec(kind, name, "routeTable must be non-zero"));
             }
+            if value.spec.backend == TransparentBackend::Ebpf {
+                if value.spec.interface.as_deref().is_none_or(str::is_empty) {
+                    return Err(invalid_spec(
+                        kind,
+                        name,
+                        "ebpf backend requires an interface",
+                    ));
+                }
+                if value.spec.allowed_sources.is_empty() {
+                    return Err(invalid_spec(
+                        kind,
+                        name,
+                        "ebpf backend requires allowedSources",
+                    ));
+                }
+            }
         }
         ListenerKind::Redirect => {
+            if value.spec.backend != TransparentBackend::Tproxy {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "redirect listeners do not accept an interception backend",
+                ));
+            }
             if value.spec.protocols.contains(&FlowProtocol::Udp) {
                 return Err(invalid_spec(
                     kind,
@@ -1671,6 +1713,13 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
             }
         }
         ListenerKind::Mixed => {
+            if value.spec.backend != TransparentBackend::Tproxy {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "mixed listeners do not accept an interception backend",
+                ));
+            }
             if !value.spec.protocols.is_empty()
                 && !value.spec.protocols.contains(&FlowProtocol::Tcp)
             {
@@ -1691,7 +1740,15 @@ fn validate_listener_spec(value: &Resource<ListenerSpec>) -> Result<(), ConfigEr
                 ));
             }
         }
-        ListenerKind::Http | ListenerKind::Socks5 => {}
+        ListenerKind::Http | ListenerKind::Socks5 => {
+            if value.spec.backend != TransparentBackend::Tproxy {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "proxy listeners do not accept an interception backend",
+                ));
+            }
+        }
     }
     let bind_required = !matches!(value.spec.kind, ListenerKind::Tun);
     if bind_required && value.spec.bind.is_none() {
@@ -2166,6 +2223,21 @@ items:
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_transparent_and_tun_examples_compile_into_validated_policy() {
+        for source in [
+            include_str!("../../../examples/ingress-tproxy.yaml"),
+            include_str!("../../../examples/ingress-tproxy-ebpf.yaml"),
+            include_str!("../../../examples/ingress-tun.yaml"),
+        ] {
+            KubeConfig::from_yaml(source)
+                .unwrap()
+                .into_validated_snapshot(Generation::new(1))
+                .unwrap();
+        }
+    }
+
     #[test]
     fn typed_tls_and_transport_options_are_preserved_and_unknown_fields_rejected() {
         let source = format!(
@@ -2557,6 +2629,35 @@ spec:
                 );
             }
         }
+    }
+
+    #[test]
+    fn ebpf_backend_requires_linux_interface_and_source_bounds() {
+        let input = platform_listener_yaml(
+            "tproxy",
+            "linux",
+            "  backend: ebpf\n  bind: 0.0.0.0:15001\n  interface: lan0\n  allowedSources: [192.168.1.0/24]\n  mark: 1\n  routeTable: 100\n  protocols: [tcp, udp]\n",
+        );
+        let policy = KubeConfig::from_yaml(&input)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        let listener = policy
+            .listeners
+            .iter()
+            .find(|listener| listener.id.as_str() == "platform-listener")
+            .unwrap();
+        assert_eq!(listener.backend, TransparentBackend::Ebpf);
+
+        let missing_source = platform_listener_yaml(
+            "tproxy",
+            "linux",
+            "  backend: ebpf\n  bind: 0.0.0.0:15001\n  interface: lan0\n  mark: 1\n  routeTable: 100\n",
+        );
+        let error = KubeConfig::from_yaml(&missing_source)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("allowedSources"));
     }
 
     #[test]
