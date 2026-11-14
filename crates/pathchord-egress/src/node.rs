@@ -28,6 +28,9 @@ use crate::{
     AuthorizationStoreError, BoxedTargetConnection, IngressId, TargetConnector, TargetRequest,
 };
 
+const DEFAULT_PATH_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PATH_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct EgressNodeConfig {
     pub bind: SocketAddr,
@@ -91,6 +94,7 @@ pub struct EgressNode<C> {
     local_addr: SocketAddr,
     config: EgressNodeConfig,
     admission: EgressPathAdmissionConfig,
+    admission_timeout: Duration,
     connector: Arc<C>,
     runtime: Arc<Mutex<NodeRuntimeState>>,
     observations: Arc<NodeObservations>,
@@ -156,6 +160,7 @@ where
             local_addr,
             config,
             admission,
+            admission_timeout: DEFAULT_PATH_ADMISSION_TIMEOUT,
             connector: Arc::new(connector),
             runtime,
             observations,
@@ -169,6 +174,18 @@ where
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Bounds the complete Noise, HELLO and ATTACH exchange before a Path
+    /// can retain a live Session. Cancellation also releases its Path permit.
+    pub fn with_admission_timeout(mut self, timeout: Duration) -> Result<Self, EgressNodeError> {
+        if timeout.is_zero() || timeout > MAX_PATH_ADMISSION_TIMEOUT {
+            return Err(EgressNodeError::InvalidConfig(
+                "Path admission timeout must be positive and at most 60 seconds",
+            ));
+        }
+        self.admission_timeout = timeout;
+        Ok(self)
     }
 
     pub fn with_status_config(
@@ -454,6 +471,7 @@ where
                         stream,
                         Arc::clone(&self.config.keypair),
                         self.admission.clone(),
+                        self.admission_timeout,
                         Arc::clone(&self.config.authorizations),
                         Arc::clone(&self.connector),
                         Arc::clone(&self.observations),
@@ -828,6 +846,7 @@ async fn run_path_task<C>(
     stream: TcpStream,
     keypair: Arc<StaticKeypair>,
     admission: EgressPathAdmissionConfig,
+    admission_timeout: Duration,
     authorizations: Arc<AuthorizationStore>,
     connector: Arc<C>,
     observations: Arc<NodeObservations>,
@@ -844,13 +863,18 @@ async fn run_path_task<C>(
     let authorizer = StorePathAuthorizer {
         store: Arc::clone(&authorizations),
     };
-    let path = match accept_path(stream, keypair.private(), &admission, &authorizer).await {
-        Ok(PathAdmissionOutcome::Ready(path)) => path,
-        Ok(PathAdmissionOutcome::Rejected { .. }) => {
+    let path = match tokio::time::timeout(
+        admission_timeout,
+        accept_path(stream, keypair.private(), &admission, &authorizer),
+    )
+    .await
+    {
+        Ok(Ok(PathAdmissionOutcome::Ready(path))) => path,
+        Ok(Ok(PathAdmissionOutcome::Rejected { .. })) => {
             let _ = events.send(NodeEvent::Rejected);
             return;
         }
-        Err(_) => {
+        Ok(Err(_)) | Err(_) => {
             let _ = events.send(NodeEvent::Failed);
             return;
         }
@@ -1209,7 +1233,8 @@ mod tests {
                 max_session_buffering: 64 * 1024,
             },
             required_capabilities: 1,
-            supported_capabilities: 1,
+            supported_capabilities: pathchord_core::CAPABILITY_TCP_STREAM
+                | pathchord_core::CAPABILITY_UDP_SESSION,
             max_concurrent_paths: 8,
             capacity_bps: 1_000_000_000,
             recommended_path_count: 1,
@@ -1227,7 +1252,9 @@ mod tests {
             ingress_id: b"runtime-ingress".to_vec(),
             session_id: SessionId::new(session),
             path_id: pathchord_core::PathId::new(path),
-            offered_capabilities: 1,
+            offered_capabilities: pathchord_core::CAPABILITY_TCP_STREAM
+                | pathchord_core::CAPABILITY_UDP_SESSION,
+            required_capabilities: 1,
             local_limits: ProtocolLimits::default(),
         }
     }
@@ -1555,6 +1582,112 @@ mod tests {
         ) -> Result<BoxedTargetConnection, TargetConnectError> {
             Err(TargetConnectError::Connection("target refused".to_owned()))
         }
+    }
+
+    #[tokio::test]
+    async fn incomplete_admission_releases_the_only_path_permit() {
+        let ingress_key = generate_static_keypair().unwrap();
+        let egress_key = Arc::new(generate_static_keypair().unwrap());
+        let store = Arc::new(
+            AuthorizationStore::open(
+                ":memory:",
+                EgressId::new("runtime-egress"),
+                *egress_key.public(),
+            )
+            .unwrap(),
+        );
+        enroll(&store, &ingress_key);
+        let mut config = node_config(Arc::clone(&egress_key), store);
+        config.max_concurrent_paths = 1;
+        let node = Arc::new(
+            EgressNode::bind(config, EchoConnector::default())
+                .await
+                .unwrap()
+                .with_admission_timeout(Duration::from_millis(150))
+                .unwrap(),
+        );
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let runner = tokio::spawn(run_node(Arc::clone(&node), shutdown_rx));
+
+        for stage in 0..5 {
+            let mut peer = TcpStream::connect(node.local_addr()).await.unwrap();
+            match stage {
+                0 => {}                                          // No prefix.
+                1 => peer.write_all(&[0]).await.unwrap(),        // Incomplete prefix.
+                2 => peer.write_all(&[0, 96, 1]).await.unwrap(), // Incomplete Noise body.
+                _ => {
+                    let config = ingress_config(10 + stage, 20 + stage);
+                    let mut handshake = pathchord_noise::InitiatorHandshake::new(
+                        ingress_key.private(),
+                        egress_key.public(),
+                        &config.egress_identity,
+                    )
+                    .unwrap();
+                    let request = handshake.write_message(&[]).unwrap();
+                    peer.write_all(&(request.len() as u16).to_be_bytes())
+                        .await
+                        .unwrap();
+                    peer.write_all(&request).await.unwrap();
+                    let mut prefix = [0_u8; 2];
+                    peer.read_exact(&mut prefix).await.unwrap();
+                    let mut response = vec![0; u16::from_be_bytes(prefix) as usize];
+                    peer.read_exact(&mut response).await.unwrap();
+                    handshake.read_message(&response).unwrap();
+                    if stage == 4 {
+                        let mut noise = handshake.into_transport().unwrap();
+                        let message =
+                            pathchord_core::Message::PathHello(pathchord_core::PathHello {
+                                version: pathchord_core::WIRE_PROFILE_V1_VERSION,
+                                capabilities: 1,
+                                path_id: config.path_id,
+                                transport_metadata: Vec::new(),
+                            });
+                        let frame = pathchord_core::PathFrame::new(
+                            message.frame_type(),
+                            pathchord_core::FrameFlags::empty(),
+                            config.session_id,
+                            config.path_id,
+                            0,
+                            message.encode(config.local_limits).unwrap(),
+                            config.local_limits,
+                        )
+                        .unwrap();
+                        peer.write_all(
+                            &noise
+                                .seal_frame(&frame, config.local_limits)
+                                .unwrap()
+                                .encode(),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if node.snapshot().unwrap().failed_paths > stage as u64
+                        && node.runtime.lock().unwrap().paths.is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("admission must expire and release the permit");
+            assert_eq!(peer.read(&mut [0_u8; 1]).await.unwrap(), 0);
+        }
+        let PathAdmissionOutcome::Ready(path) =
+            dial_ingress(&node, &ingress_key, &egress_key, 100, 101).await
+        else {
+            panic!("valid admission should recover")
+        };
+        let ingress = IngressSessionHandle::start(path).unwrap();
+        ingress.shutdown().await.unwrap();
+        shutdown.send(()).unwrap();
+        let result = runner.await.unwrap().unwrap();
+        assert_eq!(result.failed_paths, 5);
+        assert_eq!(result.admitted_paths, 1);
     }
 
     #[tokio::test]

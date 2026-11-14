@@ -61,8 +61,13 @@ impl LinuxEbpfInterception {
                 "the eBPF object was not generated; install clang and rebuild PathChord".to_owned(),
             ));
         }
-        let safe_id =
-            listener_id.replace(|character: char| !character.is_ascii_alphanumeric(), "_");
+        let identity = pathchord_policy::ResourceIdentity::from_id(listener_id);
+        let safe_id = if identity.namespace == pathchord_policy::ResourceIdentity::DEFAULT_NAMESPACE
+        {
+            listener_id.replace(|character: char| !character.is_ascii_alphanumeric(), "_")
+        } else {
+            identity.storage_component()
+        };
         let pin_dir = data_dir.join("ebpf").join(safe_id);
         std::fs::create_dir_all(&pin_dir)
             .map_err(|error| LinuxEbpfError::Command(format!("create pin directory: {error}")))?;

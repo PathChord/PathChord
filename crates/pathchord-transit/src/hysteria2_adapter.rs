@@ -296,7 +296,7 @@ impl Hysteria2Adapter {
             allowed.push(field);
         }
         crate::adapter_registry::validate_credentials(Some(credential), &allowed)?;
-        crate::adapter_registry::validate_native_options(config, true, false, false)?;
+        crate::adapter_registry::validate_native_options(config, true, false, true)?;
         if let (Some(password), Some(auth)) =
             (credential.field("password"), credential.field("auth"))
             && password != auth

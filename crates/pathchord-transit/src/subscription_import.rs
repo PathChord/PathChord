@@ -175,12 +175,10 @@ impl Node {
         );
         NormalizedNode {
             config: TransitProxyConfig {
-                id: TransitProxyId::new(unique_node_id(
-                    config.id.as_str(),
-                    &self.name,
-                    index,
-                    used,
-                )),
+                id: TransitProxyId::in_namespace(
+                    config.id.namespace(),
+                    unique_node_id(&config.id, &self.name, index, used),
+                ),
                 source: Some(TransitSource {
                     source_type: source.to_owned(),
                     subscription: config.id.as_str().to_owned(),
@@ -462,7 +460,17 @@ fn header_map(value: Option<Value>, field: &str, node: &mut Node) -> BTreeMap<St
 fn credentials(fields: &mut Map<String, Value>, names: &[(&str, &str)], node: &mut Node) {
     for (input, output) in names {
         if let Some(value) = text(fields, input, &mut node.invalid) {
-            node.credentials.insert((*output).to_owned(), value);
+            match node.credentials.entry((*output).to_owned()) {
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    if entry.get() != &value {
+                        node.invalid.insert((*input).to_owned());
+                        node.invalid.insert((*output).to_owned());
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(value);
+                }
+            }
         }
     }
 }

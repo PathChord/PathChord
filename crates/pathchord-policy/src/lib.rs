@@ -12,6 +12,7 @@ use thiserror::Error;
 
 mod compiled;
 mod config;
+mod resource;
 mod service_config;
 mod transit_options;
 pub use service_config::{EgressServiceSpec, NodeProbePolicySpec};
@@ -26,6 +27,7 @@ pub use compiled::{
     TransitCandidate, TransitProxyRuntimeStatus,
 };
 pub use config::{ConfigError, KubeConfig, KubeResource, ObjectMeta};
+pub use resource::ResourceIdentity;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -40,6 +42,32 @@ macro_rules! id_type {
 
             pub fn as_str(&self) -> &str {
                 &self.0
+            }
+
+            pub fn in_namespace(namespace: &str, name: impl AsRef<str>) -> Self {
+                Self(
+                    ResourceIdentity {
+                        namespace,
+                        name: name.as_ref(),
+                    }
+                    .into_id(),
+                )
+            }
+
+            pub fn identity(&self) -> ResourceIdentity<'_> {
+                ResourceIdentity::from_id(&self.0)
+            }
+
+            pub fn namespace(&self) -> &str {
+                self.identity().namespace
+            }
+
+            pub fn resource_name(&self) -> &str {
+                self.identity().name
+            }
+
+            pub fn storage_component(&self) -> String {
+                self.identity().storage_component()
             }
         }
     };
@@ -134,6 +162,7 @@ pub struct PolicyContext {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Capabilities {
     pub tcp: bool,
     pub udp: bool,
@@ -526,6 +555,8 @@ pub enum ValidationError {
     MissingFallback,
     #[error("{kind} id must not be empty")]
     EmptyId { kind: &'static str },
+    #[error("{kind} identity or namespace exceeds the 255-byte internal resource limit")]
+    ResourceIdentityLimit { kind: &'static str },
     #[error("duplicate {kind} id: {id}")]
     DuplicateId { kind: &'static str, id: String },
     #[error("{kind} {id} uses invalid port 0")]
@@ -613,13 +644,16 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         config.subscriptions.iter().map(|item| item.id.as_str()),
     )?;
     validate_unique(
-        "rule",
-        config
-            .egress_rules
-            .iter()
-            .map(|item| item.id.as_str())
-            .chain(config.transit_rules.iter().map(|item| item.id.as_str()))
-            .chain(config.proxy_rules.iter().map(|item| item.id.as_str())),
+        "Egress rule",
+        config.egress_rules.iter().map(|item| item.id.as_str()),
+    )?;
+    validate_unique(
+        "Transit rule",
+        config.transit_rules.iter().map(|item| item.id.as_str()),
+    )?;
+    validate_unique(
+        "Proxy rule",
+        config.proxy_rules.iter().map(|item| item.id.as_str()),
     )?;
     validate_unique(
         "traffic policy",
@@ -712,10 +746,22 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
     for rule in &config.egress_rules {
         if let EgressSelection::Id(egress_id) = &rule.egress {
             validate_egress_reference(rule.id.as_str(), egress_id.as_str(), &egress_ids)?;
+            if egress_id.namespace() != rule.id.namespace() {
+                return Err(ValidationError::UnknownEgress {
+                    rule_id: rule.id.as_str().to_owned(),
+                    egress_id: egress_id.as_str().to_owned(),
+                });
+            }
         }
     }
     for rule in &config.transit_rules {
         validate_egress_reference(rule.id.as_str(), rule.egress.as_str(), &egress_ids)?;
+        if rule.egress.namespace() != rule.id.namespace() {
+            return Err(ValidationError::UnknownEgress {
+                rule_id: rule.id.as_str().to_owned(),
+                egress_id: rule.egress.as_str().to_owned(),
+            });
+        }
     }
 
     let policy_ids: HashSet<_> = config
@@ -724,7 +770,9 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         .map(|item| item.id.as_str())
         .collect();
     for rule in &config.transit_rules {
-        if !policy_ids.contains(rule.traffic_policy.as_str()) {
+        if !policy_ids.contains(rule.traffic_policy.as_str())
+            || rule.traffic_policy.namespace() != rule.id.namespace()
+        {
             return Err(ValidationError::UnknownTrafficPolicy {
                 rule_id: rule.id.as_str().to_owned(),
                 policy_id: rule.traffic_policy.as_str().to_owned(),
@@ -760,7 +808,9 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
     for proxy in &config.transit_proxies {
         if let Some(source) = &proxy.source
             && source.source_type != "static"
-            && !subscription_ids.contains(source.subscription.as_str())
+            && (!subscription_ids.contains(source.subscription.as_str())
+                || proxy.id.namespace()
+                    != ResourceIdentity::from_id(&source.subscription).namespace)
         {
             return Err(ValidationError::UnknownSubscription {
                 proxy_id: proxy.id.as_str().to_owned(),
@@ -780,6 +830,9 @@ fn validate_unique<'a>(
     for id in ids {
         if id.is_empty() {
             return Err(ValidationError::EmptyId { kind });
+        }
+        if !ResourceIdentity::from_id(id).is_representable() {
+            return Err(ValidationError::ResourceIdentityLimit { kind });
         }
         if !seen.insert(id) {
             return Err(ValidationError::DuplicateId {
@@ -862,6 +915,9 @@ fn validate_subscription(subscription: &SubscriptionConfig) -> Result<(), Valida
 }
 
 fn validate_dns_policy(policy: &DnsPolicyConfig) -> Result<(), ValidationError> {
+    if !policy.id.identity().is_representable() {
+        return Err(ValidationError::ResourceIdentityLimit { kind: "DNS policy" });
+    }
     let invalid = |reason| ValidationError::InvalidDnsPolicy {
         policy_id: policy.id.as_str().to_owned(),
         reason,

@@ -196,6 +196,16 @@ impl From<FlowMatchSpec> for FlowMatch {
     }
 }
 
+fn qualified_match(value: Option<FlowMatchSpec>, namespace: &str) -> FlowMatch {
+    let mut matches: FlowMatch = value.unwrap_or_default().into();
+    matches.listener_ids = matches
+        .listener_ids
+        .into_iter()
+        .map(|id| ListenerId::in_namespace(namespace, id.as_str()))
+        .collect();
+    matches
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SelectorSpec {
@@ -660,11 +670,12 @@ impl KubeConfig {
         let mut transit_rules = Vec::new();
         let mut proxy_rules = Vec::new();
         let mut rule_orders = HashSet::new();
-        let mut implicit_single_transit_policy = false;
+        let mut implicit_single_transit_namespaces = BTreeSet::new();
         for resource in self.resources {
+            let namespace = resource.metadata().namespace.clone();
             match resource {
                 KubeResource::Egress(value) => config.egresses.push(EgressConfig {
-                    id: EgressId::new(value.metadata.name),
+                    id: EgressId::in_namespace(&namespace, &value.metadata.name),
                     endpoint: Endpoint {
                         host: value.spec.address,
                         port: value.spec.port,
@@ -677,11 +688,18 @@ impl KubeConfig {
                 KubeResource::TransitProxy(value) => {
                     let source = value.spec.source.map(|source| TransitSource {
                         source_type: source.source_type,
-                        subscription: source.subscription_ref.unwrap_or_default(),
+                        subscription: source
+                            .subscription_ref
+                            .map(|name| {
+                                SubscriptionId::in_namespace(&namespace, &name)
+                                    .as_str()
+                                    .to_owned()
+                            })
+                            .unwrap_or_default(),
                     });
                     let port = value.spec.port.unwrap_or(443);
                     config.transit_proxies.push(TransitProxyConfig {
-                        id: TransitProxyId::new(value.metadata.name),
+                        id: TransitProxyId::in_namespace(&namespace, &value.metadata.name),
                         source,
                         protocol: value.spec.protocol,
                         endpoint: Endpoint {
@@ -708,7 +726,9 @@ impl KubeConfig {
                         value.spec.egress_selector,
                         value.spec.mode,
                     ) {
-                        (Some(id), None, None) => EgressSelection::Id(EgressId::new(id)),
+                        (Some(id), None, None) => {
+                            EgressSelection::Id(EgressId::in_namespace(&namespace, &id))
+                        }
                         (None, Some(selector), None) => {
                             if selector_empty(&selector) {
                                 return Err(ConfigError::InvalidSpec {
@@ -731,8 +751,8 @@ impl KubeConfig {
                     egress_rules.push((
                         value.spec.order,
                         EgressRule {
-                            id: RuleId::new(value.metadata.name),
-                            matches: value.spec.matches.unwrap_or_default().into(),
+                            id: RuleId::in_namespace(&namespace, &value.metadata.name),
+                            matches: qualified_match(value.spec.matches, &namespace),
                             egress,
                             min_usable_paths: value.spec.requirements.min_usable_paths,
                             required_capabilities: value.spec.requirements.capabilities,
@@ -748,19 +768,19 @@ impl KubeConfig {
                         });
                     }
                     let policy = value.spec.traffic_policy_ref.unwrap_or_else(|| {
-                        implicit_single_transit_policy = true;
+                        implicit_single_transit_namespaces.insert(namespace.clone());
                         IMPLICIT_SINGLE_TRANSIT_POLICY.to_owned()
                     });
                     transit_rules.push((
                         value.spec.order,
                         TransitRule {
-                            id: RuleId::new(value.metadata.name),
-                            egress: EgressId::new(value.spec.egress_ref),
-                            matches: value.spec.matches.unwrap_or_default().into(),
+                            id: RuleId::in_namespace(&namespace, &value.metadata.name),
+                            egress: EgressId::in_namespace(&namespace, &value.spec.egress_ref),
+                            matches: qualified_match(value.spec.matches, &namespace),
                             require: value.spec.require.into(),
                             reject_tags: value.spec.reject.tags,
                             weight: value.spec.weight,
-                            traffic_policy: TrafficPolicyId::new(policy),
+                            traffic_policy: TrafficPolicyId::in_namespace(&namespace, &policy),
                             traffic_class: value.spec.traffic_class_ref,
                         },
                     ));
@@ -818,8 +838,8 @@ impl KubeConfig {
                     proxy_rules.push((
                         value.spec.order,
                         ProxyRule {
-                            id: RuleId::new(value.metadata.name),
-                            matches: value.spec.matches.unwrap_or_default().into(),
+                            id: RuleId::in_namespace(&namespace, &value.metadata.name),
+                            matches: qualified_match(value.spec.matches, &namespace),
                             require: value.spec.require.into(),
                             select,
                         },
@@ -834,7 +854,7 @@ impl KubeConfig {
                         });
                     }
                     config.traffic_policies.push(TrafficPolicy {
-                        id: TrafficPolicyId::new(value.metadata.name),
+                        id: TrafficPolicyId::in_namespace(&namespace, &value.metadata.name),
                         scheduler: Scheduler::EffectiveCapacityWeighted,
                         session_replication_budget_bps: value.spec.session_replication_budget_bps,
                         class_replication_budget_bps: value.spec.class_replication_budget_bps,
@@ -908,7 +928,7 @@ impl KubeConfig {
                         value.spec.protocols
                     };
                     config.listeners.push(ListenerConfig {
-                        id: ListenerId::new(value.metadata.name),
+                        id: ListenerId::in_namespace(&namespace, &value.metadata.name),
                         kind: value.spec.kind,
                         platform: value.spec.platform,
                         bind,
@@ -923,7 +943,11 @@ impl KubeConfig {
                         address: value.spec.address,
                         mtu: value.spec.mtu,
                         bypass: value.spec.bypass,
-                        proxy_ref: value.spec.proxy_ref,
+                        proxy_ref: value.spec.proxy_ref.map(|name| {
+                            TransitProxyId::in_namespace(&namespace, &name)
+                                .as_str()
+                                .to_owned()
+                        }),
                         flow_tags: value.spec.flow_tags,
                         process_metadata: value.spec.process_metadata.unwrap_or_default(),
                     });
@@ -950,7 +974,7 @@ impl KubeConfig {
                         max_age_seconds: cache.max_age_seconds,
                     });
                     config.subscriptions.push(SubscriptionConfig {
-                        id: SubscriptionId::new(value.metadata.name),
+                        id: SubscriptionId::in_namespace(&namespace, &value.metadata.name),
                         enabled: value.spec.enabled,
                         source: SubscriptionSource {
                             source_type,
@@ -962,6 +986,16 @@ impl KubeConfig {
                     });
                 }
                 KubeResource::DnsPolicy(value) => {
+                    let convert_servers = |servers: &[String]| {
+                        servers
+                            .iter()
+                            .map(|server| {
+                                parse_dns_server(server).map_err(|reason| {
+                                    invalid_spec(&value.kind, &value.metadata.name, reason)
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    };
                     let default_route = match value.spec.default_route.as_str() {
                         "local" => DnsRoute::Local,
                         "transit" => DnsRoute::Transit,
@@ -969,15 +1003,14 @@ impl KubeConfig {
                         "blocked" => DnsRoute::Blocked,
                         _ => unreachable!("validated DNS route"),
                     };
-                    let local = value.spec.local.map(|local| DnsLocalConfig {
-                        servers: local
-                            .servers
-                            .iter()
-                            .map(|server| {
-                                parse_dns_server(server).expect("validated DNS server endpoint")
-                            })
-                            .collect(),
-                    });
+                    let local = value
+                        .spec
+                        .local
+                        .map(|local| {
+                            convert_servers(&local.servers)
+                                .map(|servers| DnsLocalConfig { servers })
+                        })
+                        .transpose()?;
                     let transit_proxy_selector = value
                         .spec
                         .transit
@@ -988,15 +1021,8 @@ impl KubeConfig {
                         .spec
                         .transit
                         .as_ref()
-                        .map(|route| {
-                            route
-                                .servers
-                                .iter()
-                                .map(|server| {
-                                    parse_dns_server(server).expect("validated DNS server endpoint")
-                                })
-                                .collect()
-                        })
+                        .map(|route| convert_servers(&route.servers))
+                        .transpose()?
                         .unwrap_or_default();
                     let egress_selector = value
                         .spec
@@ -1008,15 +1034,8 @@ impl KubeConfig {
                         .spec
                         .egress
                         .as_ref()
-                        .map(|route| {
-                            route
-                                .servers
-                                .iter()
-                                .map(|server| {
-                                    parse_dns_server(server).expect("validated DNS server endpoint")
-                                })
-                                .collect()
-                        })
+                        .map(|route| convert_servers(&route.servers))
+                        .transpose()?
                         .unwrap_or_default();
                     let blocked_response = match value.spec.blocked_response.as_deref() {
                         Some("nxdomain") => DnsBlockedResponse::Nxdomain,
@@ -1033,7 +1052,7 @@ impl KubeConfig {
                             max_ttl_seconds: cache.max_ttl_seconds.unwrap_or(86_400) as u32,
                         });
                     config.dns_policy = Some(DnsPolicyConfig {
-                        id: DnsPolicyId::new(value.metadata.name),
+                        id: DnsPolicyId::in_namespace(&namespace, &value.metadata.name),
                         default_route,
                         local,
                         transit_proxy_selector,
@@ -1051,21 +1070,21 @@ impl KubeConfig {
                 KubeResource::NodeProbePolicy(value) => config.node_probe = Some(value.spec),
             }
         }
-        if implicit_single_transit_policy {
+        for namespace in implicit_single_transit_namespaces {
             let mut implicit = config
                 .traffic_policies
                 .iter()
-                .find(|policy| policy.id.as_str() == "default")
+                .find(|policy| policy.id == TrafficPolicyId::in_namespace(&namespace, "default"))
                 .cloned()
                 .unwrap_or_else(|| TrafficPolicy {
-                    id: TrafficPolicyId::new(IMPLICIT_SINGLE_TRANSIT_POLICY),
+                    id: TrafficPolicyId::in_namespace(&namespace, IMPLICIT_SINGLE_TRANSIT_POLICY),
                     scheduler: Scheduler::EffectiveCapacityWeighted,
                     session_replication_budget_bps: 0,
                     class_replication_budget_bps: None,
                     retransmission_replication: RetransmissionReplication::Disabled,
                     classes: BTreeMap::new(),
                 });
-            implicit.id = TrafficPolicyId::new(IMPLICIT_SINGLE_TRANSIT_POLICY);
+            implicit.id = TrafficPolicyId::in_namespace(&namespace, IMPLICIT_SINGLE_TRANSIT_POLICY);
             config.traffic_policies.push(implicit);
         }
         egress_rules.sort_by_key(|(order, _)| *order);
@@ -1170,6 +1189,7 @@ fn validate_resource_set(
     resources: &[KubeResource],
     require_ingress: bool,
 ) -> Result<(), ConfigError> {
+    let resource_keys: HashSet<_> = resources.iter().map(KubeResource::key).collect();
     let dns = resources
         .iter()
         .filter(|resource| matches!(resource, KubeResource::DnsPolicy(_)))
@@ -1201,6 +1221,27 @@ fn validate_resource_set(
     }
     for resource in resources {
         validate_metadata(resource.metadata())?;
+        let matches = match resource {
+            KubeResource::EgressRule(value) => value.spec.matches.as_ref(),
+            KubeResource::TransitRule(value) => value.spec.matches.as_ref(),
+            KubeResource::ProxyRule(value) => value.spec.matches.as_ref(),
+            _ => None,
+        };
+        if let Some(matches) = matches {
+            for listener in &matches.listener_refs {
+                if !resource_keys.contains(&(
+                    resource.metadata().namespace.as_str(),
+                    "Listener",
+                    listener.as_str(),
+                )) {
+                    return Err(invalid_spec(
+                        resource.key().1,
+                        resource.key().2,
+                        "listenerRefs references an unknown Listener in this namespace",
+                    ));
+                }
+            }
+        }
         match resource {
             KubeResource::EgressService(value) => value
                 .spec
@@ -1322,6 +1363,12 @@ fn validate_metadata(metadata: &ObjectMeta) -> Result<(), ConfigError> {
         return Err(ConfigError::InvalidEnvelope(format!(
             "invalid metadata name or namespace: {namespace}/{name}"
         )));
+    }
+    let identity = crate::ResourceIdentity { namespace, name };
+    if !identity.is_representable() {
+        return Err(ConfigError::Validation(
+            crate::ValidationError::ResourceIdentityLimit { kind: "resource" },
+        ));
     }
     validate_string_map("metadata.labels", &metadata.labels).map_err(|reason| {
         ConfigError::InvalidSpec {
@@ -1889,6 +1936,38 @@ fn validate_prefix(value: &str) -> Result<(), String> {
 fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), ConfigError> {
     let kind = value.kind.as_str();
     let name = value.metadata.name.as_str();
+    for (field, servers) in value
+        .spec
+        .local
+        .iter()
+        .map(|route| ("local.servers", &route.servers))
+        .chain(
+            value
+                .spec
+                .transit
+                .iter()
+                .map(|route| ("transit.servers", &route.servers)),
+        )
+        .chain(
+            value
+                .spec
+                .egress
+                .iter()
+                .map(|route| ("egress.servers", &route.servers)),
+        )
+    {
+        if servers.len() > MAX_MAP_ENTRIES {
+            return Err(invalid_spec(
+                kind,
+                name,
+                format!("{field} has too many entries"),
+            ));
+        }
+        for server in servers {
+            validate_dns_server(server)
+                .map_err(|reason| invalid_spec(kind, name, format!("{field}: {reason}")))?;
+        }
+    }
     if !matches!(
         value.spec.default_route.as_str(),
         "local" | "transit" | "egress" | "blocked"
@@ -1907,16 +1986,6 @@ fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), Confi
                 name,
                 "local.servers is required for local DNS route",
             ));
-        }
-        if servers.is_some_and(|servers| servers.len() > MAX_MAP_ENTRIES) {
-            return Err(invalid_spec(
-                kind,
-                name,
-                "local.servers has too many entries",
-            ));
-        }
-        for server in servers.expect("checked above") {
-            validate_dns_server(server).map_err(|reason| invalid_spec(kind, name, reason))?;
         }
     }
     if value.spec.default_route == "transit"
@@ -1945,16 +2014,6 @@ fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), Confi
                 name,
                 "transit.servers is required for transit route",
             ));
-        }
-        if servers.len() > MAX_MAP_ENTRIES {
-            return Err(invalid_spec(
-                kind,
-                name,
-                "transit.servers has too many entries",
-            ));
-        }
-        for server in servers {
-            validate_dns_server(server).map_err(|reason| invalid_spec(kind, name, reason))?;
         }
     }
     if value
@@ -1996,16 +2055,6 @@ fn validate_dns_policy_spec(value: &Resource<DnsPolicySpec>) -> Result<(), Confi
                 name,
                 "egress.servers is required for egress route",
             ));
-        }
-        if servers.len() > MAX_MAP_ENTRIES {
-            return Err(invalid_spec(
-                kind,
-                name,
-                "egress.servers has too many entries",
-            ));
-        }
-        for server in servers {
-            validate_dns_server(server).map_err(|reason| invalid_spec(kind, name, reason))?;
         }
     }
     if value
@@ -2124,13 +2173,6 @@ fn validate_rule_spec(
             kind: kind.into(),
             name: name.into(),
             reason: "catchAll:true cannot be combined with match".into(),
-        });
-    }
-    if matches.is_none() && !catch_all {
-        return Err(ConfigError::InvalidSpec {
-            kind: kind.into(),
-            name: name.into(),
-            reason: "match is required unless catchAll:true".into(),
         });
     }
     if order == 0 {
@@ -2587,6 +2629,323 @@ spec:
             .unwrap_err()
             .to_string();
         assert!(error.contains("capability"));
+    }
+
+    #[test]
+    fn capability_fields_default_independently_and_unknown_fields_are_rejected() {
+        for (mapping, tcp, udp) in [("{tcp: true}", true, false), ("{udp: true}", false, true)] {
+            let input = VALID.replace("{tcp: true, udp: true}", mapping);
+            let policy = KubeConfig::from_yaml(&input)
+                .unwrap()
+                .into_policy_config()
+                .unwrap();
+            assert_eq!(policy.egresses[0].capabilities, Capabilities { tcp, udp });
+        }
+        let input = VALID.replace(
+            "{tcp: true, udp: true}",
+            "{tcp: true, udp: true, udpp: true}",
+        );
+        assert!(
+            KubeConfig::from_yaml(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("udpp")
+        );
+    }
+
+    #[test]
+    fn omitted_match_is_a_catch_all_and_empty_match_is_rejected() {
+        for (kind, action) in [
+            ("EgressRule", "egressRef: jp-1"),
+            ("TransitRule", "egressRef: jp-1"),
+            ("ProxyRule", "proxy: direct"),
+        ] {
+            let input = format!(
+                "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: {kind}\nmetadata: {{name: all}}\nspec: {{order: 1, {action}}}\n"
+            );
+            KubeConfig::from_yaml(&input)
+                .unwrap()
+                .into_policy_config()
+                .unwrap();
+            let empty = input.replace(
+                &format!("order: 1, {action}"),
+                &format!("order: 1, match: {{}}, {action}"),
+            );
+            assert!(
+                KubeConfig::from_yaml(&empty)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("empty match")
+            );
+        }
+    }
+
+    #[test]
+    fn validates_endpoints_of_every_supplied_dns_route() {
+        for route in [
+            "local: {servers: [invalid:port]}",
+            "transit: {servers: [invalid:port]}",
+            "egress: {servers: [invalid:port]}",
+        ] {
+            let input = format!(
+                "apiVersion: pathchord.io/v1\nkind: DNSPolicy\nmetadata: {{name: dns}}\nspec: {{defaultRoute: blocked, {route}}}\n---\napiVersion: pathchord.io/v1\nkind: FallbackPolicy\nmetadata: {{name: fallback}}\nspec: {{action: reject}}\n"
+            );
+            let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
+            assert!(error.contains("DNS server port"), "{error}");
+        }
+    }
+
+    fn namespaced_resources(namespace: &str, order: u32, port: u16) -> String {
+        format!(
+            r#"
+apiVersion: pathchord.io/v1
+kind: Egress
+metadata: {{name: edge, namespace: {namespace}, labels: {{region: jp}}}}
+spec: {{address: 127.0.0.1, port: 7443, publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, capabilities: {{tcp: true}}}}
+---
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata: {{name: local, namespace: {namespace}}}
+spec: {{type: mixed, bind: "127.0.0.1:{port}", authentication: {{mode: required, credentialsRef: "{namespace}-listener-secret"}}}}
+---
+apiVersion: pathchord.io/v1
+kind: Subscription
+metadata: {{name: provider, namespace: {namespace}}}
+spec: {{source: {{type: clash, url: "https://example.test/subscription", credentialsRef: "{namespace}-subscription-secret"}}}}
+---
+apiVersion: pathchord.io/v1
+kind: TransitProxy
+metadata: {{name: node, namespace: {namespace}, labels: {{region: jp}}}}
+spec: {{protocol: direct, source: {{type: clash, subscriptionRef: provider}}, credentialsRef: "{namespace}-node-secret"}}
+---
+apiVersion: pathchord.io/v1
+kind: TrafficPolicy
+metadata: {{name: traffic, namespace: {namespace}}}
+spec: {{classes: {{interactive: {{priority: 1, share: 2}}}}}}
+---
+apiVersion: pathchord.io/v1
+kind: EgressRule
+metadata: {{name: route, namespace: {namespace}}}
+spec: {{order: {order}, match: {{listenerRefs: [local]}}, egressRef: edge}}
+---
+apiVersion: pathchord.io/v1
+kind: TransitRule
+metadata: {{name: route, namespace: {namespace}}}
+spec: {{order: {}, egressRef: edge, trafficPolicyRef: traffic, trafficClassRef: interactive}}
+---
+apiVersion: pathchord.io/v1
+kind: ProxyRule
+metadata: {{name: route, namespace: {namespace}}}
+spec: {{order: {}, require: {{labels: {{region: jp}}}}}}
+"#,
+            order + 1,
+            order + 2
+        )
+    }
+
+    fn namespaced_bundle(namespaces: &[&str]) -> String {
+        let mut documents = vec!["apiVersion: pathchord.io/v1\nkind: DNSPolicy\nmetadata: {name: dns}\nspec: {defaultRoute: blocked}\n---\napiVersion: pathchord.io/v1\nkind: FallbackPolicy\nmetadata: {name: fallback}\nspec: {action: reject}\n".to_owned()];
+        documents.extend(namespaces.iter().enumerate().map(|(index, namespace)| {
+            namespaced_resources(namespace, 10 * (index as u32 + 1), 19000 + index as u16)
+        }));
+        documents.join("\n---\n")
+    }
+
+    #[test]
+    fn namespaced_graph_keeps_same_names_and_resolves_owners_without_rewriting_secrets() {
+        let input = namespaced_bundle(&["alpha", "beta"]);
+        let policy = KubeConfig::from_yaml(&input)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(policy.egresses.len(), 2);
+        assert_ne!(policy.egresses[0].id, policy.egresses[1].id);
+        for namespace in ["alpha", "beta"] {
+            let egress = EgressId::in_namespace(namespace, "edge");
+            assert!(policy.egresses.iter().any(|value| value.id == egress));
+            let rule = policy
+                .transit_rules
+                .iter()
+                .find(|rule| rule.id.namespace() == namespace)
+                .unwrap();
+            assert_eq!(rule.egress, egress);
+            assert_eq!(
+                rule.traffic_policy,
+                TrafficPolicyId::in_namespace(namespace, "traffic")
+            );
+            let proxy = policy
+                .transit_proxies
+                .iter()
+                .find(|proxy| proxy.id.namespace() == namespace)
+                .unwrap();
+            assert_eq!(
+                proxy.source.as_ref().unwrap().subscription,
+                SubscriptionId::in_namespace(namespace, "provider").as_str()
+            );
+            assert_eq!(
+                proxy.credentials_ref.as_deref(),
+                Some(format!("{namespace}-node-secret").as_str())
+            );
+            let listener = policy
+                .listeners
+                .iter()
+                .find(|listener| listener.id.namespace() == namespace)
+                .unwrap();
+            assert_eq!(
+                listener.credentials_ref.as_deref(),
+                Some(format!("{namespace}-listener-secret").as_str())
+            );
+            let subscription = policy
+                .subscriptions
+                .iter()
+                .find(|subscription| subscription.id.namespace() == namespace)
+                .unwrap();
+            assert_eq!(
+                subscription.source.credentials_ref.as_deref(),
+                Some(format!("{namespace}-subscription-secret").as_str())
+            );
+        }
+        let reversed = input
+            .split("\n---\n")
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        assert_eq!(
+            policy,
+            KubeConfig::from_yaml(&reversed)
+                .unwrap()
+                .into_policy_config()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn namespace_capacity_is_checked_for_authored_and_programmatic_resource_graphs() {
+        let namespace = "n".repeat(127);
+        let input = namespaced_bundle(&[&namespace]);
+        let policy = KubeConfig::from_yaml(&input)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(policy.subscriptions[0].id.namespace(), namespace);
+        let unavailable_namespace = "n".repeat(187);
+        let input = namespaced_bundle(&[&unavailable_namespace]);
+        assert!(matches!(
+            KubeConfig::from_yaml(&input),
+            Err(ConfigError::Validation(
+                crate::ValidationError::ResourceIdentityLimit { .. }
+            ))
+        ));
+
+        let mut candidate = policy.clone();
+        candidate.subscriptions[0].id = SubscriptionId::in_namespace(&unavailable_namespace, "x");
+        assert!(matches!(
+            ValidatedPolicySnapshot::new(Generation::new(2), candidate),
+            Err(crate::ValidationError::ResourceIdentityLimit { .. })
+        ));
+        let mut candidate = policy;
+        candidate.dns_policy.as_mut().unwrap().id =
+            DnsPolicyId::in_namespace(&unavailable_namespace, "x");
+        assert!(matches!(
+            ValidatedPolicySnapshot::new(Generation::new(2), candidate),
+            Err(crate::ValidationError::ResourceIdentityLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn references_cannot_resolve_another_namespaces_same_name() {
+        let input = namespaced_bundle(&["alpha"]);
+        for (kind, name) in [
+            ("Egress", "edge"),
+            ("TrafficPolicy", "traffic"),
+            ("Listener", "local"),
+            ("Subscription", "provider"),
+        ] {
+            let original = format!("kind: {kind}\nmetadata: {{name: {name}, namespace: alpha");
+            let foreign = format!("kind: {kind}\nmetadata: {{name: {name}, namespace: beta");
+            let invalid = input.replace(&original, &foreign);
+            assert!(
+                KubeConfig::from_yaml(&invalid)
+                    .and_then(KubeConfig::into_policy_config)
+                    .is_err(),
+                "cross-namespace {kind} reference was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn selectors_and_catch_all_rules_stay_in_their_own_namespace() {
+        let input = namespaced_bundle(&["alpha", "beta"]);
+        let policy = KubeConfig::from_yaml(&input)
+            .unwrap()
+            .into_validated_snapshot(Generation::new(1))
+            .unwrap();
+        let compiled = policy.compile().unwrap();
+        let mut runtime = crate::RuntimeCatalog::default();
+        for namespace in ["alpha", "beta"] {
+            runtime.set_transit_proxy(
+                TransitProxyId::in_namespace(namespace, "node"),
+                crate::TransitProxyRuntimeStatus {
+                    state: crate::RuntimeNodeState::Ready,
+                    capabilities: BTreeSet::from([FlowProtocol::Tcp]),
+                    selection_score: if namespace == "beta" { 1_000_000 } else { 1 },
+                    ..Default::default()
+                },
+            );
+        }
+        let context = crate::PolicyContext {
+            listener_id: ListenerId::in_namespace("alpha", "local"),
+            source: "127.0.0.1:1234".parse().unwrap(),
+            authentication_identity: None,
+            process: None,
+            flow_tags: BTreeSet::new(),
+            protocol: FlowProtocol::Tcp,
+            target: crate::TargetEndpoint {
+                host: crate::TargetHost::Hostname("example.test".into()),
+                port: 443,
+            },
+        };
+        let crate::Evaluation::Route(crate::RoutePlan::Proxy(route)) =
+            compiled.evaluate(&context, &runtime)
+        else {
+            panic!("expected ordinary proxy route")
+        };
+        assert_eq!(
+            route.transit_proxy_id,
+            TransitProxyId::in_namespace("alpha", "node")
+        );
+        runtime.set_transit_proxy(
+            TransitProxyId::in_namespace("alpha", "node"),
+            crate::TransitProxyRuntimeStatus::default(),
+        );
+        assert!(matches!(
+            compiled.evaluate(&context, &runtime),
+            crate::Evaluation::Reject { .. }
+        ));
+
+        let input = input.replace(
+            "egressRef: edge}",
+            "egressSelector: {labels: {region: jp}}}",
+        );
+        let policy = KubeConfig::from_yaml(&input)
+            .unwrap()
+            .into_validated_snapshot(Generation::new(2))
+            .unwrap();
+        let compiled = policy.compile().unwrap();
+        runtime.set_egress(
+            EgressId::in_namespace("beta", "edge"),
+            crate::EgressRuntimeStatus {
+                state: crate::RuntimeNodeState::Ready,
+                usable_paths: 1,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            compiled.evaluate(&context, &runtime),
+            crate::Evaluation::Reject { .. }
+        ));
     }
 
     #[test]

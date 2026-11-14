@@ -2486,6 +2486,7 @@ name = "pathchord-path"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "getrandom 0.4.3",
  "pathchord-core",
  "pathchord-egress",
  "pathchord-noise",
@@ -2499,6 +2500,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "noyalib-serde-yaml",
+ "orion",
  "serde",
  "thiserror 2.0.21",
  "url",

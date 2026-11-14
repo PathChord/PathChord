@@ -40,7 +40,9 @@ impl Default for ListenerRuntimeConfig {
 
 impl ListenerRuntimeConfig {
     fn validate(self) -> Result<Self, RuntimeError> {
-        if self.max_connections == 0 {
+        if self.max_connections == 0
+            || self.max_connections > crate::control::MAX_CONNECTION_OBSERVATIONS
+        {
             return Err(RuntimeError::InvalidMaxConnections);
         }
         Ok(self)
@@ -108,7 +110,7 @@ pub struct RuntimeReport {
 pub enum RuntimeError {
     #[error("listener runtime has no configured listeners")]
     NoListeners,
-    #[error("max_connections must be greater than zero")]
+    #[error("max_connections must be in 1..=16384 to retain every live connection observation")]
     InvalidMaxConnections,
     #[error("duplicate listener id: {0}")]
     DuplicateListener(String),
@@ -140,6 +142,7 @@ pub struct ListenerRuntime<D> {
     protected_endpoints: crate::ProtectedEndpointSet,
     process_metadata: Arc<dyn ProcessMetadataProvider>,
     events: Option<ListenerRuntimeEventSender>,
+    connection_admission: Option<Arc<Semaphore>>,
 }
 
 impl<D> std::fmt::Debug for ListenerRuntime<D> {
@@ -166,6 +169,7 @@ where
             protected_endpoints: crate::ProtectedEndpointSet::default(),
             process_metadata: Arc::new(NoopProcessMetadataProvider),
             events: None,
+            connection_admission: None,
         }
     }
 
@@ -178,6 +182,7 @@ where
             protected_endpoints: crate::ProtectedEndpointSet::default(),
             process_metadata: Arc::new(NoopProcessMetadataProvider),
             events: None,
+            connection_admission: None,
         })
     }
 
@@ -318,6 +323,10 @@ where
         self.events = Some(sender);
     }
 
+    pub(crate) fn set_connection_admission(&mut self, admission: Arc<Semaphore>) {
+        self.connection_admission = Some(admission);
+    }
+
     pub fn set_process_metadata_provider(&mut self, provider: Arc<dyn ProcessMetadataProvider>) {
         self.process_metadata = provider;
     }
@@ -422,6 +431,7 @@ where
                 Arc::clone(&self.process_metadata),
                 bind,
                 self.events.clone(),
+                self.connection_admission.clone(),
             ));
         }
 
@@ -531,6 +541,7 @@ async fn run_listener<D>(
     process_metadata: Arc<dyn ProcessMetadataProvider>,
     listener_address: std::net::SocketAddr,
     events: Option<ListenerRuntimeEventSender>,
+    connection_admission: Option<Arc<Semaphore>>,
 ) -> Result<(), RuntimeError>
 where
     D: IngressTargetDialer + 'static,
@@ -574,6 +585,14 @@ where
                     continue;
                 }
                 let metadata_request = listener.descriptor().process_metadata;
+                let admission = match connection_admission.as_ref() {
+                    Some(shared) => Some(tokio::select! {
+                        () = cancellation.cancelled() => break,
+                        result = Arc::clone(shared).acquire_owned() => result
+                            .map_err(|error| RuntimeError::Task(error.to_string()))?,
+                    }),
+                    None => None,
+                };
                 if connection.context.protocol == crate::FlowProtocol::Tcp
                     && !metadata_request.is_empty()
                 {
@@ -615,6 +634,7 @@ where
                 let flow_events = events.clone();
                 let flow_connection_id = connection_id;
                 flows.spawn(async move {
+                    let _admission = admission;
                     let result = bridge_connection(connection, flow_dialer.as_ref()).await;
                     match &result {
                         Ok(stats) => {
@@ -790,6 +810,24 @@ mod tests {
         AcceptedConnection, ConnectionContext, FixedTargetDialer, FlowProtocol, TargetAddress,
         TargetHost,
     };
+
+    #[test]
+    fn connection_admission_cannot_exceed_live_observation_capacity() {
+        assert!(
+            ListenerRuntimeConfig {
+                max_connections: crate::control::MAX_CONNECTION_OBSERVATIONS,
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ListenerRuntimeConfig {
+                max_connections: crate::control::MAX_CONNECTION_OBSERVATIONS + 1,
+            }
+            .validate()
+            .is_err()
+        );
+    }
 
     struct ScriptedListener {
         descriptor: ListenerDescriptor,

@@ -20,10 +20,12 @@ pub const MAX_DNS_MESSAGE_BYTES: usize = u16::MAX as usize;
 pub enum DnsRouteSelection {
     Local,
     Transit {
+        namespace: String,
         proxy_selector: Selector,
         servers: Vec<Endpoint>,
     },
     Egress {
+        namespace: String,
         egress_selector: Selector,
         servers: Vec<Endpoint>,
     },
@@ -248,6 +250,7 @@ impl DnsRuntime {
                 .transit_proxy_selector
                 .clone()
                 .map(|proxy_selector| DnsRouteSelection::Transit {
+                    namespace: self.policy.id.namespace().to_owned(),
                     proxy_selector,
                     servers: self.policy.transit_servers.clone(),
                 })
@@ -257,6 +260,7 @@ impl DnsRuntime {
                 .egress_selector
                 .clone()
                 .map(|egress_selector| DnsRouteSelection::Egress {
+                    namespace: self.policy.id.namespace().to_owned(),
                     egress_selector,
                     servers: self.policy.egress_servers.clone(),
                 })
@@ -843,6 +847,20 @@ mod tests {
                     .unwrap();
             assert_eq!(response.metadata.response_code, expected);
             assert!(response.answers.is_empty());
+        }
+    }
+
+    #[test]
+    fn routed_dns_selection_retains_the_policy_namespace() {
+        for route in [DnsRoute::Transit, DnsRoute::Egress] {
+            let mut config = policy(route);
+            config.id = pathchord_policy::DnsPolicyId::in_namespace("tenant-a", "dns");
+            let runtime = DnsRuntime::new(config, DnsAdapters::default()).unwrap();
+            match runtime.selection().unwrap() {
+                DnsRouteSelection::Transit { namespace, .. }
+                | DnsRouteSelection::Egress { namespace, .. } => assert_eq!(namespace, "tenant-a"),
+                DnsRouteSelection::Local => panic!("expected a routed DNS selection"),
+            }
         }
     }
 

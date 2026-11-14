@@ -26,6 +26,15 @@ use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn http_connect_crosses_transit_noise_session_and_egress() {
+    http_connect_through_egress("default").await;
+}
+
+#[tokio::test]
+async fn namespaced_egress_keeps_its_canonical_noise_and_enrollment_identity() {
+    http_connect_through_egress("tenant-a").await;
+}
+
+async fn http_connect_through_egress(namespace: &str) {
     let ingress_key = generate_static_keypair().expect("Ingress identity");
     let egress_key = Arc::new(generate_static_keypair().expect("Egress identity"));
     let store = Arc::new(
@@ -88,7 +97,7 @@ async fn http_connect_crosses_transit_noise_session_and_egress() {
             .await
     });
 
-    let policy = policy(egress_address, egress_key.public());
+    let policy = policy(namespace, egress_address, egress_key.public());
     let data_plane = Arc::new(
         IngressDataPlane::new(IngressDataPlaneConfig::new(
             "ingress-a",
@@ -118,7 +127,7 @@ async fn http_connect_crosses_transit_noise_session_and_egress() {
     });
 
     let descriptor = ListenerDescriptor {
-        id: ListenerId::new("http-e2e"),
+        id: ListenerId::in_namespace(namespace, "http-e2e"),
         kind: ListenerKind::Http,
         bind: Some("127.0.0.1:0".parse().unwrap()),
         interface: None,
@@ -191,12 +200,13 @@ async fn http_connect_crosses_transit_noise_session_and_egress() {
 }
 
 fn policy(
+    namespace: &str,
     egress_address: std::net::SocketAddr,
     egress_public_key: &[u8; 32],
 ) -> ValidatedPolicySnapshot {
-    let egress_id = EgressId::new("egress-a");
-    let transit_id = TransitProxyId::new("direct-a");
-    let traffic_policy_id = TrafficPolicyId::new("default");
+    let egress_id = EgressId::in_namespace(namespace, "egress-a");
+    let transit_id = TransitProxyId::in_namespace(namespace, "direct-a");
+    let traffic_policy_id = TrafficPolicyId::in_namespace(namespace, "default");
     ValidatedPolicySnapshot::new(
         Generation::new(1),
         PolicyConfig {
@@ -232,14 +242,14 @@ fn policy(
                 weight: 100,
             }],
             egress_rules: vec![EgressRule {
-                id: RuleId::new("all-to-egress"),
+                id: RuleId::in_namespace(namespace, "all-to-egress"),
                 matches: FlowMatch::default(),
                 egress: EgressSelection::Id(egress_id.clone()),
                 min_usable_paths: 1,
                 required_capabilities: BTreeSet::from([FlowProtocol::Tcp]),
             }],
             transit_rules: vec![TransitRule {
-                id: RuleId::new("egress-direct"),
+                id: RuleId::in_namespace(namespace, "egress-direct"),
                 egress: egress_id,
                 matches: FlowMatch::default(),
                 require: Selector::default(),

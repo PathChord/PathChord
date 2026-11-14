@@ -405,11 +405,26 @@ impl MultipathSession {
         &mut self,
         path_id: PathId,
     ) -> Result<PathFailureOutcome, MultipathError> {
+        self.mark_path_terminal(path_id, PathState::Failed)
+    }
+
+    pub fn mark_path_closed(
+        &mut self,
+        path_id: PathId,
+    ) -> Result<PathFailureOutcome, MultipathError> {
+        self.mark_path_terminal(path_id, PathState::Closed)
+    }
+
+    fn mark_path_terminal(
+        &mut self,
+        path_id: PathId,
+        state: PathState,
+    ) -> Result<PathFailureOutcome, MultipathError> {
         let path = self
             .paths
             .get_mut(&path_id)
             .ok_or(MultipathError::UnknownPath(path_id))?;
-        path.state = PathState::Failed;
+        path.state = state;
         let remaining_ready_paths = self.ready_path_count();
         let session_closed = remaining_ready_paths == 0;
         self.state = if session_closed {

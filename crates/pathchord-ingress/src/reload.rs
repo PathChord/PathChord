@@ -583,6 +583,10 @@ fn validation_diagnostic(error: ValidationError) -> ReloadDiagnostic {
         ValidationError::EmptyId { .. } => {
             ("CONFIG_INVALID_FIELD", "$.resources[].metadata.name".into())
         }
+        ValidationError::ResourceIdentityLimit { .. } => (
+            "CONFIG_RESOURCE_LIMIT",
+            "$.resources[].metadata.namespace".into(),
+        ),
         ValidationError::DuplicateId { kind, id } => (
             "CONFIG_DUPLICATE_RESOURCE",
             resource_field(kind, &id, "metadata.name"),
@@ -883,6 +887,84 @@ items:
         let diagnostic = handle.status().diagnostic.unwrap();
         assert_eq!(diagnostic.code, "CONFIG_PARSE_ERROR");
         assert_eq!(diagnostic.field_path, "$");
+    }
+
+    #[test]
+    fn invalid_inactive_dns_route_retains_snapshot_and_next_valid_reload_applies() {
+        let handle = ConfigReloadHandle::from_yaml(VALID, 1).unwrap();
+        for route in ["transit", "egress"] {
+            let invalid = VALID.replace(
+                "defaultRoute: local",
+                &format!("defaultRoute: local\n      {route}: {{servers: [invalid:port]}}"),
+            );
+            assert_eq!(
+                handle.reload_text(&invalid),
+                ReloadOutcome::Rejected {
+                    active_generation: 1
+                }
+            );
+            assert_eq!(handle.snapshot().unwrap().generation, 1);
+            assert_eq!(handle.status().state, ReloadState::Rejected);
+        }
+        let valid = VALID.replace("action: reject", "action: direct");
+        assert_eq!(
+            handle.reload_text(&valid),
+            ReloadOutcome::Applied { generation: 2 }
+        );
+        assert_eq!(handle.snapshot().unwrap().generation, 2);
+        assert_eq!(handle.status().state, ReloadState::Applied);
+    }
+
+    #[test]
+    fn reload_preserves_namespaced_nodes_and_changes_only_the_owning_resource() {
+        let input = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: shared, namespace: alpha}}\nspec: {{protocol: direct, tags: [alpha-old]}}\n---\napiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: shared, namespace: beta}}\nspec: {{protocol: direct, tags: [beta-old]}}\n"
+        );
+        let handle = ConfigReloadHandle::from_yaml(&input, 1).unwrap();
+        let changed = input.replace("alpha-old", "alpha-new");
+        assert_eq!(
+            handle.reload_text(&changed),
+            ReloadOutcome::Applied { generation: 2 }
+        );
+        let snapshot = handle.snapshot().unwrap();
+        let nodes = &snapshot.config.transit_proxies;
+        assert_eq!(nodes.len(), 2);
+        let alpha = nodes
+            .iter()
+            .find(|node| node.id.namespace() == "alpha")
+            .unwrap();
+        let beta = nodes
+            .iter()
+            .find(|node| node.id.namespace() == "beta")
+            .unwrap();
+        assert_eq!(alpha.id.resource_name(), "shared");
+        assert_eq!(alpha.tags, BTreeSet::from(["alpha-new".to_owned()]));
+        assert_eq!(beta.tags, BTreeSet::from(["beta-old".to_owned()]));
+    }
+
+    #[test]
+    fn oversized_namespace_rejects_candidate_and_keeps_future_generated_ids_bounded() {
+        let handle = ConfigReloadHandle::from_yaml(VALID, 1).unwrap();
+        let namespace = "n".repeat(187);
+        let invalid = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: Subscription\nmetadata: {{name: x, namespace: {namespace}}}\nspec: {{source: {{type: clash, url: https://example.test/sub}}}}\n"
+        );
+        assert_eq!(
+            handle.reload_text(&invalid),
+            ReloadOutcome::Rejected {
+                active_generation: 1
+            }
+        );
+        assert_eq!(handle.snapshot().unwrap().generation, 1);
+        assert_eq!(
+            handle.status().diagnostic.unwrap().code,
+            "CONFIG_RESOURCE_LIMIT"
+        );
+        let valid = VALID.replace("action: reject", "action: direct");
+        assert_eq!(
+            handle.reload_text(&valid),
+            ReloadOutcome::Applied { generation: 2 }
+        );
     }
 
     #[test]

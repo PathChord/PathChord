@@ -1817,7 +1817,7 @@ fn declarative_control_resources(
             Ok(ControlSubscriptionSpec {
                 id: ControlSubscriptionId::new(subscription.id.as_str())?,
                 source_type: subscription.source.source_type.as_str().to_owned(),
-                display_name: subscription.id.as_str().to_owned(),
+                display_name: subscription.id.resource_name().to_owned(),
                 enabled: subscription.enabled,
                 url: subscription.source.url.clone(),
                 credentials_ref: subscription.source.credentials_ref.clone(),
@@ -1976,7 +1976,7 @@ async fn sync_control_nodes(
         {
             observations.set_node_metadata(
                 NodeId::new(node.id.as_str())?,
-                None,
+                Some(node.id.namespace().to_owned()),
                 Some(node.protocol.clone()),
                 Some(format!("{}:{}", node.endpoint.host, node.endpoint.port)),
                 node.source
@@ -2496,6 +2496,34 @@ mod tests {
             cli.command,
             Command::Ingress(IngressArgs { config: Some(config), .. }) if config.as_os_str() == "config.yaml"
         ));
+    }
+
+    #[test]
+    fn declared_subscriptions_keep_qualified_ids_and_canonical_display_names_in_control() {
+        let configs: Vec<_> = ["tenant-a", "tenant-b"]
+            .into_iter()
+            .map(|namespace| pathchord_policy::SubscriptionConfig {
+                id: pathchord_policy::SubscriptionId::in_namespace(namespace, "provider"),
+                enabled: true,
+                source: pathchord_policy::SubscriptionSource {
+                    source_type: pathchord_policy::SubscriptionSourceType::Clash,
+                    url: format!("https://example.test/{namespace}"),
+                    credentials_ref: Some(format!("{namespace}-secret")),
+                },
+                refresh: Default::default(),
+                cache: None,
+            })
+            .collect();
+        let config = PolicyConfig {
+            subscriptions: configs.clone(),
+            ..Default::default()
+        };
+        let (_, specs) = declarative_control_resources(&config).unwrap();
+        assert_ne!(specs[0].id, specs[1].id);
+        for (spec, expected) in specs.iter().zip(&configs) {
+            assert_eq!(spec.display_name, "provider");
+            assert_eq!(spec.runtime_config().unwrap(), *expected);
+        }
     }
 
     #[test]

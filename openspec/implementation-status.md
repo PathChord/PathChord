@@ -31,6 +31,16 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   Files form one validated graph with global references and duplicate checks.
   Directory changes and atomic replacement reload the complete candidate;
   invalid candidates retain the last good snapshot.
+  Resource identities and references retain their namespace through policy,
+  DNS, subscriptions, credentials, runtime slots, reload, and management views.
+  Wire Egress identities and TrafficClass names use canonical resource names;
+  opaque credential references retain their original values. Supplied inactive
+  DNS routes are validated without panicking, capability booleans default
+  independently, and omitted rule matches express catch-all intent.
+  Owner journal/pin components use stable bounded digests where needed, and
+  identities that cannot fit management bounds are rejected before publication.
+  Long subscription names preserve independent generated-node ownership, while
+  older cache IDs remain readable and drain on the next successful refresh.
 
 - The eight-crate Rust workspace uses the pinned Rust 1.100.0 toolchain,
   builds on Linux, and cross-checks for Windows GNU and FreeBSD x86_64.
@@ -47,7 +57,14 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   have explicit cleanup paths. Frozen vectors preserve the previous wire bytes.
 - Async role-separated Path admission performs Noise IK, `PATH_HELLO`,
   `SESSION_ATTACH`, authorization lookup, capability negotiation, and
-  `PATH_READY` over a real byte stream.
+  `PATH_READY` over a real byte stream. Egress bounds the complete admission
+  exchange to ten seconds by default, with an explicit positive runtime override
+  capped at sixty seconds. Timeout and authorization cleanup release its permit.
+  Both peers retain the complete known capability intersection and enforce TCP,
+  UDP, and TrafficClass admission; subsequent Paths must match the Session set.
+  Capability selection uses the already registered `PATH_READY_CAPABILITIES`
+  message. Update both endpoints together: older implementations can reject that
+  message without the class bit or omit required selections in plain `PATH_READY`.
 - The Session runtime supports TCP and UDP Streams, multiple Paths, per-Stream
   eligible Path sets, DATA/ACK/WINDOW/FIN/RST, bounded reordering and buffers,
   Path drain/close, bounded timer retransmission, cross-Path re-framing, and
@@ -56,6 +73,10 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   records are dropped without failing the Path, and UDP close drains accepted
   queued datagrams within a deadline. The Session control envelope changes the
   v1 wire exchange: Ingress and Egress must run matching revisions.
+  Authenticated malformed payloads fail only their owning Path, Egress target
+  I/O errors retain `TARGET_FAILURE`, received drain deadlines close expired
+  Paths, and Stream open RequestIDs use operating-system random 128-bit values
+  while semantic retransmissions retain the original identifier.
 - Ingress has ordinary HTTP forwarding and CONNECT, SOCKS4/4a/5 CONNECT,
   SOCKS5 UDP ASSOCIATE, Linux REDIRECT
   and TPROXY adapters, transparent UDP, a direct smoltcp TUN reactor, process
@@ -144,10 +165,17 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   only to the same origin. Individual invalid nodes retain sanitized
   diagnostics; malformed documents and failed providers retain applicable
   last-good data. Cache, draining, controls, and reload preserve diagnostics.
+  Root fetches, provider expansion, and retries share one 4 MiB body budget;
+  interrupted and cancelled downloads retain their consumed allowance.
+  Conflicting credential aliases produce unavailable-node diagnostics.
+  Native Hysteria2 and TUIC honor explicit UDP enablement and disablement.
 - Subscription usage is collected from `Subscription-Userinfo`; an explicit
   `PathChord-Traffic-Multiplier` extension supplies billing metadata. Cache,
   node queries, the console, and Path economics consume the metadata. Unknown
   statistics stay unknown; expiry is not a quota reset timestamp.
+  Malformed optional total/expiry values do not erase valid upload/download
+  counts. Explicit billing multipliers remain available independently of usage,
+  and missing usage counts are null rather than fabricated zeroes.
 - `/metrics` exposes bounded aggregate Prometheus gauges for runtime, node
   health, Path quality, and observed Stream byte/retransmission totals through
   the optional Web Gateway's existing authentication, Origin, and capability
@@ -180,6 +208,14 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   Ingress exposes listener and resource events, authenticated Egress reports,
   subscription refresh state, structured reload diagnostics, and replayable
   management responses. Subscription URLs are redacted in read views.
+  SSE rejects missing capabilities before opening the stream and closes failed
+  gap recovery without publishing a partial snapshot or advancing its cursor.
+- Connection observations preserve every admitted live record and keep at most
+  1,024 terminal history records. At the 16,384-record safety bound, only terminal
+  history is evicted; fixed resource-limit reasons remain queryable as degraded
+  observation state. HTTP, SOCKS, and Mixed runtimes share a platform admission
+  allowance in addition to their local limits, so connection churn cannot
+  exhaust history and terminate Ingress.
 
 ## Remaining explicit-listener work
 
@@ -226,9 +262,9 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   they remain unknown rather than being inferred from idle throughput.
 - Some management detail fields, including listener-independent connection
   timing, Path admission timestamps and Transit identity, Session admission
-  timestamps, and source namespace after policy compilation, have no runtime
-  producer. The API exposes unavailable values as null; they still need typed
-  producers before the full observability contract is met.
+  timestamps have no runtime producer. The API exposes unavailable values as
+  null; they still need typed producers before the full observability contract
+  is met.
 - Subscription enable/disable/delete and source replacement use a control/data
   plane visibility barrier. Successful mutations block new selection before the
   worker drains old imported nodes; stale refreshes and publications are
@@ -262,6 +298,28 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   protocol-specific interoperability fixtures.
 
 ## Validation evidence
+
+The [specification-alignment repair](changes/fix-spec-alignment-findings/) adds
+regressions for connection churn beyond 16,384 completions, shared admission
+across HTTP/SOCKS/Mixed runtimes, typed history limits, SSE authorization and
+failed gap recovery, namespace-isolated configuration/selection/cache/control,
+bounded owner filenames, invalid DNS reload recovery, admission timeouts at
+five handshake stages, malformed authenticated frames with a surviving Path
+and Stream, capability negotiation and TCP/UDP admission, target failure
+classification, drain deadlines, random RequestID replay, native UDP options,
+credential aliases, failed provider budgets, and independently optional usage
+facts. These are local deterministic or loopback checks; they do not establish
+new native-host, cross-machine, or prolonged-soak evidence.
+
+The repair workspace run passes 671 tests with zero failures and ten existing
+external-peer tests ignored. A separate CLI-process check completes 16,500
+loopback CONNECT flows while Ingress remains running, then shuts it down
+normally. Workspace Clippy and formatting checks pass. All-target workspace
+checks pass for Windows GNU and FreeBSD x86_64; the FreeBSD check uses the
+existing SDK/compiler wrappers described below and does not execute native
+FreeBSD tests. Strict OpenSpec validation passes all sixteen current items,
+and local documentation links, anchors, and bilingual structural identities
+pass validation.
 
 Recorded passing checks include:
 

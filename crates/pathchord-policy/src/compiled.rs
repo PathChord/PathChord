@@ -165,6 +165,7 @@ pub enum CompileError {
 
 #[derive(Debug, Clone)]
 struct CompiledMatch {
+    namespace: String,
     source: FlowMatch,
     source_networks: Vec<Network>,
 }
@@ -182,13 +183,16 @@ impl CompiledMatch {
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
+            namespace: rule_id.namespace().to_owned(),
             source: source.clone(),
             source_networks,
         })
     }
 
     fn matches(&self, context: &PolicyContext) -> bool {
-        (self.source.flow_tags.is_empty() || !self.source.flow_tags.is_disjoint(&context.flow_tags))
+        context.listener_id.namespace() == self.namespace
+            && (self.source.flow_tags.is_empty()
+                || !self.source.flow_tags.is_disjoint(&context.flow_tags))
             && (self.source.protocols.is_empty()
                 || self.source.protocols.contains(&context.protocol))
             && (self.source.listener_ids.is_empty()
@@ -402,9 +406,10 @@ impl CompiledPolicy {
                 .egresses
                 .values()
                 .filter(|egress| {
-                    runtime
-                        .egress(&egress.id)
-                        .is_some_and(|status| egress_selector_matches(selector, egress, status))
+                    egress.id.namespace() == rule.id.namespace()
+                        && runtime
+                            .egress(&egress.id)
+                            .is_some_and(|status| egress_selector_matches(selector, egress, status))
                 })
                 .collect(),
             EgressSelection::None => Vec::new(),
@@ -439,6 +444,9 @@ impl CompiledPolicy {
         let mut transit_proxies: Vec<_> = self
             .transit_proxy_configs(runtime)
             .filter_map(|proxy| {
+                if proxy.id.namespace() != compiled.rule.id.namespace() {
+                    return None;
+                }
                 let status = runtime.transit_proxy(&proxy.id)?;
                 if !transit_is_usable(&compiled.rule, proxy, status, context.protocol) {
                     return None;
@@ -454,7 +462,7 @@ impl CompiledPolicy {
             return Ok(None);
         }
         if transit_proxies.len() > 1
-            && compiled.rule.traffic_policy.as_str()
+            && compiled.rule.traffic_policy.resource_name()
                 == crate::config::IMPLICIT_SINGLE_TRANSIT_POLICY
         {
             return Err(RejectReason::MissingTrafficPolicy);
@@ -483,6 +491,9 @@ impl CompiledPolicy {
         let mut candidates: Vec<_> = self
             .transit_proxy_configs(runtime)
             .filter_map(|proxy| {
+                if proxy.id.namespace() != rule.id.namespace() {
+                    return None;
+                }
                 let status = runtime.transit_proxy(&proxy.id)?;
                 if !ordinary_proxy_is_usable(rule, selected, proxy, status, context.protocol) {
                     return None;
