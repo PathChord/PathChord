@@ -78,6 +78,14 @@ worker 和请求的 Web Gateway。`egress` 会启动经过认证的 Path 监听�
 只有在策略没有 Egress/Transit 路由且显式选择 direct fallback 时，才会使用 direct
 target bridge。
 
+## 软件包
+
+[`packaging/`](packaging/README.md) 下提供 Debian（`.deb`）、Alpine（`.apk`）、
+Arch Linux（`.pkg.tar.*`）、FreeBSD（`.pkg`）和 Windows NSIS（`.exe`）的原生
+打包配方。每个软件包都包含 `pathchord(1)` 手册页、服务定义和仅监听回环地址的
+配置模板。先构建 release 二进制，再使用 `make -C packaging` 选择软件包目标；
+软件包指南说明所需的原生构建工具以及交叉编译产物覆盖方式。
+
 ## 开发
 
 ```sh

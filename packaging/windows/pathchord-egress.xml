@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WinSW service definition. Keep this file beside the matching WinSW
+     executable (pathchord-egress-service.exe) before installing it. -->
+<service>
+  <id>PathChordEgress</id>
+  <name>PathChord Egress</name>
+  <description>PathChord authenticated Egress Path listener.</description>
+  <startmode>Manual</startmode>
+  <executable>%ProgramFiles%\PathChord\pathchord.exe</executable>
+  <arguments>egress --config-dir "%ProgramData%\PathChord\config" --bind 127.0.0.1:9443 --egress-id exit --identity "%ProgramData%\PathChord\credentials\egress.key.json" --authorization-db "%ProgramData%\PathChord\data\authorizations.sqlite" --control-socket "\\.\pipe\pathchord-egress"</arguments>
+  <workingdirectory>%ProgramData%\PathChord</workingdirectory>
+  <logpath>%ProgramData%\PathChord\logs\egress</logpath>
+  <log mode="roll" />
+  <onfailure action="restart" delay="10 sec" />
+  <stoptimeout>15 sec</stoptimeout>
+</service>

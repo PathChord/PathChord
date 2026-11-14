@@ -1,0 +1,34 @@
+#!/bin/sh
+
+# PROVIDE: pathchord-egress
+# REQUIRE: NETWORKING pathchord
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="pathchord_egress"
+rcvar=pathchord_egress_enable
+load_rc_config "$name"
+
+: "${pathchord_egress_enable:=NO}"
+: "${pathchord_egress_user:=pathchord}"
+: "${pathchord_egress_config_dir:=/usr/local/etc/pathchord}"
+: "${pathchord_egress_data_dir:=/var/db/pathchord}"
+: "${pathchord_egress_identity:=${pathchord_egress_data_dir}/egress.key.json}"
+: "${pathchord_egress_id:=egress}"
+: "${pathchord_egress_bind:=0.0.0.0:7443}"
+: "${pathchord_egress_control_socket:=/var/run/pathchord/egress.sock}"
+
+command="/usr/sbin/daemon"
+procname="/usr/local/bin/pathchord"
+pidfile="/var/run/${name}.pid"
+command_args="-f -p ${pidfile} -u ${pathchord_egress_user} -- ${procname} egress --config-dir ${pathchord_egress_config_dir} --egress-id ${pathchord_egress_id} --bind ${pathchord_egress_bind} --identity ${pathchord_egress_identity} --authorization-db ${pathchord_egress_data_dir}/authorizations.sqlite --control-socket ${pathchord_egress_control_socket}"
+
+start_precmd="pathchord_egress_precmd"
+pathchord_egress_precmd()
+{
+	install -d -o "${pathchord_egress_user}" -g "${pathchord_egress_user}" -m 0750 "${pathchord_egress_data_dir}"
+	install -d -o "${pathchord_egress_user}" -g "${pathchord_egress_user}" -m 0750 "$(dirname "${pathchord_egress_control_socket}")"
+}
+
+run_rc_command "$1"

@@ -1,0 +1,31 @@
+# PathChord's package default: a loopback-only mixed HTTP/SOCKS listener.
+#
+# Replace this file or add resources under the same configuration directory
+# before enabling an Internet-facing listener.  Keep private credentials and
+# identity files outside this directory.
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata:
+  name: local-mixed
+spec:
+  type: mixed
+  platform: any
+  bind: 127.0.0.1:7890
+  protocols: [tcp, udp]
+  authentication: disabled
+---
+apiVersion: pathchord.io/v1
+kind: DNSPolicy
+metadata:
+  name: dns
+spec:
+  defaultRoute: local
+  local:
+    servers: [9.9.9.9:53]
+---
+apiVersion: pathchord.io/v1
+kind: FallbackPolicy
+metadata:
+  name: fallback
+spec:
+  action: direct

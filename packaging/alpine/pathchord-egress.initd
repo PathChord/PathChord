@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+
+name="pathchord-egress"
+description="PathChord Egress proxy runtime"
+rcvar="pathchord_egress_enable"
+command="/usr/bin/pathchord"
+command_args="egress --config-dir /etc/pathchord --egress-id egress --identity /var/lib/pathchord/egress.key.json --authorization-db /var/lib/pathchord/authorizations.db --control-socket /run/pathchord/egress.sock"
+command_user="pathchord:pathchord"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+retry="TERM/30/KILL/5"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	checkpath --directory --owner pathchord:pathchord --mode 0750 /var/lib/pathchord
+	checkpath --directory --owner pathchord:pathchord --mode 0750 /run/pathchord
+}
