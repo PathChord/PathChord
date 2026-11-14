@@ -223,6 +223,8 @@ Recorded passing checks include:
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
+cargo test --locked -p netlink-packet-utils
+cargo deny --all-features --locked check advisories
 cargo check --locked --workspace --all-targets --target x86_64-pc-windows-gnu
 cargo check --locked --workspace --all-targets --target x86_64-unknown-freebsd
 cargo build --locked -p pathchord-cli --target x86_64-unknown-freebsd
@@ -233,8 +235,11 @@ The full workspace test run covers protocol, policy, Noise, Path, Transit,
 Ingress, Egress, CLI, real loopback Egress/Ingress TCP and UDP paths, platform
 fakes, route rollback, TUN packet flows, Web REST/SSE, persistence, reload,
 subscription normalization, and fault/retransmission cases. The dependency
-graph excludes the previously unmaintained `paste` path from the TUN adapter
-feature set.
+graph contains no `paste` package. A local `netlink-packet-utils` 0.5.2
+compatibility patch aliases the maintained `pastey` macro crate for the
+Netlink dependencies of `netsock`; the upstream Rust source and public API
+are preserved. CI tests the exported buffer macros separately, and
+`cargo-deny` 0.20.2 passes the same advisory check used by GitHub Actions.
 
 The Linux workspace run passes every non-ignored workspace test. The Transit
 unit set reports 75 passed and 2 ignored without an external proxy executable.

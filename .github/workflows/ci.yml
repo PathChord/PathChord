@@ -34,6 +34,9 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --all-targets
 
+      - name: Test Netlink compatibility patch
+        run: cargo test --locked -p netlink-packet-utils
+
   dependency-audit:
     name: Dependency advisories
     runs-on: ubuntu-latest
