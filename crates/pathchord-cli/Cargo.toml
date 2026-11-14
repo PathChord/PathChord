@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 description = "Adaptive multipath proxy runtime and local management CLI"
-homepage = "https://github.com/KagurazakaNyaa/PathChord"
 repository = "https://github.com/KagurazakaNyaa/PathChord"
 readme = "../../README.md"
 

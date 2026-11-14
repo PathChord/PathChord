@@ -18,7 +18,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.1 \
+          rustup toolchain install 1.100.0 \
             --profile minimal \
             --component clippy,rustfmt
 
@@ -59,7 +59,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.1 --profile minimal
+          rustup toolchain install 1.100.0 --profile minimal
 
       - name: Download test-only sing-box peer
         run: |
@@ -99,7 +99,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.1 --profile minimal
+          rustup toolchain install 1.100.0 --profile minimal
 
       - name: Download external server core
         env:

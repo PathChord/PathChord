@@ -20,6 +20,8 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 notify = "8.2.0"
+# Runtime use is non-Linux; keep this unconditional so Cargo 1.100 can run
+# the Netlink compatibility patch's package test without a resolver panic.
 netsock.workspace = true
 pathchord-core = { path = "../pathchord-core" }
 pathchord-noise = { path = "../pathchord-noise" }

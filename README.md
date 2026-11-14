@@ -124,6 +124,8 @@ artifact override.
 
 ## Development
 
+Development uses the pinned Rust 1.100.0 toolchain with rustfmt and Clippy.
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
