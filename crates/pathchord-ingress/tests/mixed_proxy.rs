@@ -157,6 +157,7 @@ impl Proxy {
             } else {
                 AuthenticationMode::Disabled
             },
+            backend: Default::default(),
             credentials_ref: authentication_required.then(|| "mixed-users".to_owned()),
             mark: None,
             route_table: None,

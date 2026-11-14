@@ -205,15 +205,41 @@ where
         dialer: D,
         config: ListenerRuntimeConfig,
         descriptors: I,
+        credentials: std::collections::BTreeMap<ListenerId, Arc<dyn ListenerCredentialVerifier>>,
+    ) -> Result<Self, RuntimeError>
+    where
+        I: IntoIterator<Item = ListenerDescriptor>,
+    {
+        Self::bind_descriptors_with_credentials_and_protected(
+            dialer,
+            config,
+            descriptors,
+            credentials,
+            crate::ProtectedEndpointSet::default(),
+        )
+        .await
+    }
+
+    /// Binds listener descriptors with the shared protected-endpoint set.
+    ///
+    /// Transparent listeners must receive the same atomically replaced set as
+    /// the UDP and TUN adapters; otherwise their loop-prevention check would
+    /// silently use an unrelated empty set.
+    pub async fn bind_descriptors_with_credentials_and_protected<I>(
+        dialer: D,
+        config: ListenerRuntimeConfig,
+        descriptors: I,
         mut credentials: std::collections::BTreeMap<
             ListenerId,
             Arc<dyn ListenerCredentialVerifier>,
         >,
+        protected_endpoints: crate::ProtectedEndpointSet,
     ) -> Result<Self, RuntimeError>
     where
         I: IntoIterator<Item = ListenerDescriptor>,
     {
         let mut runtime = Self::with_config(dialer, config)?;
+        runtime.protected_endpoints = protected_endpoints;
         for descriptor in descriptors {
             if runtime.listener_ids.contains(&descriptor.id) {
                 return Err(RuntimeError::DuplicateListener(

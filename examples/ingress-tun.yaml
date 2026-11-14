@@ -1,0 +1,27 @@
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata:
+  name: pathchord-tun
+spec:
+  type: tun
+  platform: any
+  interface: PathChord
+  address: 198.18.0.1/30
+  mtu: 1500
+  protocols: [tcp, udp]
+---
+apiVersion: pathchord.io/v1
+kind: DNSPolicy
+metadata:
+  name: dns
+spec:
+  defaultRoute: local
+  local:
+    servers: [9.9.9.9:53]
+---
+apiVersion: pathchord.io/v1
+kind: FallbackPolicy
+metadata:
+  name: fallback
+spec:
+  action: direct

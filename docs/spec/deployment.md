@@ -4,8 +4,10 @@
 
 The `pathchord` executable provides the Ingress and Egress service subcommands
 and local management commands. Each service invocation owns a separate
-process. Configuration examples use explicit listeners and require no packet
-interception or TUN privileges.
+process. The ordinary examples use explicit proxy listeners and require no
+packet interception or TUN privileges. Linux transparent and TUN examples are
+provided separately and require the platform privileges and routing setup
+described below.
 
 ## Configuration directory and overrides
 
@@ -58,6 +60,49 @@ usable matching node. Its provider URL MUST be replaced before use:
 ```sh
 pathchord ingress --config examples/ingress-subscriptions.yaml
 ```
+
+## Linux transparent and TUN listeners
+
+The [`ingress-tproxy.yaml`](../../examples/ingress-tproxy.yaml) example starts
+Linux TPROXY TCP/UDP interception on `0.0.0.0:15001`, using packet mark `1` and
+policy-routing table `100`. The host packet-filter rules that send traffic to
+the listener and apply the mark remain administrator-owned; they MUST use the
+same bind address, mark, and route table. PathChord owns only the matching
+policy-routing objects and removes only objects that still match its journal.
+The service requires the privileges needed to create transparent sockets and
+manage those routes, such as root or the equivalent `CAP_NET_ADMIN` and
+`CAP_NET_RAW` capability set.
+
+The [`ingress-tproxy-ebpf.yaml`](../../examples/ingress-tproxy-ebpf.yaml)
+example selects `backend: ebpf` and attaches a small Linux TC classifier to the
+administrator-selected `lan0` ingress interface. It marks only TCP/UDP packets
+for the existing TPROXY policy route; the transparent listener, original-target
+handling, UDP associations, and Path/Session policy remain in userspace. The
+eBPF backend requires `clang` at build time and `bpftool`, `tc`, BPF/BTF kernel
+support, and privileged network administration at runtime. It is intentionally
+interface-bound and requires `allowedSources`; use the ordinary TPROXY backend
+when the host cannot provide those capabilities.
+
+The [`ingress-tun.yaml`](../../examples/ingress-tun.yaml) example creates a
+`PathChord` TUN interface at `198.18.0.1/30` with MTU 1500 and carries TCP and
+UDP packets through the same policy and fallback route. The account running
+Ingress needs permission to create and configure the TUN device. Add the
+desired host routes to the interface and preserve the documented protected
+endpoint bypasses before directing host traffic into it. FreeBSD rejects both
+transparent and TUN listeners; TUN support is available on Windows through its
+native adapter.
+
+Start either example explicitly so a privileged configuration is never picked
+up accidentally from the account default:
+
+```sh
+sudo ./target/release/pathchord ingress --config examples/ingress-tproxy.yaml
+sudo ./target/release/pathchord ingress --config examples/ingress-tun.yaml
+```
+
+TPROXY and TUN listeners accept IP flows, so routing matches the original IP
+address, port, protocol, and available process metadata. Domain-only policy
+conditions do not match a flow whose original packet contains no hostname.
 
 Unsupported Transit protocols and parameters remain visible as typed node
 diagnostics until their native PathChord adapters are implemented. PathChord

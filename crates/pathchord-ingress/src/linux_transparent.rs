@@ -63,6 +63,11 @@ impl LinuxTransparentTcpListener {
         if mode == TransparentMode::Tproxy {
             setsockopt(&socket, IpTransparent, &true)
                 .map_err(|error| ListenerError::Bind(error.to_string()))?;
+            if bind.is_ipv6() {
+                socket
+                    .set_ip_transparent_v6(true)
+                    .map_err(|error| ListenerError::Bind(error.to_string()))?;
+            }
         }
         socket
             .bind(&SockAddr::from(bind))

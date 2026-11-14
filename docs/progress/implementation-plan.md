@@ -8,7 +8,9 @@ Final-state requirements remain under `docs/design/` and `docs/spec/`.
 Prioritize HTTP forwarding/CONNECT, SOCKS4/4a/5, and same-port mixed listeners
 on Linux, Windows, and FreeBSD. SOCKS5 UDP includes ordinary native Proxy and
 direct forwarding as well as Session UDP through a controlled Egress.
-Transparent interception and TUN work follow this explicit-listener baseline.
+Transparent interception and TUN runtime wiring are implemented alongside the
+explicit-listener baseline; privileged host validation follows the same
+platform matrix.
 
 | Platform | Explicit listeners | Local control | Remaining platform validation |
 | --- | --- | --- | --- |
@@ -57,15 +59,19 @@ until its wire and obfuscation implementation is complete.
 
 ## Current sequence
 
-1. Complete native Windows and FreeBSD explicit-listener validation. Cover
-   authentication, source restrictions, IPv4/IPv6 and domain targets, DNS,
-   reload, bounded resources, shutdown, and local management. Validate Windows
-   Named Pipe ACLs, WinINet refresh, and crash recovery on a real host.
+1. Complete native Windows and FreeBSD explicit-listener validation, then run
+   privileged Linux transparent/TUN smoke coverage. Cover authentication,
+   source restrictions, IPv4/IPv6 and domain targets, DNS, reload, bounded
+   resources, shutdown, and local management. Validate Windows Named Pipe ACLs,
+   WinINet refresh, and crash recovery on a real host.
 2. Exercise real provider exports across URI/Base64, Clash HTTP providers,
    SIP008, sing-box document syntax, and supported text node formats. Extend interoperability
    fixtures for the remaining protocol/TLS/Reality/transport combinations;
-   unsupported options must remain
-   explicit per-node diagnostics.
+   unsupported options must remain explicit per-node diagnostics. External
+   sing-box, Mihomo, Xray, and V2Fly binaries may be supplied through
+   test-only server-peer harnesses; each core is tested only for its native
+   server protocol set, and no binary enters the runtime or Cargo dependency
+   graph.
 3. Run long-lived failure and restart tests for Path churn, authorization
    revoke, provider failures, node draining, DNS route failure, configuration
    reload. Verify cache and accounting
@@ -76,19 +82,25 @@ until its wire and obfuscation implementation is complete.
    cross-machine and long-running peer evidence separate from local fixtures
    without adding a compatibility runtime. Keep incomplete parameter
    combinations explicitly unavailable.
-5. Connect the Prometheus endpoint and structured observations to deployed
+5. Validate the optional Linux eBPF interception backend using the staged
+   approach in [the dae/eBPF research note](../research/dae-ebpf-transparent-proxy.md).
+   Keep ordinary TPROXY as the fallback, keep TUN unchanged, and require
+   root-level IPv4/IPv6 TCP/UDP smoke evidence before treating the backend as
+   production-ready.
+6. Connect the Prometheus endpoint and structured observations to deployed
    monitoring, alerts, and dashboards. Keep live gauges distinct from
    historical counters, and measure production probe/autoscaler constants.
-6. Run the native package recipes for Debian, Alpine, Arch Linux, FreeBSD, and
+7. Run the native package recipes for Debian, Alpine, Arch Linux, FreeBSD, and
    Windows NSIS on their package hosts. Verify artifact metadata, installed
    service definitions, default configuration paths, and upgrade/rollback
    behavior before attaching packages to a release.
 
 ## Deferred work
 
-- TPROXY, REDIRECT, transparent UDP interception, and TUN integration follow
-  explicit-listener validation. Privileged route validation, journal recovery,
-  and Wintun packaging are outside the active acceptance scope.
+- TPROXY, REDIRECT, transparent UDP interception, and TUN integration are
+  implemented. Privileged route validation, real `/dev/net/tun` smoke, journal
+  recovery on a live host, and Wintun packaging remain outside the active
+  acceptance scope.
 - Additional FreeBSD transparent interception or TUN support needs a separate
   platform assessment.
 - Further native protocol implementations need maintained libraries and

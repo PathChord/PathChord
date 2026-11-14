@@ -3,7 +3,8 @@
 [English](deployment.md) | **简体中文**
 
 `pathchord` 可执行文件提供 Ingress、Egress 服务子命令和本地管理命令。每次服务调用拥有独立
-进程。配置示例使用显式监听器，不需要流量拦截或 TUN 权限。
+进程。普通示例使用显式代理监听器，不需要流量拦截或 TUN 权限。Linux 透明代理和 TUN 示例
+单独提供，需要下面描述的平台权限和路由设置。
 
 ## 配置目录与覆写
 
@@ -49,6 +50,37 @@ curl -x socks5h://127.0.0.1:7890 https://example.com
 ```sh
 pathchord ingress --config examples/ingress-subscriptions.yaml
 ```
+
+## Linux 透明代理与 TUN 监听器
+
+[`ingress-tproxy.yaml`](../../examples/ingress-tproxy.yaml) 示例在 Linux 上启动
+`0.0.0.0:15001` 的 TPROXY TCP/UDP 接管，使用包标记 `1` 和策略路由表 `100`。把流量发送到
+监听器并设置标记的主机 packet-filter 规则仍由管理员负责，必须使用相同的 bind 地址、标记和
+路由表。PathChord 只拥有匹配的策略路由对象，并且只删除仍与其 journal 匹配的对象。服务需要
+创建透明 socket 和管理路由所需的权限，例如 root 或等效的 `CAP_NET_ADMIN` 与 `CAP_NET_RAW`。
+
+[`ingress-tproxy-ebpf.yaml`](../../examples/ingress-tproxy-ebpf.yaml) 示例选择
+`backend: ebpf`，并把一个 Linux TC classifier 挂载到管理员指定的 `lan0` ingress 接口。它只为
+TCP/UDP 数据包设置现有 TPROXY 策略路由所需的标记；透明 listener、原目标处理、UDP association
+以及 Path/Session 策略仍在用户态完成。eBPF 后端构建时需要 `clang`，运行时需要 `bpftool`、`tc`、
+BPF/BTF 内核支持和网络管理特权。该后端刻意绑定单个接口并要求 `allowedSources`；主机无法提供这些
+能力时应使用普通 TPROXY 后端。
+
+[`ingress-tun.yaml`](../../examples/ingress-tun.yaml) 示例创建名为 `PathChord`、地址为
+`198.18.0.1/30`、MTU 为 1500 的 TUN 接口，并通过相同的策略和 fallback 路由承载 TCP 与 UDP
+数据包。运行 Ingress 的账号必须有权限创建和配置 TUN 设备。把所需的主机路由添加到该接口，
+并在把主机流量导入之前保留规范中描述的受保护端点旁路。FreeBSD 拒绝透明监听器和 TUN；
+Windows 通过原生适配器提供 TUN 支持。
+
+显式指定任一示例启动，避免特权配置被账号默认配置意外加载：
+
+```sh
+sudo ./target/release/pathchord ingress --config examples/ingress-tproxy.yaml
+sudo ./target/release/pathchord ingress --config examples/ingress-tun.yaml
+```
+
+TPROXY 和 TUN 监听器接收 IP flow，因此路由匹配原始 IP 地址、端口、协议和可用的进程元数据。
+原始数据包不包含 hostname 时，要求域名的策略条件不会匹配。
 
 未实现的 Transit 协议和参数会保持为类型化节点诊断，直到对应的 PathChord 原生适配器完成。
 PathChord 不启动或嵌入外部代理进程作为兼容后端。见

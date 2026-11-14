@@ -443,6 +443,14 @@ pub enum AuthenticationMode {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparentBackend {
+    #[default]
+    Tproxy,
+    Ebpf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerConfig {
     pub id: ListenerId,
@@ -453,6 +461,7 @@ pub struct ListenerConfig {
     pub bind: Option<Endpoint>,
     pub allowed_sources: Vec<String>,
     pub authentication: AuthenticationMode,
+    pub backend: TransparentBackend,
     /// Opaque local secret reference; never contains credential material.
     pub credentials_ref: Option<String>,
     pub mark: Option<u32>,

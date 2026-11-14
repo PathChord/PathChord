@@ -16,18 +16,23 @@ Proxies, and route TCP/UDP flows through authenticated Session/Path runtimes.
 Egress exposes the authenticated Path listener and authorization control plane;
 the optional REST/SSE Web Gateway is shared by both control planes.
 
-Current work prioritizes ordinary HTTP forwarding, CONNECT, and SOCKS4/4a/5 on
-Linux, Windows, and FreeBSD. HTTP uses a message codec for streaming bodies,
-persistent requests, and Upgrade; SOCKS5 also provides UDP ASSOCIATE. The
+Current work prioritizes ordinary HTTP forwarding, CONNECT, SOCKS4/4a/5, Linux
+transparent interception, and TUN listeners on Linux, Windows, and FreeBSD.
+HTTP uses a message codec for streaming bodies, persistent requests, and
+Upgrade; SOCKS5 also provides UDP ASSOCIATE. The
 `socks` listener spelling is accepted as an alias for canonical `socks5`.
 `type: mixed` serves HTTP and SOCKS on one TCP port, including SOCKS5 UDP
 ASSOCIATE through its negotiated relay endpoint.
 FreeBSD has explicit-listener platform validation and Unix local
 control. Target compilation and CLI linking pass; native host validation
 remains outstanding. Portable listener regressions run in the existing Rust CI
-job. Transparent interception and TUN work follow this listener baseline. See the
-[implementation plan](docs/progress/implementation-plan.md) for platform
-validation, shared runtime gaps, and subsequent adapter work.
+job. Transparent TCP/UDP interception and TUN packet flows use the same policy
+and Session/Path data plane. Privileged host routing, real TUN device smoke,
+and platform-specific packaging validation remain separate acceptance steps.
+Linux TPROXY also accepts `backend: ebpf` for an interface-bound TC classifier;
+the ordinary `tproxy` backend remains the default and fallback.
+See the [implementation plan](docs/progress/implementation-plan.md) for
+platform validation, shared runtime gaps, and subsequent adapter work.
 
 Node imports support automatic detection, Clash/Mihomo providers, SIP008,
 URI/Base64 lists, sing-box JSON, and supported Surge/Quantumult X/Loon node

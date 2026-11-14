@@ -199,6 +199,11 @@ SOCKS4/4a，不得降级 verifier。HTTP 监听器支持普通 `http://` 转发�
 认证和求值策略。消息 framing、限制、凭据/头字段过滤和升级行为遵循
 [HTTP 和 SOCKS 契约](platform-and-dns.zh-CN.md#http-和-socks-监听器)。
 
+`spec.backend` 默认值为 `tproxy`。`backend: ebpf` 仅适用于 Linux 的 `type: tproxy`，必须使用
+`platform: linux`、非空的 ingress `interface` 和至少一个 `allowedSources` CIDR。它在该接口上为
+TCP/UDP 数据包设置现有 TPROXY 策略路由所需的标记；透明 listener、原目标处理、UDP association
+以及 Path/Session 策略仍在用户态完成。其他 Listener 类型在验证期间拒绝 `backend: ebpf`。
+
 `spec.type: mixed` 在一个 TCP 端点上共用 HTTP 和 SOCKS。其 `protocols` 默认值为
 `[tcp, udp]`；TCP 必须启用，UDP 可选。两个 parser 共用相同的凭据、来源限制和 Listener 身份。
 

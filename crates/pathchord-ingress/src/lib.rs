@@ -31,6 +31,8 @@ mod flow;
 mod http_connect;
 mod http_forward;
 #[cfg(target_os = "linux")]
+mod linux_ebpf;
+#[cfg(target_os = "linux")]
 mod linux_routing;
 #[cfg(target_os = "linux")]
 mod linux_tproxy_udp;
@@ -96,6 +98,8 @@ pub use flow::{
     bridge_connection,
 };
 pub use http_connect::{HttpConnectListener, MAX_HEADER_BYTES as HTTP_MAX_HEADER_BYTES};
+#[cfg(target_os = "linux")]
+pub use linux_ebpf::{LinuxEbpfError, LinuxEbpfInterception};
 #[cfg(target_os = "linux")]
 pub use linux_routing::{
     IpCommandRouteAdapter, IpFamily, LinuxRouteAdapter, LinuxRoutingEffect, LinuxRoutingError,
@@ -213,12 +217,16 @@ impl ListenerDescriptor {
     /// by an embedding caller fail closed here.
     #[must_use]
     pub fn allows_source(&self, source: IpAddr) -> bool {
-        self.allowed_sources.is_empty()
-            || self
-                .allowed_sources
-                .iter()
-                .any(|cidr| ip_in_cidr(source, cidr))
+        source_allowed(&self.allowed_sources, source)
     }
+}
+
+/// Returns whether a source address is admitted by a listener CIDR list.
+///
+/// Socket listeners, transparent UDP, and TUN use the same matcher so
+/// `allowedSources` has identical semantics for every ingress mode.
+pub(crate) fn source_allowed(allowed_sources: &[String], source: IpAddr) -> bool {
+    allowed_sources.is_empty() || allowed_sources.iter().any(|cidr| ip_in_cidr(source, cidr))
 }
 
 fn ip_in_cidr(source: IpAddr, cidr: &str) -> bool {
