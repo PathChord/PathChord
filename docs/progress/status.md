@@ -30,10 +30,10 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   Directory changes and atomic replacement reload the complete candidate;
   invalid candidates retain the last good snapshot.
 
-- The eight-crate Rust workspace builds on Linux and cross-checks for Windows
-  GNU and FreeBSD x86_64. Core frame/message codecs, state machines, bounded
-  reliability buffers, wire vectors, and UDP/Path lifecycle payloads are
-  implemented.
+- The eight-crate Rust workspace uses the pinned Rust 1.100.0 toolchain,
+  builds on Linux, and cross-checks for Windows GNU and FreeBSD x86_64.
+  Core frame/message codecs, state machines, bounded reliability buffers,
+  wire vectors, and UDP/Path lifecycle payloads are implemented.
 - Native package recipes cover Debian, Alpine, Arch Linux, FreeBSD, and
   Windows NSIS. They share the `pathchord(1)` manual and loopback-only default
   configuration template; Linux and Alpine service definitions use
@@ -254,6 +254,13 @@ Netlink dependencies of `netsock`; the upstream Rust source and public API
 are preserved. CI tests the exported buffer macros separately, and
 `cargo-deny` 0.20.2 passes the same advisory check used by GitHub Actions.
 
+Cargo 1.100 reports an unused `netsock` dependency on Linux because the native
+provider uses it only on non-Linux platforms. Its dependency declaration stays
+unconditional: restricting it to non-Linux targets makes
+`cargo test --locked -p netlink-packet-utils` panic inside Cargo's feature
+resolver when selecting the inactive compatibility patch. The existing CI
+package test remains enabled.
+
 The Linux workspace run passes every non-ignored workspace test. The normal
 Transit unit run does not require an external proxy executable and leaves the
 reference-peer tests ignored. With
@@ -310,12 +317,24 @@ the command-line override is effective.
 
 The FreeBSD target check and CLI build use Zig 0.17.1 C/C++ compiler and archiver
 wrappers with the official FreeBSD 15.1 SDK, including the bundled SQLite and
-crypto dependencies. The resulting x86_64 ELF uses `/libexec/ld-elf.so.1` and
-links against `libthr.so.3` and `libc.so.7`. This validates target compilation
-and linking; it does not execute FreeBSD tests. Native FreeBSD validation
-remains pending a host run.
+crypto dependencies. Both pass with Rust 1.100.0. The resulting x86_64 ELF
+uses `/libexec/ld-elf.so.1` and links against `libprocstat.so.1`, `libthr.so.3`,
+`libc.so.7`, and `libutil.so.10`. This validates target compilation and
+linking; it does not execute FreeBSD tests. Native FreeBSD validation remains
+pending a host run.
 
-The package change's local rerun did not have those SDK wrappers configured;
-`aws-lc-sys` stopped while the host C compiler was checking FreeBSD headers.
-That failure is a toolchain limitation for this checkout and does not replace
-the configured SDK evidence above.
+The default Linux environment does not select the SDK wrappers. A plain
+FreeBSD workspace check invokes the host GCC for `aws-lc-sys` and fails with
+`unknown type name 'pthread_rwlock_t'`. A minimal Rust binary also fails to
+link with the host linker because it cannot find `-lexecinfo`. The Rust target
+standard library alone does not supply a FreeBSD C compiler, headers, startup
+objects, or system libraries.
+
+The local Zig and FreeBSD SDK are already present; the missing setup is
+target-specific compiler, archiver, and linker selection. Cross builds need
+`CC_x86_64_unknown_freebsd`, `CXX_x86_64_unknown_freebsd`,
+`AR_x86_64_unknown_freebsd`, and
+`CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER` to select wrappers that use the
+same FreeBSD sysroot. The linker wrapper must preserve host build-library
+search directories passed by Cargo rather than resolving them inside the
+sysroot, and must not bind those directories to one checkout or target folder.

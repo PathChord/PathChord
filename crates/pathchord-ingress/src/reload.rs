@@ -494,13 +494,9 @@ fn compile_candidate_documents<'a>(
 }
 
 fn startup_fields_changed(current: &PolicyConfig, candidate: &PolicyConfig) -> bool {
-    if current.listeners != candidate.listeners
+    current.listeners != candidate.listeners
         || current.egresses != candidate.egresses
         || current.dns_policy != candidate.dns_policy
-    {
-        return true;
-    }
-    false
 }
 
 fn failed_lock_status() -> ReloadStatus {
