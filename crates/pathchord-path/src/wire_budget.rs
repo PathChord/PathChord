@@ -47,6 +47,19 @@ impl WireBudget {
         self.capacity_bytes_per_second
     }
 
+    #[must_use]
+    pub fn remaining_bytes(&self) -> u64 {
+        let Ok(state) = self.state.lock() else {
+            return 0;
+        };
+        if state.window_started.elapsed() >= Duration::from_secs(1) {
+            self.capacity_bytes_per_second
+        } else {
+            self.capacity_bytes_per_second
+                .saturating_sub(state.consumed_bytes)
+        }
+    }
+
     pub fn try_reserve(&self, priority: WirePriority, bytes: u64) -> bool {
         let Ok(mut state) = self.state.lock() else {
             return false;

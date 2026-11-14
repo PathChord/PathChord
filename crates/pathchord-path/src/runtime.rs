@@ -32,6 +32,7 @@ use crate::{
     DemandKey, EgressAdmittedPath, IngressAdmittedPath, MultipathConfig, MultipathError,
     MultipathPathObservation, MultipathSession, NoiseRecordStream, PathEconomicStatus,
     ScheduleDirection, SessionUdpError, SessionUdpHandle, UdpAssociationRuntime, UdpTargetFactory,
+    WirePriority,
 };
 
 const MAX_SESSION_STREAMS: usize = 256;
@@ -197,6 +198,10 @@ pub struct EgressStatusSample {
 
 pub trait EgressStatusProvider: std::fmt::Debug + Send + Sync + 'static {
     fn sample(&self) -> EgressStatusSample;
+
+    fn try_reserve_wire(&self, _priority: WirePriority, _bytes: u64) -> bool {
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -354,6 +359,8 @@ pub enum SessionRuntimeError {
     InvalidRuntimeLimit,
     #[error("Session peer violated an authenticated Stream invariant")]
     SessionTrustFailure,
+    #[error("Egress global wire budget is exhausted")]
+    WireBudgetExhausted,
     #[error("Session RequestID random source failed")]
     RequestIdRandom,
     #[error("Session task failed: {0}")]
@@ -2370,7 +2377,11 @@ where
         // The ordinary retransmission was already sent. Failure of this optional
         // copy must not turn the Stream or Session into a failure.
         let _ = self
-            .send_raw_message_on(plan.path_id, Message::StreamData(plan.data))
+            .send_raw_message_on_priority(
+                plan.path_id,
+                Message::StreamData(plan.data),
+                WirePriority::OptionalReplication,
+            )
             .await;
         Ok(())
     }
@@ -3499,6 +3510,13 @@ where
         let send_result = self
             .send_message_on(path_id, Message::StreamData(data))
             .await;
+        if matches!(&send_result, Err(SessionRuntimeError::WireBudgetExhausted)) {
+            self.multipath.forget_retained(stream_id, chunk.offset);
+            if let Some(stream) = self.streams.get_mut(&stream_id) {
+                stream.pending.push_front(chunk);
+            }
+            return Ok(());
+        }
         self.session_sent_total += length as u64;
         self.bytes_sent += length as u64;
         if let Some(snapshot) = self.stream_observations.get_mut(&stream_id) {
@@ -4529,7 +4547,7 @@ where
                 break;
             }
             if self
-                .send_raw_message_on(path, message.clone())
+                .send_raw_message_on_priority(path, message.clone(), WirePriority::RequiredControl)
                 .await
                 .is_ok()
             {
@@ -4548,11 +4566,25 @@ where
         path_id: PathId,
         message: Message,
     ) -> Result<(), SessionRuntimeError> {
+        self.send_raw_message_on_priority(path_id, message, WirePriority::Primary)
+            .await
+    }
+
+    async fn send_raw_message_on_priority(
+        &mut self,
+        path_id: PathId,
+        message: Message,
+        priority: WirePriority,
+    ) -> Result<(), SessionRuntimeError> {
         let data_bytes = match &message {
             Message::StreamData(data) => data.data.len() as u64,
             Message::UdpDatagram(datagram) => datagram.payload.len() as u64,
             _ => 0,
         };
+        let wire_bytes = message.encode(self.limits)?.len() as u64 + 64;
+        if !self.status_provider.try_reserve_wire(priority, wire_bytes) {
+            return Err(SessionRuntimeError::WireBudgetExhausted);
+        }
         if path_id != self.path_id {
             let sender = self
                 .extra_paths
