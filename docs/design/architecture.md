@@ -97,7 +97,7 @@ Adapters preserve typed connection semantics and reject unsupported parameters
 before admission; an HTTP node that requests TLS cannot become a plaintext
 connection. Unsupported protocol inputs remain unavailable until a native
 PathChord adapter is implemented and do not own PathChord authorization or Noise state. The
-[Transit Proxy contract](../spec/transit-proxies.md) defines supported document
+[Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md) defines supported document
 families, private engine ownership, provider expansion, and accounting facts.
 
 ## 9. Metadata
@@ -117,7 +117,7 @@ Local overrides take precedence over subscription annotations. Hard states such 
 
 Multiple HTTP/SOCKS listeners have unique IDs and participate in policy evaluation. A `mixed` listener shares one TCP endpoint between HTTP and SOCKS and retains one identity across both protocol branches. Listener authentication and source-network restrictions are independent of Ingress-to-Egress Noise authentication.
 
-Ordinary HTTP requests are routed independently, including requests to different targets on one persistent client connection. Proxy credentials remain local, and framing-aware forwarding preserves message boundaries and streaming backpressure. HTTP CONNECT and SOCKS connections become byte streams only after target admission succeeds. The [platform and DNS specification](../spec/platform-and-dns.md#http-and-socks-listeners) owns request, authentication, upgrade, and SOCKS compatibility details.
+Ordinary HTTP requests are routed independently, including requests to different targets on one persistent client connection. Proxy credentials remain local, and framing-aware forwarding preserves message boundaries and streaming backpressure. HTTP CONNECT and SOCKS connections become byte streams only after target admission succeeds. The [platform and DNS specification](../../openspec/specs/platform-and-dns/spec.md#http-and-socks-listeners) owns request, authentication, upgrade, and SOCKS compatibility details.
 
 Windows system-proxy integration is a control-plane switch that selects one HTTP/SOCKS or mixed listener by ID. A selected mixed listener uses HTTP proxy settings for its shared endpoint. Linux and FreeBSD do not expose a system-proxy activation mode; their listeners and unsupported system-proxy status remain inspectable through the control plane. Local control uses Unix sockets on Linux and FreeBSD and a Named Pipe on Windows.
 

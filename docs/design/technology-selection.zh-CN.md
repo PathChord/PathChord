@@ -58,7 +58,7 @@ Ingress 拥有一个类型化 command/query service，用于节点元数据、�
 
 Prometheus 导出通过 Web Gateway 的认证与 capability 边界，从同一份观测快照读取聚合 gauge。
 提供方用量是可选的显式元数据，与私有订阅快照共同持久化，并由调度器消费；不得变成硬性限制。
-[Transit Proxy 契约](../spec/transit-proxies.zh-CN.md)拥有节点和导入语义，包括原生 UDP 与可选
+[Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)拥有节点和导入语义，包括原生 UDP 与可选
 引擎生命周期。
 
 ## Noise 和记录处理
@@ -97,7 +97,7 @@ mixed TCP 监听器在不消耗首字节的情况下选择 HTTP 或 SOCKS，然�
 凭据 verifier、flow opener 和任务监督。其 SOCKS5 UDP Association 与独立 SOCKS 监听器
 保留相同的有界 relay 生命周期。
 
-Linux、Windows 和 FreeBSD 共享普通 HTTP 转发、HTTP CONNECT、SOCKS4/4a/5 CONNECT 和 SOCKS5 UDP ASSOCIATE adapter。HTTP 消息 framing 使用 Hyper，每个普通请求使用与其他本地 flow 相同的 TCP flow opener 和策略引擎。规范配置名 `socks5` 接受输入别名 `socks` 及全部三个 SOCKS 版本。协议行为以[平台与 DNS 规范](../spec/platform-and-dns.zh-CN.md#http-和-socks-监听器)为准。FreeBSD 使用 Unix 本地控制，v1 平台契约禁止其暴露 TPROXY、REDIRECT 或 TUN 监听器。系统代理 mutation 仅限 Windows；Linux 和 FreeBSD 报告激活不受支持。平台无法安全获取的进程元数据保持 unknown。
+Linux、Windows 和 FreeBSD 共享普通 HTTP 转发、HTTP CONNECT、SOCKS4/4a/5 CONNECT 和 SOCKS5 UDP ASSOCIATE adapter。HTTP 消息 framing 使用 Hyper，每个普通请求使用与其他本地 flow 相同的 TCP flow opener 和策略引擎。规范配置名 `socks5` 接受输入别名 `socks` 及全部三个 SOCKS 版本。协议行为以[平台与 DNS 规范](../../openspec/specs/platform-and-dns/spec.zh-CN.md#http-和-socks-监听器)为准。FreeBSD 使用 Unix 本地控制，v1 平台契约禁止其暴露 TPROXY、REDIRECT 或 TUN 监听器。系统代理 mutation 仅限 Windows；Linux 和 FreeBSD 报告激活不受支持。平台无法安全获取的进程元数据保持 unknown。
 
 Linux 通过平台适配器集成 TPROXY、REDIRECT、进程元数据和透明路由。Windows 使用 Wintun，并通过控制面选择监听器来集成系统代理。TUN 适配器只暴露有界 IP 包；单一所有者的 `smoltcp` reactor 持有 `Interface`、`SocketSet`、TCP Listener、UDP socket、计时器和 flow 生命周期，并通过与普通 Listener 相同的 Ingress opener 连接已接受 flow。三个平台复用核心和策略 crate。
 

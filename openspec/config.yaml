@@ -2,33 +2,29 @@ schema: spec-driven
 githubCopilot:
   cloudAgent: true
 
-# Project context (optional)
-# Add only constraints that should guide OpenSpec artifacts and workflows.
-# Include constraints an agent cannot infer by reading the code.
-# Keep general project documentation and discoverable codebase facts out.
-# Example:
-#   context: |
-#     Designs and tasks must cover Windows, macOS, and Linux
-#     Write all artifacts in Spanish
+context: |
+  Preserve the domain vocabulary Ingress, Transit Proxy, Egress, Session, Path,
+  and Stream. Final-state design and behavior are distinct from implementation
+  status and validation evidence. A target build, a loopback fixture, a native
+  host run, and a deployed interoperability check are different evidence.
+  Capability specs are canonical English spec.md documents paired with
+  Simplified Chinese spec.zh-CN.md; both languages have equal normative meaning.
+  Planning artifacts and the implementation-status snapshot are English-only;
+  supporting research may retain its source language. User configuration and
+  operation guides belong in docs/guides, with links to the authoritative specs.
+  Preserve explicit enrollment, independent per-Path Noise state, and no TOFU.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always state what is out of scope
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
-
-# Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+rules:
+  proposal:
+    - Reuse existing capability paths; distinguish a contract change from implementing or validating an existing contract.
+    - Use skip_specs only when no normative behavior changes; do not invent requirements for documentation or validation work.
+  specs:
+    - Write canonical English deltas as specs/<capability>/spec.md with Requirement and Scenario headings and explicit WHEN/THEN outcomes.
+    - Preserve complete normative wire layouts, registries, schemas, limits, and failure semantics in the capability's Detailed contract section where needed; user procedures belong only in docs/guides.
+    - Synchronize the matching main spec.zh-CN.md and affected bilingual design documents when merging deltas; do not add translated delta files for the CLI to merge.
+    - Keep implementation status, rollout sequencing, temporary scope, and validation claims out of main specifications.
+  design:
+    - Keep change-specific approach and migration decisions here; keep durable architecture under docs/design, user instructions under docs/guides, and current evidence in openspec/implementation-status.md.
+  tasks:
+    - Give each task an observable completion check and keep native-host, provider, and deployed validation separate from local tests.
+    - For documentation work verify strict OpenSpec validation, bilingual structure, local links and anchors, and git diff whitespace.

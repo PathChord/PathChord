@@ -80,7 +80,7 @@ Prometheus export reads aggregate gauges from the same observation snapshot
 through the Web Gateway's authentication and capability boundary. Provider
 usage is optional explicit metadata, persisted with private subscription
 snapshots and consumed by scheduling without converting it into a hard limit.
-The [Transit Proxy contract](../spec/transit-proxies.md) owns node and import
+The [Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md) owns node and import
 semantics, including native UDP and optional engine lifecycle.
 
 ## Noise and record handling
@@ -123,7 +123,7 @@ then reuses the existing protocol codecs, credential verifier, flow openers,
 and supervision. Its SOCKS5 UDP Associations retain the same bounded relay
 lifecycle as a dedicated SOCKS listener.
 
-Linux, Windows, and FreeBSD share ordinary HTTP forwarding, HTTP CONNECT, SOCKS4/4a/5 CONNECT, and SOCKS5 UDP ASSOCIATE adapters. HTTP message framing uses Hyper while each ordinary request uses the same TCP flow opener and policy engine as other local flows. The canonical `socks5` configuration name accepts `socks` as an input alias and all three SOCKS versions. The [platform and DNS specification](../spec/platform-and-dns.md#http-and-socks-listeners) owns protocol behavior. FreeBSD uses Unix local control and MUST NOT expose TPROXY, REDIRECT, or TUN listeners in the v1 platform contract. System-proxy mutations are Windows-only; Linux and FreeBSD report unsupported activation. Process metadata that a platform cannot safely obtain remains unknown.
+Linux, Windows, and FreeBSD share ordinary HTTP forwarding, HTTP CONNECT, SOCKS4/4a/5 CONNECT, and SOCKS5 UDP ASSOCIATE adapters. HTTP message framing uses Hyper while each ordinary request uses the same TCP flow opener and policy engine as other local flows. The canonical `socks5` configuration name accepts `socks` as an input alias and all three SOCKS versions. The [platform and DNS specification](../../openspec/specs/platform-and-dns/spec.md#http-and-socks-listeners) owns protocol behavior. FreeBSD uses Unix local control and MUST NOT expose TPROXY, REDIRECT, or TUN listeners in the v1 platform contract. System-proxy mutations are Windows-only; Linux and FreeBSD report unsupported activation. Process metadata that a platform cannot safely obtain remains unknown.
 
 Linux integrates TPROXY, REDIRECT, process metadata, and transparent routing through platform adapters. Windows uses Wintun and system-proxy integration selected through the control plane. TUN adapters expose bounded IP packets only; one single-owner `smoltcp` reactor owns `Interface`, `SocketSet`, TCP listeners, UDP sockets, timers, and flow lifecycle and connects accepted flows through the same Ingress openers as ordinary listeners. All three platforms reuse the core and policy crates.
 

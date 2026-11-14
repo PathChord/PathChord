@@ -2,7 +2,7 @@
 
 ## Project structure and module organization
 
-PathChord has a runnable Rust implementation. Current work prioritizes HTTP forwarding/CONNECT, SOCKS4/4a/5, and same-port mixed listeners on Linux, Windows, and FreeBSD; native FreeBSD validation remains tracked in `docs/progress/`. Transparent interception and TUN work follow this listener baseline. `README.md` defines the project vocabulary and links the documentation sets. The `docs/design/` directory contains final-state architecture and design decisions, `docs/spec/` contains final-state behavioral and format contracts, and `docs/progress/` contains only the current implementation status and active implementation plan. Superseded reviews, phase-specific acceptance records, temporary fixtures, and other process history belong in Git history, not in the maintained progress directory. The root Cargo workspace contains protocol primitives and test fixtures under `crates/`.
+PathChord has a runnable Rust implementation. Implementation and validation evidence is recorded in `openspec/implementation-status.md`; pending work is tracked as OpenSpec changes. `README.md` defines the project vocabulary and links the documentation sets. The `docs/design/` directory contains durable architecture and design decisions, and `docs/guides/` contains user-facing configuration and operation guides. `openspec/specs/` contains capability-based behavioral and format contracts, and `openspec/changes/` contains change proposals, designs, deltas, tasks, and supporting research. The root Cargo workspace contains protocol primitives and test fixtures under `crates/`.
 
 The Rust layout separates `pathchord-core`, `pathchord-noise`, `pathchord-path`, `pathchord-policy`, `pathchord-transit`, `pathchord-egress`, `pathchord-ingress`, and `pathchord-cli`. Keep `pathchord-core` independent of platforms, subscription formats, and listener implementations.
 
@@ -16,7 +16,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 ```
 
-For documentation changes, also run `git diff --check` and `rg -n '^#{1,6} ' README.md README.zh-CN.md docs AGENTS.md`.
+For documentation changes, also run `openspec validate --all --strict --no-interactive`, `git diff --check`, and `rg -n '^#{1,6} ' README.md README.zh-CN.md docs openspec AGENTS.md`. Verify local links and anchors, language switches, paired requirement/scenario identities, and preservation of technical examples and registries after moving or restructuring documents.
 
 Ingress configuration source precedence is command line, then
 `PATHCHORD_CONFIG` / `PATHCHORD_CONFIG_DIR`, then the account default:
@@ -26,17 +26,20 @@ last-file-wins semantics or a working-directory default fallback.
 
 ## Documentation taxonomy
 
-Treat the three documentation sets as strict content boundaries:
+Maintain these content boundaries:
 
-- `docs/design/` describes only the intended final-state requirements, principles, overall design, architecture, and durable design decisions.
-- `docs/spec/` describes only the intended final-state implementation contract: required behavior, state transitions, protocols, wire formats, configuration models, APIs, and other testable details.
-- `docs/progress/` contains only implementation status and the active implementation plan. Status records current capabilities, gaps, constraints, and validation state; the plan records current sequencing and next work. Do not add historical reviews, completed acceptance reports, temporary wire fixtures, or obsolete process notes.
+- `docs/design/` describes the intended final-state principles, architecture, and durable decisions.
+- `docs/guides/` explains configuration, deployment, and local operation for users. Keep procedures, runnable examples, prerequisites, and troubleshooting here, linking to authoritative capability specs for exact schemas and protocol rules. Do not maintain a second specification collection in `docs/` or copy complete normative tables into guides.
+- `openspec/specs/<capability>/spec.md` is the authoritative English behavior contract for that capability. Use `## Purpose`, `## Requirements`, `### Requirement:`, and `#### Scenario:` with explicit WHEN/THEN outcomes. Preserve complete normative wire layouts, registries, schema tables, configuration models, state transitions, and failure semantics under `## Detailed contract` where needed. Requirement summaries and scenarios do not replace those details; user procedures and deployment walkthroughs live only in `docs/guides/`.
+- `openspec/changes/<change>/` owns proposals, change-specific design, requirement deltas, sequencing, and executable task checklists. Use the configured `spec-driven` schema. A change to behavior needs deltas for the existing capability paths; work that only implements, validates, or reorganizes existing contracts uses `skip_specs: true` in `.openspec.yaml` and has no fabricated delta.
+- `openspec/implementation-status.md` is the single English implementation and validation snapshot. Keep current capabilities, gaps, constraints, and evidence here; put pending actions in the corresponding change tasks. Do not recreate a parallel implementation plan or progress collection in `docs/`.
+- A change's `research/` directory contains its dated, non-normative investigations and source evidence. Keep historical completed changes in `openspec/changes/archive/`; superseded standalone process reports belong in Git history.
 
-Every Markdown document under `docs/design/` and `docs/spec/` must have both an English `name.md` and a Simplified Chinese `name.zh-CN.md` version. Put the reciprocal language switch immediately below the H1, update both versions in the same change, and preserve equivalent normative meaning, technical literals, links, and code blocks across the pair. Progress documents under `docs/progress/` use English as their single maintained source and do not require a Chinese pair unless a task explicitly requests one.
+Every document under `docs/design/` and `docs/guides/` has an English `name.md` and Simplified Chinese `name.zh-CN.md` pair. Every capability has `spec.md` and `spec.zh-CN.md`. Put reciprocal language switches immediately below the H1, update both languages in the same change, and preserve equivalent meaning, technical literals, links, and code blocks. Preserve the English OpenSpec structural headings and requirement/scenario identities in both spec versions so paired edits are traceable. Planning artifacts and the status snapshot are English-only unless explicitly requested otherwise; referenced research may retain its source language. Do not translate this agent-only guide.
 
-Design and specification documents must not describe the current implementation, implementation progress, rollout order, milestones, temporary phase scope, deferred work, or future plans. Phrases such as “currently implemented,” “not yet implemented,” “Phase N,” “first/next/later implementation,” “planned,” and “deferred” normally indicate material that belongs in `docs/progress/`. Root `README` files and this `AGENTS.md` may summarize current repository state, but detailed status and plans belong in `docs/progress/`.
+Design and main specifications describe only final-state contracts. Keep implementation progress, rollout order, temporary phase scope, deferred work, and validation claims in the status snapshot or change artifacts. Root READMEs and this guide may summarize repository state. When a behavior becomes durable, merge the canonical delta into its main spec, reconcile the complete Detailed contract, synchronize its Chinese counterpart and affected design documents, and validate before archiving. Repair relative links in change artifacts and research when moving a change into the archive directory. The OpenSpec CLI merges only English `spec.md` deltas; do not place translated delta files under a change's `specs/` tree. Keep architecture, protocol, configuration, state machines, and other affected capabilities mutually consistent.
 
-When a staged implementation contract becomes durable, copy its final behavior into `docs/spec/` without carrying over phase or progress language; keep the current state and active sequencing in the two maintained `docs/progress/` documents. Delete superseded process documents instead of preserving them as maintained references; Git history is the historical record. Keep related final-state claims synchronized across `docs/design/architecture*.md`, `docs/spec/protocol*.md`, `docs/spec/configuration*.md`, and `docs/spec/state-machines*.md`.
+Use `openspec list --specs` to discover the baseline and `openspec list` to discover changes. Read proposal/design/specs/tasks before applying a change. Mark a task complete only after its check passes, keep native-platform and deployed evidence distinct from local tests, and retain the pre-existing `skip_specs` opt-out only while normative behavior is unchanged.
 
 ## Coding style and naming conventions
 

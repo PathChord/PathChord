@@ -10,7 +10,7 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 本仓库包含设计基线、`wire-profile-v1` 协议契约、Kubernetes 风格配置契约，以及可运行的 Rust 实现。Ingress 可以绑定 HTTP、SOCKS5、Linux 透明模式和 TUN 监听器，维护持久化控制状态，刷新由订阅提供的 Transit Proxy，并通过经过认证的 Session/Path 运行时承载 TCP/UDP 流量。Egress 提供经过认证的 Path 监听器和授权控制面；可选的 REST/SSE Web Gateway 由两个控制面共享。
 
-当前工作优先完善 Linux、Windows 和 FreeBSD 上的普通 HTTP 转发、CONNECT、SOCKS4/4a/5、Linux 透明接管与 TUN 监听器。HTTP 使用消息编解码器处理流式正文、持久连接请求和 Upgrade；SOCKS5 还提供 UDP ASSOCIATE。监听器名称 `socks` 可作为规范名称 `socks5` 的别名。`type: mixed` 在一个 TCP 端口上提供 HTTP 和 SOCKS，并通过协商的 relay 端点提供 SOCKS5 UDP ASSOCIATE。FreeBSD 已有显式代理监听器的平台校验和 Unix 本地控制接口，目标编译和 CLI 链接已通过，原生主机验证仍待完成。通用监听器回归测试由现有 Rust CI 任务执行。透明 TCP/UDP 接管与 TUN 数据包流已经接入相同的策略和 Session/Path 数据面。特权主机路由、真实 TUN 设备 smoke 以及平台打包验证仍是单独的验收步骤。Linux TPROXY 还接受 `backend: ebpf` 以启用绑定接口的 TC classifier；普通 `tproxy` 后端仍是默认和回退路径。平台验证、共享运行时缺口及后续适配器工作见[实施计划](docs/progress/implementation-plan.md)。
+当前工作优先完善 Linux、Windows 和 FreeBSD 上的普通 HTTP 转发、CONNECT、SOCKS4/4a/5、Linux 透明接管与 TUN 监听器。HTTP 使用消息编解码器处理流式正文、持久连接请求和 Upgrade；SOCKS5 还提供 UDP ASSOCIATE。监听器名称 `socks` 可作为规范名称 `socks5` 的别名。`type: mixed` 在一个 TCP 端口上提供 HTTP 和 SOCKS，并通过协商的 relay 端点提供 SOCKS5 UDP ASSOCIATE。FreeBSD 已有显式代理监听器的平台校验和 Unix 本地控制接口，目标编译和 CLI 链接已通过，原生主机验证仍待完成。通用监听器回归测试由现有 Rust CI 任务执行。透明 TCP/UDP 接管与 TUN 数据包流已经接入相同的策略和 Session/Path 数据面。特权主机路由、真实 TUN 设备 smoke 以及平台打包验证仍是单独的验收步骤。Linux TPROXY 还接受 `backend: ebpf` 以启用绑定接口的 TC classifier；普通 `tproxy` 后端仍是默认和回退路径。平台验证、共享运行时缺口及后续适配器工作见[进行中的 OpenSpec 变更](#进行中的变更)；已记录的能力和验证依据见[实现状态](openspec/implementation-status.md)。
 
 节点导入支持自动识别、Clash/Mihomo provider、SIP008、URI/Base64 列表、sing-box JSON，以及
 所支持的 Surge/Quantumult X/Loon 节点行。原生传输支持类型化 TLS 设置、VLESS/Trojan 的
@@ -18,8 +18,8 @@ TCP/TLS/WebSocket 传输、VLESS + REALITY、带 AEAD 正文记录和单目标 U
 WebSocket、AnyTLS TCP 与 UDP-over-TCP、带 Salamander 和端口跳转的原生 Hysteria2 TCP/UDP，
 以及带 heartbeat 和可选 0-RTT 的 TUIC TCP/UDP。direct/SOCKS5/Shadowsocks UDP（包括 SS2022）
 仍可用。未支持的协议和参数保持为明确诊断。精确的兼容边界见
-[Transit Proxy 与订阅契约](docs/spec/transit-proxies.zh-CN.md)，可运行配置见
-[部署指南](docs/spec/deployment.zh-CN.md)。
+[Transit Proxy 与订阅契约](openspec/specs/transit-proxies/spec.zh-CN.md)，可运行配置见
+[部署指南](docs/guides/deployment.zh-CN.md)。
 
 ## 术语
 
@@ -32,31 +32,68 @@ WebSocket、AnyTLS TCP 与 UDP-over-TCP、带 Salamander 和端口跳转的原�
 
 ## 文档
 
-设计文档只描述预期架构和长期设计决策；规范文档定义最终行为与格式契约。维护中的进度文档只描述当前实现状态和有效的实施计划；已经被替代的过程历史保留在 Git 历史中。
-设计和规范文档均同时提供英文与简体中文版本；进度文档以英文作为唯一维护源。
+`docs/` 存放设计文档和面向用户的使用指南；行为契约、实现状态和变更跟踪由 OpenSpec 管理。
+每份内容只有一个维护位置：指南链接到精确契约，不复制规范 schema；待办放在变更任务中，
+不另设平行实施计划。设计、指南和能力规范均有英文与简体中文版本；规划产物和实现状态快照使用英文。
+
+### 用户指南
+
+- [配置指南](docs/guides/configuration.zh-CN.md)
+- [部署与本地操作](docs/guides/deployment.zh-CN.md)
+- [原生软件包](packaging/README.md)
 
 ### 设计
 
 - [架构](docs/design/architecture.zh-CN.md)
 - [技术选型](docs/design/technology-selection.zh-CN.md)
 
-### 规范
+### 能力规范
 
-- [协议](docs/spec/protocol.zh-CN.md)
-- [v1 线协议 profile](docs/spec/wire-profile.zh-CN.md)
-- [配置模型](docs/spec/configuration.zh-CN.md)
-- [配置 schema](docs/spec/configuration-schema.zh-CN.md)
-- [平台与 DNS](docs/spec/platform-and-dns.zh-CN.md)
-- [状态机](docs/spec/state-machines.zh-CN.md)
-- [Ingress 控制面](docs/spec/ingress-control-plane.zh-CN.md)
-- [Ingress 可观测性](docs/spec/observability.zh-CN.md)
-- [Transit Proxy 与订阅](docs/spec/transit-proxies.zh-CN.md)
-- [部署与本地操作](docs/spec/deployment.zh-CN.md)
+- [协议](openspec/specs/protocol/spec.zh-CN.md)
+- [v1 线协议 profile](openspec/specs/wire-profile/spec.zh-CN.md)
+- [配置模型](openspec/specs/configuration/spec.zh-CN.md)
+- [配置 schema](openspec/specs/configuration-schema/spec.zh-CN.md)
+- [平台与 DNS](openspec/specs/platform-and-dns/spec.zh-CN.md)
+- [状态机](openspec/specs/state-machines/spec.zh-CN.md)
+- [Ingress 控制面](openspec/specs/ingress-control-plane/spec.zh-CN.md)
+- [Ingress 可观测性](openspec/specs/observability/spec.zh-CN.md)
+- [Transit Proxy 与订阅](openspec/specs/transit-proxies/spec.zh-CN.md)
+- [部署行为](openspec/specs/deployment/spec.zh-CN.md)
 
-### 实施进度
+### 实现与验证依据
 
-- [实现状态](docs/progress/status.md)
-- [实施计划](docs/progress/implementation-plan.md)
+- [实现与验证状态](openspec/implementation-status.md)
+
+### 进行中的变更
+
+以下任务清单承接剩余工作；未勾选的任务不代表已经实现或通过原生主机验证。
+
+| 变更 | 范围 |
+| --- | --- |
+| [原生平台](openspec/changes/validate-native-platforms/tasks.md) | Windows/FreeBSD 监听器与本地控制，以及 Linux 透明代理/TUN/eBPF 的特权验证。 |
+| [提供商与运行时可靠性](openspec/changes/validate-provider-and-runtime-reliability/tasks.md) | 真实提供商导出、独立协议 peer、跨机器流量、故障与重启长时间测试。 |
+| [调度与可观测性](openspec/changes/complete-scheduling-and-observability/tasks.md) | 策略/类别预算、Egress 协调、类型化观测和实际监控部署。 |
+| [原生软件包](openspec/changes/validate-native-packages/tasks.md) | Debian、Alpine、Arch Linux、FreeBSD 和 NSIS 打包主机验收。 |
+
+## OpenSpec 工作流
+
+使用 OpenSpec 查看已有契约和当前变更：
+
+```sh
+openspec list --specs
+openspec list
+openspec status --change organize-documentation-with-openspec
+openspec validate --all --strict --no-interactive
+```
+
+使用 `openspec new change <name>` 创建范围明确的变更，然后编写提案、设计和任务清单。
+改变行为时，在 `specs/<capability>/spec.md` 中编写英文规范增量；只实现、验证或整理已有
+契约的工作，在 `.openspec.yaml` 中使用 `skip_specs: true`。
+[OpenSpec 项目配置](openspec/config.yaml)记录各类产物的规则。
+
+实现并验证任务，同时保持实现状态快照准确。使用 `openspec archive <name>` 归档前，
+同步英文主规范、完整技术契约、对应中文规范，以及受影响的设计和用户文档。
+已完成变更的历史保存在 `openspec/changes/archive/`。
 
 ## 命令界面
 

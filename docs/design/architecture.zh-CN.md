@@ -88,7 +88,7 @@ Ingress 通过原子运行时快照 provider 发布这些观测数据。该 prov
 
 订阅文档规范化独立于节点传输支持。适配器保留类型化连接语义，并在准入前拒绝不支持参数；
 请求 TLS 的 HTTP 节点不能变成明文连接。不支持的协议输入在对应的 PathChord 原生适配器完成前
-保持不可用，且不拥有 PathChord 授权或 Noise 状态。[Transit Proxy 契约](../spec/transit-proxies.zh-CN.md)定义受支持
+保持不可用，且不拥有 PathChord 授权或 Noise 状态。[Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)定义受支持
 文档类型、provider 展开及用量事实。
 
 ## 9. 元数据
@@ -108,7 +108,7 @@ Ingress 通过原子运行时快照 provider 发布这些观测数据。该 prov
 
 多个 HTTP/SOCKS 监听器各自具有唯一 ID，并参与策略评估。`mixed` 监听器在一个 TCP 端点上共用 HTTP 和 SOCKS，两个协议分支保留同一个身份。监听器认证和来源网络限制独立于 Ingress 到 Egress 的 Noise 认证。
 
-普通 HTTP 请求分别独立路由，包括同一个客户端持久连接中发往不同目标的请求。代理凭据保留在本地，按 framing 转发以保留消息边界和流式背压。HTTP CONNECT 和 SOCKS 连接只有在目标准入成功后才成为字节流。请求、认证、升级和 SOCKS 兼容性的细节以[平台与 DNS 规范](../spec/platform-and-dns.zh-CN.md#http-和-socks-监听器)为准。
+普通 HTTP 请求分别独立路由，包括同一个客户端持久连接中发往不同目标的请求。代理凭据保留在本地，按 framing 转发以保留消息边界和流式背压。HTTP CONNECT 和 SOCKS 连接只有在目标准入成功后才成为字节流。请求、认证、升级和 SOCKS 兼容性的细节以[平台与 DNS 规范](../../openspec/specs/platform-and-dns/spec.zh-CN.md#http-和-socks-监听器)为准。
 
 Windows 系统代理集成是控制面开关，按 ID 选择一个 HTTP/SOCKS 或 mixed 监听器。选中 mixed 监听器时，使用共享端点的 HTTP 代理设置。Linux 和 FreeBSD 不暴露系统代理激活模式；其监听器及系统代理不受支持的状态仍可通过控制面查看。Linux 和 FreeBSD 的本地控制使用 Unix socket，Windows 使用 Named Pipe。
 
