@@ -946,12 +946,13 @@ impl IngressDataPlane {
                     adapters
                         .keys()
                         .filter(|id| {
-                            runtime.transit_proxy(id).is_some_and(|status| {
-                                matches!(
-                                    status.state,
-                                    RuntimeNodeState::Ready | RuntimeNodeState::Degraded
-                                )
-                            })
+                            id.namespace() == egress_id.namespace()
+                                && runtime.transit_proxy(id).is_some_and(|status| {
+                                    matches!(
+                                        status.state,
+                                        RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+                                    )
+                                })
                         })
                         .take(minimum)
                         .cloned()
@@ -1160,10 +1161,18 @@ impl IngressDataPlane {
         let class_budget = policy
             .class_replication_budget_bps
             .map_or(session_budget, bits_to_bytes);
+        // Sessions never span configuration namespaces. Send the canonical
+        // policy/class names on the wire, preserving the registered class-name
+        // grammar while internal lookups retain their qualified resource ID.
         let mut class_replication_budget_bytes: BTreeMap<_, _> = policy
             .classes
             .keys()
-            .map(|class| (format!("{}:{class}", policy_id.as_str()), class_budget))
+            .map(|class| {
+                (
+                    format!("{}:{class}", policy_id.resource_name()),
+                    class_budget,
+                )
+            })
             .collect();
         if policy.class_replication_budget_bps.is_some() {
             class_replication_budget_bytes.insert("default".to_owned(), class_budget);
@@ -1174,7 +1183,7 @@ impl IngressDataPlane {
                     .classes
                     .get(name)
                     .map(|class| pathchord_core::TrafficClassConfig {
-                        name: format!("{}:{name}", policy_id.as_str()),
+                        name: format!("{}:{name}", policy_id.resource_name()),
                         priority: class.priority,
                         share: class.share,
                     })
@@ -1458,8 +1467,21 @@ impl IngressDataPlane {
         Ok(self.snapshot().await)
     }
 
-    async fn first_available_transit(&self) -> Option<TransitProxyId> {
-        self.transit_adapters.read().await.keys().next().cloned()
+    async fn first_available_transit(&self, namespace: &str) -> Option<TransitProxyId> {
+        let adapters = self.transit_adapters.read().await;
+        let runtime = self.runtime.read().await;
+        adapters
+            .keys()
+            .find(|id| {
+                id.namespace() == namespace
+                    && runtime.transit_proxy(id).is_some_and(|status| {
+                        matches!(
+                            status.state,
+                            RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+                        )
+                    })
+            })
+            .cloned()
     }
 
     async fn connect_direct(
@@ -1502,6 +1524,9 @@ impl IngressDataPlane {
         egress_id: &EgressId,
         transit_id: &TransitProxyId,
     ) -> Result<Arc<IngressSessionHandle>, DataPlaneError> {
+        if egress_id.namespace() != transit_id.namespace() {
+            return Err(DataPlaneError::NoUsableRoute);
+        }
         if !self
             .runtime
             .read()
@@ -1598,20 +1623,29 @@ impl IngressDataPlane {
         .map_err(|_| TransitError::Connection("Egress Path connection timed out".into()))??;
         let responder_key = decode_key(&slot.egress.public_key)?;
         let mut prologue = WIRE_PROFILE_V1_PROLOGUE_PREFIX.to_vec();
-        prologue.extend_from_slice(slot.egress.id.as_str().as_bytes());
+        prologue.extend_from_slice(slot.egress.id.resource_name().as_bytes());
         let outcome = dial_path(
             io,
             self.identity.private(),
             &responder_key,
             &IngressPathAdmissionConfig {
                 egress_identity: prologue,
-                egress_id: slot.egress.id.as_str().as_bytes().to_vec(),
+                egress_id: slot.egress.id.resource_name().as_bytes().to_vec(),
                 ingress_id: self.ingress_id.as_bytes().to_vec(),
                 session_id,
                 path_id,
                 offered_capabilities: TCP_CAPABILITY
                     | UDP_CAPABILITY
                     | pathchord_core::CAPABILITY_TRAFFIC_CLASSES,
+                required_capabilities: if slot.egress.capabilities.tcp {
+                    TCP_CAPABILITY
+                } else {
+                    0
+                } | if slot.egress.capabilities.udp {
+                    UDP_CAPABILITY
+                } else {
+                    0
+                },
                 local_limits: ProtocolLimits::default(),
             },
         )
@@ -1696,16 +1730,17 @@ impl DnsRouteAdapter for DataPlaneDnsAdapter {
         let _configuration = self.data_plane.configuration_gate.read().await;
         match request.selection {
             DnsRouteSelection::Egress {
+                namespace,
                 egress_selector,
                 servers,
             } => {
                 let egress_id = self
-                    .select_egress(&egress_selector)
+                    .select_egress(&namespace, &egress_selector)
                     .await
                     .ok_or(DnsAdapterError::Unavailable)?;
                 let transit_id = self
                     .data_plane
-                    .first_available_transit()
+                    .first_available_transit(&namespace)
                     .await
                     .ok_or(DnsAdapterError::Unavailable)?;
                 let session = self
@@ -1726,11 +1761,12 @@ impl DnsRouteAdapter for DataPlaneDnsAdapter {
                     })
             }
             DnsRouteSelection::Transit {
+                namespace,
                 proxy_selector,
                 servers,
             } => {
                 let proxy_id = self
-                    .select_transit(&proxy_selector)
+                    .select_transit(&namespace, &proxy_selector)
                     .await
                     .ok_or(DnsAdapterError::Unavailable)?;
                 let adapter = self
@@ -1786,24 +1822,25 @@ impl DnsRouteAdapter for DataPlaneDnsAdapter {
 }
 
 impl DataPlaneDnsAdapter {
-    async fn select_egress(&self, selector: &Selector) -> Option<EgressId> {
+    async fn select_egress(&self, namespace: &str, selector: &Selector) -> Option<EgressId> {
         let runtime = self.data_plane.runtime.read().await;
         self.data_plane
             .egresses
             .iter()
             .find(|(id, config)| {
-                runtime.egress(id).is_some_and(|status| {
-                    matches!(
-                        status.state,
-                        RuntimeNodeState::Ready | RuntimeNodeState::Degraded
-                    ) && status.usable_paths > 0
-                        && selector_matches_egress(selector, config, status)
-                })
+                id.namespace() == namespace
+                    && runtime.egress(id).is_some_and(|status| {
+                        matches!(
+                            status.state,
+                            RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+                        ) && status.usable_paths > 0
+                            && selector_matches_egress(selector, config, status)
+                    })
             })
             .map(|(id, _)| id.clone())
     }
 
-    async fn select_transit(&self, selector: &Selector) -> Option<TransitProxyId> {
+    async fn select_transit(&self, namespace: &str, selector: &Selector) -> Option<TransitProxyId> {
         let runtime = self.data_plane.runtime.read().await;
         let dynamic = self.data_plane.dynamic_transit_configs.read().await;
         let static_configs = self.data_plane.transit_configs.read().await;
@@ -1811,12 +1848,13 @@ impl DataPlaneDnsAdapter {
             .iter()
             .chain(dynamic.iter())
             .find(|(id, config)| {
-                runtime.transit_proxy(id).is_some_and(|status| {
-                    matches!(
-                        status.state,
-                        RuntimeNodeState::Ready | RuntimeNodeState::Degraded
-                    ) && selector_matches_transit(selector, config, status)
-                })
+                id.namespace() == namespace
+                    && runtime.transit_proxy(id).is_some_and(|status| {
+                        matches!(
+                            status.state,
+                            RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+                        ) && selector_matches_transit(selector, config, status)
+                    })
             })
             .map(|(id, _)| id.clone())
     }
@@ -2035,6 +2073,102 @@ mod tests {
                 port: address.port(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn dns_selectors_and_session_bootstrap_stay_in_the_owners_namespace() {
+        let identity = pathchord_noise::generate_static_keypair().unwrap();
+        let mut config = PolicyConfig {
+            fallback: Some(FallbackAction::Reject),
+            ..Default::default()
+        };
+        for namespace in ["alpha", "beta"] {
+            config.egresses.push(EgressConfig {
+                id: EgressId::in_namespace(namespace, "edge"),
+                endpoint: pathchord_policy::Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: 9,
+                },
+                public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(identity.public()),
+                labels: BTreeMap::from([("region".into(), "jp".into())]),
+                capabilities: pathchord_policy::Capabilities {
+                    tcp: true,
+                    udp: true,
+                },
+                status_requirements: Default::default(),
+            });
+            config.transit_proxies.push(TransitProxyConfig {
+                id: TransitProxyId::in_namespace(namespace, "node"),
+                source: None,
+                protocol: "direct".into(),
+                endpoint: pathchord_policy::Endpoint {
+                    host: String::new(),
+                    port: 1,
+                },
+                credentials_ref: None,
+                labels: BTreeMap::from([("region".into(), "jp".into())]),
+                tags: BTreeSet::new(),
+                weight: 100,
+                options: Default::default(),
+            });
+        }
+        let policy = ValidatedPolicySnapshot::new(Generation::new(1), config).unwrap();
+        let plane = Arc::new(
+            IngressDataPlane::new(IngressDataPlaneConfig::new("ingress", identity, policy))
+                .unwrap(),
+        );
+        for namespace in ["alpha", "beta"] {
+            plane
+                .mark_egress(
+                    &EgressId::in_namespace(namespace, "edge"),
+                    RuntimeNodeState::Ready,
+                    1,
+                )
+                .await;
+        }
+        let adapter = DataPlaneDnsAdapter {
+            data_plane: Arc::clone(&plane),
+        };
+        let selector = Selector {
+            labels: BTreeMap::from([("region".into(), "jp".into())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            adapter.select_egress("beta", &selector).await,
+            Some(EgressId::in_namespace("beta", "edge"))
+        );
+        assert_eq!(
+            adapter.select_transit("beta", &selector).await,
+            Some(TransitProxyId::in_namespace("beta", "node"))
+        );
+        assert!(matches!(
+            plane
+                .ensure_session(
+                    &EgressId::in_namespace("alpha", "edge"),
+                    &TransitProxyId::in_namespace("beta", "node")
+                )
+                .await,
+            Err(DataPlaneError::NoUsableRoute)
+        ));
+        plane.runtime.write().await.set_transit_proxy(
+            TransitProxyId::in_namespace("alpha", "node"),
+            TransitProxyRuntimeStatus::default(),
+        );
+        plane
+            .mark_egress(
+                &EgressId::in_namespace("alpha", "edge"),
+                RuntimeNodeState::Down,
+                0,
+            )
+            .await;
+        assert_eq!(adapter.select_transit("alpha", &selector).await, None);
+        assert_eq!(adapter.select_egress("alpha", &selector).await, None);
+        assert_eq!(plane.first_available_transit("alpha").await, None);
+        assert_eq!(
+            plane.first_available_transit("beta").await,
+            Some(TransitProxyId::in_namespace("beta", "node"))
+        );
     }
 
     #[tokio::test]
@@ -2264,7 +2398,7 @@ mod tests {
             Generation::new(1),
             PolicyConfig {
                 traffic_policies: vec![TrafficPolicy {
-                    id: TrafficPolicyId::new("latency"),
+                    id: TrafficPolicyId::in_namespace("tenant-a", "latency"),
                     scheduler: Scheduler::EffectiveCapacityWeighted,
                     session_replication_budget_bps: 16_000,
                     class_replication_budget_bps: Some(8_000),
@@ -2286,7 +2420,10 @@ mod tests {
             IngressDataPlane::new(IngressDataPlaneConfig::new("ingress-a", identity, policy))
                 .expect("data plane");
         let config = plane
-            .multipath_config_for(&TrafficPolicyId::new("latency"), Some("interactive"))
+            .multipath_config_for(
+                &TrafficPolicyId::in_namespace("tenant-a", "latency"),
+                Some("interactive"),
+            )
             .await;
         assert_eq!(config.session_replication_budget_bytes, 2_000);
         assert_eq!(config.default_stream_replication_budget_bytes, 2_000);
@@ -2299,6 +2436,7 @@ mod tests {
         assert_eq!(class.name, "latency:interactive");
         assert_eq!(class.priority, 10);
         assert_eq!(class.share, 100);
+        class.validate().unwrap();
     }
 
     #[tokio::test]

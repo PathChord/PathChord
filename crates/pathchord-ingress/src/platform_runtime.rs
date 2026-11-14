@@ -13,7 +13,7 @@ use pathchord_policy::{
     PolicyConfig, TransparentBackend,
 };
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::{
@@ -66,6 +66,8 @@ impl IngressPlatformConfig {
 
     fn validate(&self) -> Result<(), IngressPlatformError> {
         if self.route_priority_base == 0
+            || self.listener_runtime.max_connections == 0
+            || self.listener_runtime.max_connections > crate::control::MAX_CONNECTION_OBSERVATIONS
             || self.route_protocol == 0
             || self.maximum_udp_payload == 0
             || self.maximum_udp_payload > u16::MAX as usize
@@ -266,6 +268,17 @@ pub struct IngressPlatformReport {
 }
 
 impl IngressPlatformRuntime {
+    fn set_connection_admission(&mut self, admission: Arc<Semaphore>) {
+        if let Some(runtime) = self.listeners.as_mut() {
+            runtime.set_connection_admission(Arc::clone(&admission));
+        }
+        for entry in &mut self.socks {
+            entry
+                .runtime
+                .set_connection_admission(Arc::clone(&admission));
+        }
+    }
+
     pub fn set_listener_event_sender(&mut self, sender: crate::ListenerRuntimeEventSender) {
         if let Some(runtime) = self.listeners.as_mut() {
             runtime.set_event_sender(sender.clone());
@@ -446,7 +459,7 @@ impl IngressPlatformRuntime {
                             Arc::clone(&factories.route),
                             config
                                 .data_dir
-                                .join(format!("{}-routing.json", listener.id.as_str())),
+                                .join(format!("{}-routing.json", listener.id.storage_component())),
                         ));
                         if let Err(error) = manager.apply(route_config) {
                             if let Some(rollback) = restore_routes(&routes) {
@@ -627,7 +640,7 @@ impl IngressPlatformRuntime {
                 "no runnable listeners are configured".to_owned(),
             ));
         }
-        Ok(Self {
+        let mut runtime = Self {
             config,
             inventory,
             event_sender: None,
@@ -642,7 +655,11 @@ impl IngressPlatformRuntime {
             routes,
             #[cfg(target_os = "linux")]
             ebpf,
-        })
+        };
+        runtime.set_connection_admission(Arc::new(Semaphore::new(
+            crate::control::MAX_CONNECTION_OBSERVATIONS,
+        )));
+        Ok(runtime)
     }
 
     pub async fn run_until_shutdown<F>(
@@ -1327,6 +1344,144 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn http_socks_and_mixed_share_live_connection_admission() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        async fn tunnel(address: SocketAddr) -> TcpStream {
+            let mut client = TcpStream::connect(address).await.unwrap();
+            client
+                .write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n")
+                .await
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(client.read_u8().await.unwrap());
+                assert!(header.len() < 4096);
+            }
+            assert!(header.starts_with(b"HTTP/1.1 200"));
+            client
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let peers = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let target_peers = Arc::clone(&peers);
+            let opener = crate::FixedTargetDialer::new(move |_| {
+                let (flow, peer) = tokio::io::duplex(64);
+                target_peers.lock().unwrap().push(peer);
+                Ok(flow)
+            });
+            let policy = PolicyConfig {
+                listeners: vec![
+                    listener("shared-http", PolicyListenerKind::Http),
+                    listener("shared-socks", PolicyListenerKind::Socks5),
+                    listener("shared-mixed", PolicyListenerKind::Mixed),
+                ],
+                ..Default::default()
+            };
+            let root = data_dir();
+            let mut config = IngressPlatformConfig::new(&root);
+            config.listener_runtime.max_connections = 3;
+            let mut runtime = IngressPlatformRuntime::bind(
+                config,
+                &policy,
+                Arc::new(opener),
+                Arc::new(RejectUdpOpener),
+                ProtectedEndpointSet::default(),
+            )
+            .await
+            .unwrap();
+            let admission = Arc::new(Semaphore::new(2));
+            runtime.set_connection_admission(Arc::clone(&admission));
+            let addresses = runtime.listener_addresses().unwrap();
+            let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            runtime.set_listener_event_sender(events);
+            let (shutdown, signal) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(runtime.run_until_shutdown(async move {
+                let _ = signal.await;
+            }));
+
+            let http = tunnel(addresses[&pathchord_policy::ListenerId::new("shared-http")]).await;
+            let mixed = tunnel(addresses[&pathchord_policy::ListenerId::new("shared-mixed")]).await;
+            assert_eq!(admission.available_permits(), 0);
+            let mut socks =
+                TcpStream::connect(addresses[&pathchord_policy::ListenerId::new("shared-socks")])
+                    .await
+                    .unwrap();
+            socks.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0; 2];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), socks.read_exact(&mut method))
+                    .await
+                    .is_err()
+            );
+
+            drop(http);
+            drop(peers.lock().unwrap().remove(0));
+            socks.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [5, 0]);
+            socks
+                .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0, 9])
+                .await
+                .unwrap();
+            let mut reply = [0; 10];
+            socks.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+
+            let observations = crate::IngressControlService::new();
+            let handle = observations.observation_handle();
+            let mut observed_socks = false;
+            while !observed_socks {
+                let event = receiver.recv().await.unwrap();
+                if let crate::ListenerRuntimeEvent::ConnectionAccepted { listener_id, .. } = &event
+                {
+                    observed_socks = listener_id.as_str() == "shared-socks";
+                }
+                handle.apply_listener_event(event).unwrap();
+                assert!(
+                    observations
+                        .observation_snapshot()
+                        .runtime
+                        .target_connections
+                        <= 2
+                );
+            }
+            assert_eq!(
+                observations
+                    .observation_snapshot()
+                    .runtime
+                    .target_connections,
+                2
+            );
+            // Shutdown must also cancel a client waiting for shared admission.
+            let mut waiting =
+                TcpStream::connect(addresses[&pathchord_policy::ListenerId::new("shared-mixed")])
+                    .await
+                    .unwrap();
+            waiting
+                .write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n")
+                .await
+                .unwrap();
+            shutdown.send(()).unwrap();
+            task.await.unwrap().unwrap();
+            assert_eq!(admission.available_permits(), 2);
+            drop((mixed, socks, waiting));
+            if root.exists() {
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn platform_rejects_live_limits_above_observation_capacity() {
+        let mut config = IngressPlatformConfig::new(data_dir());
+        config.listener_runtime.max_connections = crate::control::MAX_CONNECTION_OBSERVATIONS + 1;
+        assert!(config.validate().is_err());
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn mixed_platform_config_starts_stops_and_restores_routes() {
@@ -1469,6 +1624,34 @@ mod tests {
         .await;
         assert!(matches!(result, Err(IngressPlatformError::Adapter { .. })));
         assert_eq!(routes.count(), 0);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn namespaced_listener_journals_remain_owned_safe_paths_and_restore() {
+        let routes = Arc::new(FakeRouteAdapter::default());
+        let mut tproxy = listener("shared", PolicyListenerKind::Tproxy);
+        tproxy.id = pathchord_policy::ListenerId::in_namespace(&"n".repeat(127), "s".repeat(63));
+        tproxy.protocols = BTreeSet::from([FlowProtocol::Udp]);
+        let root = data_dir();
+        let journal = root.join(format!("{}-routing.json", tproxy.id.storage_component()));
+        let runtime = IngressPlatformRuntime::bind_with_factories(
+            IngressPlatformConfig::new(&root),
+            &[tproxy],
+            tcp_opener(),
+            Arc::new(RejectUdpOpener),
+            ProtectedEndpointSet::default(),
+            factories(routes.clone(), false),
+        )
+        .await
+        .unwrap();
+        assert!(journal.is_file());
+        assert_eq!(journal.parent(), Some(root.as_path()));
+        assert_eq!(routes.count(), 4);
+        runtime.run_until_shutdown(async {}).await.unwrap();
+        assert_eq!(routes.count(), 0);
+        assert!(!journal.exists());
         let _ = std::fs::remove_dir(root);
     }
 

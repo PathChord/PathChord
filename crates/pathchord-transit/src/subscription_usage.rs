@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionUsage {
-    pub upload_bytes: u64,
-    pub download_bytes: u64,
+    pub upload_bytes: Option<u64>,
+    pub download_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
     pub expires_at: Option<u64>,
     pub traffic_multiplier_basis_points: Option<u32>,
@@ -15,9 +15,8 @@ pub struct SubscriptionUsage {
 impl SubscriptionUsage {
     #[must_use]
     pub fn remaining_bytes(&self) -> Option<u64> {
-        self.total_bytes.map(|total| {
-            total.saturating_sub(self.upload_bytes.saturating_add(self.download_bytes))
-        })
+        let used = self.upload_bytes?.checked_add(self.download_bytes?)?;
+        self.total_bytes.map(|total| total.saturating_sub(used))
     }
 
     #[must_use]
@@ -47,45 +46,6 @@ impl std::fmt::Debug for SubscriptionDocument {
 /// positive decimal multiplier with at most four fractional digits. No
 /// multiplier is guessed from names, URLs, traffic counts, or quota.
 pub(super) fn parse_usage(headers: &HeaderMap) -> Option<SubscriptionUsage> {
-    let mut values = headers.get_all("subscription-userinfo").iter();
-    let value = values.next()?.to_str().ok()?;
-    if values.next().is_some() || value.len() > 1024 {
-        return None;
-    }
-    let mut upload = None;
-    let mut download = None;
-    let mut total = None;
-    let mut expire = None;
-    let mut used = std::collections::BTreeSet::new();
-    for field in value
-        .split(';')
-        .map(str::trim)
-        .filter(|field| !field.is_empty())
-    {
-        let (key, value) = field.split_once('=')?;
-        let key = key.trim().to_ascii_lowercase();
-        if !used.insert(key.clone()) {
-            return None;
-        }
-        if !matches!(key.as_str(), "upload" | "download" | "total" | "expire") {
-            continue;
-        }
-        let value = value.trim();
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        let value = value.parse::<u64>().ok()?;
-        match key.as_str() {
-            "upload" => upload = Some(value),
-            "download" => download = Some(value),
-            "total" => total = Some(value),
-            "expire" => expire = Some(value),
-            _ => unreachable!(),
-        }
-    }
-    let upload = upload?;
-    let download = download?;
-    upload.checked_add(download)?;
     let mut multiplier_headers = headers.get_all("pathchord-traffic-multiplier").iter();
     let multiplier = multiplier_headers
         .next()
@@ -96,13 +56,58 @@ pub(super) fn parse_usage(headers: &HeaderMap) -> Option<SubscriptionUsage> {
     } else {
         multiplier
     };
+    let statistics = parse_statistics(headers);
+    if statistics.is_none() && multiplier.is_none() {
+        return None;
+    }
+    let (upload_bytes, download_bytes, total_bytes, expires_at) = statistics
+        .map(|(upload, download, total, expire)| (Some(upload), Some(download), total, expire))
+        .unwrap_or_default();
     Some(SubscriptionUsage {
-        upload_bytes: upload,
-        download_bytes: download,
-        total_bytes: total,
-        expires_at: expire,
+        upload_bytes,
+        download_bytes,
+        total_bytes,
+        expires_at,
         traffic_multiplier_basis_points: multiplier,
     })
+}
+
+fn parse_statistics(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>, Option<u64>)> {
+    let mut values = headers.get_all("subscription-userinfo").iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() || value.len() > 1024 {
+        return None;
+    }
+    let mut facts = std::collections::BTreeMap::new();
+    for field in value
+        .split(';')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+    {
+        let (key, value) = field.split_once('=').unwrap_or((field, ""));
+        let key = key.trim().to_ascii_lowercase();
+        if !matches!(key.as_str(), "upload" | "download" | "total" | "expire") {
+            continue;
+        }
+        let value = value.trim();
+        let parsed = (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| value.parse::<u64>().ok())
+            .flatten();
+        // Duplicate or malformed optional facts invalidate only that fact.
+        facts
+            .entry(key)
+            .and_modify(|value| *value = None)
+            .or_insert(parsed);
+    }
+    let upload = facts.get("upload").copied().flatten()?;
+    let download = facts.get("download").copied().flatten()?;
+    upload.checked_add(download)?;
+    Some((
+        upload,
+        download,
+        facts.get("total").copied().flatten(),
+        facts.get("expire").copied().flatten(),
+    ))
 }
 
 fn parse_multiplier(value: &str) -> Option<u32> {
@@ -182,7 +187,6 @@ mod tests {
             "upload=1; upload=2; download=1",
             "upload=-1; download=0",
             "upload=18446744073709551615; download=1",
-            "upload=1; download=2; total=NaN",
         ] {
             assert!(usage(text, None).is_none());
         }
@@ -208,76 +212,169 @@ mod tests {
         );
     }
 
+    #[test]
+    fn malformed_optional_usage_facts_preserve_required_counts_and_independent_multiplier() {
+        for (header, total, expire) in [
+            (
+                "upload=1; download=2; total=NaN; expire=1900000000",
+                None,
+                Some(1_900_000_000),
+            ),
+            (
+                "upload=1; download=2; total=100; expire=invalid",
+                Some(100),
+                None,
+            ),
+            (
+                "upload=1; download=2; total=100; total=101; expire=1900000000",
+                None,
+                Some(1_900_000_000),
+            ),
+            (
+                "upload=1; download=2; total; expire=18446744073709551616",
+                None,
+                None,
+            ),
+        ] {
+            let parsed = usage(header, Some("2.5")).unwrap();
+            assert_eq!(parsed.upload_bytes, Some(1));
+            assert_eq!(parsed.download_bytes, Some(2));
+            assert_eq!(parsed.total_bytes, total);
+            assert_eq!(parsed.expires_at, expire);
+            assert_eq!(parsed.traffic_multiplier_basis_points, Some(25_000));
+        }
+        for header in [
+            "upload=invalid; download=2",
+            "upload=1",
+            "upload=1; upload=2; download=1",
+        ] {
+            let parsed = usage(header, Some("2.5")).unwrap();
+            assert_eq!((parsed.upload_bytes, parsed.download_bytes), (None, None));
+            assert_eq!(parsed.remaining_bytes(), None);
+            assert_eq!(parsed.traffic_multiplier_basis_points, Some(25_000));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("pathchord-traffic-multiplier", "2.5".parse().unwrap());
+        let parsed = parse_usage(&headers).unwrap();
+        assert_eq!((parsed.upload_bytes, parsed.download_bytes), (None, None));
+        assert_eq!(parsed.remaining_ratio(), None);
+        assert_eq!(parsed.traffic_multiplier_basis_points, Some(25_000));
+    }
+
     #[tokio::test]
     async fn http_fetch_extracts_usage_and_private_cache_restores_it() {
-        let body = "proxies: [{name: node, type: socks5, server: proxy.test, port: 1080}]";
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                request.push(stream.read_u8().await.unwrap());
-                assert!(request.len() < 8192);
-            }
-            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nSubscription-Userinfo: upload=100; download=250; total=1000; expire=1900000000\r\nPathChord-Traffic-Multiplier: 2.5\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-        });
-        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let directory = std::env::temp_dir().join(format!(
-            "pathchord-usage-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let config = SubscriptionConfig {
-            id: SubscriptionId::new("usage-fixture"),
-            enabled: true,
-            source: SubscriptionSource {
-                source_type: SubscriptionSourceType::Auto,
-                url: format!("http://{endpoint}/subscription"),
-                credentials_ref: None,
-            },
-            refresh: SubscriptionRefresh {
-                max_attempts: 1,
-                ..SubscriptionRefresh::default()
-            },
-            cache: Some(SubscriptionCache {
-                path: "usage.snapshot".to_owned(),
-                max_age_seconds: 3600,
-            }),
-        };
-        let mut manager = SubscriptionManager::new(
-            Arc::new(HttpSubscriptionFetcher::new().unwrap()),
-            &directory,
-            BTreeSet::from(["socks5".to_owned()]),
+        for (userinfo, expected_usage) in [
+            (
+                Some("upload=100; download=250; total=1000; expire=1900000000"),
+                SubscriptionUsage {
+                    upload_bytes: Some(100),
+                    download_bytes: Some(250),
+                    total_bytes: Some(1000),
+                    expires_at: Some(1_900_000_000),
+                    traffic_multiplier_basis_points: Some(25_000),
+                },
+            ),
+            (
+                Some("upload=100; download=250; total=NaN; expire=invalid"),
+                SubscriptionUsage {
+                    upload_bytes: Some(100),
+                    download_bytes: Some(250),
+                    total_bytes: None,
+                    expires_at: None,
+                    traffic_multiplier_basis_points: Some(25_000),
+                },
+            ),
+            (
+                None,
+                SubscriptionUsage {
+                    upload_bytes: None,
+                    download_bytes: None,
+                    total_bytes: None,
+                    expires_at: None,
+                    traffic_multiplier_basis_points: Some(25_000),
+                },
+            ),
+        ] {
+            let body = "proxies: [{name: node, type: socks5, server: proxy.test, port: 1080}]";
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                    assert!(request.len() < 8192);
+                }
+                let userinfo = userinfo
+                    .map(|value| format!("Subscription-Userinfo: {value}\r\n"))
+                    .unwrap_or_default();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{userinfo}PathChord-Traffic-Multiplier: 2.5\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "pathchord-usage-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let config = SubscriptionConfig {
+                id: SubscriptionId::new("usage-fixture"),
+                enabled: true,
+                source: SubscriptionSource {
+                    source_type: SubscriptionSourceType::Auto,
+                    url: format!("http://{endpoint}/subscription"),
+                    credentials_ref: None,
+                },
+                refresh: SubscriptionRefresh {
+                    max_attempts: 1,
+                    ..SubscriptionRefresh::default()
+                },
+                cache: Some(SubscriptionCache {
+                    path: "usage.snapshot".to_owned(),
+                    max_age_seconds: 3600,
+                }),
+            };
+            let mut manager = SubscriptionManager::new(
+                Arc::new(HttpSubscriptionFetcher::new().unwrap()),
+                &directory,
+                BTreeSet::from(["socks5".to_owned()]),
+            );
+            assert!(matches!(
+                manager.refresh(&config).await,
+                RefreshOutcome::Published { .. }
+            ));
+            let expected = manager.snapshot().clone();
+            let usage = expected
+                .nodes
+                .values()
+                .next()
+                .unwrap()
+                .usage
+                .as_ref()
+                .unwrap();
+            assert_eq!(usage, &expected_usage);
+            server.await.unwrap();
+            let mut restored = SubscriptionManager::new(
+                Arc::new(HttpSubscriptionFetcher::new().unwrap()),
+                &directory,
+                BTreeSet::from(["socks5".to_owned()]),
+            );
+            assert!(matches!(
+                restored.load_cache(&config).await.unwrap(),
+                CacheLoadOutcome::Loaded { .. }
+            ));
+            assert_eq!(restored.snapshot(), &expected);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn previous_cache_numeric_usage_fields_remain_readable() {
+        let parsed: SubscriptionUsage = serde_json::from_str(r#"{"upload_bytes":100,"download_bytes":250,"total_bytes":1000,"expires_at":null,"traffic_multiplier_basis_points":25000}"#).unwrap();
+        assert_eq!(
+            (parsed.upload_bytes, parsed.download_bytes),
+            (Some(100), Some(250))
         );
-        assert!(matches!(
-            manager.refresh(&config).await,
-            RefreshOutcome::Published { .. }
-        ));
-        let expected = manager.snapshot().clone();
-        let usage = expected
-            .nodes
-            .values()
-            .next()
-            .unwrap()
-            .usage
-            .as_ref()
-            .unwrap();
-        assert_eq!(usage.remaining_bytes(), Some(650));
-        assert_eq!(usage.remaining_ratio(), Some(0.65));
-        assert_eq!(usage.traffic_multiplier_basis_points, Some(25_000));
-        server.await.unwrap();
-        let mut restored = SubscriptionManager::new(
-            Arc::new(HttpSubscriptionFetcher::new().unwrap()),
-            &directory,
-            BTreeSet::from(["socks5".to_owned()]),
-        );
-        assert!(matches!(
-            restored.load_cache(&config).await.unwrap(),
-            CacheLoadOutcome::Loaded { .. }
-        ));
-        assert_eq!(restored.snapshot(), &expected);
-        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(parsed.remaining_bytes(), Some(650));
     }
 
     #[tokio::test]
@@ -331,8 +428,8 @@ mod tests {
             Ok(SubscriptionDocument {
                 body: body.as_bytes().to_vec(),
                 usage: Some(SubscriptionUsage {
-                    upload_bytes: 100,
-                    download_bytes: 200,
+                    upload_bytes: Some(100),
+                    download_bytes: Some(200),
                     total_bytes: Some(total),
                     expires_at: None,
                     traffic_multiplier_basis_points: None,

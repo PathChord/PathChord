@@ -28,6 +28,7 @@ pub(super) async fn normalize_fetched(
     manager: &SubscriptionManager,
     config: &SubscriptionConfig,
     document: SubscriptionDocument,
+    budget: &SubscriptionDownloadBudget,
 ) -> Result<Vec<NormalizedNode>, SubscriptionError> {
     let body = &document.body;
     let mut root = normalize(config, body, &manager.available_adapters)?;
@@ -46,7 +47,6 @@ pub(super) async fn normalize_fetched(
         url.set_fragment(None);
         url.to_string()
     });
-    let mut total = body.len();
     let mut references = 0;
     for reference in references_in(body) {
         let key = provider_segment(&reference.name);
@@ -68,7 +68,7 @@ pub(super) async fn normalize_fetched(
                 .url
                 .as_ref()
                 .is_some_and(|url| !pending.ancestors.contains(url))
-            && total < MAX_SUBSCRIPTION_BYTES;
+            && budget.remaining() > 0;
         let request = permitted.then(|| SubscriptionFetchRequest {
             url: pending
                 .reference
@@ -83,19 +83,17 @@ pub(super) async fn normalize_fetched(
                     .flatten()
             }),
             timeout: Duration::from_secs(config.refresh.timeout_seconds.clamp(1, 300)),
-            max_bytes: MAX_SUBSCRIPTION_BYTES - total,
+            max_bytes: budget.remaining(),
         });
         let fetched = match request {
             Some(request) => {
-                match tokio::time::timeout(request.timeout, manager.fetcher.fetch_document(request))
-                    .await
+                match tokio::time::timeout(
+                    request.timeout,
+                    manager.fetcher.fetch_document_with_budget(request, budget),
+                )
+                .await
                 {
-                    Ok(Ok(document))
-                        if total.saturating_add(document.body.len()) <= MAX_SUBSCRIPTION_BYTES =>
-                    {
-                        total += document.body.len();
-                        Some(document)
-                    }
+                    Ok(Ok(document)) => Some(document),
                     _ => None,
                 }
             }
@@ -171,8 +169,10 @@ pub(super) async fn normalize_fetched(
             ),
             None => name,
         };
-        node.config.id =
-            TransitProxyId::new(unique_node_id(config.id.as_str(), &name, index, &mut used));
+        node.config.id = TransitProxyId::in_namespace(
+            config.id.namespace(),
+            unique_node_id(&config.id, &name, index, &mut used),
+        );
     }
     Ok(nodes)
 }

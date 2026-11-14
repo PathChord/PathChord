@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -34,6 +35,53 @@ pub struct SubscriptionFetchRequest {
     pub credentials_ref: Option<String>,
     pub timeout: Duration,
     pub max_bytes: usize,
+}
+
+/// One body-byte allowance shared by root fetches, providers, and retries.
+/// Charges survive cancellation and failed or malformed HTTP responses.
+#[derive(Debug)]
+pub struct SubscriptionDownloadBudget {
+    maximum: usize,
+    remaining: AtomicUsize,
+}
+
+impl SubscriptionDownloadBudget {
+    #[must_use]
+    pub fn new(maximum: usize) -> Self {
+        Self {
+            maximum,
+            remaining: AtomicUsize::new(maximum),
+        }
+    }
+
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.remaining.load(Ordering::Relaxed)
+    }
+
+    /// Charges bytes as they are consumed, exhausting the allowance on overflow.
+    pub fn charge(&self, bytes: usize) -> Result<(), SubscriptionError> {
+        let previous = self
+            .remaining
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(bytes))
+            })
+            .unwrap_or_default();
+        if bytes > previous {
+            return Err(self.exhausted());
+        }
+        Ok(())
+    }
+
+    fn exhausted(&self) -> SubscriptionError {
+        SubscriptionError::ResponseTooLarge {
+            maximum: self.maximum,
+        }
+    }
+
+    fn refund(&self, bytes: usize) {
+        self.remaining.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -88,6 +136,28 @@ pub trait SubscriptionFetcher: Send + Sync {
             .await
             .map(|body| SubscriptionDocument { body, usage: None })
     }
+
+    /// Streaming fetchers override this method and charge each consumed chunk.
+    /// Legacy implementations reserve their whole request allowance before I/O;
+    /// an unknown partial failure or cancellation cannot release that allowance.
+    async fn fetch_document_with_budget(
+        &self,
+        mut request: SubscriptionFetchRequest,
+        budget: &SubscriptionDownloadBudget,
+    ) -> Result<SubscriptionDocument, SubscriptionError> {
+        let reserved = request.max_bytes.min(budget.remaining());
+        if reserved == 0 {
+            return Err(budget.exhausted());
+        }
+        budget.charge(reserved)?;
+        request.max_bytes = reserved;
+        let document = self.fetch_document(request).await?;
+        if document.body.len() > reserved {
+            return Err(budget.exhausted());
+        }
+        budget.refund(reserved - document.body.len());
+        Ok(document)
+    }
 }
 
 pub trait SubscriptionCredentialProvider: Send + Sync {
@@ -139,6 +209,7 @@ impl HttpSubscriptionFetcher {
     async fn request_document(
         &self,
         request: SubscriptionFetchRequest,
+        budget: Option<&SubscriptionDownloadBudget>,
     ) -> Result<SubscriptionDocument, SubscriptionError> {
         let parsed =
             reqwest::Url::parse(&request.url).map_err(|_| SubscriptionError::InvalidUrl)?;
@@ -184,6 +255,9 @@ impl HttpSubscriptionFetcher {
             .await
             .map_err(|_| SubscriptionError::Fetch)?
         {
+            if let Some(budget) = budget {
+                budget.charge(chunk.len())?;
+            }
             if body.len().saturating_add(chunk.len()) > request.max_bytes {
                 return Err(SubscriptionError::ResponseTooLarge {
                     maximum: request.max_bytes,
@@ -198,7 +272,7 @@ impl HttpSubscriptionFetcher {
 #[async_trait]
 impl SubscriptionFetcher for HttpSubscriptionFetcher {
     async fn fetch(&self, request: SubscriptionFetchRequest) -> Result<Vec<u8>, SubscriptionError> {
-        self.request_document(request)
+        self.request_document(request, None)
             .await
             .map(|document| document.body)
     }
@@ -206,7 +280,18 @@ impl SubscriptionFetcher for HttpSubscriptionFetcher {
         &self,
         request: SubscriptionFetchRequest,
     ) -> Result<SubscriptionDocument, SubscriptionError> {
-        self.request_document(request).await
+        self.request_document(request, None).await
+    }
+
+    async fn fetch_document_with_budget(
+        &self,
+        request: SubscriptionFetchRequest,
+        budget: &SubscriptionDownloadBudget,
+    ) -> Result<SubscriptionDocument, SubscriptionError> {
+        if budget.remaining() == 0 {
+            return Err(budget.exhausted());
+        }
+        self.request_document(request, Some(budget)).await
     }
 }
 
@@ -527,17 +612,28 @@ impl SubscriptionManager {
         let source_fingerprint = subscription_source_fingerprint(config);
         let attempts = config.refresh.max_attempts.clamp(1, 10);
         let mut last_error = SubscriptionError::Fetch;
+        let budget = SubscriptionDownloadBudget::new(MAX_SUBSCRIPTION_BYTES);
+        let mut attempted = 0;
         for attempt in 1..=attempts {
+            if budget.remaining() == 0 {
+                break;
+            }
+            attempted = attempt;
             let request = SubscriptionFetchRequest {
                 url: config.source.url.clone(),
                 credentials_ref: config.source.credentials_ref.clone(),
                 timeout: Duration::from_secs(config.refresh.timeout_seconds.clamp(1, 300)),
-                max_bytes: MAX_SUBSCRIPTION_BYTES,
+                max_bytes: budget.remaining(),
             };
-            let fetched =
-                tokio::time::timeout(request.timeout, self.fetcher.fetch_document(request)).await;
+            let fetched = tokio::time::timeout(
+                request.timeout,
+                self.fetcher.fetch_document_with_budget(request, &budget),
+            )
+            .await;
             let candidate = match fetched {
-                Ok(Ok(document)) => providers::normalize_fetched(self, config, document).await,
+                Ok(Ok(document)) => {
+                    providers::normalize_fetched(self, config, document, &budget).await
+                }
                 Ok(Err(error)) => Err(error),
                 Err(_) => Err(SubscriptionError::Timeout),
             };
@@ -571,7 +667,7 @@ impl SubscriptionManager {
                 }
                 Err(error) => last_error = error,
             }
-            if attempt < attempts {
+            if attempt < attempts && budget.remaining() > 0 {
                 self.sleeper
                     .sleep(backoff_delay(config.refresh.backoff_seconds, attempt))
                     .await;
@@ -579,7 +675,7 @@ impl SubscriptionManager {
         }
         Err(RefreshOutcome::Retained {
             generation: self.snapshot.generation,
-            attempts,
+            attempts: attempted,
             error: last_error,
         })
     }
@@ -706,7 +802,15 @@ impl SubscriptionManager {
             return Err(SubscriptionError::InvalidCache);
         }
         for node in &cached.nodes {
-            if node.source_subscription != config.id {
+            if node.source_subscription != config.id
+                || node.config.id.namespace() != config.id.namespace()
+                || node
+                    .config
+                    .source
+                    .as_ref()
+                    .is_none_or(|source| source.subscription != config.id.as_str())
+                || node.protocol != node.config.protocol
+            {
                 return Err(SubscriptionError::InvalidCache);
             }
         }
@@ -868,7 +972,14 @@ impl SubscriptionManager {
     ) -> Result<(), SubscriptionError> {
         let mut candidate_ids = BTreeSet::new();
         for node in nodes {
-            if !candidate_ids.insert(node.config.id.clone()) {
+            if node.config.id.namespace() != subscription_id.namespace()
+                || node
+                    .config
+                    .source
+                    .as_ref()
+                    .is_none_or(|source| source.subscription != subscription_id.as_str())
+                || !candidate_ids.insert(node.config.id.clone())
+            {
                 return Err(SubscriptionError::NodeIdentityConflict);
             }
             if self
@@ -1122,20 +1233,49 @@ fn validate_tags(index: usize, tags: &BTreeSet<String>) -> Result<(), Subscripti
 }
 
 fn unique_node_id(
-    subscription: &str,
+    subscription: &SubscriptionId,
     display_name: &str,
     index: usize,
     used: &mut BTreeSet<String>,
 ) -> String {
-    let prefix = canonical_segment(subscription, 24);
-    let name = canonical_segment(display_name, 28);
+    use base64::Engine as _;
+    let source_name = subscription.resource_name();
+    let canonical_source = canonical_segment(source_name, 24);
+    let needs_owner_digest = canonical_source != source_name;
+    let (prefix, maximum_name) = if !needs_owner_digest {
+        // Preserve published/cache identities for ordinary short resource names.
+        (canonical_source, 28)
+    } else {
+        // Canonicalization/truncation must not collapse distinct source owners.
+        // The complete 256-bit digest fits a bounded node ID; `s_` cannot be
+        // produced by the legacy lowercase/hyphen canonicalization.
+        let mut digest = Sha256::new();
+        digest.update(b"PathChord/subscription-node-owner/v1\0");
+        digest.update(subscription.as_str().as_bytes());
+        (
+            format!(
+                "s_{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize())
+            ),
+            17,
+        )
+    };
+    let mut name = canonical_segment(display_name, maximum_name);
+    if needs_owner_digest {
+        // A pending separator in legacy canonicalization can add one byte.
+        // Bound the new representation without changing existing short IDs.
+        name.truncate(maximum_name);
+    }
     let base = format!("{prefix}-{name}");
     let mut candidate = base.clone();
     let mut suffix = index + 1;
     while !used.insert(candidate.clone()) {
-        candidate = format!("{base}-{suffix}");
-        candidate.truncate(63);
-        candidate = candidate.trim_end_matches('-').to_owned();
+        let ending = format!("-{suffix}");
+        let maximum_base = 63 - ending.len();
+        candidate = format!(
+            "{}{ending}",
+            base[..base.len().min(maximum_base)].trim_end_matches('-')
+        );
         suffix += 1;
     }
     candidate
@@ -1287,6 +1427,17 @@ mod tests {
                 .expect("fetch queue")
                 .pop_front()
                 .expect("scripted fetch result")
+        }
+
+        async fn fetch_document_with_budget(
+            &self,
+            request: SubscriptionFetchRequest,
+            budget: &SubscriptionDownloadBudget,
+        ) -> Result<SubscriptionDocument, SubscriptionError> {
+            // Scripted failures perform no I/O and consume no response bytes.
+            let document = self.fetch_document(request).await?;
+            budget.charge(document.body.len())?;
+            Ok(document)
         }
     }
 
@@ -1784,5 +1935,90 @@ proxies:
             Err(SubscriptionError::ResponseTooLarge { maximum: 16 })
         );
         server.await.unwrap();
+    }
+
+    struct LegacyUnknownFailure;
+
+    #[async_trait]
+    impl SubscriptionFetcher for LegacyUnknownFailure {
+        async fn fetch(&self, _: SubscriptionFetchRequest) -> Result<Vec<u8>, SubscriptionError> {
+            Err(SubscriptionError::Fetch)
+        }
+    }
+
+    struct LegacyPendingFetcher;
+
+    #[async_trait]
+    impl SubscriptionFetcher for LegacyPendingFetcher {
+        async fn fetch(&self, _: SubscriptionFetchRequest) -> Result<Vec<u8>, SubscriptionError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_fetcher_unknown_failures_and_cancellation_cannot_release_reserved_bytes() {
+        let request = SubscriptionFetchRequest {
+            url: "https://provider.invalid/sub".into(),
+            credentials_ref: None,
+            timeout: Duration::from_secs(1),
+            max_bytes: 1024,
+        };
+        let budget = SubscriptionDownloadBudget::new(2048);
+        assert_eq!(
+            LegacyUnknownFailure
+                .fetch_document_with_budget(request.clone(), &budget)
+                .await,
+            Err(SubscriptionError::Fetch)
+        );
+        assert_eq!(budget.remaining(), 1024);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                LegacyPendingFetcher.fetch_document_with_budget(request, &budget)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_root_retries_share_the_refresh_body_budget() {
+        struct MalformedFetcher {
+            requests: Mutex<Vec<usize>>,
+        }
+        #[async_trait]
+        impl SubscriptionFetcher for MalformedFetcher {
+            async fn fetch(
+                &self,
+                request: SubscriptionFetchRequest,
+            ) -> Result<Vec<u8>, SubscriptionError> {
+                self.requests.lock().unwrap().push(request.max_bytes);
+                Ok(vec![b'x'; MAX_SUBSCRIPTION_BYTES / 2 + 1])
+            }
+        }
+        let fetcher = Arc::new(MalformedFetcher {
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut manager = SubscriptionManager::with_sleeper(
+            fetcher.clone(),
+            Arc::new(RecordingSleeper::default()),
+            std::env::temp_dir(),
+            BTreeSet::new(),
+        );
+        assert!(matches!(
+            manager
+                .refresh(&config(SubscriptionSourceType::Clash, None))
+                .await,
+            RefreshOutcome::Retained {
+                attempts: 2,
+                error: SubscriptionError::ResponseTooLarge { .. },
+                ..
+            }
+        ));
+        assert_eq!(
+            *fetcher.requests.lock().unwrap(),
+            [MAX_SUBSCRIPTION_BYTES, MAX_SUBSCRIPTION_BYTES / 2 - 1]
+        );
     }
 }

@@ -1277,12 +1277,35 @@ where
         },
         None => None,
     };
+    // Authorize through the canonical dispatcher before committing an SSE
+    // response. Errors can still use their ordinary HTTP status here.
+    let initial_events =
+        dispatch_for_sse(&state, "events.subscribe", json!({"last_event_id": cursor})).await;
+    if !initial_events.ok {
+        let status = initial_events
+            .error
+            .as_ref()
+            .map_or(StatusCode::INTERNAL_SERVER_ERROR, |error| {
+                error_status(error.code)
+            });
+        return (status, Json(initial_events)).into_response();
+    }
+    let snapshot = dispatch_for_sse(&state, "metrics.snapshot", json!({})).await;
+    if !snapshot.ok {
+        let status = snapshot
+            .error
+            .as_ref()
+            .map_or(StatusCode::INTERNAL_SERVER_ERROR, |error| {
+                error_status(error.code)
+            });
+        return (status, Json(snapshot)).into_response();
+    }
     let heartbeat = state.config.heartbeat_interval;
     let stream_state = state.clone();
     let event_stream = stream! {
         let _permit = permit;
         let mut cursor = cursor;
-        let snapshot = dispatch_for_sse(&stream_state, "metrics.snapshot", Value::Object(Map::new())).await;
+        let mut initial_events = Some(initial_events);
         if let Some(result) = snapshot.result {
             let value = json!({
                 "type": "metrics.snapshot",
@@ -1295,15 +1318,25 @@ where
             yield Ok::<Event, Infallible>(Event::default().event("metrics.snapshot").data(value.to_string()));
         }
         loop {
-            let response = dispatch_for_sse(
-                &stream_state,
-                "events.subscribe",
-                json!({"last_event_id": cursor}),
-            ).await;
+            let response = match initial_events.take() {
+                Some(response) => response,
+                None => dispatch_for_sse(
+                    &stream_state,
+                    "events.subscribe",
+                    json!({"last_event_id": cursor}),
+                ).await,
+            };
+            if !response.ok {
+                break;
+            }
             let result = response.result.unwrap_or(Value::Null);
             if result.get("reset_required").and_then(Value::as_bool) == Some(true) {
                 let boundary = result.get("latest_event_id").and_then(Value::as_u64).unwrap_or(0);
-                let snapshot = complete_snapshot_for_sse(&stream_state).await;
+                let Ok(snapshot) = complete_snapshot_for_sse(&stream_state).await else {
+                    // A failed recovery must not acknowledge a cursor whose
+                    // required state the client has never received.
+                    break;
+                };
                 let value = json!({
                     "id": boundary,
                     "type": "metrics.snapshot",
@@ -1357,11 +1390,19 @@ where
         .into_response()
 }
 
-async fn complete_snapshot_for_sse<D>(state: &WebState<D>) -> Value
+async fn complete_snapshot_for_sse<D>(state: &WebState<D>) -> Result<Value, ErrorCode>
 where
     D: ManagementDispatcher,
 {
     let metrics = dispatch_for_sse(state, "metrics.snapshot", json!({})).await;
+    if !metrics.ok {
+        return Err(metrics
+            .error
+            .map_or(ErrorCode::PersistenceUnavailable, |error| error.code));
+    }
+    let Some(metrics_result) = metrics.result.filter(Value::is_object) else {
+        return Err(ErrorCode::PersistenceUnavailable);
+    };
     let mut resources = Map::new();
     let mut operations = vec![
         ("nodes", "nodes.list"),
@@ -1379,6 +1420,8 @@ where
         let mut items = Vec::new();
         let mut token: Option<String> = None;
         let mut complete = false;
+        let mut hidden = false;
+        let mut page_tokens = BTreeSet::new();
         for _ in 0..64 {
             let response = dispatch_for_sse(
                 state,
@@ -1387,23 +1430,39 @@ where
             )
             .await;
             if !response.ok {
-                break;
+                let code = response
+                    .error
+                    .map_or(ErrorCode::PersistenceUnavailable, |error| error.code);
+                if code == ErrorCode::CapabilityDenied {
+                    hidden = true;
+                    break;
+                }
+                return Err(code);
             }
             let Some(result) = response.result else {
-                break;
+                return Err(ErrorCode::PersistenceUnavailable);
             };
             let Some(page) = result.get("items").and_then(Value::as_array) else {
-                break;
+                return Err(ErrorCode::PersistenceUnavailable);
             };
             items.extend(page.iter().cloned());
-            token = result
-                .get("next_page_token")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            token = match result.get("next_page_token") {
+                Some(Value::Null) => None,
+                Some(Value::String(next)) if !next.is_empty() => {
+                    if !page_tokens.insert(next.clone()) {
+                        return Err(ErrorCode::ResourceLimit);
+                    }
+                    Some(next.clone())
+                }
+                _ => return Err(ErrorCode::PersistenceUnavailable),
+            };
             if token.is_none() {
                 complete = true;
                 break;
             }
+        }
+        if !complete && !hidden {
+            return Err(ErrorCode::ResourceLimit);
         }
         resources.insert(
             name.to_owned(),
@@ -1414,7 +1473,9 @@ where
             },
         );
     }
-    json!({"generation": metrics.observed_generation, "metrics": metrics.result, "resources": resources})
+    Ok(
+        json!({"generation": metrics.observed_generation, "metrics": metrics_result, "resources": resources}),
+    )
 }
 
 async fn dispatch_for_sse<D>(
@@ -1529,10 +1590,13 @@ mod tests {
         Arc::new(Mutex::new(dispatcher))
     }
 
-    async fn start(
+    async fn start<D>(
         config: WebGatewayConfig,
-        dispatcher: SharedManagementDispatcher<LocalControlDispatcher>,
-    ) -> RunningGateway {
+        dispatcher: SharedManagementDispatcher<D>,
+    ) -> RunningGateway
+    where
+        D: ManagementDispatcher,
+    {
         let gateway = WebGateway::bind(config, dispatcher).await.unwrap();
         let address = gateway.local_addr().unwrap();
         let (shutdown, signal) = oneshot::channel();
@@ -1697,6 +1761,55 @@ mod tests {
         gateway.stop().await;
     }
 
+    #[tokio::test]
+    async fn namespaced_node_ids_round_trip_through_encoded_resource_urls() {
+        let shared = dispatcher();
+        let ids: Vec<_> = ["tenant-a", "tenant-b"]
+            .into_iter()
+            .map(|namespace| pathchord_policy::TransitProxyId::in_namespace(namespace, "shared"))
+            .collect();
+        for id in &ids {
+            shared
+                .lock()
+                .await
+                .service_mut()
+                .add_node(NodeId::new(id.as_str()).unwrap())
+                .unwrap();
+        }
+        let generation = shared.lock().await.service().snapshot().generation;
+        let gateway = start(WebGatewayConfig::default(), shared).await;
+        let client = Client::new();
+        let node_url = |id: &pathchord_policy::TransitProxyId| {
+            let mut url = url::Url::parse(&gateway.url("/api/v1/nodes")).unwrap();
+            url.path_segments_mut().unwrap().push(id.as_str());
+            url
+        };
+        let alpha = json(client.get(node_url(&ids[0])).send().await.unwrap()).await;
+        assert_eq!(alpha["result"]["id"], ids[0].as_str());
+        assert_eq!(alpha["result"]["name"], "shared");
+        assert_eq!(alpha["result"]["namespace"], "tenant-a");
+        let mut labels = node_url(&ids[0]);
+        labels.path_segments_mut().unwrap().push("labels");
+        let response = client
+            .patch(labels)
+            .header("x-request-id", "namespaced-node-patch")
+            .header("x-pathchord-generation", generation.to_string())
+            .json(&json!({"set": {"admin.region": "jp"}, "remove": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let alpha = json(client.get(node_url(&ids[0])).send().await.unwrap()).await;
+        let beta = json(client.get(node_url(&ids[1])).send().await.unwrap()).await;
+        assert_eq!(alpha["result"]["admin"]["labels"]["admin.region"], "jp");
+        assert_eq!(
+            beta["result"]["admin"]["labels"]["admin.region"],
+            Value::Null
+        );
+        assert_eq!(beta["result"]["namespace"], "tenant-b");
+        gateway.stop().await;
+    }
+
     #[test]
     fn non_loopback_requires_strong_authentication_and_origins() {
         let mut config = WebGatewayConfig {
@@ -1785,6 +1898,269 @@ mod tests {
         .await
         .expect("SSE event timeout");
         received
+    }
+
+    #[tokio::test]
+    async fn sse_rejects_missing_metric_capability_before_opening_a_stream() {
+        let gateway = start(
+            WebGatewayConfig {
+                actor_capabilities: BTreeSet::from(["status:read".to_owned()]),
+                max_sse_clients: 1,
+                ..WebGatewayConfig::default()
+            },
+            dispatcher(),
+        )
+        .await;
+        let client = Client::new();
+        // Repeated denied subscriptions must release their client permit.
+        for _ in 0..2 {
+            let response = client
+                .get(gateway.url("/api/v1/events"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(json(response).await["error"]["code"], "CAPABILITY_DENIED");
+        }
+        gateway.stop().await;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RecoveryFault {
+        None,
+        Metrics,
+        ResourcePage,
+        MissingItems,
+        MissingToken,
+        InvalidToken,
+        RepeatedToken,
+        PaginationLimit,
+        HiddenAfterPage,
+    }
+
+    #[derive(Default)]
+    struct RecoveryQueries {
+        events: usize,
+        metrics: usize,
+        nodes: usize,
+    }
+
+    fn recovery_dispatcher(
+        fault: RecoveryFault,
+    ) -> (
+        SharedManagementDispatcher<impl ManagementDispatcher>,
+        Arc<StdMutex<RecoveryQueries>>,
+    ) {
+        let mut inner = Arc::try_unwrap(dispatcher())
+            .expect("exclusive dispatcher")
+            .into_inner();
+        let queries = Arc::new(StdMutex::new(RecoveryQueries::default()));
+        let recorded = queries.clone();
+        let controlled = move |request: RequestEnvelope| {
+            // Retain canonical actor checks and redaction while injecting only
+            // the response needed to exercise recovery, including pagination.
+            let mut authorization = request.clone();
+            authorization.body = json!({});
+            let authorized = inner.dispatch(authorization);
+            if !authorized.ok {
+                return authorized;
+            }
+            let success = |value| {
+                ResponseEnvelope::success(
+                    request.request_id.clone(),
+                    authorized.observed_generation.clone(),
+                    value,
+                )
+            };
+            let failure = |code| {
+                ResponseEnvelope::failure(
+                    request.request_id.clone(),
+                    authorized.observed_generation.clone(),
+                    pathchord_core::management::ErrorBody {
+                        code,
+                        message: "injected snapshot query failure".into(),
+                        details: None,
+                    },
+                )
+            };
+            let mut queries = recorded.lock().unwrap();
+            match request.operation.as_str() {
+                "events.subscribe" => {
+                    queries.events += 1;
+                    return match queries.events {
+                        1 => success(
+                            json!({"items": [], "reset_required": true, "latest_event_id": 42}),
+                        ),
+                        2 => success(
+                            json!({"items": [{"id":43, "type":"node.changed", "resource_id":"delta-after-failed-recovery"}], "reset_required":false, "latest_event_id":43}),
+                        ),
+                        _ => failure(ErrorCode::PersistenceUnavailable),
+                    };
+                }
+                "metrics.snapshot" => {
+                    queries.metrics += 1;
+                    if matches!(fault, RecoveryFault::Metrics) && queries.metrics == 2 {
+                        return failure(ErrorCode::PersistenceUnavailable);
+                    }
+                }
+                "nodes.list" => {
+                    queries.nodes += 1;
+                    match fault {
+                        RecoveryFault::ResourcePage | RecoveryFault::HiddenAfterPage => {
+                            return if queries.nodes == 1 {
+                                success(
+                                    json!({"items":[{"id":"must-not-expose-partial-node"}], "next_page_token":"second-page"}),
+                                )
+                            } else {
+                                failure(if matches!(fault, RecoveryFault::HiddenAfterPage) {
+                                    ErrorCode::CapabilityDenied
+                                } else {
+                                    ErrorCode::PersistenceUnavailable
+                                })
+                            };
+                        }
+                        RecoveryFault::MissingItems => return success(json!({})),
+                        RecoveryFault::MissingToken => return success(json!({"items": []})),
+                        RecoveryFault::InvalidToken => {
+                            return success(json!({"items":[], "next_page_token":17}));
+                        }
+                        RecoveryFault::RepeatedToken => {
+                            return success(json!({"items":[], "next_page_token":"repeated-page"}));
+                        }
+                        RecoveryFault::PaginationLimit => {
+                            return success(
+                                json!({"items":[], "next_page_token":format!("page-{}", queries.nodes)}),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            inner.dispatch(request)
+        };
+        (Arc::new(Mutex::new(controlled)), queries)
+    }
+
+    #[tokio::test]
+    async fn sse_gap_query_failures_end_without_acknowledging_recovery_and_release_client_permits()
+    {
+        for fault in [
+            RecoveryFault::Metrics,
+            RecoveryFault::ResourcePage,
+            RecoveryFault::MissingItems,
+            RecoveryFault::MissingToken,
+            RecoveryFault::InvalidToken,
+            RecoveryFault::RepeatedToken,
+            RecoveryFault::PaginationLimit,
+        ] {
+            let (dispatcher, queries) = recovery_dispatcher(fault);
+            let gateway = start(
+                WebGatewayConfig {
+                    max_sse_clients: 1,
+                    event_poll_interval: Duration::from_millis(1),
+                    ..WebGatewayConfig::default()
+                },
+                dispatcher,
+            )
+            .await;
+            let client = Client::new();
+            let response = client
+                .get(gateway.url("/api/v1/events"))
+                .header("last-event-id", "9999")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = tokio::time::timeout(Duration::from_secs(3), response.text())
+                .await
+                .expect("failed recovery must end the stream")
+                .unwrap();
+            assert!(
+                body.contains("event: metrics.snapshot"),
+                "initial authorization succeeds: {fault:?}"
+            );
+            assert!(
+                !body.contains("\"resources\""),
+                "incomplete recovery emitted: {fault:?}"
+            );
+            assert!(
+                !body.contains("id: 42"),
+                "recovery cursor acknowledged: {fault:?}"
+            );
+            assert!(
+                !body.contains("delta-after-failed-recovery"),
+                "delta followed failed recovery: {fault:?}"
+            );
+            assert_eq!(
+                queries.lock().unwrap().events,
+                1,
+                "events polled after failed recovery: {fault:?}"
+            );
+
+            // The failed stream must release the sole permit before a new
+            // subscription starts. The controller closes that second stream.
+            let response = client
+                .get(gateway.url("/api/v1/events"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "client permit leaked: {fault:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(3), response.text())
+                .await
+                .unwrap()
+                .unwrap();
+            gateway.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_gap_snapshots_hide_unauthorized_resources_and_redact_targets() {
+        for (fault, capabilities) in [
+            (
+                RecoveryFault::None,
+                BTreeSet::from(["metrics:read".to_owned()]),
+            ),
+            (
+                RecoveryFault::HiddenAfterPage,
+                WebGatewayConfig::default().actor_capabilities,
+            ),
+        ] {
+            let (dispatcher, _) = recovery_dispatcher(fault);
+            let gateway = start(
+                WebGatewayConfig {
+                    actor_capabilities: capabilities,
+                    event_poll_interval: Duration::from_millis(1),
+                    ..WebGatewayConfig::default()
+                },
+                dispatcher,
+            )
+            .await;
+            let response = Client::new()
+                .get(gateway.url("/api/v1/events"))
+                .header("last-event-id", "9999")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = read_sse_until(response, "\"resources\"").await;
+            let recovery = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|event| event.pointer("/payload/resources").is_some())
+                .unwrap();
+            assert_eq!(recovery["id"], 42);
+            assert!(recovery["payload"]["resources"]["nodes"].is_null());
+            assert!(recovery["payload"]["resources"]["connections"][0]["target"].is_null());
+            assert!(!body.contains("private.example.test"));
+            assert!(!body.contains("must-not-expose-partial-node"));
+            gateway.stop().await;
+        }
     }
 
     #[tokio::test]

@@ -302,4 +302,27 @@ mod tests {
         ));
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn namespaced_service_defaults_to_the_canonical_name_for_enrollment_and_noise() {
+        let root = std::env::temp_dir().join(format!(
+            "pathchord-egress-namespaced-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("edge.yaml"), "apiVersion: pathchord.io/v1\nkind: EgressService\nmetadata: {name: edge, namespace: tenant-a}\nspec: {identity: identity.key}\n").unwrap();
+        let config = resolve_source(
+            args(&[]),
+            ConfigSelection {
+                path: root.clone(),
+                directory: true,
+                explicit: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(config.egress_id, "edge");
+        assert_eq!(config.identity, root.join("identity.key"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

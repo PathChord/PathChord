@@ -33,6 +33,7 @@ pub(crate) struct TuicAdapter {
     tls: Arc<rustls::ClientConfig>,
     server_name: String,
     zero_rtt: bool,
+    udp_enabled: bool,
     heartbeat: Option<Duration>,
     timeout: Duration,
 }
@@ -56,7 +57,7 @@ impl TuicAdapter {
         if config.protocol != "tuic" {
             return Err(unsupported("TUIC adapter requires protocol tuic"));
         }
-        crate::adapter_registry::validate_native_options(config, true, false, false)?;
+        crate::adapter_registry::validate_native_options(config, true, false, true)?;
         let mut allowed = vec![
             "uuid",
             "password",
@@ -144,6 +145,7 @@ impl TuicAdapter {
             tls,
             server_name,
             zero_rtt,
+            udp_enabled: config.options.udp != Some(false),
             heartbeat,
             timeout,
         })
@@ -238,7 +240,7 @@ impl TransitAdapter for TuicAdapter {
         &self.metadata
     }
     fn supports_udp(&self) -> bool {
-        true
+        self.udp_enabled
     }
 
     async fn connect(
@@ -283,6 +285,9 @@ impl TransitAdapter for TuicAdapter {
         &self,
         request: ConnectRequest,
     ) -> Result<BoxedTransitDatagram, TransitError> {
+        if !self.udp_enabled {
+            return Err(unsupported("TUIC UDP is disabled"));
+        }
         crate::validate_destination(&request.destination)?;
         let connection = self.connect_session().await?;
         let mut token = [0_u8; 32];

@@ -350,11 +350,10 @@ pub fn establish_single_path(
     let received_attach = responder_transport.open_frame(&sealed_attach, config.local_limits)?;
     validate_attach(&received_attach, config)?;
 
-    let negotiated_capabilities = config.offered_capabilities & config.supported_capabilities;
-    if config.offered_capabilities & config.required_capabilities != config.required_capabilities
-        || config.supported_capabilities & config.required_capabilities
-            != config.required_capabilities
-    {
+    let negotiated_capabilities = config.offered_capabilities
+        & config.supported_capabilities
+        & crate::admission::REGISTERED_CAPABILITIES;
+    if negotiated_capabilities & config.required_capabilities != config.required_capabilities {
         return reject(
             &mut initiator_transport,
             &mut responder_transport,
@@ -415,7 +414,10 @@ pub fn establish_single_path(
     }
 
     let ready_frame = make_frame(
-        Message::PathReady(config.ready_limits.clone()),
+        Message::PathReadyCapabilities(pathchord_core::PathReadyCapabilities {
+            limits: config.ready_limits.clone(),
+            capabilities: negotiated_capabilities,
+        }),
         config.session_id,
         config.path_id,
         1,
@@ -425,7 +427,9 @@ pub fn establish_single_path(
     let received_ready = initiator_transport.open_frame(&sealed_ready, config.local_limits)?;
     validate_frame_ids(&received_ready, config)?;
     let ready = match decode_message(&received_ready, config.local_limits)? {
-        Message::PathReady(value) => value,
+        Message::PathReadyCapabilities(value) if value.capabilities == negotiated_capabilities => {
+            value.limits
+        }
         _ => {
             return Err(SinglePathError::Message(MessageCodecError::InvalidField {
                 field: "path_ready",

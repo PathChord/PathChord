@@ -7,14 +7,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pathchord_core::{
-    AckRange, CAPABILITY_TRAFFIC_CLASSES, ControlAck, ControlReceiver, ControlSender,
-    EgressServiceState, ErrorClass, FrameCodecError, FrameFlags, FrameType, Heartbeat, MAX_VARINT,
-    Message, MessageCodecError, PathClose, PathDrain, PathFrame, PathId, ProtocolLimits,
-    ReliabilityError, RequestId, SessionClose, SessionControl, SessionControlCancel,
-    SessionControlFlow, SessionId, StatusReport, StatusReportDisposition, StreamAck, StreamData,
-    StreamFin, StreamId, StreamOpen, StreamOpenClass, StreamOpenErr, StreamOpenOk,
-    StreamReceiveBuffer, StreamRst, StreamState, StreamWindow, TargetEndpoint, TrafficClassConfig,
-    UdpClose, UdpDatagram, UdpOpen, UdpOpenClass, UdpOpenErr,
+    AckRange, CAPABILITY_TCP_STREAM, CAPABILITY_TRAFFIC_CLASSES, CAPABILITY_UDP_SESSION,
+    ControlAck, ControlReceiver, ControlSender, EgressServiceState, ErrorClass, FrameCodecError,
+    FrameFlags, FrameType, Heartbeat, MAX_VARINT, Message, MessageCodecError, PathClose, PathDrain,
+    PathFrame, PathId, ProtocolLimits, ReliabilityError, RequestId, SessionClose, SessionControl,
+    SessionControlCancel, SessionControlFlow, SessionId, StatusReport, StatusReportDisposition,
+    StreamAck, StreamData, StreamFin, StreamId, StreamOpen, StreamOpenClass, StreamOpenErr,
+    StreamOpenOk, StreamReceiveBuffer, StreamRst, StreamState, StreamWindow, TargetEndpoint,
+    TrafficClassConfig, UdpClose, UdpDatagram, UdpOpen, UdpOpenClass, UdpOpenErr,
 };
 use pathchord_noise::{
     MAX_NOISE_MESSAGE_LEN, NoiseError, NoiseTransport, RECORD_ENVELOPE_HEADER_LEN,
@@ -329,6 +329,8 @@ pub enum SessionRuntimeError {
     UnacknowledgedData { bytes: usize },
     #[error("Session runtime limit is invalid")]
     InvalidRuntimeLimit,
+    #[error("Session RequestID random source failed")]
+    RequestIdRandom,
     #[error("Session task failed: {0}")]
     Task(String),
     #[error("Session multipath state failed: {0}")]
@@ -1291,6 +1293,7 @@ struct PathHealth {
     scheduling_overhead_bps: Option<u64>,
     exclusion_reason: Option<PathExclusionReason>,
     relationship_weight_basis_points: u16,
+    drain_deadline: Option<Instant>,
 }
 
 impl PathHealth {
@@ -1317,6 +1320,7 @@ impl PathHealth {
             scheduling_overhead_bps: None,
             exclusion_reason: None,
             relationship_weight_basis_points: 10_000,
+            drain_deadline: None,
         })
     }
 }
@@ -1343,7 +1347,7 @@ struct SessionActor<W> {
     closing_udp: HashMap<u64, Vec<oneshot::Sender<Result<(), OpenUdpError>>>>,
     role: ActorRole,
     writer: RecordWriter<W>,
-    reader_task: JoinHandle<()>,
+    reader_task: Option<JoinHandle<()>>,
     frame_tx: mpsc::Sender<ReaderEvent>,
     frames: mpsc::Receiver<ReaderEvent>,
     extra_paths: HashMap<PathId, ExtraPath>,
@@ -1381,7 +1385,6 @@ struct SessionActor<W> {
     chunk_size: usize,
     next_frame_seq: u64,
     next_stream_id: u64,
-    next_request_id: u128,
     send_budget: Arc<Semaphore>,
     inbound_budget: Arc<Semaphore>,
     remote_session_limit: u64,
@@ -1485,7 +1488,7 @@ where
             closing_udp: HashMap::new(),
             role,
             writer,
-            reader_task,
+            reader_task: Some(reader_task),
             frame_tx,
             frames,
             extra_paths: HashMap::new(),
@@ -1523,7 +1526,6 @@ where
             chunk_size,
             next_frame_seq,
             next_stream_id: 1,
-            next_request_id: 1,
             send_budget: Arc::new(Semaphore::new(buffer_limit)),
             inbound_budget: Arc::new(Semaphore::new(buffer_limit)),
             remote_session_limit: buffer_limit as u64,
@@ -1618,8 +1620,19 @@ where
                 frame = self.frames.recv() => {
                     match frame {
                         Some(ReaderEvent::Frame { path_id, frame }) => {
-                            if self.handle_frame(path_id, frame).await? {
-                                return Ok(());
+                            // A reader can have queued frames before its Path
+                            // was failed by a different event.
+                            if !self.path_health.contains_key(&path_id) {
+                                continue;
+                            }
+                            match self.handle_frame(path_id, frame).await {
+                                Ok(true) => return Ok(()),
+                                Ok(false) => {},
+                                Err(error) => {
+                                    if self.handle_path_failure(path_id).await? {
+                                        return Err(error);
+                                    }
+                                }
                             }
                         }
                         Some(ReaderEvent::Closed { path_id }) => {
@@ -1705,6 +1718,13 @@ where
                 multipath_config,
                 reply,
             } => {
+                if self.capabilities & CAPABILITY_UDP_SESSION == 0 {
+                    let _ = reply.send(Err(OpenUdpError::Rejected {
+                        error: ErrorClass::EgressFailure,
+                        reason: b"UDP capability was not negotiated".to_vec(),
+                    }));
+                    return Ok(false);
+                }
                 let traffic_class = multipath_config
                     .as_ref()
                     .and_then(|config| config.traffic_class.clone());
@@ -1917,6 +1937,13 @@ where
                 multipath_config,
                 reply,
             } => {
+                if self.capabilities & CAPABILITY_TCP_STREAM == 0 {
+                    let _ = reply.send(Err(OpenStreamError::Rejected {
+                        error: ErrorClass::EgressFailure,
+                        reason: b"TCP capability was not negotiated".to_vec(),
+                    }));
+                    return Ok(false);
+                }
                 let traffic_class = multipath_config
                     .as_ref()
                     .and_then(|config| config.traffic_class.clone());
@@ -1958,11 +1985,9 @@ where
                     .next_stream_id
                     .checked_add(1)
                     .ok_or(SessionRuntimeError::FrameSequenceExhausted)?;
-                let request_id = RequestId::new(self.next_request_id);
-                self.next_request_id = self
-                    .next_request_id
-                    .checked_add(1)
-                    .ok_or(SessionRuntimeError::FrameSequenceExhausted)?;
+                let mut random = [0_u8; 16];
+                getrandom::fill(&mut random).map_err(|_| SessionRuntimeError::RequestIdRandom)?;
+                let request_id = RequestId::from_be_bytes(random);
                 self.observe_open(stream_id, target.clone(), traffic_class.clone());
                 let request = StreamOpen {
                     stream_id,
@@ -2000,9 +2025,7 @@ where
         path: ErasedAdmittedPath,
         observation: MultipathPathObservation,
     ) -> Result<(), SessionRuntimeError> {
-        if path.capabilities & self.capabilities & CAPABILITY_TRAFFIC_CLASSES
-            != self.capabilities & CAPABILITY_TRAFFIC_CLASSES
-        {
+        if path.capabilities != self.capabilities {
             return Err(SessionRuntimeError::InvalidRuntimeLimit);
         }
         if path.session_id != self.session_id {
@@ -2088,6 +2111,25 @@ where
     }
 
     async fn handle_path_failure(&mut self, path_id: PathId) -> Result<bool, SessionRuntimeError> {
+        self.retire_path(path_id, false).await
+    }
+
+    async fn retire_path(
+        &mut self,
+        path_id: PathId,
+        drained: bool,
+    ) -> Result<bool, SessionRuntimeError> {
+        if !self.path_health.contains_key(&path_id) {
+            return Ok(self.multipath.state() == pathchord_core::SessionState::Closed);
+        }
+        if path_id == self.path_id {
+            if let Some(task) = self.reader_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            let _ =
+                tokio::time::timeout(MIN_RETRANSMISSION_TIMEOUT, self.writer.io.shutdown()).await;
+        }
         if let Some(path) = self.extra_paths.remove(&path_id) {
             path.writer_task.abort();
             path.reader_task.abort();
@@ -2095,7 +2137,11 @@ where
             let _ = path.reader_task.await;
         }
         self.path_health.remove(&path_id);
-        let outcome = self.multipath.mark_path_failed(path_id)?;
+        let outcome = if drained {
+            self.multipath.mark_path_closed(path_id)?
+        } else {
+            self.multipath.mark_path_failed(path_id)?
+        };
         if !outcome.session_closed {
             self.cancel_unroutable_flows().await?;
             let retained: Vec<_> = self
@@ -2271,6 +2317,19 @@ where
     ) -> Result<(), SessionRuntimeError> {
         if matches!(self.role, ActorRole::Egress { .. }) {
             if let Message::UdpOpen(open) = &message {
+                if self.capabilities & CAPABILITY_UDP_SESSION == 0 {
+                    self.udp_classes.remove(&open.association_id);
+                    return self
+                        .send_udp_message(
+                            open.association_id,
+                            Message::UdpOpenErr(UdpOpenErr {
+                                association_id: open.association_id,
+                                error: ErrorClass::EgressFailure,
+                                reason: b"UDP capability was not negotiated".to_vec(),
+                            }),
+                        )
+                        .await;
+                }
                 self.egress_udp_paths
                     .entry(open.association_id)
                     .or_default()
@@ -2454,9 +2513,17 @@ where
         let mut degraded = Vec::new();
         let mut active = Vec::new();
         let mut failed = Vec::new();
+        let mut expired_drains = Vec::new();
         let mut status_paths = Vec::new();
 
         for (path_id, health) in &mut self.path_health {
+            if health
+                .drain_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                expired_drains.push(*path_id);
+                continue;
+            }
             let heartbeat_age = now.duration_since(health.last_heartbeat_received);
             let status_age = now.duration_since(health.last_status_received);
             if heartbeat_age >= PATH_FAILED_AFTER {
@@ -2611,6 +2678,11 @@ where
         }
         failed.sort_unstable();
         failed.dedup();
+        for path_id in expired_drains {
+            if self.retire_path(path_id, true).await? {
+                return Ok(true);
+            }
+        }
         for path_id in failed {
             if self.handle_path_failure(path_id).await? {
                 return Ok(true);
@@ -2953,7 +3025,22 @@ where
             Message::StreamWindow(window) => self.handle_stream_window(window).await?,
             Message::StreamFin(fin) => self.handle_stream_fin(fin, None).await?,
             Message::StreamRst(rst) => self.handle_stream_rst(rst).await,
-            Message::PathDrain(_) => self.multipath.drain_path(path_id)?,
+            Message::PathDrain(drain) => {
+                self.multipath.drain_path(path_id)?;
+                if let Some(health) = self.path_health.get_mut(&path_id) {
+                    health.exclusion_reason = Some(PathExclusionReason::Draining);
+                    if drain.deadline_ms != 0 {
+                        let deadline = Instant::now()
+                            .checked_add(Duration::from_millis(drain.deadline_ms))
+                            .ok_or(SessionRuntimeError::InvalidRuntimeLimit)?;
+                        health.drain_deadline = Some(
+                            health
+                                .drain_deadline
+                                .map_or(deadline, |current| current.min(deadline)),
+                        );
+                    }
+                }
+            }
             Message::PathClose(_) => return self.handle_path_failure(path_id).await,
             Message::SessionClose(_) => return Ok(true),
             Message::StatusReport(report) => {
@@ -2998,6 +3085,15 @@ where
         let ActorRole::Egress { factory } = &self.role else {
             return Err(SessionRuntimeError::UnexpectedFrame(FrameType::StreamOpen));
         };
+        if self.capabilities & CAPABILITY_TCP_STREAM == 0 {
+            return self
+                .send_open_error(
+                    request.stream_id,
+                    ErrorClass::EgressFailure,
+                    b"TCP capability was not negotiated".to_vec(),
+                )
+                .await;
+        }
         if let Some(cached) = self.egress_requests.get_mut(&request.request_id) {
             if cached.request != request || cached.traffic_class != traffic_class {
                 return self
@@ -3233,7 +3329,11 @@ where
                 let _ = should_send;
             }
             StreamEvent::IoFailed { stream_id, reason } => {
-                self.reset_stream(stream_id, true, reason.into_bytes())
+                let error = match self.role {
+                    ActorRole::Egress { .. } => ErrorClass::TargetFailure,
+                    ActorRole::Ingress => ErrorClass::PathFailure,
+                };
+                self.reset_stream_with_error(stream_id, true, error, reason.into_bytes())
                     .await?;
             }
             StreamEvent::Delivered { stream_id, bytes } => {
@@ -4038,23 +4138,41 @@ where
     }
 
     async fn handle_stream_rst(&mut self, rst: StreamRst) {
-        let _ = self.reset_stream(rst.stream_id, false, rst.reason).await;
+        let _ = self
+            .reset_stream_with_error(rst.stream_id, false, rst.error, rst.reason)
+            .await;
     }
 
     async fn reset_stream(
         &mut self,
         stream_id: StreamId,
         notify_peer: bool,
+        reason: Vec<u8>,
+    ) -> Result<(), SessionRuntimeError> {
+        self.reset_stream_with_error(stream_id, notify_peer, ErrorClass::PathFailure, reason)
+            .await
+    }
+
+    async fn reset_stream_with_error(
+        &mut self,
+        stream_id: StreamId,
+        notify_peer: bool,
+        error: ErrorClass,
         mut reason: Vec<u8>,
     ) -> Result<(), SessionRuntimeError> {
         reason.truncate(self.limits.max_control_payload());
-        self.observe_closed(stream_id, "reset", StreamState::Reset);
+        let close_reason = if error == ErrorClass::TargetFailure {
+            "target_failure"
+        } else {
+            "reset"
+        };
+        self.observe_closed(stream_id, close_reason, StreamState::Reset);
         if notify_peer {
             self.send_stream_message(
                 stream_id,
                 Message::StreamRst(StreamRst {
                     stream_id,
-                    error: ErrorClass::PathFailure,
+                    error,
                     reason: reason.clone(),
                 }),
             )
@@ -4489,14 +4607,18 @@ where
             let _ = path.writer_task.await;
             let _ = path.reader_task.await;
         }
-        self.reader_task.abort();
-        let _ = (&mut self.reader_task).await;
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
 impl<W> Drop for SessionActor<W> {
     fn drop(&mut self) {
-        self.reader_task.abort();
+        if let Some(task) = &self.reader_task {
+            task.abort();
+        }
         for task in self.opening_tasks.values() {
             task.abort();
         }
@@ -4851,6 +4973,10 @@ async fn stream_read_loop(
 }
 
 #[cfg(test)]
+#[path = "runtime_alignment_tests.rs"]
+mod alignment_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::CompleteFrameTransport;
@@ -4866,31 +4992,32 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, copy};
 
-    fn keys() -> (StaticKeypair, StaticKeypair) {
+    pub(super) fn keys() -> (StaticKeypair, StaticKeypair) {
         (
             generate_static_keypair().expect("Ingress key"),
             generate_static_keypair().expect("Egress key"),
         )
     }
 
-    fn ingress_config() -> IngressPathAdmissionConfig {
+    pub(super) fn ingress_config() -> IngressPathAdmissionConfig {
         IngressPathAdmissionConfig {
             egress_identity: b"PathChord/wire-v1/egress/runtime-egress".to_vec(),
             egress_id: b"runtime-egress".to_vec(),
             ingress_id: b"runtime-ingress".to_vec(),
             session_id: SessionId::new(0x1234),
             path_id: PathId::new(0x5678),
-            offered_capabilities: 1,
+            offered_capabilities: CAPABILITY_TCP_STREAM | CAPABILITY_UDP_SESSION,
+            required_capabilities: 1,
             local_limits: ProtocolLimits::default(),
         }
     }
 
-    fn egress_config() -> EgressPathAdmissionConfig {
+    pub(super) fn egress_config() -> EgressPathAdmissionConfig {
         EgressPathAdmissionConfig {
             egress_identity: b"PathChord/wire-v1/egress/runtime-egress".to_vec(),
             egress_id: b"runtime-egress".to_vec(),
             required_capabilities: 1,
-            supported_capabilities: 1,
+            supported_capabilities: CAPABILITY_TCP_STREAM | CAPABILITY_UDP_SESSION,
             local_limits: ProtocolLimits::default(),
             ready_limits: PathReady {
                 max_frame_payload: 4096,
@@ -4900,7 +5027,7 @@ mod tests {
         }
     }
 
-    fn authorization(ingress: &StaticKeypair) -> PathAuthorization {
+    pub(super) fn authorization(ingress: &StaticKeypair) -> PathAuthorization {
         PathAuthorization {
             ingress_id: b"runtime-ingress".to_vec(),
             public_key: *ingress.public(),
@@ -5287,7 +5414,7 @@ mod tests {
         (ingress, egress)
     }
 
-    async fn admitted_pair_for(
+    pub(super) async fn admitted_pair_for(
         ingress_key: &StaticKeypair,
         egress_key: &StaticKeypair,
         path_id: u128,
@@ -5536,7 +5663,7 @@ mod tests {
         (ingress, egress)
     }
 
-    fn target(name: &str) -> TargetEndpoint {
+    pub(super) fn target(name: &str) -> TargetEndpoint {
         TargetEndpoint {
             hostname: name.as_bytes().to_vec(),
             port: 443,
@@ -5545,12 +5672,12 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct EchoFactory {
+    pub(super) struct EchoFactory {
         tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     }
 
     impl EchoFactory {
-        async fn join(&self) {
+        pub(super) async fn join(&self) {
             let tasks = std::mem::take(&mut *self.tasks.lock().expect("echo task lock"));
             for task in tasks {
                 task.await.expect("echo task");
@@ -6847,7 +6974,7 @@ mod tests {
         .unwrap();
     }
     #[derive(Clone)]
-    struct EchoUdpFactory;
+    pub(super) struct EchoUdpFactory;
     struct EchoUdpSocket {
         pending: VecDeque<Vec<u8>>,
     }

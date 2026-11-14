@@ -17,6 +17,10 @@ use crate::{
     PathAuthorization,
 };
 
+// wire-profile-v1 registers capability bits 0 through 5. Other bits do not
+// participate in negotiation or Session compatibility checks.
+pub(crate) const REGISTERED_CAPABILITIES: u64 = (1 << 6) - 1;
+
 /// Ingress-owned inputs for dialing and admitting one Path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IngressPathAdmissionConfig {
@@ -27,6 +31,7 @@ pub struct IngressPathAdmissionConfig {
     pub session_id: SessionId,
     pub path_id: PathId,
     pub offered_capabilities: u64,
+    pub required_capabilities: u64,
     pub local_limits: ProtocolLimits,
 }
 
@@ -230,6 +235,8 @@ pub enum PathAdmissionError {
     InvalidSessionAttach,
     #[error("PATH_READY limits exceed local or profile limits")]
     ReadyLimitsExceedLocal,
+    #[error("Path capability negotiation is inconsistent with the local offer")]
+    InvalidCapabilities,
 }
 
 /// Dials one Egress Path and completes Noise IK plus Path/Session admission.
@@ -309,11 +316,8 @@ where
     let (limits, negotiated_capabilities) = match decode_message(&ready_frame, config.local_limits)?
     {
         Message::PathReady(value) => (value, 0),
-        Message::PathReadyCapabilities(value)
-            if value.capabilities & !config.offered_capabilities == 0
-                && value.capabilities & pathchord_core::CAPABILITY_TRAFFIC_CLASSES != 0 =>
-        {
-            (value.limits, value.capabilities)
+        Message::PathReadyCapabilities(value) => {
+            (value.limits, value.capabilities & REGISTERED_CAPABILITIES)
         }
         other => {
             return Err(PathAdmissionError::UnexpectedMessage {
@@ -322,6 +326,15 @@ where
             });
         }
     };
+    if negotiated_capabilities & !config.offered_capabilities != 0 {
+        return Err(PathAdmissionError::InvalidCapabilities);
+    }
+    if negotiated_capabilities & config.required_capabilities != config.required_capabilities {
+        return Ok(PathAdmissionOutcome::Rejected {
+            error: ErrorClass::EgressFailure,
+            reason: b"required capability is unavailable".to_vec(),
+        });
+    }
     validate_ready_limits(&limits, config.local_limits)?;
     Ok(PathAdmissionOutcome::Ready(IngressAdmittedPath {
         transport: records,
@@ -395,11 +408,10 @@ where
         }
     };
 
-    let negotiated_capabilities = offered_capabilities & config.supported_capabilities;
-    let rejection_reason = if offered_capabilities & config.required_capabilities
+    let negotiated_capabilities =
+        offered_capabilities & config.supported_capabilities & REGISTERED_CAPABILITIES;
+    let rejection_reason = if negotiated_capabilities & config.required_capabilities
         != config.required_capabilities
-        || config.supported_capabilities & config.required_capabilities
-            != config.required_capabilities
     {
         Some(b"required capability is unavailable".as_slice())
     } else {
@@ -458,14 +470,10 @@ where
     .await?;
     send_message(
         &mut records,
-        if negotiated_capabilities & pathchord_core::CAPABILITY_TRAFFIC_CLASSES != 0 {
-            Message::PathReadyCapabilities(pathchord_core::PathReadyCapabilities {
-                limits: config.ready_limits.clone(),
-                capabilities: negotiated_capabilities,
-            })
-        } else {
-            Message::PathReady(config.ready_limits.clone())
-        },
+        Message::PathReadyCapabilities(pathchord_core::PathReadyCapabilities {
+            limits: config.ready_limits.clone(),
+            capabilities: negotiated_capabilities,
+        }),
         session_id,
         path_id,
         1,
@@ -583,6 +591,9 @@ fn validate_ingress_config(config: &IngressPathAdmissionConfig) -> Result<(), Pa
     if !valid_identifier(&config.ingress_id) {
         return Err(PathAdmissionError::InvalidIdentity);
     }
+    if config.required_capabilities & !config.offered_capabilities != 0 {
+        return Err(PathAdmissionError::InvalidCapabilities);
+    }
     Ok(())
 }
 
@@ -654,6 +665,7 @@ mod tests {
             session_id: SessionId::new(7),
             path_id: PathId::new(9),
             offered_capabilities: 0b11,
+            required_capabilities: 0b01,
             local_limits: ProtocolLimits::default(),
         }
     }
@@ -711,6 +723,7 @@ mod tests {
             panic!("Egress should be ready");
         };
         assert_eq!(ingress.authorization_generation(), 12);
+        assert_eq!(ingress.negotiated_capabilities(), 0b01);
         assert_eq!(egress.negotiated_capabilities(), 0b01);
         assert_eq!(egress.ingress_id(), b"ingress-a");
         assert_eq!(egress.authenticated_remote_key(), initiator.public());
@@ -736,6 +749,139 @@ mod tests {
         );
         sent.expect("heartbeat send");
         assert_eq!(received.expect("heartbeat receive"), Some(frame));
+    }
+
+    #[tokio::test]
+    async fn peers_share_the_full_known_capability_intersection() {
+        let (initiator, responder) = keys();
+        for selected in [0, 1, 3, 5, 7, REGISTERED_CAPABILITIES] {
+            let mut ingress = ingress_config();
+            ingress.offered_capabilities = selected | (1 << 20);
+            ingress.required_capabilities = selected & 1;
+            let mut egress = egress_config();
+            egress.required_capabilities = selected & 1;
+            egress.supported_capabilities = selected | (1 << 20);
+            let authorization = authorization(&initiator);
+            let (client, server) = duplex(256 * 1024);
+            let (client, server) = tokio::join!(
+                dial_path(client, initiator.private(), responder.public(), &ingress),
+                accept_path(server, responder.private(), &egress, &authorization),
+            );
+            let PathAdmissionOutcome::Ready(client) = client.unwrap() else {
+                panic!("Ingress rejected")
+            };
+            let PathAdmissionOutcome::Ready(server) = server.unwrap() else {
+                panic!("Egress rejected")
+            };
+            assert_eq!(client.negotiated_capabilities(), selected);
+            assert_eq!(server.negotiated_capabilities(), selected);
+        }
+    }
+
+    #[tokio::test]
+    async fn ingress_rejects_a_missing_required_optional_capability() {
+        let (initiator, responder) = keys();
+        let mut ingress = ingress_config();
+        ingress.required_capabilities = 3;
+        let egress = egress_config();
+        let authorization = authorization(&initiator);
+        let (client, server) = duplex(256 * 1024);
+        let (client, _) = tokio::join!(
+            dial_path(client, initiator.private(), responder.public(), &ingress),
+            accept_path(server, responder.private(), &egress, &authorization),
+        );
+        assert!(matches!(
+            client.unwrap(),
+            PathAdmissionOutcome::Rejected {
+                error: ErrorClass::EgressFailure,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn readiness_cannot_add_unoffered_capabilities_or_skip_required_ones() {
+        let (initiator, responder) = keys();
+        for advertised in [None, Some(3), Some(1 | (1 << 20))] {
+            let mut config = ingress_config();
+            config.offered_capabilities = 1;
+            config.required_capabilities = 1;
+            let limits = egress_config().ready_limits;
+            let (client, mut server) = duplex(256 * 1024);
+            let responder_side = async {
+                let mut handshake =
+                    ResponderHandshake::new(responder.private(), &config.egress_identity).unwrap();
+                let request = read_handshake_message(&mut server).await.unwrap();
+                handshake.read_message(&request).unwrap();
+                let response = handshake.write_message(&[]).unwrap();
+                write_handshake_message(&mut server, &response)
+                    .await
+                    .unwrap();
+                let mut records = NoiseRecordStream::new(
+                    server,
+                    handshake.into_transport().unwrap(),
+                    config.local_limits,
+                );
+                receive_required(&mut records, "PATH_HELLO").await.unwrap();
+                receive_required(&mut records, "SESSION_ATTACH")
+                    .await
+                    .unwrap();
+                send_message(
+                    &mut records,
+                    Message::SessionAttachOk(pathchord_core::SessionAttachOk {
+                        authorization_generation: 1,
+                    }),
+                    config.session_id,
+                    config.path_id,
+                    0,
+                    config.local_limits,
+                )
+                .await
+                .unwrap();
+                let message = advertised.map_or_else(
+                    || Message::PathReady(limits.clone()),
+                    |capabilities| {
+                        Message::PathReadyCapabilities(pathchord_core::PathReadyCapabilities {
+                            limits: limits.clone(),
+                            capabilities,
+                        })
+                    },
+                );
+                send_message(
+                    &mut records,
+                    message,
+                    config.session_id,
+                    config.path_id,
+                    1,
+                    config.local_limits,
+                )
+                .await
+                .unwrap();
+            };
+            let (client, ()) = tokio::join!(
+                dial_path(client, initiator.private(), responder.public(), &config),
+                responder_side
+            );
+            match advertised {
+                None => assert!(matches!(
+                    client.unwrap(),
+                    PathAdmissionOutcome::Rejected {
+                        error: ErrorClass::EgressFailure,
+                        ..
+                    }
+                )),
+                Some(3) => assert!(matches!(
+                    client,
+                    Err(PathAdmissionError::InvalidCapabilities)
+                )),
+                Some(_) => {
+                    let PathAdmissionOutcome::Ready(path) = client.unwrap() else {
+                        panic!("known subset must be accepted")
+                    };
+                    assert_eq!(path.negotiated_capabilities(), 1);
+                }
+            }
+        }
     }
 
     #[tokio::test]

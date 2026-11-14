@@ -1041,6 +1041,64 @@ mod tests {
     }
 
     #[test]
+    fn same_named_subscriptions_retain_namespace_and_independent_overrides_after_reopen() {
+        let path = database_path();
+        let specs: Vec<_> = ["tenant-a", "tenant-b"]
+            .into_iter()
+            .map(|namespace| {
+                let mut spec = subscription();
+                spec.id = SubscriptionId::new(
+                    pathchord_policy::SubscriptionId::in_namespace(namespace, "provider").as_str(),
+                )
+                .unwrap();
+                spec.credentials_ref = Some(format!("{namespace}-secret"));
+                spec
+            })
+            .collect();
+        {
+            let store = Arc::new(IngressControlStore::open(&path).unwrap());
+            let mut service = IngressControlService::open(store).unwrap();
+            service
+                .reconcile_declarative_resources(1, [], specs.clone())
+                .unwrap();
+            let generation = service.snapshot().generation;
+            service
+                .set_subscription_enabled(
+                    "admin",
+                    RequestId::new(1),
+                    generation,
+                    &specs[0].id,
+                    false,
+                )
+                .unwrap();
+        }
+        {
+            let store = Arc::new(IngressControlStore::open(&path).unwrap());
+            let mut service = IngressControlService::open(store).unwrap();
+            service
+                .reconcile_declarative_resources(1, [], specs.clone())
+                .unwrap();
+            let snapshot = service.snapshot();
+            assert_eq!(snapshot.subscriptions.len(), 2);
+            assert!(!snapshot.subscriptions[&specs[0].id].spec.enabled);
+            assert!(snapshot.subscriptions[&specs[1].id].spec.enabled);
+            for spec in &specs {
+                let restored = snapshot.subscriptions[&spec.id]
+                    .spec
+                    .runtime_config()
+                    .unwrap();
+                assert_eq!(restored.id.resource_name(), "provider");
+                assert_eq!(
+                    restored.id.namespace(),
+                    pathchord_policy::ResourceIdentity::from_id(spec.id.as_str()).namespace
+                );
+                assert_eq!(restored.source.credentials_ref, spec.credentials_ref);
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn declarative_subscription_overrides_and_deletion_survive_reopen() {
         let path = database_path();
         let store = Arc::new(IngressControlStore::open(&path).unwrap());

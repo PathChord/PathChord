@@ -62,6 +62,8 @@ pub struct PathReady {
     pub max_session_buffering: u64,
 }
 
+pub const CAPABILITY_TCP_STREAM: u64 = 1;
+pub const CAPABILITY_UDP_SESSION: u64 = 1 << 1;
 /// Negotiated optional extension; legacy message bytes remain unchanged.
 pub const CAPABILITY_TRAFFIC_CLASSES: u64 = 1 << 2;
 

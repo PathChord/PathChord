@@ -83,6 +83,7 @@ pub struct Socks5Runtime {
     credential_verifier: Arc<dyn SocksCredentialVerifier>,
     process_metadata: Arc<dyn ProcessMetadataProvider>,
     events: Option<crate::ListenerRuntimeEventSender>,
+    connection_admission: Option<Arc<Semaphore>>,
 }
 
 impl std::fmt::Debug for Socks5Runtime {
@@ -125,11 +126,16 @@ impl Socks5Runtime {
             credential_verifier,
             process_metadata: Arc::new(NoopProcessMetadataProvider),
             events: None,
+            connection_admission: None,
         })
     }
 
     pub fn set_event_sender(&mut self, sender: crate::ListenerRuntimeEventSender) {
         self.events = Some(sender);
+    }
+
+    pub(crate) fn set_connection_admission(&mut self, admission: Arc<Semaphore>) {
+        self.connection_admission = Some(admission);
     }
 
     pub fn set_process_metadata_provider(&mut self, provider: Arc<dyn ProcessMetadataProvider>) {
@@ -173,6 +179,14 @@ impl Socks5Runtime {
                     };
                     let (stream, source) = accepted
                         .map_err(|error| Socks5RuntimeError::Listener(error.to_string()))?;
+                    let admission = match self.connection_admission.as_ref() {
+                        Some(shared) => Some(tokio::select! {
+                            () = shutdown.as_mut() => break,
+                            result = Arc::clone(shared).acquire_owned() => result
+                                .map_err(|error| Socks5RuntimeError::Task(error.to_string()))?,
+                        }),
+                        None => None,
+                    };
                     report.accepted_clients = report.accepted_clients.saturating_add(1);
                     let descriptor = self.descriptor.clone();
                     let config = self.config.clone();
@@ -186,6 +200,7 @@ impl Socks5Runtime {
                     let receiver = cancel.subscribe();
                     tasks.spawn(async move {
                         let _permit = permit;
+                        let _admission = admission;
                         handle_client(
                             stream,
                             source,

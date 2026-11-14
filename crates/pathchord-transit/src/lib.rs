@@ -51,8 +51,8 @@ pub use subscription::{
     HttpSubscriptionFetcher, MAX_SUBSCRIPTION_BYTES, MAX_SUBSCRIPTION_NODES,
     NoSubscriptionCredentials, NodeDiagnostic, NodeUnavailableReason, PreparedSubscriptionRefresh,
     RefreshOutcome, SnapshotDiff, SubscriptionCredential, SubscriptionCredentialProvider,
-    SubscriptionDocument, SubscriptionError, SubscriptionFetchRequest, SubscriptionFetcher,
-    SubscriptionManager, SubscriptionUsage,
+    SubscriptionDocument, SubscriptionDownloadBudget, SubscriptionError, SubscriptionFetchRequest,
+    SubscriptionFetcher, SubscriptionManager, SubscriptionUsage,
 };
 
 pub trait TransitConnection: AsyncRead + AsyncWrite + Send + Unpin {}

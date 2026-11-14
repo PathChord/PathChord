@@ -55,6 +55,11 @@ function text(value, fallback = "-") {
   return value === null || value === undefined || value === "" ? fallback : String(value);
 }
 
+function resourceName(item) {
+  if (!item.name) return item.id;
+  return item.namespace && item.namespace !== "default" ? `${item.namespace}/${item.name}` : item.name;
+}
+
 function tags(values, tone = "") {
   const fragment = document.createDocumentFragment();
   const list = Array.isArray(values) ? values : Object.entries(values || {}).map(([key, value]) => `${key}=${value}`);
@@ -121,7 +126,7 @@ function renderNodes(result) {
   body.replaceChildren();
   items.forEach((item) => {
     const row = body.insertRow();
-    cell(row, item.id, "mono");
+    cell(row, resourceName(item), "mono");
     cell(row, tags(item.admin?.labels));
     cell(row, tags(item.admin?.tags || [], "blue"));
     const diagnostic = item.observed?.diagnostic;
@@ -183,7 +188,7 @@ function renderListeners(result) {
     body.replaceChildren();
     items.forEach((item) => {
       const row = body.insertRow();
-      cell(row, item.id, "mono");
+      cell(row, resourceName(item), "mono");
       cell(row, item.kind);
       cell(row, item.bind, "mono");
       cell(row, item.state, `state ${stateClass(item.state)}`);
@@ -195,7 +200,7 @@ function renderListeners(result) {
   items.filter((item) => ["http", "socks5", "mixed"].includes(String(item.kind).toLowerCase())).forEach((item) => {
     const option = document.createElement("option");
     option.value = item.id;
-    option.textContent = `${item.id} (${item.bind})`;
+    option.textContent = `${resourceName(item)} (${item.bind})`;
     select.append(option);
   });
 }
@@ -207,7 +212,7 @@ function renderSubscriptions(result) {
   body.replaceChildren();
   items.forEach((item) => {
     const row = body.insertRow();
-    cell(row, item.id, "mono");
+    cell(row, resourceName(item), "mono");
     cell(row, item.source_type);
     cell(row, item.state, `state ${stateClass(item.state)}`);
     cell(row, item.revision, "mono");
@@ -231,7 +236,8 @@ function renderSubscriptions(result) {
 
 function renderProxy(result) {
   $("proxy-enabled").textContent = result.enabled ? "Enabled" : "Disabled";
-  $("proxy-listener").textContent = text(result.listener_id, "None");
+  const listener = state.listeners.find((item) => item.id === result.listener_id);
+  $("proxy-listener").textContent = text(listener ? resourceName(listener) : result.listener_id, "None");
   $("proxy-effect").textContent = text(result.platform_effect);
   $("proxy-restoration").textContent = text(result.restoration_state);
 }

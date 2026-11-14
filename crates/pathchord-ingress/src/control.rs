@@ -30,6 +30,8 @@ pub const MAX_EVENT_COUNT: usize = 2048;
 pub const MAX_REQUEST_CACHE_COUNT: usize = 4096;
 pub const MAX_REFRESH_QUEUE_COUNT: usize = 256;
 pub const MAX_CONNECTION_OBSERVATIONS: usize = 16_384;
+/// Terminal connections are optional history; live connections have priority.
+pub const MAX_CONNECTION_HISTORY: usize = 1024;
 pub const DEFAULT_OBSERVATION_STALE_AFTER_MS: u64 = 30_000;
 pub const REQUEST_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -462,6 +464,7 @@ pub struct ObservationSnapshot {
     pub queued_refreshes: usize,
     pub runtime: RuntimeCounts,
     pub runtime_state: RuntimeSnapshotState,
+    pub resource_limits: BTreeSet<&'static str>,
     pub active_listener_count: usize,
     pub listener_states: BTreeMap<ListenerId, ListenerObservation>,
     pub connection_listeners: BTreeMap<String, ListenerId>,
@@ -500,6 +503,8 @@ struct SharedObservationState {
     streams: BTreeMap<(SessionId, StreamId), StreamObservation>,
     paths: BTreeMap<PathId, PathObservation>,
     connections: BTreeMap<String, ConnectionObservation>,
+    closed_connection_ids: VecDeque<String>,
+    resource_limits: BTreeSet<&'static str>,
     connection_listeners: BTreeMap<String, ListenerId>,
     node_metadata: BTreeMap<NodeId, NodeMetadata>,
     subscription_runtime: BTreeMap<SubscriptionId, SubscriptionRuntimeObservation>,
@@ -794,16 +799,7 @@ impl IngressObservationHandle {
             .state
             .lock()
             .map_err(|_| ControlError::ObservationUnavailable)?;
-        if !state.connections.contains_key(&observation.connection_id)
-            && state.connections.len() >= MAX_CONNECTION_OBSERVATIONS
-        {
-            return Err(ControlError::ResourceLimit {
-                resource: "connection observations",
-            });
-        }
-        state
-            .connections
-            .insert(observation.connection_id.clone(), observation);
+        upsert_connection_observation(&mut state, observation)?;
         touch_observations(&mut state);
         refresh_target_connection_count(&mut state);
         Ok(())
@@ -820,6 +816,8 @@ impl IngressObservationHandle {
         let removed = state.connections.remove(connection_id);
         if removed.is_some() {
             state.connection_listeners.remove(connection_id);
+            state.closed_connection_ids.retain(|id| id != connection_id);
+            state.resource_limits.remove("connection_observations");
             touch_observations(&mut state);
             refresh_target_connection_count(&mut state);
         }
@@ -898,6 +896,7 @@ impl IngressObservationHandle {
                         )
                     {
                         connection.state = ConnectionState::Reset;
+                        retain_terminal_connection(&mut state, &connection_id);
                     }
                 }
                 removed || had_affected || previous.as_ref() != Some(&status)
@@ -907,20 +906,10 @@ impl IngressObservationHandle {
                 connection_id,
                 target_display,
             } => {
-                if !state.connections.contains_key(&connection_id)
-                    && state.connections.len() >= MAX_CONNECTION_OBSERVATIONS
-                {
-                    return Err(ControlError::ResourceLimit {
-                        resource: "connection observations",
-                    });
-                }
-                state
-                    .connection_listeners
-                    .insert(connection_id.clone(), listener_id);
-                state.connections.insert(
-                    connection_id.clone(),
+                upsert_connection_observation(
+                    &mut state,
                     ConnectionObservation {
-                        connection_id,
+                        connection_id: connection_id.clone(),
                         session_id: None,
                         stream_id: None,
                         state: ConnectionState::Open,
@@ -928,7 +917,10 @@ impl IngressObservationHandle {
                         bytes_received: 0,
                         target_display: Some(target_display),
                     },
-                );
+                )?;
+                state
+                    .connection_listeners
+                    .insert(connection_id.clone(), listener_id);
                 true
             }
             crate::runtime::ListenerRuntimeEvent::ConnectionCompleted {
@@ -940,6 +932,7 @@ impl IngressObservationHandle {
                     connection.state = ConnectionState::Closed;
                     connection.bytes_sent = stats.local_to_target_bytes;
                     connection.bytes_received = stats.target_to_local_bytes;
+                    retain_terminal_connection(&mut state, &connection_id);
                     true
                 } else {
                     false
@@ -951,6 +944,7 @@ impl IngressObservationHandle {
             } => {
                 if let Some(connection) = state.connections.get_mut(&connection_id) {
                     connection.state = ConnectionState::Reset;
+                    retain_terminal_connection(&mut state, &connection_id);
                     true
                 } else {
                     false
@@ -982,6 +976,77 @@ impl IngressObservationHandle {
         }
         Ok(())
     }
+}
+
+fn connection_is_live(connection: &ConnectionObservation) -> bool {
+    matches!(
+        connection.state,
+        ConnectionState::Opening | ConnectionState::Open | ConnectionState::HalfClosed
+    )
+}
+
+fn record_observation_limit(state: &mut SharedObservationState, resource: &'static str) {
+    if state.resource_limits.insert(resource) {
+        touch_observations(state);
+        queue_observation_event(
+            state,
+            ControlEventKind::ObservationChanged,
+            "runtime".to_owned(),
+            json!({"state": "degraded", "reason": "resource_limit", "resource": resource}),
+        );
+    }
+}
+
+fn evict_terminal_connection(state: &mut SharedObservationState) -> bool {
+    let Some(id) = state.closed_connection_ids.pop_front() else {
+        return false;
+    };
+    state.connections.remove(&id);
+    state.connection_listeners.remove(&id);
+    record_observation_limit(state, "connection_history");
+    queue_observation_event(
+        state,
+        ControlEventKind::ConnectionChanged,
+        id.clone(),
+        json!({"connection_id": id, "state": "removed", "reason": "history_limit"}),
+    );
+    true
+}
+
+fn retain_terminal_connection(state: &mut SharedObservationState, id: &str) {
+    if !state.closed_connection_ids.iter().any(|old| old == id) {
+        state.closed_connection_ids.push_back(id.to_owned());
+    }
+    while state.closed_connection_ids.len() > MAX_CONNECTION_HISTORY {
+        evict_terminal_connection(state);
+    }
+}
+
+fn upsert_connection_observation(
+    state: &mut SharedObservationState,
+    observation: ConnectionObservation,
+) -> Result<(), ControlError> {
+    if !state.connections.contains_key(&observation.connection_id) {
+        while state.connections.len() >= MAX_CONNECTION_OBSERVATIONS {
+            if !evict_terminal_connection(state) {
+                record_observation_limit(state, "connection_observations");
+                return Err(ControlError::ResourceLimit {
+                    resource: "connection observations",
+                });
+            }
+        }
+    }
+    state.resource_limits.remove("connection_observations");
+    let id = observation.connection_id.clone();
+    if connection_is_live(&observation) {
+        state.closed_connection_ids.retain(|closed| closed != &id);
+    }
+    let terminal = !connection_is_live(&observation);
+    state.connections.insert(id.clone(), observation);
+    if terminal {
+        retain_terminal_connection(state, &id);
+    }
+    Ok(())
 }
 
 fn refresh_target_connection_count(state: &mut SharedObservationState) {
@@ -1864,6 +1929,7 @@ impl IngressControlService {
             queued_refreshes: self.refresh_queue.len(),
             runtime: observations.runtime,
             runtime_state,
+            resource_limits: observations.resource_limits.clone(),
             active_listener_count: observations.active_listeners.len(),
             listener_states: observations.listener_states.clone(),
             connection_listeners: observations.connection_listeners.clone(),
@@ -1907,17 +1973,8 @@ impl IngressControlService {
             .observations
             .lock()
             .map_err(|_| ControlError::ObservationUnavailable)?;
-        if !observations
-            .connections
-            .contains_key(&observation.connection_id)
-            && observations.connections.len() >= MAX_CONNECTION_OBSERVATIONS
-        {
-            return Err(ControlError::ResourceLimit {
-                resource: "connection observations",
-            });
-        }
         let id = observation.connection_id.clone();
-        observations.connections.insert(id.clone(), observation);
+        upsert_connection_observation(&mut observations, observation)?;
         touch_observations(&mut observations);
         refresh_target_connection_count(&mut observations);
         drop(observations);
@@ -1935,6 +1992,12 @@ impl IngressControlService {
         let removed = observations.connections.remove(connection_id);
         if removed.is_some() {
             observations.connection_listeners.remove(connection_id);
+            observations
+                .closed_connection_ids
+                .retain(|id| id != connection_id);
+            observations
+                .resource_limits
+                .remove("connection_observations");
             touch_observations(&mut observations);
             refresh_target_connection_count(&mut observations);
             drop(observations);
@@ -3179,6 +3242,114 @@ mod tests {
         assert_eq!(path.throughput_bps, Some(5_000_000));
         assert_eq!(path.reordering_events, Some(6));
         assert_eq!(path.exclusion_reason.as_deref(), Some("status_stale"));
+    }
+
+    #[test]
+    fn connection_churn_keeps_live_state_and_bounds_terminal_history() {
+        let service = IngressControlService::new();
+        let handle = service.observation_handle();
+        let listener_id = ListenerId::new("history-test");
+        handle
+            .apply_listener_event(crate::ListenerRuntimeEvent::ConnectionAccepted {
+                listener_id: listener_id.clone(),
+                connection_id: "still-live".into(),
+                target_display: "live.example:443".into(),
+            })
+            .unwrap();
+        for index in 0..=MAX_CONNECTION_OBSERVATIONS {
+            let id = format!("finished-{index}");
+            handle
+                .apply_listener_event(crate::ListenerRuntimeEvent::ConnectionAccepted {
+                    listener_id: listener_id.clone(),
+                    connection_id: id.clone(),
+                    target_display: "target.example:443".into(),
+                })
+                .unwrap();
+            handle
+                .apply_listener_event(crate::ListenerRuntimeEvent::ConnectionCompleted {
+                    listener_id: listener_id.clone(),
+                    connection_id: id,
+                    stats: crate::FlowBridgeStats {
+                        local_to_target_bytes: 11,
+                        target_to_local_bytes: 22,
+                    },
+                })
+                .unwrap();
+        }
+        let snapshot = service.observation_snapshot();
+        assert_eq!(snapshot.connections.len(), MAX_CONNECTION_HISTORY + 1);
+        assert_eq!(
+            snapshot.connection_listeners.len(),
+            snapshot.connections.len()
+        );
+        assert_eq!(snapshot.runtime.target_connections, 1);
+        assert_eq!(
+            snapshot.connections["still-live"].state,
+            ConnectionState::Open
+        );
+        assert!(!snapshot.connections.contains_key("finished-0"));
+        assert_eq!(
+            snapshot.connections[&format!("finished-{MAX_CONNECTION_OBSERVATIONS}")].bytes_received,
+            22
+        );
+        assert!(snapshot.resource_limits.contains("connection_history"));
+        let state = handle.state.lock().unwrap();
+        assert_eq!(state.closed_connection_ids.len(), MAX_CONNECTION_HISTORY);
+        assert!(state.pending_events.len() <= MAX_EVENT_COUNT);
+    }
+
+    #[test]
+    fn connection_limit_preserves_live_records_and_recovers_after_close() {
+        let service = IngressControlService::new();
+        let handle = service.observation_handle();
+        let observation = |id: String, state| ConnectionObservation {
+            connection_id: id,
+            session_id: None,
+            stream_id: None,
+            state,
+            bytes_sent: 0,
+            bytes_received: 0,
+            target_display: None,
+        };
+        {
+            let mut state = handle.state.lock().unwrap();
+            for index in 0..MAX_CONNECTION_OBSERVATIONS {
+                let id = format!("live-{index}");
+                state
+                    .connections
+                    .insert(id.clone(), observation(id, ConnectionState::Open));
+            }
+            refresh_target_connection_count(&mut state);
+        }
+        assert!(matches!(
+            handle
+                .set_connection_observation(observation("next-live".into(), ConnectionState::Open)),
+            Err(ControlError::ResourceLimit { .. })
+        ));
+        let full = service.observation_snapshot();
+        assert_eq!(full.connections.len(), MAX_CONNECTION_OBSERVATIONS);
+        assert!(full.connections.values().all(connection_is_live));
+        assert!(full.resource_limits.contains("connection_observations"));
+        handle
+            .set_connection_observation(observation("live-0".into(), ConnectionState::Closed))
+            .unwrap();
+        handle
+            .set_connection_observation(observation("next-live".into(), ConnectionState::Open))
+            .unwrap();
+        let recovered = service.observation_snapshot();
+        assert_eq!(recovered.connections.len(), MAX_CONNECTION_OBSERVATIONS);
+        assert_eq!(
+            recovered.runtime.target_connections,
+            MAX_CONNECTION_OBSERVATIONS as u64
+        );
+        assert!(!recovered.connections.contains_key("live-0"));
+        assert!(recovered.connections.contains_key("live-1"));
+        assert!(recovered.connections.contains_key("next-live"));
+        assert!(
+            !recovered
+                .resource_limits
+                .contains("connection_observations")
+        );
     }
 
     #[test]

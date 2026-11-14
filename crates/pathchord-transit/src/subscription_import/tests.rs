@@ -139,6 +139,54 @@ proxies:
     );
 }
 
+#[tokio::test]
+async fn conflicting_credential_aliases_are_unavailable_without_discarding_valid_siblings() {
+    let source = r#"
+proxies:
+  - {name: conflict, type: trojan, server: proxy.test, port: 443, password: first-private-value, auth: second-private-value}
+  - {name: good, type: trojan, server: proxy.test, port: 443, password: valid-private-value}
+  - {name: equal, type: trojan, server: proxy.test, port: 443, password: matching-private-value, auth: matching-private-value}
+"#;
+    let mut manager = SubscriptionManager::new(
+        Arc::new(ScriptedFetcher::new([Ok(source.as_bytes().to_vec())])),
+        std::env::temp_dir(),
+        BTreeSet::from(["trojan".into()]),
+    );
+    assert!(matches!(
+        manager
+            .refresh(&config(SubscriptionSourceType::Clash))
+            .await,
+        RefreshOutcome::Published { .. }
+    ));
+    assert_eq!(manager.snapshot().selectable_nodes().count(), 2);
+    let conflict = manager
+        .snapshot()
+        .nodes
+        .values()
+        .find(|node| {
+            node.config
+                .labels
+                .get("source.name")
+                .is_some_and(|name| name == "conflict")
+        })
+        .unwrap();
+    assert_eq!(
+        conflict.state,
+        DynamicNodeState::Unavailable(NodeUnavailableReason::InvalidNode)
+    );
+    let diagnostic = conflict.diagnostic.as_ref().unwrap();
+    assert_eq!(diagnostic.fields, ["auth", "password"]);
+    let exposed = format!("{:?}", manager.snapshot());
+    for secret in [
+        "first-private-value",
+        "second-private-value",
+        "valid-private-value",
+        "matching-private-value",
+    ] {
+        assert!(!exposed.contains(secret));
+    }
+}
+
 #[test]
 fn clash_nested_unknown_options_and_external_providers_are_visible() {
     let nodes = imports(

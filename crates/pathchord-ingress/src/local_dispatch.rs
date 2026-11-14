@@ -284,6 +284,10 @@ impl LocalControlDispatcher {
                 "ingress": {"state": "running"},
                 "control_plane": {"state": if self.service.audit_degraded() {"degraded"} else {"running"}},
                 "runtime_snapshot": {"state": runtime_state, "generation": snapshot.generation},
+                "observations": {
+                    "state": if snapshot.resource_limits.is_empty() {"running"} else {"degraded"},
+                    "resource_limits": snapshot.resource_limits,
+                },
                 "data_path_summary": data_path_summary,
                 "configuration_generation": self.service.snapshot().generation,
                 "observation_generation": snapshot.generation,
@@ -846,6 +850,8 @@ impl LocalControlDispatcher {
             .map(|subscription| {
                 json!({
                     "id": subscription.spec.id.as_str(),
+                    "name": pathchord_policy::ResourceIdentity::from_id(subscription.spec.id.as_str()).name,
+                    "namespace": pathchord_policy::ResourceIdentity::from_id(subscription.spec.id.as_str()).namespace,
                     "display_name": subscription.spec.display_name,
                     "source_type": subscription.spec.source_type,
                     "source": {
@@ -1174,6 +1180,10 @@ impl LocalControlDispatcher {
                 "generation": snapshot.generation,
                 "snapshot_generation": snapshot.generation,
                 "freshness": format!("{:?}", snapshot.runtime_state).to_ascii_lowercase(),
+                "observations": {
+                    "state": if snapshot.resource_limits.is_empty() {"running"} else {"degraded"},
+                    "resource_limits": snapshot.resource_limits,
+                },
                 "ingress": {"state": "running"},
                 "system_proxy": self.system_proxy_value(),
                 "egress": {
@@ -1723,9 +1733,11 @@ fn node_value(
         crate::NodeHealthState::Degraded => "degraded",
         crate::NodeHealthState::Down => "down",
     });
+    let identity = pathchord_policy::ResourceIdentity::from_id(id.as_str());
     json!({
         "id": id.as_str(),
-        "namespace": metadata.and_then(|value| value.namespace.as_deref()),
+        "name": identity.name,
+        "namespace": metadata.and_then(|value| value.namespace.as_deref()).unwrap_or(identity.namespace),
         "protocol": metadata.and_then(|value| value.protocol.as_deref()),
         "endpoint": metadata.and_then(|value| value.endpoint.as_deref()),
         "node": {"id": id.as_str(), "protocol": metadata.and_then(|value| value.protocol.as_deref()), "endpoint": metadata.and_then(|value| value.endpoint.as_deref())},
@@ -1863,6 +1875,8 @@ fn listener_value(
 ) -> Value {
     json!({
         "id": descriptor.id.as_str(),
+        "name": descriptor.id.resource_name(),
+        "namespace": descriptor.id.namespace(),
         "kind": format!("{:?}", descriptor.kind).to_ascii_lowercase(),
         "platform": std::env::consts::OS,
         "bind": descriptor.bind.map(|value| value.to_string()),
@@ -2441,6 +2455,82 @@ mod tests {
     use std::net::SocketAddr;
 
     #[test]
+    fn node_queries_keep_independent_billing_without_usage_measurements() {
+        let mut dispatcher = LocalControlDispatcher::new(SystemProxyPlatform::Linux);
+        let node = crate::NodeId::new("billing-only").unwrap();
+        dispatcher.service_mut().add_node(node.clone()).unwrap();
+        dispatcher
+            .service_mut()
+            .set_node_observation(
+                node,
+                crate::NodeObservation {
+                    state: crate::NodeHealthState::Unknown,
+                    rtt_ms: None,
+                    jitter_ms: None,
+                    loss_ppm: None,
+                    throughput_bps: None,
+                    effective_capacity_bps: None,
+                    diagnostic: None,
+                    usage: Some(pathchord_transit::SubscriptionUsage {
+                        upload_bytes: None,
+                        download_bytes: None,
+                        total_bytes: None,
+                        expires_at: None,
+                        traffic_multiplier_basis_points: Some(25000),
+                    }),
+                },
+            )
+            .unwrap();
+        let response = dispatcher.dispatch(request(
+            "nodes.get",
+            &["nodes:read"],
+            json!({"node_id": "billing-only"}),
+        ));
+        assert!(response.ok);
+        let node = response.result.unwrap();
+        assert!(node["observed"]["quota"]["upload_bytes"].is_null());
+        assert!(node["observed"]["quota"]["download_bytes"].is_null());
+        assert!(node["observed"]["quota"]["remaining_bytes"].is_null());
+        assert_eq!(
+            node["observed"]["billing"]["traffic_multiplier_basis_points"],
+            25000
+        );
+    }
+
+    #[test]
+    fn connection_history_limit_is_queryable_as_typed_degradation() {
+        let mut dispatcher = LocalControlDispatcher::new(SystemProxyPlatform::Linux);
+        let handle = dispatcher.service().observation_handle();
+        for index in 0..=crate::control::MAX_CONNECTION_HISTORY {
+            handle
+                .set_connection_observation(crate::ConnectionObservation {
+                    connection_id: format!("closed-{index}"),
+                    session_id: None,
+                    stream_id: None,
+                    state: crate::ConnectionState::Closed,
+                    bytes_sent: 0,
+                    bytes_received: 0,
+                    target_display: None,
+                })
+                .unwrap();
+        }
+        for operation in ["status.get", "metrics.snapshot"] {
+            let response = dispatcher.dispatch(request(
+                operation,
+                &["status:read", "metrics:read"],
+                json!({}),
+            ));
+            assert!(response.ok);
+            let result = response.result.unwrap();
+            assert_eq!(result["observations"]["state"], "degraded");
+            assert_eq!(
+                result["observations"]["resource_limits"],
+                json!(["connection_history"])
+            );
+        }
+    }
+
+    #[test]
     fn node_queries_expose_a_sanitized_unavailability_reason() {
         let mut dispatcher = LocalControlDispatcher::new(SystemProxyPlatform::Linux);
         let node = crate::NodeId::new("imported-node").unwrap();
@@ -2462,8 +2552,8 @@ mod tests {
                         message: "node has unsupported connection parameters".to_owned(),
                     }),
                     usage: Some(pathchord_transit::SubscriptionUsage {
-                        upload_bytes: 100,
-                        download_bytes: 150,
+                        upload_bytes: Some(100),
+                        download_bytes: Some(150),
                         total_bytes: Some(1000),
                         expires_at: Some(1900000000),
                         traffic_multiplier_basis_points: Some(25000),
@@ -2740,6 +2830,36 @@ mod tests {
         assert_eq!(items[0]["kind"], "mixed");
         assert_eq!(items[0]["authentication"], "required");
         assert_eq!(items[0]["flow_tags"], json!(["interactive"]));
+    }
+
+    #[test]
+    fn resource_views_preserve_names_and_namespace_independently_of_internal_ids() {
+        let id = pathchord_policy::TransitProxyId::in_namespace("tenant-a", "shared");
+        let id = crate::NodeId::new(id.as_str()).unwrap();
+        let node = node_value(&id, &crate::NodeAdminState::default(), None, None, 1);
+        assert_eq!(node["id"], id.as_str());
+        assert_eq!(node["name"], "shared");
+        assert_eq!(node["namespace"], "tenant-a");
+        let mut dispatcher = dispatcher(SystemProxyPlatform::Linux);
+        let mut listener = dispatcher
+            .service()
+            .listeners()
+            .get(&ListenerId::new("local-http"))
+            .unwrap()
+            .clone();
+        listener.id = ListenerId::in_namespace("tenant-b", "shared");
+        dispatcher.service_mut().register_listener(listener);
+        let result = dispatcher
+            .dispatch(request("listeners.list", &["listeners:read"], json!({})))
+            .result
+            .unwrap();
+        let listener = result["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "shared")
+            .unwrap();
+        assert_eq!(listener["namespace"], "tenant-b");
     }
 
     #[test]

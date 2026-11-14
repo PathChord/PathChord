@@ -404,6 +404,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn namespaced_nodes_retain_distinct_ids_and_original_opaque_credential_references() {
+        let provider = Arc::new(Credentials {
+            requested: Mutex::new(Vec::new()),
+        });
+        let registry = registry(provider.clone());
+        let mut adapter_ids = BTreeSet::new();
+        for (namespace, reference) in [("alpha", "secret-a"), ("beta", "secret-b")] {
+            let mut config = config("socks5");
+            config.id = TransitProxyId::in_namespace(namespace, "shared-proxy");
+            config.credentials_ref = Some(reference.into());
+            let adapter = registry.build(&config).await.unwrap();
+            assert_eq!(adapter.metadata().adapter_id, config.id.as_str());
+            adapter_ids.insert(adapter.metadata().adapter_id.clone());
+        }
+        assert_eq!(adapter_ids.len(), 2);
+        assert_eq!(
+            *provider.requested.lock().unwrap(),
+            ["secret-a", "secret-b"]
+        );
+    }
+
     #[test]
     fn credential_debug_never_contains_values() {
         let credential = TransitCredential::new(BTreeMap::from([(
@@ -453,6 +475,44 @@ mod tests {
                     .unwrap()
                     .supports_udp()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_quic_adapters_honor_explicit_udp_enablement_and_disable_before_dialing() {
+        let registry = registry(Arc::new(Credentials {
+            requested: Mutex::new(Vec::new()),
+        }));
+        for protocol in ["hysteria2", "tuic"] {
+            let mut config = config(protocol);
+            // A disabled datagram request must fail before resolution or dialing.
+            config.endpoint.host = "must-not-resolve.invalid".into();
+            let mut fields = BTreeMap::from([("password".into(), "fixture-password".into())]);
+            if protocol == "tuic" {
+                fields.insert("uuid".into(), "6cbf3f72-3417-4922-bde6-67820d041f25".into());
+            }
+            let credentials = TransitCredential::new(fields);
+            for udp in [None, Some(true), Some(false)] {
+                config.options.udp = udp;
+                let adapter = registry
+                    .build_with_credential(&config, &credentials)
+                    .unwrap();
+                assert!(adapter.supports_tcp());
+                assert_eq!(adapter.supports_udp(), udp != Some(false), "{protocol}");
+                if udp == Some(false) {
+                    assert!(matches!(
+                        adapter
+                            .connect_udp(crate::ConnectRequest {
+                                destination: crate::Endpoint {
+                                    host: "target.invalid".into(),
+                                    port: 53,
+                                },
+                            })
+                            .await,
+                        Err(TransitError::Unsupported(_))
+                    ));
+                }
+            }
         }
     }
 }
