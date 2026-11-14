@@ -27,7 +27,7 @@
 | DNS 线协议处理 | 路由 adapter 后使用 `hickory-proto` | 使用成熟的 DNS 解析/编码，同时保持 local、Transit、Egress 和 blocked 路由可替换 |
 | 测试 | `cargo test`、确定性模拟传输、属性测试、数据包跟踪和故障注入 | 多路径正确性依赖可复现的丢包、重复、重排序和重启测试 |
 
-调度器使用有效容量加权。配置的关系权重提供基线；Path 报告的容量、拥塞窗口、RTT、抖动和丢包率会调整即时分配。重传复制同时使用 Session 全局预算和可选的逐流量类别预算，其中 Session 预算为硬性上限。
+调度器使用有效容量加权。配置的关系权重提供基线；Ingress 分别观测上行和下行 Path 的容量、拥塞、RTT、抖动、丢包和重传，以调整即时分配。Egress 执行全局 wire 硬上限，并报告聚合的配置/有效容量和准入状态；它不解释 Ingress 规则，也不提供期望 Path 数。Session 建立时必须协商复制硬上限；逐流量/类别预算只保留在 Ingress，额外副本只能使用主流量、普通重传和必要控制流量之后的剩余容量。
 
 ## 架构边界
 
@@ -54,7 +54,7 @@ Ingress 拥有一个类型化 command/query service，用于节点元数据、�
 
 节点 tag/label 修改、订阅创建/删除/刷新及其他变更都是带代次检查、幂等和审计的 command。动态快照原子替换；订阅刷新失败时保留最近一次成功快照。观测 provider 发布类型化的节点、Path、Session、Stream、目标连接、订阅和策略 metric。Web Gateway 暴露这些快照和有界事件流；运维人员不能依靠解析日志重建当前状态。
 
-`STATUS_REPORT` 仍然是用于 Egress 准入和健康状态的紧凑认证 data-Path 消息，不是管理 API，也不是 metrics 传输。
+`STATUS_REPORT` 仍然是用于 Egress 全局资源和准入状态的紧凑认证 data-Path 消息。它不是管理 API，不携带 Ingress 规则或 TrafficClass 元数据，也不是 Path-local 质量的权威来源；Ingress 在本地推导方向性 Path 观测。
 
 Prometheus 导出通过 Web Gateway 的认证与 capability 边界，从同一份观测快照读取聚合 gauge。
 提供方用量是可选的显式元数据，与私有订阅快照共同持久化，并由调度器消费；不得变成硬性限制。

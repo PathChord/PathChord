@@ -27,7 +27,15 @@ This document defines the selected technologies and implementation boundaries. P
 | DNS wire handling | `hickory-proto` behind route adapters | Mature DNS parsing/encoding while keeping local, Transit, Egress, and blocked routing replaceable |
 | Testing | `cargo test`, deterministic fake transports, property tests, packet traces, and fault injection | Multipath correctness depends on reproducible loss, duplication, reordering, and restart tests |
 
-The scheduler uses effective-capacity weighting. Configured relationship weights provide the baseline; Path-reported capacity, congestion window, RTT, jitter, and loss adjust the instantaneous allocation. Retransmission replication uses both a Session-wide budget and optional per-traffic-class budgets, with the Session budget as the hard upper bound.
+The scheduler uses effective-capacity weighting. Configured relationship weights
+provide the baseline; Ingress observes upstream and downstream Path capacity,
+congestion, RTT, jitter, loss, and retransmission to adjust instantaneous
+allocation. Egress enforces a global wire hard cap and reports aggregate
+configured/effective capacity and admission state; it does not interpret
+Ingress rules or provide a desired Path count. A mandatory Session replication
+cap is negotiated during attachment, while per-flow/class budgets remain local
+to Ingress and extra copies use only residual capacity after primary traffic,
+ordinary retransmission, and required control traffic.
 
 ## Architecture boundaries
 
@@ -73,8 +81,10 @@ connection, subscription, and policy metrics. The Web Gateway exposes those
 snapshots and bounded event streams; operators must not reconstruct current
 state by parsing logs.
 
-`STATUS_REPORT` remains a compact authenticated data-Path message for Egress
-admission and health. It is not the management API or the metrics transport.
+`STATUS_REPORT` remains a compact authenticated data-Path message for global
+Egress resource and admission state. It is not the management API, carries no
+Ingress rule or TrafficClass metadata, and is not the authoritative source for
+Path-local quality; Ingress derives directional Path observations locally.
 
 Prometheus export reads aggregate gauges from the same observation snapshot
 through the Web Gateway's authentication and capability boundary. Provider

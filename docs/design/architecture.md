@@ -51,14 +51,22 @@ For Egress mode, the admitted Proxy-to-Egress relationships form the multipath c
 
 ## 5. Runtime state
 
-`connected` means that at least one authenticated, bidirectional Ingress-to-Egress Path exists through a Transit Proxy. If no Path exists, `connected` is false. Egress service state can additionally be `up`, `degraded`, `draining`, or `down`.
+`connected` means that the current Ingress-to-Egress Session has at least one
+authenticated, bidirectional ready Path through a Transit Proxy. It is a
+Session relationship fact, not a global Egress health fact. Egress service state
+can additionally be `up`, `degraded`, `draining`, or `down`, and a separate
+`admission_allowed` value states whether new target connections are accepted.
 
-- `up`: connected and meets current admission requirements.
-- `degraded`: connected, but capacity, path count, or capability requirements are not met.
-- `draining`: no new flows; existing flows drain.
-- `down`: no bidirectional Path or explicit administrative shutdown.
+- `up`: connected and meeting the current global resource and admission requirements.
+- `degraded`: connected, but capacity, Path, quality, or resource requirements are below the ideal state; admission may remain allowed or may be denied.
+- `draining`: administrative or lifecycle drain; new flows are denied and existing flows drain.
+- `down`: no ready Path, authorization failure, or explicit administrative shutdown; related Sessions and business resources close.
 
-Egress status is reported over existing Paths. Ingress maintains per-Ingress-to-Egress state; Egress resource metrics may be global and may include per-Ingress quotas or admission limits.
+Egress reports aggregate resource facts over existing Paths: configured and
+effective wire capacity, current wire rate, active target connections, capacity
+confidence, service state, and global admission state. It does not report or
+evaluate Ingress rules. Ingress owns per-Path directional observations and
+per-Session rule demand. Cross-Ingress fairness is not guaranteed.
 
 ## 6. Failure semantics
 
@@ -70,25 +78,55 @@ Egress status is reported over existing Paths. Ingress maintains per-Ingress-to-
 
 ## 7. Sessions and Paths
 
-One Session exists for each active Ingress-to-Egress relationship and has a strict one-to-one relationship with that Egress. Ingress attempts to establish Sessions for configured Egresses when it comes online and maintains them while the Egress is online. The Session is the logical channel between one Ingress and one Egress; business Streams and UDP sessions reuse it. A Session is not tied to one physical transport.
+One Session exists for each active Ingress-to-Egress relationship and has a
+strict one-to-one relationship with that Egress. A Session owns its own Path
+set, flow control, demand windows, replication accounting, and lifecycle. A
+Session reconnect always creates a new SessionID and resets its runtime state.
 
-Each live Session contains at least one `PATH_READY` bidirectional, long-lived Path. The Session manager may retain a reconnecting record with zero Paths, but that record cannot carry business traffic. A Path is one physical transit link for the Session. Ingress creates, expands, drains, and closes Paths; Egress reuses the same Paths for return traffic. Streams are independent of Path identity and may migrate between Paths at any time.
+Each live Session contains at least one `PATH_READY` bidirectional, long-lived
+Path. The Session manager may retain a reconnecting record with zero Paths, but
+that record cannot carry business traffic. A Transit relationship is separate
+from its Path instances, so one Transit Proxy may carry multiple independent
+Paths. Relationship weight is applied once before those Path instances share
+the relationship allocation.
 
-Control messages have an independent sending budget. Business traffic is scheduled by bounded class queues: priority gives a bounded initial preference, shares provide weighted fair service, and every backlogged class makes progress. Each class uses round-robin service among its Streams, so adding Streams does not multiply its allocation. The scheduler decides which currently usable Paths may carry each traffic class; Streams do not retain Path identity. Session control can use any non-revoked Path.
+Ingress creates, expands, drains, and closes Paths. Streams and UDP
+Associations are independent of Path identity and may migrate between Paths.
+Each EgressRule computes its own eligible Path requirement; shared compliant
+Paths may satisfy several rules, while ineligible Paths never count for a rule.
+
+Session control and optional extra replication use the negotiated Session hard
+cap. The first copy and ordinary reliable retransmissions remain available
+when optional replication is exhausted. Egress applies global resource limits
+and strict priority for primary traffic, ordinary retransmission, and required
+control; it does not interpret Ingress rules or promise cross-Ingress fairness.
 
 ## 8. Dynamic scheduling
 
-Egress reports load, connection utilization, bandwidth utilization, active sessions, active Streams, active target connections, capacity, and a recommended Path count. Ingress measures per-Path RTT, jitter, loss, reordering, throughput, and connection establishment quality.
+Egress reports global resource facts: configured wire hard capacity, measured
+effective capacity, current wire rate, capacity state (`unknown`, `provisional`,
+`measured`, or `stale`), active target connections, `admission_allowed`, and a
+stable admission reason. `recommendedPathCount` is not an Egress contract.
 
-Ingress publishes these observations through an atomic local snapshot provider.
-The provider also exposes node labels/tags, subscription generations, Session,
-Stream, target-connection, and policy state for structured management queries.
-Logs are supplementary diagnostics; current operational state and metrics are
-not reconstructed from log text. An optional authenticated Web Gateway may
-serve the snapshot and bounded change events to a frontend, while the
-authoritative local control API remains on a Unix socket or Named Pipe.
+Ingress measures each Path independently in the upstream and downstream
+directions using bounded counters, ACKs, heartbeat timing, data rate, loss,
+retransmission, RTT, jitter, and congestion feedback. It aggregates demand by
+Session-scoped rule/policy/class keys without retaining unbounded per-Stream
+history. Health sampling and demand windows are low-frequency; the data path
+only performs bounded counter updates.
 
-Autoscaling adds Paths when effective aggregate capacity is insufficient and removes Paths cautiously after sustained surplus. Quality degradation reduces allocation quickly; recovery and scale-in are stabilized. A poor Path may be compensated by adding other Paths, but is excluded when its additional capacity is lower than its overhead.
+For each matching EgressRule, Ingress computes a Path target from its minimum
+Path requirement, eligible Transit relationships, directional demand, Path
+quality, and the Egress hard safety ceiling. The physical Path target covers
+the larger upstream/downstream requirement. Scale-out and scale-in use
+hysteresis, retain a compliant Path during drain, and exclude candidates whose
+incremental capacity is below scheduling overhead.
+
+Egress's effective capacity is a global scheduler/resource estimate. It is
+bounded by the configured wire cap and is derived passively from aggregate
+wire rate, queues, retransmission, and resource feedback; idle throughput does
+not fabricate a measured capacity. Egress does not perform rule-level demand
+calculation or cross-Ingress fairness.
 
 Subscription quota and traffic multiplier are optional reference metadata. They may produce tags or affect weight; they are not hard limits and do not directly change Egress connectivity.
 
@@ -130,7 +168,7 @@ an explicit command-line source before environment configuration and account
 defaults. Directory files are loaded deterministically, validated together,
 and published as one snapshot; failed candidates retain the prior graph.
 
-Egress topology, Egress public keys, and Ingress local private keys are static and require Ingress restart when changed. Transit Proxy lists are runtime data, refreshed from subscriptions into a disk cache and hot-reloaded. Failed refreshes keep the current list; deleted subscription Proxies drain.
+Egress topology, Egress public keys, and Ingress local private keys are static and require Ingress restart when changed. Transit Proxy lists are runtime data, refreshed from subscriptions into a disk cache and hot-reloaded. Failed refreshes keep the current list; deleted subscription Proxies drain. Egress capacity and global connection limits are resource ceilings; desired Path counts remain Ingress runtime decisions.
 
 Static rule configuration is compiled at startup. Subscription-derived data and
 approved dynamic rule snapshots may be compiled off-thread and hot-reloaded

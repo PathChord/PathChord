@@ -51,14 +51,20 @@ Transit A  Transit B  Transit C
 
 ## 5. 运行时状态
 
-`connected` 表示至少存在一条经过 Transit Proxy、已经认证且双向连通的 Ingress 到 Egress Path。若不存在 Path，`connected` 为 false。Egress 服务状态还可以是 `up`、`degraded`、`draining` 或 `down`。
+`connected` 表示当前 Ingress 到 Egress 的 Session 至少存在一条经过
+认证且双向就绪的 Transit Proxy Path。它是 Session 关系事实，不是 Egress
+全局健康事实。Egress 服务状态还可以是 `up`、`degraded`、`draining` 或
+`down`，并通过独立的 `admission_allowed` 表示当前是否接受新的目标连接。
 
-- `up`：已连接并满足当前准入要求。
-- `degraded`：已连接，但容量、Path 数量或能力要求未满足。
-- `draining`：不接受新流；现有流继续排空。
-- `down`：不存在双向 Path，或已被管理员显式关闭。
+- `up`：已连接并满足当前全局资源和准入要求。
+- `degraded`：已连接，但容量、Path、质量或资源要求低于理想状态；可以允许或拒绝新准入。
+- `draining`：管理员或生命周期正在排空；拒绝新流并排空现有流。
+- `down`：没有就绪 Path、授权失败或管理员显式关闭；关闭相关 Session 和业务资源。
 
-Egress 状态通过现有 Path 上报。Ingress 维护每个 Ingress 到 Egress 关系的状态；Egress 资源指标可以是全局的，并可包含每个 Ingress 的配额或准入限制。
+Egress 通过现有 Path 上报聚合资源事实：配置的 wire 容量上限、有效容量、
+当前 wire 速率、容量可信度、活跃目标连接数、服务状态和全局准入状态。
+Egress 不上报或解释 Ingress 规则。Ingress 拥有每条 Path 的方向性观测和
+每个 Session 的规则 demand。系统不保证跨 Ingress 的公平性。
 
 ## 6. 故障语义
 
@@ -70,19 +76,43 @@ Egress 状态通过现有 Path 上报。Ingress 维护每个 Ingress 到 Egress 
 
 ## 7. Session 与 Path
 
-每个活跃的 Ingress 到 Egress 关系对应一个 Session，并且该 Session 与 Egress 严格一一对应。Ingress 上线时会尝试为已配置的 Egress 建立 Session，并在 Egress 在线期间维持这些 Session。Session 是一个 Ingress 与一个 Egress 之间的逻辑通道；业务 Stream 和 UDP 会话复用该通道。Session 不绑定单一物理传输。
+每个活跃的 Ingress 到 Egress 关系对应一个 Session，并且该 Session 与
+Egress 严格一一对应。Session 拥有自己的 Path 集合、流控、demand 窗口、
+复制记账和生命周期。Session 重连始终创建新的 SessionID，并重置运行时状态。
 
-每个存活的 Session 至少包含一条处于 `PATH_READY` 状态、双向且长连接的 Path。Session 管理器可以保留一条 Path 数量为零、正在重连的记录，但该记录不能承载业务流量。Path 是 Session 的一条物理中转链路。Ingress 创建、扩展、排空和关闭 Path；Egress 复用相同的 Path 传输返回流量。Stream 独立于 Path 标识，可以随时在 Path 之间迁移。
+每个存活的 Session 至少包含一条处于 `PATH_READY` 状态、双向且长连接的
+Path。Session 管理器可以保留一条 Path 数量为零、正在重连的记录，但该记录
+不能承载业务流量。Transit 关系与 Path 实例分离，因此同一个 Transit Proxy
+可以承载多条独立 Path。关系权重只计算一次，再由这些 Path 实例共享该关系分配。
 
-控制消息具有独立的发送预算。业务流量通过有界类别队列调度：优先级只提供有界的初始偏好，份额提供加权公平服务，每个有待发送数据的类别都会取得进展。每个类别内部对 Stream 轮询，因此增加 Stream 不会放大其分配。调度器决定当前可用的哪些 Path 可以承载每个流量类别；Stream 不保留 Path 标识。Session 控制消息可以使用任何未撤销的 Path。
+Ingress 创建、扩展、排空和关闭 Path。Stream 和 UDP 会话独立于 Path 标识，
+可以在 Path 之间迁移。每条 EgressRule 单独计算自己的合规 Path 要求；同一条
+合规 Path 可以被多条规则复用，但不合规 Path 不得计入任何对应规则。
+
+Session 控制和可选额外复制使用协商出的 Session 硬上限。即使可选复制耗尽，
+第一份副本和普通可靠重传仍然可用。Egress 执行全局资源上限，并优先保障业务
+主流量、普通重传和必要控制流量；它不解释 Ingress 规则，也不承诺跨 Ingress 公平性。
 
 ## 8. 动态调度
 
-Egress 上报负载、连接利用率、带宽利用率、活跃 Session、活跃 Stream、活跃目标连接、容量以及建议 Path 数量。Ingress 测量每条 Path 的 RTT、抖动、丢包、乱序、吞吐量和连接建立质量。
+Egress 上报全局资源事实：配置的 wire 容量上限、测得的有效容量、当前
+wire 速率、容量状态（`unknown`、`provisional`、`measured` 或 `stale`）、
+活跃目标连接数、`admission_allowed` 和稳定的准入原因。`recommendedPathCount`
+不是 Egress 契约。
 
-Ingress 通过原子运行时快照 provider 发布这些观测数据。该 provider 也提供节点 label/tag、订阅代次、Session、Stream、目标连接和策略状态，供结构化管理查询使用。日志只是补充诊断；当前运行状态和 metric 不得依靠解析日志重建。可选的认证 Web Gateway 可以向前端提供快照和有界变更事件，而权威本地控制 API 仍然位于 Unix socket 或 Named Pipe 上。
+Ingress 使用有界 counter、ACK、heartbeat、数据速率、丢包、重传、RTT、抖动
+和拥塞反馈，分别测量每条 Path 的上行和下行状态。它按 Session 作用域的规则、
+策略和类别 key 聚合 demand，但不保留无界的 per-Stream 历史。健康采样和
+demand 窗口以低频运行；数据路径只更新有界 counter。
 
-有效聚合容量不足时，自动扩缩容会增加 Path；只有在持续出现容量富余后才会谨慎移除 Path。质量下降时会快速减少分配；恢复和缩容过程保持稳定。可以通过增加其他 Path 来补偿质量较差的 Path，但当其新增容量低于自身开销时会将其排除。
+对于每条匹配的 EgressRule，Ingress 根据最小 Path 要求、合规 Transit 关系、
+方向性 demand、Path 质量和 Egress 硬安全上限计算 Path target。物理 Path target
+覆盖上行和下行中需求较大的方向。扩容和缩容使用迟滞，缩容时保留一条合规 Path，
+并排除新增容量低于调度开销的候选。
+
+Egress 的有效容量是全局 scheduler/resource 估计值，受配置 wire 上限约束，
+并通过 aggregate wire 速率、队列、重传和资源反馈被动计算；空闲吞吐不能伪造
+测得容量。Egress 不计算规则级 demand，也不执行跨 Ingress 公平调度。
 
 订阅配额和流量倍率是可选的参考元数据。它们可以生成标签或影响权重；它们不是硬性限制，也不会直接改变 Egress 连通性。
 
@@ -119,7 +149,7 @@ Windows 系统代理集成是控制面开关，按 ID 选择一个 HTTP/SOCKS �
 一个文件或目录资源集合定义一张资源图。Ingress 按显式命令行来源、环境变量、账号默认值的
 优先级选择配置。目录文件按确定顺序加载、统一验证并发布为一个快照；候选失败时保留原图。
 
-Egress 拓扑、Egress 公钥和 Ingress 本地私钥属于静态配置，发生变更时需要重启 Ingress。Transit Proxy 列表是运行时数据，从订阅刷新到磁盘缓存并热重载。刷新失败时保留当前列表；订阅中已删除的 Proxy 进入排空状态。
+Egress 拓扑、Egress 公钥和 Ingress 本地私钥属于静态配置，发生变更时需要重启 Ingress。Transit Proxy 列表是运行时数据，从订阅刷新到磁盘缓存并热重载。刷新失败时保留当前列表；订阅中已删除的 Proxy 进入排空状态。Egress 容量和全局连接限制是资源上限；期望 Path 数由 Ingress 运行时决定。
 
 静态规则配置在启动时编译。订阅派生数据和获准的动态规则快照可以在后台编译并原子热重载。运行时分别维护策略、Egress、Proxy、认证和指标快照。Ingress 内部流量绕过自身的透明拦截，以防止形成环路。
 
