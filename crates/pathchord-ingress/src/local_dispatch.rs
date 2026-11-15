@@ -905,6 +905,8 @@ impl LocalControlDispatcher {
                 "created_at",
                 "last_change_at",
                 "close_reason",
+                "active_udp_associations",
+                "pending_session_controls",
             ],
         ) {
             Ok(query) => query,
@@ -1083,6 +1085,12 @@ impl LocalControlDispatcher {
         );
         let path_throughput_bps_sum =
             sum_observed(snapshot.paths.values().map(|path| path.throughput_bps));
+        let path_capacity_bps_sum = sum_observed(
+            snapshot
+                .paths
+                .values()
+                .map(|path| path.available_capacity_bps),
+        );
         let path_reordering_events =
             sum_observed(snapshot.paths.values().map(|path| path.reordering_events));
         let stream_bytes_sent: u64 = snapshot
@@ -1168,6 +1176,38 @@ impl LocalControlDispatcher {
             "admission_reason": format!("{:?}", report.admission_reason).to_ascii_lowercase(),
             "status_report_age_ms": entry.age_ms,
         }))).collect();
+        let (
+            egress_configured_capacity_bps,
+            egress_effective_capacity_bps,
+            egress_current_wire_rate_bps,
+            egress_replication_allowance_bps,
+            egress_admission_denied,
+            egress_stale_reports,
+        ) = snapshot.egress_runtime.values().fold(
+            (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64),
+            |totals, entry| {
+                let Some(report) = entry.report.as_ref() else {
+                    return (
+                        totals.0,
+                        totals.1,
+                        totals.2,
+                        totals.3,
+                        totals.4,
+                        totals.5 + 1,
+                    );
+                };
+                (
+                    totals.0.saturating_add(report.configured_capacity_bps),
+                    totals.1.saturating_add(report.effective_capacity_bps),
+                    totals.2.saturating_add(report.current_wire_rate_bps),
+                    totals.3.saturating_add(report.replication_allowance_bps),
+                    totals
+                        .4
+                        .saturating_add(u64::from(!report.admission_allowed)),
+                    totals.5.saturating_add(u64::from(!entry.fresh)),
+                )
+            },
+        );
         let udp_associations: usize = snapshot
             .egress_runtime
             .values()
@@ -1197,6 +1237,12 @@ impl LocalControlDispatcher {
                     "degraded": measured.then(|| egress_state_count(pathchord_core::EgressServiceState::Degraded)),
                     "draining": measured.then(|| egress_state_count(pathchord_core::EgressServiceState::Draining)),
                     "down": measured.then(|| egress_state_count(pathchord_core::EgressServiceState::Down)),
+                    "configured_capacity_bps": measured.then_some(egress_configured_capacity_bps),
+                    "effective_capacity_bps": measured.then_some(egress_effective_capacity_bps),
+                    "current_wire_rate_bps": measured.then_some(egress_current_wire_rate_bps),
+                    "replication_allowance_bps": measured.then_some(egress_replication_allowance_bps),
+                    "admission_denied": measured.then_some(egress_admission_denied),
+                    "stale_reports": measured.then_some(egress_stale_reports),
                 },
                 "egress_reports": measured.then_some(egress_reports),
                 "runtime": {
@@ -1213,6 +1259,7 @@ impl LocalControlDispatcher {
                     "jitter_ms_sum": path_jitter_ms_sum,
                     "loss_ppm_sum": path_loss_ppm_sum,
                     "throughput_bps_sum": path_throughput_bps_sum,
+                    "capacity_bps_sum": path_capacity_bps_sum,
                     "reordering_events": path_reordering_events,
                 },
                 "streams_observed": snapshot.streams.len(),
@@ -1257,17 +1304,31 @@ impl LocalControlDispatcher {
         let query = match ListQuery::parse(
             &request.body,
             "metrics.paths",
-            &["path_id", "session_id", "egress_id", "state"],
             &[
                 "path_id",
                 "session_id",
                 "egress_id",
+                "transit_proxy_id",
                 "state",
+            ],
+            &[
+                "path_id",
+                "session_id",
+                "egress_id",
+                "transit_proxy_id",
+                "state",
+                "ready_since_ms",
+                "last_change_at_ms",
                 "rtt_ms",
                 "jitter_ms",
                 "loss_ppm",
                 "throughput_bps",
+                "upstream_throughput_bps",
+                "downstream_throughput_bps",
+                "available_capacity_bps",
                 "reordering_events",
+                "control_pending",
+                "control_retransmissions",
             ],
         ) {
             Ok(query) => query,
@@ -1289,14 +1350,24 @@ impl LocalControlDispatcher {
                 json!({
                     "path_id": path.path_id.to_string(),
                     "session_id": path.session_id.to_string(),
-                    "egress_id": snapshot.sessions.get(&path.session_id).map(|session| &session.egress_id),
+                    "egress_id": path.egress_id.as_ref().or_else(|| snapshot.sessions.get(&path.session_id).map(|session| &session.egress_id)),
+                    "transit_proxy_id": path.transit_proxy_id,
                     "generation": snapshot.generation,
                     "state": format!("{:?}", path.state).to_ascii_lowercase(),
+                    "ready_since_ms": path.ready_since_ms,
+                    "ready_since": path.ready_since_ms.map(rfc3339_utc),
+                    "last_change_at_ms": path.last_change_at_ms,
+                    "last_change_at": path.last_change_at_ms.map(rfc3339_utc),
                     "rtt_ms": path.rtt_ms,
                     "jitter_ms": path.jitter_ms,
                     "loss_ppm": path.loss_ppm,
                     "throughput_bps": path.throughput_bps,
+                    "upstream_throughput_bps": path.upstream_throughput_bps,
+                    "downstream_throughput_bps": path.downstream_throughput_bps,
+                    "available_capacity_bps": path.available_capacity_bps,
                     "reordering_events": path.reordering_events,
+                    "control_pending": path.control_pending,
+                    "control_retransmissions": path.control_retransmissions,
                     "exclusion_reason": path.exclusion_reason,
                 })
             })
@@ -1857,15 +1928,20 @@ fn session_value(
         "session_id": session.session_id.to_string(),
         "egress_id": session.egress_id,
         "state": format!("{:?}", session.state).to_ascii_lowercase(),
+        "admission_generation": session.admission_generation,
+        "created_at_ms": session.created_at_ms,
+        "created_at": session.created_at_ms.map(rfc3339_utc),
+        "last_change_at_ms": session.last_change_at_ms,
+        "last_change_at": session.last_change_at_ms.map(rfc3339_utc),
+        "close_reason": session.close_reason,
         "ready_paths": session.ready_paths,
         "ready_path_count": session.ready_paths,
-        "admission_generation": Value::Null,
-        "created_at": Value::Null,
-        "last_change_at": Value::Null,
-        "close_reason": Value::Null,
         "active_streams": session.active_streams,
-        "active_udp_associations": runtime.map(|value| value.active_udp_associations),
-        "control_pending": runtime.map(|value| value.pending_session_controls),
+        "active_udp_associations": session.active_udp_associations,
+        "pending_session_controls": session.pending_session_controls,
+        "control_pending": runtime
+            .map(|value| value.pending_session_controls)
+            .or(Some(session.pending_session_controls)),
         "generation": generation,
         "retained_outbound_bytes": session.retained_outbound_bytes,
         "bytes_sent": session.bytes_sent,
@@ -2678,8 +2754,14 @@ mod tests {
                     session_id,
                     egress_id: "egress-a".into(),
                     state: pathchord_core::SessionState::Active,
+                    admission_generation: None,
+                    created_at_ms: None,
+                    last_change_at_ms: None,
+                    close_reason: None,
                     ready_paths: 1,
                     active_streams: 2,
+                    active_udp_associations: 0,
+                    pending_session_controls: 0,
                     retained_outbound_bytes: 3,
                     bytes_sent: 4,
                     bytes_received: 5,
@@ -2687,12 +2769,21 @@ mod tests {
                 [crate::PathObservation {
                     path_id,
                     session_id,
+                    egress_id: Some("egress-a".into()),
+                    transit_proxy_id: Some("transit-a".into()),
                     state: pathchord_core::PathState::Active,
+                    ready_since_ms: None,
+                    last_change_at_ms: None,
                     rtt_ms: Some(12),
                     jitter_ms: Some(3),
                     loss_ppm: Some(4_000),
                     throughput_bps: Some(5_000_000),
+                    upstream_throughput_bps: Some(4_000_000),
+                    downstream_throughput_bps: Some(6_000_000),
+                    available_capacity_bps: Some(7_000_000),
                     reordering_events: Some(6),
+                    control_pending: Some(1),
+                    control_retransmissions: Some(2),
                     exclusion_reason: None,
                 }],
             )
@@ -3068,8 +3159,14 @@ mod tests {
                     session_id,
                     egress_id: "egress-a".into(),
                     state: pathchord_core::SessionState::Active,
+                    admission_generation: None,
+                    created_at_ms: None,
+                    last_change_at_ms: None,
+                    close_reason: None,
                     ready_paths: 1,
                     active_streams: 0,
+                    active_udp_associations: 0,
+                    pending_session_controls: 0,
                     retained_outbound_bytes: 0,
                     bytes_sent: 0,
                     bytes_received: 0,

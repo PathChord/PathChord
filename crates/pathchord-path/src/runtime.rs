@@ -372,6 +372,8 @@ pub struct PathQualitySnapshot {
     pub downstream_effective_capacity_bps: Option<u64>,
     pub upstream_throughput_bps: u64,
     pub downstream_throughput_bps: u64,
+    pub control_pending: usize,
+    pub control_retransmissions: u64,
     pub reordering_events: u64,
     pub exclusion_reason: Option<PathExclusionReason>,
 }
@@ -4984,6 +4986,8 @@ where
                         downstream_effective_capacity_bps: health.downstream_effective_capacity_bps,
                         upstream_throughput_bps: health.upstream_throughput_bps,
                         downstream_throughput_bps: health.downstream_throughput_bps,
+                        control_pending: health.sender.pending_len(),
+                        control_retransmissions: health.retransmitted_controls,
                         reordering_events: health.reordering_events,
                         exclusion_reason: health.exclusion_reason.or_else(|| self.multipath.quality_exclusion(*path_id).ok().flatten().map(|reason| match reason {
                             crate::PathQualityExclusionReason::IncrementalCapacityBelowOverhead => PathExclusionReason::IncrementalCapacityBelowOverhead,

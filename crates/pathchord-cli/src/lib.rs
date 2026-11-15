@@ -920,6 +920,8 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         .iter()
         .map(|egress| egress.id.as_str().to_owned())
         .collect();
+    let mut session_timing: BTreeMap<pathchord_core::SessionId, (u64, u64, String)> =
+        BTreeMap::new();
     let observation_shutdown = shutdown.subscribe();
     let observation_future = async move {
         let mut shutdown = observation_shutdown;
@@ -940,8 +942,18 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                         .map_err(|error| CliError::Observation(error.to_string()))?;
                 }
                 _ = interval.tick() => {
+                    let captured_at_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
                     let snapshot = observation_plane.snapshot().await;
                     let session_snapshots = observation_plane.session_snapshots().await;
+                    let current_session_ids: BTreeSet<_> = session_snapshots
+                        .iter()
+                        .map(|entry| entry.session.session_id)
+                        .collect();
+                    session_timing.retain(|id, _| current_session_ids.contains(id));
                     for egress_id in &observation_egresses {
                         let session = session_snapshots.iter().find(|entry| &entry.egress_id == egress_id);
                         let status = session.and_then(|entry| entry.session.egress_status.as_ref());
@@ -954,21 +966,45 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                             session.map_or(0, |entry| entry.session.pending_session_controls),
                         ).map_err(|error| CliError::Observation(error.to_string()))?;
                     }
-                    let sessions = session_snapshots.iter().map(|entry| SessionObservation {
-                        session_id: entry.session.session_id,
-                        egress_id: entry.egress_id.clone(),
-                        state: if entry.session.closed {
+                    let sessions = session_snapshots.iter().map(|entry| {
+                        let state = if entry.session.closed {
                             SessionState::Closed
                         } else if entry.session.ready_paths == 0 {
                             SessionState::Connecting
+                        } else if entry.session.degraded_paths > 0 {
+                            SessionState::Degraded
                         } else {
                             SessionState::Active
-                        },
-                        ready_paths: entry.session.ready_paths,
-                        active_streams: entry.session.active_streams,
-                        retained_outbound_bytes: entry.session.retained_outbound_bytes,
-                        bytes_sent: entry.session.bytes_sent,
-                        bytes_received: entry.session.bytes_received,
+                        };
+                        let fingerprint = format!(
+                            "{state:?}:{}:{}:{}",
+                            entry.session.ready_paths,
+                            entry.session.active_streams,
+                            entry.session.active_udp_associations
+                        );
+                        let timing = session_timing
+                            .entry(entry.session.session_id)
+                            .or_insert((captured_at_ms, captured_at_ms, fingerprint.clone()));
+                        if timing.2 != fingerprint {
+                            timing.1 = captured_at_ms;
+                            timing.2 = fingerprint;
+                        }
+                        SessionObservation {
+                            session_id: entry.session.session_id,
+                            egress_id: entry.egress_id.clone(),
+                            state,
+                            admission_generation: None,
+                            created_at_ms: Some(timing.0),
+                            last_change_at_ms: Some(timing.1),
+                            close_reason: None,
+                            ready_paths: entry.session.ready_paths,
+                            active_streams: entry.session.active_streams,
+                            active_udp_associations: entry.session.active_udp_associations,
+                            pending_session_controls: entry.session.pending_session_controls,
+                            retained_outbound_bytes: entry.session.retained_outbound_bytes,
+                            bytes_sent: entry.session.bytes_sent,
+                            bytes_received: entry.session.bytes_received,
+                        }
                     });
                     let paths = session_snapshots.iter().flat_map(|entry| {
                         let ready: BTreeSet<_> = entry.session.ready_path_ids.iter().copied().collect();
@@ -991,13 +1027,27 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                             PathObservation {
                                 path_id,
                                 session_id: entry.session.session_id,
+                                egress_id: Some(entry.egress_id.clone()),
+                                transit_proxy_id: entry.path_transit.get(&path_id).cloned(),
                                 state,
+                                ready_since_ms: None,
+                                last_change_at_ms: None,
                                 rtt_ms: quality.map(|quality| quality.rtt_ms),
                                 jitter_ms: quality.map(|quality| quality.jitter_ms),
                                 loss_ppm: quality.map(|quality| quality.loss_ppm),
                                 throughput_bps: quality.map(|quality| quality.throughput_bps),
+                                upstream_throughput_bps: quality
+                                    .map(|quality| quality.upstream_throughput_bps),
+                                downstream_throughput_bps: quality
+                                    .map(|quality| quality.downstream_throughput_bps),
+                                available_capacity_bps: quality
+                                    .map(|quality| quality.effective_capacity_bps),
                                 reordering_events: quality
                                     .map(|quality| quality.reordering_events),
+                                control_pending: quality
+                                    .map(|quality| quality.control_pending as u64),
+                                control_retransmissions: quality
+                                    .map(|quality| quality.control_retransmissions),
                                 exclusion_reason,
                             }
                         })

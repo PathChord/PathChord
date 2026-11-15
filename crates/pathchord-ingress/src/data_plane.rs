@@ -110,6 +110,7 @@ pub struct DataPlaneSnapshot {
 pub struct DataPlaneSessionSnapshot {
     pub egress_id: String,
     pub session: SessionSnapshot,
+    pub path_transit: BTreeMap<PathId, String>,
 }
 
 #[derive(Debug, Error)]
@@ -1668,6 +1669,17 @@ impl IngressDataPlane {
                 snapshots.push(DataPlaneSessionSnapshot {
                     egress_id: egress_id.as_str().to_owned(),
                     session: session.snapshot(),
+                    path_transit: slot
+                        .transit_paths
+                        .lock()
+                        .await
+                        .iter()
+                        .flat_map(|(transit, paths)| {
+                            paths
+                                .iter()
+                                .map(move |path| (*path, transit.as_str().to_owned()))
+                        })
+                        .collect(),
                 });
             }
         }

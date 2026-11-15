@@ -43,6 +43,36 @@ pub(crate) fn prometheus(snapshot: &Value) -> String {
             "/generation",
         ),
         (
+            "pathchord_egress_configured_capacity_bps",
+            "Sum of configured Egress capacity in bits per second.",
+            "/egress/configured_capacity_bps",
+        ),
+        (
+            "pathchord_egress_effective_capacity_bps",
+            "Sum of effective Egress capacity in bits per second.",
+            "/egress/effective_capacity_bps",
+        ),
+        (
+            "pathchord_egress_current_wire_rate_bps",
+            "Sum of current Egress wire rate in bits per second.",
+            "/egress/current_wire_rate_bps",
+        ),
+        (
+            "pathchord_egress_replication_allowance_bps",
+            "Sum of Egress replication allowance in bits per second.",
+            "/egress/replication_allowance_bps",
+        ),
+        (
+            "pathchord_egress_admission_denied",
+            "Egress observations currently denying new admission.",
+            "/egress/admission_denied",
+        ),
+        (
+            "pathchord_egress_stale_reports",
+            "Egress observations with stale status reports.",
+            "/egress/stale_reports",
+        ),
+        (
             "pathchord_observed_paths",
             "Paths represented in the observation snapshot.",
             "/observed_paths",
@@ -93,6 +123,11 @@ pub(crate) fn prometheus(snapshot: &Value) -> String {
             "/path_quality/throughput_bps_sum",
         ),
         (
+            "pathchord_path_capacity_bps_sum",
+            "Sum of observed Path available capacity values in bits per second.",
+            "/path_quality/capacity_bps_sum",
+        ),
+        (
             "pathchord_path_reordering_events",
             "Observed Path reordering events.",
             "/path_quality/reordering_events",
@@ -128,10 +163,11 @@ mod tests {
     fn exports_gauges_without_turning_targets_or_admin_tags_into_labels() {
         let result = super::prometheus(&serde_json::json!({
             "runtime": {"sessions": 3, "ready_paths": 2, "streams": 7, "target_connections": 8},
+            "egress": {"configured_capacity_bps": 1000, "effective_capacity_bps": 800, "current_wire_rate_bps": 500, "replication_allowance_bps": 100, "admission_denied": 1, "stale_reports": 0},
             "nodes": 4, "observed_connections": 8, "generation": 42,
             "observed_paths": 2, "streams_observed": 3,
             "node_health": {"unknown": 1, "up": 2, "degraded": 1, "down": 0},
-            "path_quality": {"rtt_ms_sum": 25, "jitter_ms_sum": 5, "loss_ppm_sum": 4000, "throughput_bps_sum": 1000, "reordering_events": 2},
+            "path_quality": {"rtt_ms_sum": 25, "jitter_ms_sum": 5, "loss_ppm_sum": 4000, "throughput_bps_sum": 1000, "capacity_bps_sum": 2000, "reordering_events": 2},
             "stream_totals": {"bytes_sent": 10, "bytes_received": 11, "bytes_acked": 9, "retransmissions": 1},
             "private_target": "private.example", "admin": {"owner": "arbitrary-label"},
         }));
@@ -141,6 +177,8 @@ mod tests {
         assert!(result.contains("pathchord_observation_generation 42\n"));
         assert!(result.contains("pathchord_nodes_up 2\n"));
         assert!(result.contains("pathchord_stream_bytes_sent 10\n"));
+        assert!(result.contains("pathchord_path_capacity_bps_sum 2000\n"));
+        assert!(result.contains("pathchord_egress_current_wire_rate_bps 500\n"));
         assert!(!result.contains("private.example"));
         assert!(!result.contains("arbitrary-label"));
     }
