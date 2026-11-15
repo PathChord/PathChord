@@ -27,6 +27,14 @@ are present in the local implementation.
 The evidence below remains local Linux build/test evidence unless a section
 explicitly names a native host, external peer, cross-machine run, or soak.
 
+The scheduling slice now has deterministic coverage for independent mixed-flow
+replication budgets, reserved control/retransmission priority, directional
+autoscale inputs, rule-union Path planning, and Egress capacity hysteresis.
+Egress target opens (TCP and UDP) share one bounded active-plus-pending
+reservation pool; local control saturation returns a typed resource-limit
+response. Relative truststore sources are resolved from the selected config
+source and all TLS-capable adapters consume the resolved truststore.
+
 Final v1 contract validation in this checkout:
 
 - `cargo fmt --all -- --check` passed.
@@ -282,11 +290,12 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Shared implementation gaps
 
-- A Session containing flows admitted by different TrafficPolicies uses the
-  most restrictive local policy floor while the negotiated Session replication
-  cap remains the hard ceiling. The current bounded wire-budget helper and
-  status allowance are deterministic local components; aggregate Egress wire
-  accounting still needs prolonged load evidence and cross-machine validation.
+- A Session containing flows admitted by different TrafficPolicies keeps an
+  independent bounded replication budget per Stream/Association while the
+  negotiated Session replication cap remains the hard ceiling. Required
+  control and ordinary retransmission reserve the aggregate wire budget before
+  optional copies; aggregate Egress wire accounting still needs prolonged load
+  evidence and cross-machine validation.
 - Congestion-window, incremental-capacity, and scheduling-overhead measurements
   are optional scheduler inputs. No platform source supplies them by default;
   they remain unknown rather than being inferred from idle throughput.

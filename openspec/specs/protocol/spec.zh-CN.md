@@ -67,15 +67,83 @@ Session 控制 SHALL 使用 Session 范围的序列空间、重复抑制、依�
 
 调度 SHALL 保留关系权重、有效容量和质量输入、Session 范围的复制预算，以及任何更严格的流量类别预算。需要流量类别的 flow 在对应 capability 缺失时 SHALL 被拒绝，不能静默丢弃类别信息。
 
-#### Scenario: Required traffic class is unavailable
+#### Scenario: Traffic class policy is local
 
-- **WHEN** flow 需要流量类别，但 Session 尚未协商 `traffic-classes` capability
-- **THEN** 拒绝该 flow，不会在丢弃类别信息后继续打开
+- **WHEN** Ingress 在 TrafficPolicy 类别下准入一个 flow
+- **THEN** 类别只影响 Ingress 本地调度和记账，不会作为元数据加入 `STREAM_OPEN` 或 `UDP_OPEN`
 
 #### Scenario: Class replication exceeds remaining Session budget
 
 - **WHEN** 流量类别复制策略允许的额外副本数量超过 Session 范围预算的剩余额度
 - **THEN** 复制仍受 Session 范围剩余预算约束，控制复制也计入该预算
+
+### Requirement: Egress hard failure closes the Session
+
+Egress `down`、授权失败或最后一条 ready Path 丢失 SHALL 关闭相关 Session 和业务资源。替代连接必须使用新 SessionID；`degraded` 和 stale status 在没有独立硬故障时保留已有工作。
+
+#### Scenario: Egress reports down
+
+- **WHEN** 新鲜认证的 Egress 报告 `connected=0` 且 `service_state=down`
+- **THEN** Ingress 关闭相关 Path、Session、Stream、UDP Association、本地连接和目标连接，并废弃 SessionID
+
+### Requirement: Stale health blocks new admission only
+
+Ingress SHALL 将 heartbeat liveness 与 Egress health freshness 分开处理。Egress health stale 或缺失时，若 Path liveness 仍健康，只拒绝新的业务准入并保留已有工作。
+
+#### Scenario: Heartbeat is fresh but status is stale
+
+- **WHEN** Path 仍交换 heartbeat，但最新 Egress status 超过本地新鲜度限制
+- **THEN** Path 保持控制和已有工作的可用性，新的 Stream 和 UDP Association 被拒绝
+
+### Requirement: Validated future ACKs are Session trust failures
+
+Ingress SHALL 在应用 ACK 前按本地 emitted Stream 区间校验。认证的 future ACK SHALL 关闭 Session 的所有 Path，废弃 SessionID，并触发有界新 Session 恢复，而不是只失败一条 Path。
+
+#### Scenario: Future ACK follows a correct local frontier
+
+- **WHEN** 对端认证 ACK 超过本地已发送区间且本地 frontier 记账有效
+- **THEN** Session 以协议信任失败关闭，ACK 不释放保留数据，后续 Session 使用新 SessionID
+
+### Requirement: Session trust failures are circuit-broken
+
+协议信任失败后的自动恢复 SHALL 使用有界指数退避，并在失败窗口内重复失败时打开断路器。断路器停止新尝试，但不得自动撤销授权。
+
+#### Scenario: Repeated protocol violations occur
+
+- **WHEN** 同一 Egress 在失败窗口内重复造成 Session 信任失败
+- **THEN** Ingress 将其标记为新 Session 不可用，保留诊断，等待冷却或显式恢复
+
+### Requirement: Candidate failover ends at business admission
+
+选定 Egress 在 `STREAM_OPEN` 或 `UDP_OPEN` 准入前失败时，Ingress MAY 在同一捕获代次尝试下一个合规候选。目标连接准入后，Egress 故障 SHALL 关闭业务资源，不得透明重建目标连接。
+
+#### Scenario: Path admission fails before Stream open
+
+- **WHEN** 第一个候选在 `STREAM_OPEN` 前无法建立合规 Path
+- **THEN** Ingress 尝试下一个合规候选，或返回类型化准入失败，不进入未配置 Proxy fallback
+
+#### Scenario: Egress fails after target admission
+
+- **WHEN** 已准入 Stream 丢失 Egress Session
+- **THEN** Stream 和目标连接关闭，由应用程序重试，代理不静默拨号替代目标
+
+### Requirement: Egress does not interpret Ingress policy
+
+Egress SHALL 只接收 wire 所需的窄资源限制和调度数据，不得接收或求值 EgressRule、TransitRule、selector、TrafficPolicy identity 或规则 demand。
+
+#### Scenario: Session carries a requested replication cap
+
+- **WHEN** Ingress 使用请求复制上限附加 Session
+- **THEN** Egress 将其作为不透明资源限制处理，不推断生成它的 Ingress 规则或策略
+
+### Requirement: Replication uses independent flow budgets under a Session cap
+
+Ingress SHALL 按 Stream/UDP policy scope 记账复制，同时执行协商的 Session 硬上限。控制副本共享该上限并优先于可选业务副本；可选复制耗尽时普通可靠重传仍可用。
+
+#### Scenario: Optional replication exhausts its budget
+
+- **WHEN** Session 没有额外复制 allowance
+- **THEN** 主副本或普通重传仍可发送，跳过可选副本，不因缺少复制单独失败 Stream
 
 ## Detailed contract
 
@@ -182,7 +250,7 @@ SESSION_CLOSE
 
 控制流量拥有预留容量。一个 Session 至少需要一条活跃 Path；最后一条 Path 丢失时，Session 终止。状态报告和心跳使用各自的 Path 本地序列。Session 控制消息使用 Session 范围的控制序列号抑制重复，并 MAY 携带依赖序列号。控制和数据交换使用可用且符合策略的 Path。
 
-默认情况下，当 Session 复制预算允许时，Session 控制消息会在当前多条可用且符合条件的 Path 上复制；首份消息和普通重传不消耗该预算。接收方对每个 `control_seqno` 最多应用一次。`SESSION_CONTROL_ACK` 报告已应用的最高连续序列号以及 OPTIONAL 的选择性范围。发送方保留未确认的 Session 控制消息，并持续重传，直至消息得到确认或 Session transport 关闭。`CONTROL_ACK` 用于确认 Path 本地心跳。
+当剩余 Session allowance 允许时，Session 控制消息可以在当前多条可用且符合条件的 Path 上复制；必要控制和普通重传优先于可选副本。接收方对每个 `control_seqno` 最多应用一次。`SESSION_CONTROL_ACK` 报告已应用的最高连续序列号以及 OPTIONAL 的选择性范围。发送方保留未确认的 Session 控制消息，并持续重传，直至消息得到确认或 Session transport 关闭。`CONTROL_ACK` 用于确认 Path 本地心跳。
 
 当 flow 失去符合条件的 Path 而 Session 中仍有其他可用 Path 时，
 `SESSION_CONTROL_CANCEL` 仅使用不透明 flow ID 推进或替换其控制序号。它清理该 flow，
@@ -199,7 +267,7 @@ REQUIRED 的语义：
 - 传播目标 FIN/RST；
 - 每 Stream 和 Session 流量控制；
 - ACK 范围和重复抑制；
-- 对未确认数据进行跨 Path 重传；重传 MAY 使用任何当前符合要求的 Path。重传复制由每个流量类别的策略控制，并可由 Egress 默认策略启用或禁用；
+- 对未确认数据进行跨 Path 重传；重传 MAY 使用任何当前符合要求的 Path，并且在可选复制耗尽后仍可用；
 - 有界重排缓冲区；
 - 使用背压，而不是静默丢弃 TCP 字节。
 
@@ -221,13 +289,9 @@ Ingress 负责 Path 的创建和准入。Path 状态对 Stream 和 UDP Session �
 
 每 Path 调度使用有效容量加权：配置的 Proxy 到 Egress 关系权重建立基线，随后每条 Path 报告的有效容量、拥塞窗口、RTT、抖动和丢包率会调整其当前份额。通过一个 Transit Proxy 的多条 Path 共享关系权重，而各自观测到的容量决定如何分配该关系的份额。
 
-重传复制受两个预算限制：Session 范围的复制预算和 OPTIONAL 的每流量类别预算。流量类别预算 MAY 进一步限制复制，但 MUST NOT 超过 Session 范围预算的剩余额度。控制消息使用默认的控制复制策略，并计入 Session 预算。
-
-#### 流量类别 capability
-
-可选的 `traffic-classes` capability 由 `PATH_READY_CAPABILITIES` 表示。选中后，
-`STREAM_OPEN_CLASS` 和 `UDP_OPEN_CLASS` 会在旧的 open payload 旁携带有界类别名称、
-优先级和份额。需要类别的 flow 在 capability 缺失时必须拒绝，不能静默丢弃类别信息。
+重传复制受协商的 Session 硬上限和 Ingress 本地逐流/逐类别预算限制。控制消息
+使用必要控制优先级，可选业务副本只能使用剩余 allowance。Egress 不接收或解释
+TrafficPolicy、TrafficClass 身份。
 
 对于有待发送数据的业务类别，先提供有界优先级偏好，再提供加权公平服务；每个类别内部轮询 Stream，即使另一个类别拥有更多 Stream，也会获得有界服务机会。控制消息使用独立预算。
 
@@ -270,6 +334,9 @@ stream_flags   FIN, RST, or half-close flags
 
 ACK 帧携带针对由经过认证的发送端角色推导出的方向的一个或多个闭区间偏移范围。
 接收方 MAY 乱序确认范围。重复范围无害，也 MAY 在多条 Path 上重复发送。
+发送方在释放保留字节前 MUST 将每个范围与本地已发送区间集合校验。覆盖未发送
+间隙或未来偏移的认证 ACK 属于 Session 信任失败：关闭所有 Path 和业务资源，废弃
+SessionID，并使用新的 SessionID 恢复。
 
 重传不会分配新的 Stream 偏移量。重传帧携带相同的 Stream 范围，并可使用不同的 `path_id`；复制的副本按 Stream 范围去重。
 
@@ -284,7 +351,7 @@ Path 管理帧使用 Path 本地管理序列号，并且仅对承载它们的 Pa
 Noise 握手后，一条 Path 执行以下交换：
 
 1. `PATH_HELLO`：协议版本、能力、Path 身份和传输元数据。
-2. `SESSION_ATTACH`：Ingress 身份、Session 身份、选定的 Egress 身份和当前控制序列。
+2. `SESSION_ATTACH`：Ingress 身份、Session 身份、选定的 Egress 身份、当前控制序列和请求的 Session 复制上限。
 3. `SESSION_ATTACH_OK` 或 `SESSION_ATTACH_REJECT`。
 4. `PATH_READY`：Path 级限制、观测到的地址族支持和初始调度器报告。
 
@@ -340,13 +407,15 @@ UDP 数据报保留边界并独立于 Path 身份。数据报 MAY 使用任何�
 
 ### 13. 错误模型
 
-错误被分为四个稳定类别：
+错误被分为五个稳定类别：
 
 ```text
 LOCAL_POLICY       rejected by Ingress rules or listener policy
 PATH_FAILURE       this Path cannot carry traffic
 EGRESS_FAILURE     the Egress or Session is unavailable
 TARGET_FAILURE     the Egress-to-target operation failed
+RESOURCE_LIMIT     a bounded Egress or local resource is exhausted
+RESOURCE_LIMIT     a bounded Egress or local resource is exhausted
 ```
 
 目标 FIN/RST 和目标连接错误会作为目标结果传播。只要还有另一条符合要求的 Path 可用，Path 故障就不会暴露为目标重置。Egress 或 Session 故障会关闭本地连接，以便普通应用程序重试。

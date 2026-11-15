@@ -19,12 +19,17 @@ Transit adapters and subscription processing SHALL conform to the complete detai
 
 ### Requirement: Validate native parameters without downgrade
 
-A node SHALL become eligible only after its selected native adapter validates the complete consumed parameter set. Unknown or unsupported parameters SHALL produce the specified configuration error or sanitized unavailable-node diagnostic. TLS and transport validation failures SHALL NOT cause plaintext, direct, plugin-process, or external compatibility-process fallback; sensitive options and complete imported documents SHALL remain private credential data.
+A native TLS-capable adapter SHALL load system roots by default, apply the configured ordered truststore source list, and fail preparation when any source cannot be read or parsed. TLS verification SHALL remain enabled unless an explicit insecure option is selected, and validation failure SHALL NOT fall back to plaintext or another protocol.
+
+#### Scenario: Intrinsic TLS has no explicit TLS block
+
+- **WHEN** a Hysteria2, TUIC, AnyTLS, or other intrinsically TLS node omits explicit TLS options
+- **THEN** the adapter still uses system roots by default and performs certificate validation
 
 #### Scenario: Requested TLS configuration fails
 
 - **WHEN** validation of a node's requested TLS configuration fails
-- **THEN** the node is rejected or remains unavailable with a typed diagnostic, and no plaintext or direct fallback is selected.
+- **THEN** the node is rejected or remains unavailable with a typed diagnostic, and no plaintext or direct fallback is selected
 
 ### Requirement: Bounded imports and source-bound caches
 
@@ -66,6 +71,24 @@ Ordinary UDP routes SHALL require the selected adapter's supported native UDP be
 
 - **WHEN** an Egress UDP Session is carried over an eligible TCP or TLS Transit Path
 - **THEN** lack of native UDP support in that Transit node does not by itself reject the Session datagrams.
+
+### Requirement: Truststore source lists are atomic
+
+An adapter SHALL process truststore sources as one atomic set. Sources SHALL be `system` or local PEM/DER certificate files; relative paths SHALL resolve from the selected configuration source, symlink targets SHALL be regular files, and any invalid source SHALL reject the adapter candidate.
+
+#### Scenario: One source in a list is invalid
+
+- **WHEN** one configured truststore source is unreadable, oversized, malformed, or contains no valid certificate
+- **THEN** adapter preparation fails closed without silently removing the invalid source or restoring system roots
+
+### Requirement: Explicit insecure verification is separate
+
+An adapter SHALL skip certificate verification only when its TLS options explicitly request insecure verification. An empty truststore without that option SHALL fail closed, and a TLS failure SHALL never downgrade to plaintext.
+
+#### Scenario: Custom roots do not validate the peer
+
+- **WHEN** a node uses a custom truststore and the peer certificate is not anchored by it
+- **THEN** the TLS connection fails with a typed adapter error and does not retry as plaintext or insecure TLS
 
 ## Detailed contract
 
@@ -115,7 +138,7 @@ are retained as unavailable-node diagnostics rather than silently ignored.
 
 | Field | Default and meaning |
 | --- | --- |
-| `tls` | absent; TLS object with `enabled`, `serverName`, `insecure`, `alpn`, `certificate`, `clientCertificate`, `clientKeyField`, `fingerprint`, `reality` |
+| `tls` | absent; TLS object with `enabled`, `serverName`, `insecure`, ordered `truststore`, `alpn`, `certificate`, `clientCertificate`, `clientKeyField`, `fingerprint`, `reality` |
 | `transport` | absent; object with `type`, `path`, `host`, `headers`, `serviceName`, `maxEarlyData`, `earlyDataHeaderName` |
 | `headers` | `{}`; non-secret HTTP CONNECT headers |
 | `udp` | absent; use adapter capability; `false` disables ordinary UDP forwarding |
@@ -125,7 +148,13 @@ are retained as unavailable-node diagnostics rather than silently ignored.
 | `routingMark` | absent; optional unsigned 32-bit routing mark |
 | `packetEncoding` | absent; `xudp` or `packetaddr` |
 
-TLS booleans default to `false`; certificate/ALPN lists default to empty.
+TLS booleans default to `false`; the truststore defaults to `["system"]` and
+certificate/ALPN lists default to empty. Each truststore source is `system` or
+a local PEM/DER file. Relative paths resolve from the selected configuration
+source, absolute paths are allowed, symlink targets must be regular files, and
+an empty list means no trust anchors. Any invalid, oversized, or malformed
+source rejects the adapter atomically. `insecure` is the only verification
+bypass and MUST be explicit.
 `https` implies enabled TLS. A Clash HTTP node with `tls: true` normalizes to
 HTTPS CONNECT. `serverName` overrides certificate/SNI identity independently
 of the connection address. Native HTTPS CONNECT permits HTTP/1.1 ALPN.

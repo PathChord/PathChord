@@ -10,7 +10,12 @@
 
 ### Requirement: Versioned schema conformance
 
-配置适配器必须（SHALL）执行完整的[详细契约](#detailed-contract)，包括资源外壳、字段类型、默认值、限制、引用和角色专用资源。未知版本、kind、字段、重复 YAML 键以及用户编写的服务端状态字段必须（SHALL）拒绝。
+v1 schema SHALL 暴露 Egress aggregate wire capacity 和全局入站目标连接限制，同时将 desired Path 数量、per-Ingress stream 配额和 Path 安全上限排除在 authored Egress policy 之外。
+
+#### Scenario: Removed desired-Path fields are authored
+
+- **WHEN** EgressService 包含 `recommendedPathCount`、`maxConcurrentPaths` 或 `maxStreamsPerIngress`
+- **THEN** schema 拒绝该 server-owned 或已废弃字段，不把它当作 Ingress Path target
 
 #### Scenario: Author runtime status in a resource
 
@@ -70,6 +75,33 @@ Transit Proxy 配置必须（SHALL）保留类型化连接选项，并验证所�
 
 - **WHEN** 配置的节点要求所选适配器不支持的连接选项
 - **THEN** 必须依照 Transit Proxy 契约拒绝节点或暴露明确诊断，不得静默丢弃该选项
+
+### Requirement: Egress resource limits are global
+
+EgressService SHALL 定义全局入站目标连接上限和配置的 aggregate wire 带宽上限。运行时 SHALL 在所有已授权 Ingress Session 之间执行这些全局资源上限。
+
+#### Scenario: Global connection cap is reached
+
+- **WHEN** 活跃目标连接加 pending reservation 达到全局上限
+- **THEN** 新目标打开返回 `RESOURCE_LIMIT`，现有目标连接保持活动
+
+### Requirement: Truststore sources are explicit and bounded
+
+TLS truststore 来源 SHALL 默认是 `["system"]`。其他来源必须是本地 PEM/DER 文件；相对路径从选定配置来源解析，允许绝对路径，符号链接目标必须是普通文件，空列表表示没有信任锚点。
+
+#### Scenario: Empty truststore is selected
+
+- **WHEN** 节点显式配置空 truststore 且未启用 insecure verification
+- **THEN** 普通证书校验 fail closed，不能隐式恢复系统根证书
+
+### Requirement: Egress capacity fields have distinct meanings
+
+Schema SHALL 区分配置的 aggregate wire 硬上限、运行时有效容量和当前负载。容量状态必须独立表示 `unknown`、`provisional`、`measured` 或 `stale`。
+
+#### Scenario: Capacity is not yet measured
+
+- **WHEN** Egress 启动时没有足够新鲜的容量测量
+- **THEN** 配置上限仍是硬上限，有效容量报告为 provisional 或 unknown，不能伪造 measured
 
 ## Detailed contract
 
@@ -178,9 +210,10 @@ mutation 写入。导入的 source、observed、quota 和 billing 值均由运�
 ### EgressService 和 NodeProbePolicy
 
 `EgressService.spec` 接受 `bind`、`egressId`、`identity`、`authorizationDb`、
-`controlSocket`、`maxConcurrentPaths`、`capacityBps`、`recommendedPathCount`、
-`maxStreamsPerIngress`、`quotaRemaining`、`trafficMultiplierBasisPoints`、
+`controlSocket`、`maxWireBandwidthBps`、`maxInboundTargetConnections`、
+`quotaRemaining`、`trafficMultiplierBasisPoints`、
 `remoteDnsOnly`、`webBind`、`webTokenFile`、`webOrigins` 和 `webProtectedTransport`。
+desired Path 数量、per-Ingress stream 配额和 Path 安全上限由运行时拥有，不得在资源中配置。
 资源中的相对路径相对于所选配置来源解析。一个 Egress 进程最多选择一个此类资源。
 应用命令行覆写后必须提供 `identity` 和 Egress ID；缺少 `egressId` 时使用资源名。
 `remoteDnsOnly` 默认 false。设为 true 且存在原始主机名时，Egress 对 TCP 和 UDP 使用自身系统

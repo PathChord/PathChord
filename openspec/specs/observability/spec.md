@@ -28,12 +28,17 @@ Runtime producers SHALL publish typed policy, Session, Path, Stream, target-conn
 
 ### Requirement: Freshness and independent health states
 
-Snapshots SHALL distinguish fresh measurements, stale observations, and unavailable producers. Stopped or stale producers SHALL NOT appear as current measured zeroes. Control-plane health, runtime-snapshot freshness, and data-Path connectivity SHALL remain separate values; stale Egress reports SHALL exclude new admission unless policy explicitly permits degraded operation.
+Snapshots and authenticated status reports SHALL distinguish configured capacity, effective capacity, current wire rate, capacity confidence, service state, and new-admission state. Stale Egress reports SHALL exclude new admission while preserving existing work when heartbeat liveness remains healthy.
+
+#### Scenario: Status is stale but the Path is alive
+
+- **WHEN** heartbeat liveness is fresh but the newest Egress status exceeds the local freshness limit
+- **THEN** the observation is marked stale, new business admission is denied, and existing work is not converted to a hard failure solely by report age
 
 #### Scenario: Egress report exceeds its freshness threshold
 
 - **WHEN** the newest authenticated Egress report is older than the configured freshness threshold
-- **THEN** its observation is marked `stale`, is not interpreted as zero load, and does not permit new admission unless policy explicitly allows degraded operation.
+- **THEN** its observation is marked `stale`, is not interpreted as zero load, and does not permit new admission unless policy explicitly allows degraded operation
 
 ### Requirement: Authorized bounded aggregate metrics
 
@@ -61,6 +66,42 @@ Observation responses, events, and audits SHALL apply actor-capability redaction
 
 - **WHEN** an observation is serialized for a role that does not need target hostnames or process metadata
 - **THEN** those details are redacted before serialization rather than being hidden only by frontend code.
+
+### Requirement: Egress status is global and policy-free
+
+Egress status reports SHALL describe global Egress resource facts and SHALL NOT contain IngressRule, TransitRule, TrafficPolicy, rule demand, or class policy metadata. Path-local quality observations SHALL be owned by Ingress and derived from local Path traffic and control feedback.
+
+#### Scenario: Egress reports shared capacity
+
+- **WHEN** an Egress serves multiple Ingress Sessions
+- **THEN** its status reports aggregate wire rate, capacity, active target connections, service state, and global admission state without exposing per-rule information
+
+### Requirement: Capacity state is explicit
+
+Observations SHALL expose configured capacity, effective capacity, current wire rate, and a capacity state of `unknown`, `provisional`, `measured`, or `stale`. Unknown values SHALL remain unknown and SHALL NOT be serialized as zero measurements.
+
+#### Scenario: Provisional scheduling is active
+
+- **WHEN** Egress has only its configured hard cap and no stable measured effective capacity
+- **THEN** the observation marks capacity provisional, and Ingress may use the configured cap as a provisional scheduling ceiling
+
+### Requirement: Admission state is explicit
+
+Egress observations SHALL expose `admission_allowed` and a stable non-sensitive `admission_reason` independently of `service_state`. Resource exhaustion SHALL be observable as a degraded service with denied admission rather than as an implicit down state.
+
+#### Scenario: Target connection resources are exhausted
+
+- **WHEN** active connections and pending reservations reach the global Egress limit
+- **THEN** observations report `admission_allowed=false` with a resource-limit reason while existing connections remain queryable
+
+### Requirement: Directional Path observations remain Ingress-owned
+
+Ingress SHALL publish bounded upstream and downstream Path observations and SHALL use them for rule-specific scheduling and autoscaling. Egress status SHALL not duplicate those Path-local observations as a second authoritative source.
+
+#### Scenario: Path capacity is asymmetric
+
+- **WHEN** upstream and downstream observations differ for one Path
+- **THEN** Ingress retains separate directional values and computes the physical Path target from the larger directional requirement
 
 ## Detailed contract
 
@@ -105,8 +146,13 @@ control-plane response metadata:
     "active_sessions": 2,
     "active_streams": 12,
     "active_target_connections": 16,
-    "capacity_bps": 180000000,
-    "recommended_path_count": 2,
+    "configured_capacity_bps": 180000000,
+    "effective_capacity_bps": 150000000,
+    "current_wire_rate_bps": 92000000,
+    "replication_allowance_bps": 12000000,
+    "capacity_state": "measured",
+    "admission_allowed": true,
+    "admission_reason": "none",
     "status_report_age_ms": 120
   }],
   "sessions": {"configured": 3, "active": 2, "degraded": 1, "draining": 0},
@@ -120,7 +166,7 @@ control-plane response metadata:
 ```
 
 `load_ratio`, utilization ratios, and loss ratios are numbers in `[0, 1]`;
-`capacity_bps` is an unsigned bit rate; counts are non-negative integers; and
+capacity fields are unsigned bit rates; counts are non-negative integers; and
 `status_report_age_ms` is the age of the newest authenticated report. A report
 older than the configured freshness threshold MUST make the corresponding
 Egress observation `stale` and MUST NOT be treated as current zero load.
@@ -212,8 +258,10 @@ credentials, secret-bearing URLs, and payload bytes MUST never be returned.
 
 The observation provider MUST retain the Egress fields needed by the scheduler:
 load, connection utilization, bandwidth utilization, active Session/Stream/
-target-connection counts, aggregate capacity, recommended Path count, and report
-freshness. Ingress Path observations MUST include RTT, jitter, loss, reordering,
+target-connection counts, configured/effective/current capacity, capacity state,
+replication allowance, admission state/reason, and report freshness. It MUST NOT
+publish a recommended Path count or per-Ingress quota. Ingress Path observations
+MUST include separate upstream/downstream RTT, jitter, loss, reordering,
 throughput, effective capacity, and connection-establishment quality.
 
 The scheduler uses the typed fields, not human-readable log text. A stale report
@@ -247,7 +295,6 @@ historical event counters or lifetime totals; absent snapshot facts are not
 fabricated. High-cardinality connection details remain in authorized resource
 queries. Provider quota, expiry, and explicit billing metadata follow the
 [Transit Proxy accounting contract](../transit-proxies/spec.md#provider-accounting-metadata).
-
 
 The service SHOULD provide these metric families:
 

@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use pathchord_core::{
@@ -47,8 +47,6 @@ pub struct EgressNodeConfig {
     pub max_concurrent_paths: usize,
     pub capacity_bps: u64,
     pub max_inbound_target_connections: usize,
-    pub recommended_path_count: u64,
-    pub max_streams_per_ingress: usize,
     pub remote_dns_only: bool,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: u32,
@@ -141,7 +139,7 @@ where
             egress_id: config.egress_id.as_bytes().to_vec(),
             required_capabilities: config.required_capabilities,
             supported_capabilities: config.supported_capabilities,
-            max_replication_budget_bytes_per_second: u64::MAX,
+            max_replication_budget_bytes_per_second: config.capacity_bps / 8,
             local_limits: config.protocol_limits,
             ready_limits: config.ready_limits.clone(),
         };
@@ -150,8 +148,6 @@ where
         let session_status = EgressStatusConfig {
             capacity_bps: config.capacity_bps,
             max_inbound_target_connections: config.max_inbound_target_connections,
-            recommended_path_count: config.recommended_path_count,
-            max_streams_per_ingress: config.max_streams_per_ingress,
             quota_remaining: config.quota_remaining,
             traffic_multiplier_basis_points: config.traffic_multiplier_basis_points,
         };
@@ -160,11 +156,13 @@ where
         let wire_budget = Arc::new(WireBudget::new(config.capacity_bps).ok_or(
             EgressNodeError::InvalidConfig("capacity is below one byte per second"),
         )?);
+        let now = Instant::now();
         let status_provider = Arc::new(NodeStatusProvider {
             runtime: Arc::clone(&runtime),
             observations: Arc::clone(&observations),
             status: session_status,
             wire_budget,
+            estimator: Mutex::new(CapacityEstimator::new(now)),
         });
         let target_slots = Arc::new(Semaphore::new(config.max_inbound_target_connections));
         Ok(Self {
@@ -205,10 +203,7 @@ where
         mut self,
         status: EgressStatusConfig,
     ) -> Result<Self, EgressNodeError> {
-        if status.capacity_bps == 0
-            || status.recommended_path_count == 0
-            || status.max_streams_per_ingress == 0
-        {
+        if status.capacity_bps == 0 || status.max_inbound_target_connections == 0 {
             return Err(EgressNodeError::InvalidConfig(
                 "status capacity and per-Ingress limits must be non-zero",
             ));
@@ -450,7 +445,8 @@ where
             runtime: Arc::clone(&self.runtime),
         };
         let semaphore = Arc::new(Semaphore::new(path_safety_ceiling(&self.config)));
-        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (events_sender, mut events) = mpsc::channel(1024);
+        let events_tx = NodeEventSender(events_sender);
         let mut tasks = JoinSet::new();
         let mut shutdown = Box::pin(shutdown);
 
@@ -460,6 +456,11 @@ where
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted?;
                     self.observations.accepted.fetch_add(1, Ordering::Relaxed);
+                    if !self.status_provider.sample().admission_allowed {
+                        self.observations.rejected.fetch_add(1, Ordering::Relaxed);
+                        drop(stream);
+                        continue;
+                    }
                     let permit = match Arc::clone(&semaphore).try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
@@ -670,8 +671,6 @@ fn validate_config(config: &EgressNodeConfig) -> Result<(), EgressNodeError> {
     }
     if config.capacity_bps == 0
         || config.max_inbound_target_connections == 0
-        || config.recommended_path_count == 0
-        || config.max_streams_per_ingress == 0
         || config.traffic_multiplier_basis_points == 0
     {
         return Err(EgressNodeError::InvalidConfig(
@@ -757,6 +756,92 @@ struct NodeStatusProvider {
     observations: Arc<NodeObservations>,
     status: EgressStatusConfig,
     wire_budget: Arc<WireBudget>,
+    estimator: Mutex<CapacityEstimator>,
+}
+
+#[derive(Debug)]
+struct CapacityEstimator {
+    last_sample_at: Instant,
+    last_total_bytes: u64,
+    effective_capacity_bps: u64,
+    measured_samples: u32,
+    last_rate_bps: u64,
+    last_activity_at: Option<Instant>,
+}
+
+impl CapacityEstimator {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_sample_at: now,
+            last_total_bytes: 0,
+            effective_capacity_bps: 0,
+            measured_samples: 0,
+            last_rate_bps: 0,
+            last_activity_at: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        configured_capacity_bps: u64,
+        total_bytes: u64,
+        now: Instant,
+        active_targets: u64,
+    ) -> (CapacityState, u64, u64) {
+        let elapsed_ms = now.duration_since(self.last_sample_at).as_millis().max(1) as u64;
+        let delta = total_bytes.saturating_sub(self.last_total_bytes);
+        let rate_bps = delta
+            .saturating_mul(8)
+            .saturating_mul(1_000)
+            .checked_div(elapsed_ms)
+            .unwrap_or(0)
+            .min(configured_capacity_bps);
+        if delta > 0 {
+            self.last_activity_at = Some(now);
+            self.measured_samples = self.measured_samples.saturating_add(1);
+            if self.effective_capacity_bps == 0 {
+                self.effective_capacity_bps = rate_bps.max(1);
+            } else if rate_bps.saturating_mul(10_000)
+                < self.effective_capacity_bps.saturating_mul(7_500)
+            {
+                // Capacity can disappear quickly; follow a sharp decline in
+                // one sample so new work stops before queues grow.
+                self.effective_capacity_bps = rate_bps.max(1);
+            } else if rate_bps > self.effective_capacity_bps {
+                // Recovery is deliberately slow and bounded.
+                let step = (rate_bps - self.effective_capacity_bps).div_ceil(4);
+                self.effective_capacity_bps = self
+                    .effective_capacity_bps
+                    .saturating_add(step)
+                    .min(configured_capacity_bps);
+            }
+            self.last_rate_bps = rate_bps;
+        }
+        self.last_total_bytes = total_bytes;
+        self.last_sample_at = now;
+        let stale = self
+            .last_activity_at
+            .is_some_and(|last| now.duration_since(last) > Duration::from_secs(10));
+        let state = if self.measured_samples == 0 {
+            if active_targets == 0 {
+                CapacityState::Unknown
+            } else {
+                CapacityState::Provisional
+            }
+        } else if stale {
+            CapacityState::Stale
+        } else if self.measured_samples < 2 {
+            CapacityState::Provisional
+        } else {
+            CapacityState::Measured
+        };
+        let effective = match state {
+            CapacityState::Unknown | CapacityState::Stale => 0,
+            CapacityState::Provisional => configured_capacity_bps,
+            CapacityState::Measured => self.effective_capacity_bps.max(1),
+        };
+        (state, effective, self.last_rate_bps)
+    }
 }
 
 impl std::fmt::Debug for NodeStatusProvider {
@@ -790,7 +875,27 @@ impl EgressStatusProvider for NodeStatusProvider {
             .checked_div(maximum_connections)
             .unwrap_or(0)
             .min(10_000) as u16;
-        let admission_allowed = active_targets < maximum_connections;
+        let now = Instant::now();
+        let (capacity_state, effective_capacity_bps, current_wire_rate_bps) = self
+            .estimator
+            .lock()
+            .map(|mut estimator| {
+                estimator.observe(
+                    self.status.capacity_bps,
+                    self.wire_budget.total_reserved_bytes(),
+                    now,
+                    active_targets,
+                )
+            })
+            .unwrap_or((CapacityState::Stale, 0, 0));
+        let bandwidth_utilization = current_wire_rate_bps
+            .saturating_mul(10_000)
+            .checked_div(self.status.capacity_bps.max(1))
+            .unwrap_or(0)
+            .min(10_000) as u16;
+        let admission_allowed = active_targets < maximum_connections
+            && !matches!(capacity_state, CapacityState::Stale)
+            && bandwidth_utilization < 10_000;
         EgressStatusSample {
             connected: true,
             service_state: if admission_allowed {
@@ -801,28 +906,25 @@ impl EgressStatusProvider for NodeStatusProvider {
             admission_allowed,
             admission_reason: if admission_allowed {
                 AdmissionReason::None
+            } else if bandwidth_utilization >= 10_000 {
+                AdmissionReason::BandwidthLimit
             } else {
                 AdmissionReason::ConnectionLimit
             },
-            load_basis_points: utilization,
+            load_basis_points: utilization.max(bandwidth_utilization),
             connection_utilization_basis_points: utilization,
-            bandwidth_utilization_basis_points: 0,
+            bandwidth_utilization_basis_points: bandwidth_utilization,
             active_sessions,
             active_streams,
             active_target_connections: active_targets,
             configured_capacity_bps: self.status.capacity_bps,
-            effective_capacity_bps: if active_targets > 0 {
-                self.status.capacity_bps
-            } else {
-                0
-            },
-            current_wire_rate_bps: 0,
-            replication_allowance_bps: self.wire_budget.remaining_bytes().saturating_mul(8),
-            capacity_state: if active_targets > 0 {
-                CapacityState::Provisional
-            } else {
-                CapacityState::Unknown
-            },
+            effective_capacity_bps,
+            current_wire_rate_bps,
+            replication_allowance_bps: self
+                .wire_budget
+                .optional_replication_remaining_bytes()
+                .saturating_mul(8),
+            capacity_state,
             quota_remaining: self.status.quota_remaining,
             traffic_multiplier_basis_points: self.status.traffic_multiplier_basis_points,
         }
@@ -861,8 +963,17 @@ enum ClaimDecision {
 
 struct PathTaskGuard {
     token: u64,
-    events: mpsc::UnboundedSender<NodeEvent>,
+    events: NodeEventSender,
     _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct NodeEventSender(mpsc::Sender<NodeEvent>);
+
+impl NodeEventSender {
+    fn send(&self, event: NodeEvent) -> Result<(), ()> {
+        self.0.try_send(event).map_err(|_| ())
+    }
 }
 
 impl Drop for PathTaskGuard {
@@ -904,7 +1015,7 @@ async fn run_path_task<C>(
     session_status: EgressStatusConfig,
     remote_dns_only: bool,
     status_provider: Arc<NodeStatusProvider>,
-    events: mpsc::UnboundedSender<NodeEvent>,
+    events: NodeEventSender,
 ) where
     C: TargetConnector + 'static,
 {
@@ -953,26 +1064,33 @@ async fn run_path_task<C>(
     }
     let factory = ConnectorStreamFactory {
         connector,
-        session_targets: active_targets,
+        session_targets: Arc::clone(&active_targets),
         global_targets: Arc::clone(&observations.active_targets),
-        target_slots,
+        target_slots: Arc::clone(&target_slots),
         remote_dns_only,
     };
     match claimed.await.unwrap_or(ClaimDecision::Reject) {
         ClaimDecision::New => {
-            let handle = match EgressSessionHandle::start_with_udp_and_status_provider(
-                path,
-                factory,
-                TokioUdpTargetFactory { remote_dns_only },
-                session_status,
-                status_provider,
-            ) {
-                Ok(handle) => handle,
-                Err(_) => {
-                    let _ = events.send(NodeEvent::Failed);
-                    return;
-                }
-            };
+            let handle =
+                match EgressSessionHandle::start_with_udp_and_status_provider_and_target_slots(
+                    path,
+                    factory,
+                    TokioUdpTargetFactory {
+                        remote_dns_only,
+                        target_slots: Arc::clone(&target_slots),
+                        session_targets: Arc::clone(&active_targets),
+                        global_targets: Arc::clone(&observations.active_targets),
+                    },
+                    session_status,
+                    status_provider,
+                    Arc::clone(&target_slots),
+                ) {
+                    Ok(handle) => handle,
+                    Err(_) => {
+                        let _ = events.send(NodeEvent::Failed);
+                        return;
+                    }
+                };
             let controller = handle.controller();
             if events
                 .send(NodeEvent::RegisterController {
@@ -1053,12 +1171,36 @@ where
         &self,
         target: TargetEndpoint,
     ) -> Result<BoxedSessionStream, EgressStreamOpenError> {
-        let permit = self.target_slots.clone().try_acquire_owned().map_err(|_| {
-            EgressStreamOpenError::new(
-                ErrorClass::ResourceLimit,
-                b"global inbound target-connection limit reached".to_vec(),
-            )
-        })?;
+        self.open_inner(target, None).await
+    }
+
+    async fn open_with_permit(
+        &self,
+        target: TargetEndpoint,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<BoxedSessionStream, EgressStreamOpenError> {
+        self.open_inner(target, permit).await
+    }
+}
+
+impl<C> ConnectorStreamFactory<C>
+where
+    C: TargetConnector + 'static,
+{
+    async fn open_inner(
+        &self,
+        target: TargetEndpoint,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<BoxedSessionStream, EgressStreamOpenError> {
+        let permit = match permit {
+            Some(permit) => permit,
+            None => self.target_slots.clone().try_acquire_owned().map_err(|_| {
+                EgressStreamOpenError::new(
+                    ErrorClass::ResourceLimit,
+                    b"global inbound target-connection limit reached".to_vec(),
+                )
+            })?,
+        };
         let original_hostname = if target.hostname.is_empty() {
             None
         } else {
@@ -1141,22 +1283,39 @@ impl Drop for TrackedTargetStream {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct TokioUdpTargetFactory {
     remote_dns_only: bool,
+    target_slots: Arc<Semaphore>,
+    session_targets: Arc<AtomicU64>,
+    global_targets: Arc<AtomicU64>,
 }
 
 #[async_trait]
 impl UdpTargetFactory for TokioUdpTargetFactory {
     async fn open(&self, target: TargetEndpoint) -> Result<BoxedUdpTargetSocket, UdpTargetError> {
+        let mut permit = Some(self.target_slots.clone().try_acquire_owned().map_err(|_| {
+            UdpTargetError::new(
+                ErrorClass::ResourceLimit,
+                b"global inbound target-connection limit reached".to_vec(),
+            )
+        })?);
         let mut tried = HashSet::new();
         if !self.remote_dns_only || target.hostname.is_empty() {
             for ip in &target.resolved_addresses {
                 let address = SocketAddr::new(*ip, target.port);
                 if tried.insert(address)
-                    && let Some(socket) = connect_udp_target(address).await
+                    && let Some((socket, visible_port)) = connect_udp_target(address).await
                 {
-                    return Ok(Box::new(socket));
+                    self.session_targets.fetch_add(1, Ordering::Relaxed);
+                    self.global_targets.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Box::new(TokioUdpTargetSocket {
+                        socket,
+                        visible_port,
+                        _permit: permit.take().expect("UDP target permit is retained"),
+                        session_targets: Arc::clone(&self.session_targets),
+                        global_targets: Arc::clone(&self.global_targets),
+                    }));
                 }
             }
         }
@@ -1175,9 +1334,17 @@ impl UdpTargetFactory for TokioUdpTargetFactory {
             })?;
             for address in addresses {
                 if tried.insert(address)
-                    && let Some(socket) = connect_udp_target(address).await
+                    && let Some((socket, visible_port)) = connect_udp_target(address).await
                 {
-                    return Ok(Box::new(socket));
+                    self.session_targets.fetch_add(1, Ordering::Relaxed);
+                    self.global_targets.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Box::new(TokioUdpTargetSocket {
+                        socket,
+                        visible_port,
+                        _permit: permit.take().expect("UDP target permit is retained"),
+                        session_targets: Arc::clone(&self.session_targets),
+                        global_targets: Arc::clone(&self.global_targets),
+                    }));
                 }
             }
         }
@@ -1188,7 +1355,7 @@ impl UdpTargetFactory for TokioUdpTargetFactory {
     }
 }
 
-async fn connect_udp_target(address: SocketAddr) -> Option<TokioUdpTargetSocket> {
+async fn connect_udp_target(address: SocketAddr) -> Option<(UdpSocket, u16)> {
     let bind = match address {
         SocketAddr::V4(_) => "0.0.0.0:0",
         SocketAddr::V6(_) => "[::]:0",
@@ -1196,15 +1363,22 @@ async fn connect_udp_target(address: SocketAddr) -> Option<TokioUdpTargetSocket>
     let socket = UdpSocket::bind(bind).await.ok()?;
     socket.connect(address).await.ok()?;
     let visible_port = socket.local_addr().ok()?.port();
-    Some(TokioUdpTargetSocket {
-        socket,
-        visible_port,
-    })
+    Some((socket, visible_port))
 }
 
 struct TokioUdpTargetSocket {
     socket: UdpSocket,
     visible_port: u16,
+    _permit: OwnedSemaphorePermit,
+    session_targets: Arc<AtomicU64>,
+    global_targets: Arc<AtomicU64>,
+}
+
+impl Drop for TokioUdpTargetSocket {
+    fn drop(&mut self) {
+        self.session_targets.fetch_sub(1, Ordering::Relaxed);
+        self.global_targets.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[async_trait]
@@ -1298,8 +1472,6 @@ mod tests {
             max_concurrent_paths: 8,
             capacity_bps: 1_000_000_000,
             max_inbound_target_connections: 256,
-            recommended_path_count: 1,
-            max_streams_per_ingress: 256,
             remote_dns_only: false,
             quota_remaining: None,
             traffic_multiplier_basis_points: 10_000,
@@ -1493,7 +1665,6 @@ mod tests {
         );
         let status = EgressStatusConfig {
             capacity_bps: 42_000,
-            recommended_path_count: 3,
             ..EgressStatusConfig::default()
         };
         let node = EgressNode::bind(node_config(egress_key, store), EchoConnector::default())
@@ -1505,6 +1676,40 @@ mod tests {
         assert_eq!(sample.configured_capacity_bps, 42_000);
         assert_eq!(sample.effective_capacity_bps, 0);
         assert_eq!(sample.capacity_state, CapacityState::Unknown);
+    }
+
+    #[test]
+    fn capacity_estimator_is_provisional_then_measured_and_stales() {
+        let start = Instant::now();
+        let mut estimator = CapacityEstimator::new(start);
+        let configured = 80_000;
+        assert_eq!(
+            estimator.observe(configured, 0, start, 1).0,
+            CapacityState::Provisional
+        );
+        assert_eq!(
+            estimator
+                .observe(configured, 1_000, start + Duration::from_secs(1), 1)
+                .0,
+            CapacityState::Provisional
+        );
+        let (_, measured_capacity, rate) =
+            estimator.observe(configured, 2_000, start + Duration::from_secs(2), 1);
+        assert_eq!(estimator.measured_samples, 2);
+        assert_eq!(
+            estimator
+                .observe(configured, 2_100, start + Duration::from_secs(3), 1)
+                .0,
+            CapacityState::Measured
+        );
+        assert!(measured_capacity > 0);
+        assert!(rate > 0);
+        assert_eq!(
+            estimator
+                .observe(configured, 2_100, start + Duration::from_secs(14), 1)
+                .0,
+            CapacityState::Stale
+        );
     }
 
     #[tokio::test]
@@ -1519,6 +1724,9 @@ mod tests {
         let target_address = target.local_addr().unwrap();
         let factory = TokioUdpTargetFactory {
             remote_dns_only: true,
+            target_slots: Arc::new(Semaphore::new(1)),
+            session_targets: Arc::new(AtomicU64::new(0)),
+            global_targets: Arc::new(AtomicU64::new(0)),
         };
         let mut socket = factory
             .open(TargetEndpoint {
@@ -1543,6 +1751,9 @@ mod tests {
         let target_address = target.local_addr().unwrap();
         let factory = TokioUdpTargetFactory {
             remote_dns_only: false,
+            target_slots: Arc::new(Semaphore::new(1)),
+            session_targets: Arc::new(AtomicU64::new(0)),
+            global_targets: Arc::new(AtomicU64::new(0)),
         };
         let mut socket = factory
             .open(TargetEndpoint {

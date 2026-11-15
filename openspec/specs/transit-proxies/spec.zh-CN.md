@@ -26,6 +26,31 @@ Transit 适配器和订阅处理 SHALL 遵循下文完整详细契约，包括�
 - **WHEN** 节点请求的 TLS 配置验证失败
 - **THEN** 节点被拒绝，或保持不可用并带类型化诊断，且不会选择明文或 direct 回退。
 
+原生 TLS 适配器 SHALL 默认加载系统根证书，应用有序 truststore 来源列表，并在任一来源无法读取或解析时拒绝准备。除非显式选择 insecure，TLS 校验必须保持开启；失败不得降级为明文或其他协议。
+
+#### Scenario: Intrinsic TLS has no explicit TLS block
+
+- **WHEN** Hysteria2、TUIC、AnyTLS 或其他内置 TLS 节点省略显式 TLS 选项
+- **THEN** 适配器仍使用系统根证书并执行证书校验
+
+### Requirement: Truststore source lists are atomic
+
+适配器 SHALL 将 truststore 来源作为一个原子集合处理。来源必须是 `system` 或本地 PEM/DER 文件；相对路径从选定配置来源解析，符号链接目标必须是普通文件，任一无效来源都必须拒绝候选。
+
+#### Scenario: One source in a list is invalid
+
+- **WHEN** 列表中某个来源不可读、超大、格式错误或不包含有效证书
+- **THEN** 适配器 fail closed，不静默移除该来源，也不恢复系统根证书
+
+### Requirement: Explicit insecure verification is separate
+
+适配器 SHALL 仅在 TLS 选项显式请求 insecure 时跳过证书校验。没有该选项时，空 truststore 必须 fail closed，TLS 失败不得降级为明文或 insecure TLS。
+
+#### Scenario: Custom roots do not validate the peer
+
+- **WHEN** 节点使用的自定义 truststore 无法锚定对端证书
+- **THEN** TLS 连接以类型化适配器错误失败，不重试为明文或 insecure TLS
+
 ### Requirement: Bounded imports and source-bound caches
 
 订阅处理 SHALL 只规范化支持的节点定义，在保留单节点诊断的同时保留有效兄弟节点，在文档格式错误时保留上一成功快照，并执行详细契约中的节点数和字节数限制。私有缓存 SHALL 保留选项与诊断，并 SHALL 绑定来源类型、URL 和凭据引用；无法验证的缓存 SHALL NOT 发布，旧来源节点 SHALL 排空而不接受新 flow。
@@ -110,7 +135,7 @@ ClientHello proof callback，不能单独启用 Vision flow。表中的协议行
 
 | 字段 | 默认值与含义 |
 | --- | --- |
-| `tls` | 缺省；TLS 对象，字段为 `enabled`、`serverName`、`insecure`、`alpn`、`certificate`、`clientCertificate`、`clientKeyField`、`fingerprint`、`reality` |
+| `tls` | 缺省；TLS 对象，字段为 `enabled`、`serverName`、`insecure`、有序 `truststore`、`alpn`、`certificate`、`clientCertificate`、`clientKeyField`、`fingerprint`、`reality` |
 | `transport` | 缺省；对象，字段为 `type`、`path`、`host`、`headers`、`serviceName`、`maxEarlyData`、`earlyDataHeaderName` |
 | `headers` | `{}`；非秘密 HTTP CONNECT 头 |
 | `udp` | 缺省；使用适配器能力；`false` 禁用普通 UDP 转发 |
@@ -120,7 +145,10 @@ ClientHello proof callback，不能单独启用 Vision flow。表中的协议行
 | `routingMark` | 缺省；可选的无符号 32 位路由标记 |
 | `packetEncoding` | 缺省；`xudp` 或 `packetaddr` |
 
-TLS 布尔值默认 `false`；证书和 ALPN 列表默认空列表。`https` 隐含启用 TLS。Clash HTTP
+TLS 布尔值默认 `false`；truststore 默认 `["system"]`，证书和 ALPN 列表默认空列表。每个 truststore
+来源必须是 `system` 或本地 PEM/DER 文件；相对路径从选定配置来源解析，允许绝对路径，符号链接目标
+必须是普通文件，空列表表示没有信任锚点。任一无效、超大或格式错误来源都必须原子拒绝适配器。
+`https` 隐含启用 TLS。Clash HTTP
 节点的 `tls: true` 必须规范化为 HTTPS CONNECT。`serverName` 独立于连接地址覆盖证书/SNI
 身份。原生 HTTPS CONNECT 允许 HTTP/1.1 ALPN。证书值是内联 PEM；客户端私钥只能从
 `clientKeyField` 指定的 opaque credential 文档字段读取。除整个对象均为默认值外，禁用 TLS

@@ -35,6 +35,42 @@
 - **WHEN** 最新的经过认证 Egress 报告超过配置的新鲜度阈值
 - **THEN** 其观测标记为 `stale`，不解释为零负载，且除非策略明确允许降级运行，否则不允许新准入。
 
+### Requirement: Egress status is global and policy-free
+
+Egress status SHALL 只描述全局 Egress 资源事实，不得包含 IngressRule、TransitRule、TrafficPolicy、规则 demand 或类别策略元数据。Path-local 质量观测由 Ingress 从本地 Path 流量和控制反馈推导并拥有。
+
+#### Scenario: Egress reports shared capacity
+
+- **WHEN** 一个 Egress 服务多个 Ingress Session
+- **THEN** status 报告聚合 wire 速率、容量、活跃目标连接、服务状态和全局准入状态，不暴露规则信息
+
+### Requirement: Capacity state is explicit
+
+观测 SHALL 暴露配置容量、有效容量、当前 wire 速率以及 `unknown`、`provisional`、`measured` 或 `stale` 容量状态。unknown 不得序列化为零测量。
+
+#### Scenario: Provisional scheduling is active
+
+- **WHEN** Egress 只有配置硬上限而没有稳定的有效容量测量
+- **THEN** 观测标记为 provisional，Ingress 可以把配置上限作为临时调度上限
+
+### Requirement: Admission state is explicit
+
+Egress 观测 SHALL 独立暴露 `admission_allowed` 和稳定、非敏感的 `admission_reason`。资源耗尽应表现为 degraded 且拒绝准入，而不是隐式 down。
+
+#### Scenario: Target connection resources are exhausted
+
+- **WHEN** 活跃连接和 pending reservation 达到 Egress 全局上限
+- **THEN** 报告 `admission_allowed=false` 和资源限制原因，同时保留现有连接可查询
+
+### Requirement: Directional Path observations remain Ingress-owned
+
+Ingress SHALL 发布有界的上行/下行 Path 观测并用于规则调度和自动扩缩容；Egress status 不得复制这些 Path-local 观测成为第二权威来源。
+
+#### Scenario: Path capacity is asymmetric
+
+- **WHEN** 一条 Path 的上行和下行观测不同
+- **THEN** Ingress 保留分离的方向值，并按需求较大方向计算物理 Path target
+
 ### Requirement: Authorized bounded aggregate metrics
 
 Web Gateway SHALL 以规定的 Prometheus 文本格式提供 `/metrics`，并与 JSON 指标查询使用相同的认证、Origin 和 `metrics:read` 边界。聚合指标 SHALL 使用有界标签域、声明其类型并区分当前 gauge 与历史 counter；缺失事实 SHALL NOT 被伪造。
@@ -101,8 +137,13 @@ Ingress 可观测性是本地控制平面的结构化查询和事件接口。日
     "active_sessions": 2,
     "active_streams": 12,
     "active_target_connections": 16,
-    "capacity_bps": 180000000,
-    "recommended_path_count": 2,
+    "configured_capacity_bps": 180000000,
+    "effective_capacity_bps": 150000000,
+    "current_wire_rate_bps": 92000000,
+    "replication_allowance_bps": 12000000,
+    "capacity_state": "measured",
+    "admission_allowed": true,
+    "admission_reason": "none",
     "status_report_age_ms": 120
   }],
   "sessions": {"configured": 3, "active": 2, "degraded": 1, "draining": 0},
@@ -115,7 +156,7 @@ Ingress 可观测性是本地控制平面的结构化查询和事件接口。日
 }
 ```
 
-`load_ratio`、利用率和丢包率是 `[0, 1]` 中的数值；`capacity_bps` 是无符号比特率；计数
+`load_ratio`、利用率和丢包率是 `[0, 1]` 中的数值；容量字段是无符号比特率；计数
 是非负整数；`status_report_age_ms` 是最新认证报告的年龄。报告超过配置的新鲜度阈值时，
 相应 Egress 观测必须标记为 `stale`，不能当作当前零负载。名称表示单调性的计数器在单个
 进程生命周期内必须单调；仪表值可以双向变化。本响应中的 `snapshot_generation` 与
@@ -200,8 +241,9 @@ URL 和载荷字节绝不得返回。
 ### 调度和 STATUS_REPORT 观测
 
 观测提供器必须保留调度器所需的 Egress 字段：负载、连接利用率、带宽利用率、活跃
-Session/Stream/目标连接数量、聚合容量、建议 Path 数量和报告新鲜度。Ingress 的 Path 观测
-必须包含 RTT、抖动、丢包、乱序、吞吐量、有效容量和连接建立质量。
+Session/Stream/目标连接数量、配置/有效/当前容量、容量状态、复制 allowance、准入状态/原因
+和报告新鲜度。不得发布建议 Path 数量或 per-Ingress 配额。Ingress 的 Path 观测必须分别包含
+上行和下行 RTT、抖动、丢包、乱序、吞吐量、有效容量和连接建立质量。
 
 调度器使用这些类型化字段，不能使用人类可读日志。报告过期时，除非策略明确允许降级运行，
 否则 Egress 必须从新的准入中移除。质量下降时快速减少分配；恢复和缩容遵循状态机的排空及

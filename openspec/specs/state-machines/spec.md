@@ -76,6 +76,60 @@ Scheduling SHALL preserve immutable negotiated class snapshots, bounded priority
 - **WHEN** surplus persists for the configured non-zero scale-in window and another compliant Path remains
 - **THEN** the selected Path enters `DRAINING` before removal, preserving the documented hysteresis and budget guards
 
+### Requirement: One owner validates lifecycle transitions
+
+One Session/Path lifecycle owner SHALL validate every Path and Session transition, update the state, and emit its transition event. Protocol handlers, schedulers, and control adapters SHALL request transitions through that owner and SHALL NOT mutate lifecycle state directly.
+
+#### Scenario: A peer requests an invalid transition
+
+- **WHEN** a peer message would move a draining Session back to active
+- **THEN** the lifecycle owner rejects the request, preserves the current state, and emits a typed diagnostic rather than applying a direct assignment
+
+### Requirement: Service state and admission state are independent
+
+The Egress service state SHALL express lifecycle and health, while a separate admission state SHALL express whether new target connections are currently accepted. `degraded` MAY allow or deny new work; `draining` and `down` SHALL deny it, with `down` closing related resources.
+
+#### Scenario: Capacity is exhausted while a Session remains healthy
+
+- **WHEN** Egress has ready Paths but no target-connection headroom
+- **THEN** it reports `service_state=degraded` and `admission_allowed=false`, retains existing work, and returns a typed resource-limit result for new opens
+
+### Requirement: Reconnected Sessions start fresh
+
+When a Session closes because of Egress failure, Path loss, authorization failure, or protocol trust failure, the replacement Session SHALL use a new SessionID and SHALL reset demand, Path targets, replication usage, and lifecycle observations.
+
+#### Scenario: Egress recovers after Session closure
+
+- **WHEN** Ingress reconnects to the same configured Egress after the old Session was retired
+- **THEN** the new Session starts from its rule minimums and fresh observations and does not reuse old Session state
+
+### Requirement: Rule-specific Path targets share Path instances
+
+Ingress SHALL calculate Path requirements independently for each matching EgressRule while allowing one compliant Path instance to satisfy multiple rules. A Path SHALL count toward a rule only when its relationship, capabilities, health, and policy eligibility satisfy that rule.
+
+#### Scenario: Two rules share a Session
+
+- **WHEN** one rule requires three compliant Paths and another requires one, with two Paths compliant with both rules
+- **THEN** the Session maintains the minimum physical Path set that satisfies each rule independently and does not count an ineligible Path for either rule
+
+### Requirement: Directional Path capacity drives scaling
+
+Ingress SHALL maintain upstream and downstream Path observations separately. A bidirectional Session target SHALL cover the larger of the direction-specific Path requirements, while each direction SHALL use its own scheduler inputs.
+
+#### Scenario: Downstream is the bottleneck
+
+- **WHEN** upstream demand fits one Path but downstream demand requires three
+- **THEN** the physical Path target is at least three and the upstream and downstream schedulers use their respective observations
+
+### Requirement: Autoscaling remains bounded and low-frequency
+
+Path health sampling and rule demand aggregation SHALL use bounded counters and low-frequency windows. Autoscaling SHALL use independent hysteresis for scale-out and scale-in, retain a compliant Path during scale-in, and exclude a candidate whose incremental capacity is below its scheduling overhead.
+
+#### Scenario: Unknown capacity at startup
+
+- **WHEN** a Session has not collected enough fresh measurements for effective capacity
+- **THEN** Ingress uses the configured Egress cap as a provisional scheduling ceiling, marks the observation provisional, and does not create unbounded extra Paths
+
 ## Detailed contract
 
 This document defines externally observable lifecycle states and the guards and
@@ -137,6 +191,12 @@ Streams, UDP Associations, local connections, and Egress target connections.
 The manager MAY retry `DOWN → CONNECTING` with bounded exponential backoff
 when configuration and authorization permit it.
 
+Egress authored resource limits are global aggregate wire capacity and global
+inbound target-connection capacity. Pending target dials reserve a slot before
+the dial and release it on success, failure, timeout, or reset. Resource
+exhaustion reports degraded service with denied admission and a stable
+`RESOURCE_LIMIT`/connection-limit reason; it does not close existing work.
+
 ### Path
 
 ```text
@@ -186,6 +246,13 @@ authorization failure MUST NOT automatically resume the old SessionID.
 Heartbeats and their acknowledgements are Path-local. Session control
 retransmissions use ready, policy-compliant Paths and are deduplicated by the
 Session control sequence.
+
+An authenticated future Stream ACK that covers bytes outside the locally
+emitted interval set is a Session trust failure, not an isolated Path failure.
+The owner closes every Path and business resource, retires the SessionID, and
+permits bounded recovery with a new SessionID. Repeated trust failures within
+the configured window open a circuit breaker without automatically revoking
+authorization.
 
 ### TCP Stream
 
@@ -297,9 +364,9 @@ effect, and error or restoration state.
 
 ### Scheduler and autoscaling guards
 
-When the optional traffic-class capability is negotiated, each admitted Stream
-and UDP Association stores an immutable class snapshot. Opening a class flow
-without the negotiated capability is rejected. The scheduler gives bounded
+Each admitted Stream and UDP Association may store an immutable Ingress-local
+TrafficPolicy class snapshot. Class identity never crosses the wire. The
+scheduler gives bounded
 priority preference, then weighted fair service by `share`, and rotates among
 backlogged Streams inside each class. A Stream's FIN is emitted only after its
 queued DATA is sent and acknowledged; a closed Stream observation may remain in
@@ -318,11 +385,12 @@ score(path) = relationship_weight
 loss, and reordering. Its coefficients are configuration, but it MUST be
 monotonic so worse quality cannot increase a Path score. A relationship's
 weight is shared by all its Paths before Path scores distribute that share.
-Control traffic is reserved first and charged to the Session replication
-budget; business replication MUST NOT consume more than the remaining budget.
+Required control and ordinary retransmission are reserved before optional
+business replication; optional copies MUST NOT consume more than the remaining
+Session allowance.
 
 The autoscaler MUST use hysteresis: it MAY add a Path only after aggregate
-capacity is below demand (or the Egress recommendation exceeds active count)
+capacity is below demand or a rule-specific target exceeds active count
 for a configured consecutive sample window; it MAY remove a Path only after
 surplus persists for a separate non-zero window and another compliant Path
 remains. Scale-in MUST enter `DRAINING` first. A Path MUST be excluded when

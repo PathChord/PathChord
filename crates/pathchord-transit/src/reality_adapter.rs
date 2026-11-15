@@ -17,7 +17,7 @@ use rustls::client::RealityCallback;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ActiveKeyExchange;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
 use sha2::{Sha256, Sha512};
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
@@ -100,10 +100,7 @@ impl RealityVlessAdapter {
                 "REALITY client certificate authentication is unsupported",
             ));
         }
-        let mut roots = RootCertStore::empty();
-        for certificate in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(certificate);
-        }
+        let roots = crate::tls::load_truststore(&tls_options.truststore)?;
         let mut tls =
             crate::tls::client_builder_with_provider(crate::reality_tls::reality_provider_arc())
                 .with_root_certificates(roots)

@@ -31,10 +31,15 @@ impl Default for PathAutoscalerConfig {
 pub struct AutoscaleInput {
     pub demand_bps: u64,
     pub effective_capacity_bps: u64,
+    pub upstream_demand_bps: Option<u64>,
+    pub downstream_demand_bps: Option<u64>,
+    pub upstream_capacity_bps: Option<u64>,
+    pub downstream_capacity_bps: Option<u64>,
     pub ready_paths: usize,
     pub degraded_paths: usize,
-    pub recommended_path_count: Option<usize>,
+    pub target_path_count: Option<usize>,
     pub hard_available: bool,
+    pub admission_allowed: bool,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: u32,
     /// Estimated incremental capacity of the next candidate, when measured.
@@ -117,6 +122,13 @@ impl PathAutoscaler {
                 }
             };
         }
+        if !input.admission_allowed {
+            self.scale_out_streak = 0;
+            self.recovery_streak = 0;
+            self.low_utilization_streak = 0;
+            self.overhead_excluded = false;
+            return AutoscaleDecision::Hold;
+        }
         let multiplier = input.traffic_multiplier_basis_points.max(1);
         let adjusted_capacity = input
             .effective_capacity_bps
@@ -127,13 +139,24 @@ impl PathAutoscaler {
         } else {
             adjusted_capacity
         };
-        let utilization = if adjusted_capacity == 0 {
-            if input.demand_bps == 0 { 0 } else { 10_000 }
+        let directional_demand = input
+            .upstream_demand_bps
+            .zip(input.downstream_demand_bps)
+            .map_or(input.demand_bps, |(upstream, downstream)| {
+                upstream.max(downstream)
+            });
+        let directional_capacity = input
+            .upstream_capacity_bps
+            .zip(input.downstream_capacity_bps)
+            .map_or(adjusted_capacity, |(upstream, downstream)| {
+                upstream.max(downstream)
+            });
+        let utilization = if directional_capacity == 0 {
+            if directional_demand == 0 { 0 } else { 10_000 }
         } else {
-            input
-                .demand_bps
+            directional_demand
                 .saturating_mul(10_000)
-                .saturating_div(adjusted_capacity)
+                .saturating_div(directional_capacity)
                 .min(10_000)
         };
 
@@ -144,11 +167,11 @@ impl PathAutoscaler {
         }
 
         let target_paths = input
-            .recommended_path_count
+            .target_path_count
             .unwrap_or(self.config.min_paths)
             .max(self.config.min_paths)
             .min(self.config.max_paths);
-        let capacity_shortfall = input.demand_bps > adjusted_capacity
+        let capacity_shortfall = directional_demand > directional_capacity
             && utilization >= u64::from(self.config.scale_out_utilization_basis_points);
         let needs_more = (capacity_shortfall || input.ready_paths < target_paths)
             && input.ready_paths < self.config.max_paths;
@@ -174,7 +197,11 @@ impl PathAutoscaler {
                 .unwrap_or(0)
                 .max(1);
             let demanded_paths = input
-                .demand_bps
+                .upstream_demand_bps
+                .zip(input.downstream_demand_bps)
+                .map_or(input.demand_bps, |(upstream, downstream)| {
+                    upstream.max(downstream)
+                })
                 .saturating_add(capacity_per_path - 1)
                 .saturating_div(capacity_per_path) as usize;
             let count = demanded_paths
@@ -215,10 +242,15 @@ mod tests {
         AutoscaleInput {
             demand_bps: demand,
             effective_capacity_bps: capacity,
+            upstream_demand_bps: None,
+            downstream_demand_bps: None,
+            upstream_capacity_bps: None,
+            downstream_capacity_bps: None,
             ready_paths: paths,
             degraded_paths: 0,
-            recommended_path_count: None,
+            target_path_count: None,
             hard_available: true,
+            admission_allowed: true,
             quota_remaining: None,
             traffic_multiplier_basis_points: 10_000,
             incremental_capacity_bps: None,
@@ -299,7 +331,7 @@ mod tests {
         ));
 
         let mut recommended = input(100, 1_000, 1);
-        recommended.recommended_path_count = Some(2);
+        recommended.target_path_count = Some(2);
         assert_eq!(scaler.evaluate(recommended, 4), AutoscaleDecision::Hold);
         assert!(matches!(
             scaler.evaluate(recommended, 5),

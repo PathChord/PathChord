@@ -182,6 +182,8 @@ struct ManagedPath {
 struct RetainedRange {
     data: StreamData,
     traffic_class: String,
+    stream_budget_bytes: u64,
+    class_budget_bytes: u64,
     last_path: PathId,
     attempts: u32,
 }
@@ -682,6 +684,25 @@ impl MultipathSession {
         traffic_class: impl Into<String>,
         path_id: PathId,
     ) -> Result<(), MultipathError> {
+        let traffic_class = traffic_class.into();
+        let budget = self.config.default_stream_replication_budget_bytes;
+        let class_budget = self
+            .config
+            .class_replication_budget_bytes
+            .get(&traffic_class)
+            .copied()
+            .unwrap_or(budget);
+        self.retain_stream_data_with_budget(data, traffic_class, path_id, budget, class_budget)
+    }
+
+    pub fn retain_stream_data_with_budget(
+        &mut self,
+        data: StreamData,
+        traffic_class: impl Into<String>,
+        path_id: PathId,
+        stream_budget_bytes: u64,
+        class_budget_bytes: u64,
+    ) -> Result<(), MultipathError> {
         if !self.paths.contains_key(&path_id) {
             return Err(MultipathError::UnknownPath(path_id));
         }
@@ -700,6 +721,8 @@ impl MultipathSession {
             RetainedRange {
                 data,
                 traffic_class: traffic_class.into(),
+                stream_budget_bytes,
+                class_budget_bytes: class_budget_bytes.min(stream_budget_bytes),
                 last_path: path_id,
                 attempts: 0,
             },
@@ -774,7 +797,7 @@ impl MultipathSession {
         if !self.config.retransmission_replication_enabled {
             return Err(MultipathError::ReplicationBudgetExhausted);
         }
-        let (data, class, attempt) = {
+        let (data, class, attempt, stream_budget, class_budget) = {
             let retained = self
                 .retained
                 .get(&(stream_id, offset))
@@ -783,12 +806,14 @@ impl MultipathSession {
                 retained.data.clone(),
                 retained.traffic_class.clone(),
                 retained.attempts.saturating_add(1),
+                retained.stream_budget_bytes,
+                retained.class_budget_bytes,
             )
         };
         self.refresh_replication_window();
         let charge = (data.data.len() as u64).saturating_add(REPLICATION_COPY_OVERHEAD_BYTES);
         let (session_next, stream_next, class_next) =
-            self.replication_totals(stream_id, &class, charge)?;
+            self.replication_totals(stream_id, &class, charge, stream_budget, class_budget)?;
         let schedule =
             self.schedule_excluding(direction, data.data.len(), excluded_path, eligible)?;
         self.session_replication_used = session_next;
@@ -841,6 +866,8 @@ impl MultipathSession {
         stream_id: StreamId,
         traffic_class: &str,
         bytes: u64,
+        stream_budget: u64,
+        class_budget: u64,
     ) -> Result<(u64, u64, u64), MultipathError> {
         let session_next = self
             .session_replication_used
@@ -862,14 +889,8 @@ impl MultipathSession {
         let class_next = class_used
             .checked_add(bytes)
             .ok_or(MultipathError::ReplicationBudgetExhausted)?;
-        let class_budget = self
-            .config
-            .class_replication_budget_bytes
-            .get(traffic_class)
-            .copied()
-            .unwrap_or(self.config.session_replication_budget_bytes);
         if session_next > self.config.session_replication_budget_bytes
-            || stream_next > self.config.default_stream_replication_budget_bytes
+            || stream_next > stream_budget
             || class_next > class_budget
         {
             return Err(MultipathError::ReplicationBudgetExhausted);
@@ -885,7 +906,15 @@ impl MultipathSession {
         bytes: u64,
     ) -> Result<(), MultipathError> {
         self.refresh_replication_window();
-        let (session, stream, class_used) = self.replication_totals(stream_id, class, bytes)?;
+        let stream_budget = self.config.default_stream_replication_budget_bytes;
+        let class_budget = self
+            .config
+            .class_replication_budget_bytes
+            .get(class)
+            .copied()
+            .unwrap_or(stream_budget);
+        let (session, stream, class_used) =
+            self.replication_totals(stream_id, class, bytes, stream_budget, class_budget)?;
         self.session_replication_used = session;
         self.stream_replication_used.insert(stream_id, stream);
         self.class_replication_used
@@ -987,6 +1016,7 @@ impl MultipathSession {
             return !self.config.require_fresh_status_report;
         };
         status.connected
+            && status.admission_allowed
             && matches!(
                 status.service_state,
                 EgressServiceState::Up | EgressServiceState::Degraded
@@ -1395,6 +1425,87 @@ mod tests {
                 None
             ),
             Err(MultipathError::ReplicationBudgetExhausted)
+        );
+    }
+
+    #[test]
+    fn independent_flow_replication_budgets_share_only_the_session_cap() {
+        let mut session = MultipathSession::new(
+            SessionId::new(1),
+            MultipathConfig {
+                session_replication_budget_bytes: 1_000,
+                default_stream_replication_budget_bytes: 1_000,
+                ..MultipathConfig::default()
+            },
+        )
+        .unwrap();
+        session
+            .add_path(PathId::new(1), observation(1_000, 10, 0))
+            .unwrap();
+        session
+            .add_path(PathId::new(2), observation(1_000, 10, 0))
+            .unwrap();
+        let low = StreamId::new(1).unwrap();
+        let high = StreamId::new(2).unwrap();
+        session
+            .retain_stream_data_with_budget(
+                StreamData {
+                    stream_id: low,
+                    offset: 0,
+                    flags: 0,
+                    data: vec![1; 32],
+                },
+                "low",
+                PathId::new(1),
+                200,
+                200,
+            )
+            .unwrap();
+        session
+            .retain_stream_data_with_budget(
+                StreamData {
+                    stream_id: high,
+                    offset: 0,
+                    flags: 0,
+                    data: vec![2; 32],
+                },
+                "high",
+                PathId::new(1),
+                600,
+                600,
+            )
+            .unwrap();
+        assert!(
+            session
+                .replicate_range(
+                    low,
+                    0,
+                    Some(PathId::new(1)),
+                    ScheduleDirection::Upstream,
+                    None
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            session.replicate_range(
+                low,
+                0,
+                Some(PathId::new(1)),
+                ScheduleDirection::Upstream,
+                None
+            ),
+            Err(MultipathError::ReplicationBudgetExhausted)
+        );
+        assert!(
+            session
+                .replicate_range(
+                    high,
+                    0,
+                    Some(PathId::new(1)),
+                    ScheduleDirection::Upstream,
+                    None
+                )
+                .is_ok()
         );
     }
 

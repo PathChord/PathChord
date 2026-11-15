@@ -5,9 +5,9 @@ These pending tasks were carried over from the implementation plan during the
 
 ## 1. Scheduling and accounting
 
-- [ ] 1.1 Implement independent per-policy/class replication accounting and budget release across flow lifecycles; add deterministic mixed-policy tests proving reserved control traffic and business copies stay within limits.
-- [ ] 1.2 Coordinate the Egress replication limit before enabling extra copies, adding normative deltas first if a wire extension is required; verify bidirectional budget enforcement and conservative behavior with absent or mismatched support.
-- [ ] 1.3 Connect congestion-window, marginal-capacity and scheduling-overhead measurements only from transports that expose them; verify unknown values stay unknown and autoscaling respects hysteresis and draining guards.
+- [x] 1.1 Implement independent per-policy/class replication accounting and budget release across flow lifecycles; add deterministic mixed-policy tests proving reserved control traffic and business copies stay within limits.
+- [x] 1.2 Coordinate the Egress replication limit before enabling extra copies, adding normative deltas first if a wire extension is required; verify bidirectional budget enforcement and conservative behavior with absent or mismatched support.
+- [x] 1.3 Connect congestion-window, marginal-capacity and scheduling-overhead measurements only from transports that expose them; verify unknown values stay unknown and autoscaling respects hysteresis and draining guards.
 
 ## 2. Typed observations and monitoring
 

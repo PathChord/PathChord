@@ -4,6 +4,8 @@ use std::fmt;
 
 use crate::PathId;
 
+const MAX_LIFECYCLE_EVENTS: usize = 1024;
+
 /// Lifecycle of one authenticated physical Path.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PathState {
@@ -285,6 +287,9 @@ impl SessionPathLifecycle {
             .checked_add(1)
             .ok_or(StateTransitionError::LifecycleEventSequenceExhausted)?;
         self.next_sequence = sequence;
+        if self.events.len() >= MAX_LIFECYCLE_EVENTS {
+            self.events.pop_front();
+        }
         self.events.push_back(LifecycleTransitionEvent {
             sequence,
             entity,

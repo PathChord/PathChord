@@ -1,9 +1,9 @@
 //! Role-separated asynchronous admission for one production byte-stream Path.
 
 use pathchord_core::{
-    ErrorClass, FrameCodecError, FrameFlags, FrameType, Message, MessageCodecError, PathFrame,
-    PathHello, PathId, PathReady, ProtocolLimits, SessionAttach, SessionId,
-    WIRE_PROFILE_V1_VERSION,
+    CAPABILITY_TCP_STREAM, CAPABILITY_UDP_SESSION, ErrorClass, FrameCodecError, FrameFlags,
+    FrameType, Message, MessageCodecError, PathFrame, PathHello, PathId, PathReady, ProtocolLimits,
+    SessionAttach, SessionId, WIRE_PROFILE_V1_VERSION,
 };
 use pathchord_noise::{
     InitiatorHandshake, MAX_NOISE_MESSAGE_LEN, NoiseError, ResponderHandshake, STATIC_KEY_LEN,
@@ -17,9 +17,9 @@ use crate::{
     PathAuthorization,
 };
 
-// wire-profile-v1 registers capability bits 0 through 5. Other bits do not
-// participate in negotiation or Session compatibility checks.
-pub(crate) const REGISTERED_CAPABILITIES: u64 = (1 << 6) - 1;
+// wire-profile-v1 registers only the TCP and UDP capabilities. All other bits
+// are unassigned and must not become part of Session compatibility checks.
+pub(crate) const REGISTERED_CAPABILITIES: u64 = CAPABILITY_TCP_STREAM | CAPABILITY_UDP_SESSION;
 
 /// Ingress-owned inputs for dialing and admitting one Path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -782,7 +782,12 @@ mod tests {
     #[tokio::test]
     async fn peers_share_the_full_known_capability_intersection() {
         let (initiator, responder) = keys();
-        for selected in [0, 1, 3, 5, 7, REGISTERED_CAPABILITIES] {
+        for selected in [
+            0,
+            CAPABILITY_TCP_STREAM,
+            CAPABILITY_UDP_SESSION,
+            REGISTERED_CAPABILITIES,
+        ] {
             let mut ingress = ingress_config();
             ingress.offered_capabilities = selected | (1 << 20);
             ingress.required_capabilities = selected & 1;
@@ -801,8 +806,14 @@ mod tests {
             let PathAdmissionOutcome::Ready(server) = server.unwrap() else {
                 panic!("Egress rejected")
             };
-            assert_eq!(client.negotiated_capabilities(), selected);
-            assert_eq!(server.negotiated_capabilities(), selected);
+            assert_eq!(
+                client.negotiated_capabilities(),
+                selected & REGISTERED_CAPABILITIES
+            );
+            assert_eq!(
+                server.negotiated_capabilities(),
+                selected & REGISTERED_CAPABILITIES
+            );
         }
     }
 

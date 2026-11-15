@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ pub struct AdapterRegistry<P> {
     credentials: Arc<P>,
     connect_timeout: Duration,
     tls: Arc<ClientConfig>,
+    source_dir: Option<PathBuf>,
 }
 
 impl<P> std::fmt::Debug for AdapterRegistry<P> {
@@ -37,7 +39,16 @@ where
             credentials,
             connect_timeout,
             tls,
+            source_dir: None,
         }
+    }
+
+    /// Resolve relative TLS truststore sources against the selected
+    /// configuration source before an adapter consumes the node.
+    #[must_use]
+    pub fn with_source_dir(mut self, source_dir: impl Into<PathBuf>) -> Self {
+        self.source_dir = Some(source_dir.into());
+        self
     }
 
     #[must_use]
@@ -129,7 +140,23 @@ where
         config: &TransitProxyConfig,
         credential: &TransitCredential,
     ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
-        self.build_native(config, credential)
+        let config = self.resolve_config(config);
+        self.build_native(&config, credential)
+    }
+
+    fn resolve_config(&self, config: &TransitProxyConfig) -> TransitProxyConfig {
+        let Some(source_dir) = &self.source_dir else {
+            return config.clone();
+        };
+        let mut resolved = config.clone();
+        if let Some(tls) = resolved.options.tls.as_mut() {
+            for source in &mut tls.truststore {
+                if source != "system" && !Path::new(source).is_absolute() {
+                    *source = source_dir.join(&*source).to_string_lossy().into_owned();
+                }
+            }
+        }
+        resolved
     }
 
     fn build_native(
@@ -388,6 +415,28 @@ mod tests {
             .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth();
         AdapterRegistry::new(provider, Duration::from_secs(1), Arc::new(tls))
+    }
+
+    #[test]
+    fn relative_truststore_sources_resolve_from_selected_source_directory() {
+        let provider = Arc::new(Credentials {
+            requested: Mutex::new(Vec::new()),
+        });
+        let registry = registry(provider).with_source_dir("/var/lib/pathchord/config");
+        let mut node = config("https");
+        node.options.tls = Some(pathchord_policy::TransitTls {
+            enabled: true,
+            truststore: vec!["certs/ca.pem".to_owned(), "system".to_owned()],
+            ..Default::default()
+        });
+        let resolved = registry.resolve_config(&node);
+        assert_eq!(
+            resolved.options.tls.unwrap().truststore,
+            vec![
+                "/var/lib/pathchord/config/certs/ca.pem".to_owned(),
+                "system".to_owned()
+            ]
+        );
     }
 
     #[tokio::test]
