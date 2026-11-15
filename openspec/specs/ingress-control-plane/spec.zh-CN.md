@@ -72,6 +72,33 @@
 - **WHEN** 授权成功撤销
 - **THEN** 新的匹配握手被拒绝，匹配的 Path、Session、Stream、UDP Association 和目标连接被终止，并报告清理结果。
 
+### Requirement: Local request stages are time-bounded
+
+Unix socket 和 Named Pipe 适配器 SHALL 分别限制前缀读取、envelope/payload 读取、dispatcher 执行和响应写入。超时 SHALL 关闭连接、释放 request permit、发布脱敏诊断且不得产生 mutation。
+
+#### Scenario: A client sends a partial length prefix
+
+- **WHEN** 本地客户端在完整规范长度前缀到达前停止发送
+- **THEN** 适配器超时并释放并发槽位，不阻塞后续管理请求
+
+### Requirement: Local resource exhaustion is typed
+
+本地控制服务 SHALL 对有界 request、pending-work 或并发资源耗尽返回 `RESOURCE_LIMIT`，可重试操作包含 retry hint，不得无界排队。
+
+#### Scenario: All control request permits are occupied
+
+- **WHEN** 新客户端超过全局控制 request 限制
+- **THEN** 服务以类型化资源限制响应拒绝请求，并保留已有请求
+
+### Requirement: Runtime resource limits do not create hidden fallback
+
+Ingress SHALL 区分资源限制、目标失败和策略失败。资源限制结果不得静默切换到 direct 或无关 Proxy 规则。
+
+#### Scenario: Egress target connection capacity is exhausted
+
+- **WHEN** 准入前 Egress open 返回 `RESOURCE_LIMIT`
+- **THEN** 有可用候选时尝试同一捕获代次中的其他合规 Egress，否则返回类型化可重试错误
+
 ## Detailed contract
 
 本文档定义用于操作 Ingress 的本地控制平面，以及供前端使用的可选 Web 网关。它独立于

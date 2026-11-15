@@ -44,7 +44,7 @@ pub(crate) fn configure(
             "TLS fingerprint and Reality require a native Reality adapter".into(),
         ));
     }
-    let mut roots = truststore(&options.truststore)?;
+    let mut roots = load_truststore(&options.truststore)?;
     let mut config = {
         for certificate in certificates(&options.certificate)? {
             roots
@@ -86,14 +86,21 @@ pub(crate) fn configure(
     Ok(Arc::new(config))
 }
 
-fn truststore(sources: &[String]) -> Result<RootCertStore, TransitError> {
+pub(crate) fn load_truststore(sources: &[String]) -> Result<RootCertStore, TransitError> {
     let mut roots = RootCertStore::empty();
     for source in sources {
         if source == "system" {
-            for certificate in rustls_native_certs::load_native_certs().certs {
-                roots
-                    .add(certificate)
-                    .map_err(|_| TransitError::Unsupported("system TLS root is invalid".into()))?;
+            let loaded = rustls_native_certs::load_native_certs();
+            let mut accepted = 0_usize;
+            for certificate in loaded.certs {
+                if roots.add(certificate).is_ok() {
+                    accepted += 1;
+                }
+            }
+            if accepted == 0 {
+                return Err(TransitError::Unsupported(
+                    "system TLS root store is empty or invalid".into(),
+                ));
             }
             continue;
         }
@@ -243,14 +250,14 @@ mod tests {
 
     #[test]
     fn empty_truststore_is_an_empty_root_set() {
-        assert!(truststore(&[]).unwrap().is_empty());
+        assert!(load_truststore(&[]).unwrap().is_empty());
     }
 
     #[test]
     fn invalid_truststore_source_fails_closed() {
         let path = temp_path("invalid");
         std::fs::write(&path, b"not a certificate").unwrap();
-        let result = truststore(&[path.to_string_lossy().into_owned()]);
+        let result = load_truststore(&[path.to_string_lossy().into_owned()]);
         let _ = std::fs::remove_file(path);
         assert!(result.is_err());
     }
@@ -262,7 +269,7 @@ mod tests {
         let link = temp_path("directory-link");
         std::fs::create_dir_all(&directory).unwrap();
         std::os::unix::fs::symlink(&directory, &link).unwrap();
-        let result = truststore(&[link.to_string_lossy().into_owned()]);
+        let result = load_truststore(&[link.to_string_lossy().into_owned()]);
         let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_dir(directory);
         assert!(result.is_err());

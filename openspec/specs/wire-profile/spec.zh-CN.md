@@ -10,7 +10,12 @@
 
 ### Requirement: Complete canonical wire contract
 
-v1 实现 SHALL 满足[详细契约](#detailed-contract)中的全部布局、注册表、限制、失败规则和一致性测试向量要求。实现 SHALL NOT 用自定义替代方案更改已注册字节、字段顺序、数字编码或扩展规则。
+v1 实现 SHALL 满足[详细契约](#detailed-contract)中的全部布局、注册表、限制、失败规则和一致性测试向量要求。未发布的 v1 注册表 SHALL 使用最终 Session budget、status 和 admission 布局，且 SHALL NOT 暴露临时 PathRebind 或 TrafficClass 扩展。
+
+#### Scenario: Provisional frame is presented
+
+- **WHEN** 对端提供属于已移除 `PathRebind`、`PathRebindAck`、`STREAM_OPEN_CLASS` 或 `UDP_OPEN_CLASS` 的帧编码
+- **THEN** 接收方将其视为未分配的 v1 输入，并按格式错误规则只关闭承载该帧的 Path
 
 #### Scenario: Deterministic vector round trip
 
@@ -85,6 +90,33 @@ Stream 和 UDP payload SHALL 使用已注册的字段顺序、目标形式、地
 
 - **WHEN** `sample_age_ms` 超过 `expires_after_ms`
 - **THEN** Ingress 将报告视为过期，不使用它准入新流或触发缩容
+
+### Requirement: Session replication cap is negotiated during attachment
+
+`SESSION_ATTACH` SHALL 携带 Ingress 请求的 Session 复制上限，`SESSION_ATTACH_OK` SHALL 携带 Egress 接受的有效上限。两者都是有界的 wire 字节速率；有效值不得高于双方接受的硬上限，并适用于 Session 中每条 Path。
+
+#### Scenario: Egress accepts a lower cap
+
+- **WHEN** Egress 无法接受请求值，但可以用更低值准入 Session
+- **THEN** 返回更低的有效值，双方将其作为 Session 硬上限，同时保持普通可靠性可用
+
+### Requirement: Global status carries explicit capacity and admission state
+
+`STATUS_REPORT` SHALL 区分配置 wire 容量、有效容量、当前聚合 wire 速率、容量状态、服务状态和全局新准入状态。有效容量状态 SHALL 明确为 `unknown`、`provisional`、`measured` 或 `stale`；`admission_allowed` 独立于 `service_state`。
+
+#### Scenario: Capacity has not been measured
+
+- **WHEN** Egress 没有足够新鲜的有效容量测量
+- **THEN** 报告 unknown 或 provisional 状态，Ingress 可以把配置硬上限作为临时调度上限
+
+### Requirement: ACK ranges cannot confirm unsent bytes
+
+接收方 SHALL 在释放重传数据前，将每个 `STREAM_ACK` 范围与发送方本地记录的已发送 Stream 区间集合校验。覆盖未发送间隙或未来偏移的范围 SHALL 被视为协议违规。
+
+#### Scenario: Future ACK is authenticated
+
+- **WHEN** 认证 ACK 覆盖本地尚未发送的偏移
+- **THEN** 拒绝该 ACK，不得依据它释放任何保留范围
 
 ## Detailed contract
 
@@ -199,13 +231,11 @@ frame_seq 等于该方向对应记录的出站 nonce。session_id 和 path_id �
 | 37 | STREAM_WINDOW | control |
 | 38 | STREAM_FIN | control |
 | 39 | STREAM_RST | control |
-| 40 | STREAM_OPEN_CLASS | control |
 | 64 | UDP_OPEN | control |
 | 65 | UDP_OPEN_OK | control |
 | 66 | UDP_OPEN_ERR | control |
 | 67 | UDP_DATAGRAM | bulk |
 | 68 | UDP_CLOSE | control |
-| 69 | UDP_OPEN_CLASS | control |
 
 PATH_HELLO 携带的 v1 capability 位集合如下：
 
@@ -213,10 +243,6 @@ PATH_HELLO 携带的 v1 capability 位集合如下：
 |---:|---|
 | 0 | TCP_STREAM |
 | 1 | UDP_SESSION |
-| 2 | TRAFFIC_CLASSES |
-| 3 | CONTROL_REPLICATION |
-| 4 | ADDRESS_CANDIDATES |
-| 5 | EXTENDED_STATUS_REPORT |
 
 未知 capability 位 MUST 忽略。若配置要求的 capability 缺失，则使用
 EGRESS_FAILURE 拒绝 SESSION_ATTACH；OPTIONAL capability 取双方交集。一个
@@ -283,13 +309,18 @@ ingress_id           bytes(max_target_name), non-empty UTF-8
 session_id           id128; MUST equal the frame header SessionID
 egress_id            bytes(max_target_name), non-empty UTF-8
 control_seqno        varint
+replication_budget_bytes_per_second  varint
 ~~~
 
 SESSION_ATTACH_OK：
 
 ~~~text
 authorization_generation  varint
+replication_budget_bytes_per_second  varint
 ~~~
+
+请求的 attachment budget 是有界字节速率。Egress MAY 返回更低的有效值（包括零）。
+双方将该有效值作为共享于所有 Path 的 Session 硬上限；它不是规则或 TrafficClass 标识。
 
 SESSION_ATTACH_REJECT：
 
@@ -316,15 +347,6 @@ max_frame_payload        varint
 max_control_payload      varint
 max_session_buffering    varint
 capabilities             varint bitset
-~~~
-
-协商 `TRAFFIC_CLASSES` 后，`STREAM_OPEN_CLASS` 和 `UDP_OPEN_CLASS` 会在旧的
-open payload 后附加：
-
-~~~text
-class_name               bytes(256)，非空 UTF-8
-class_priority           varint，0..=255
-class_share              varint，1..=1000000
 ~~~
 
 PATH_DRAIN：
@@ -372,12 +394,12 @@ eligible_paths        重复的 PathID，按序排列且无重复
 inner_payload         bytes(max_control_payload)
 ~~~
 
-`inner_frame_type` 为 SESSION_CLOSE、STREAM_OPEN、STREAM_OPEN_CLASS、
-STREAM_OPEN_OK、STREAM_OPEN_ERR、STREAM_ACK、STREAM_WINDOW、STREAM_FIN、
-STREAM_RST、UDP_OPEN、UDP_OPEN_CLASS、UDP_OPEN_OK、UDP_OPEN_ERR 或 UDP_CLOSE。
+`inner_frame_type` 为 SESSION_CLOSE、STREAM_OPEN、STREAM_OPEN_OK、
+STREAM_OPEN_ERR、STREAM_ACK、STREAM_WINDOW、STREAM_FIN、STREAM_RST、UDP_OPEN、
+UDP_OPEN_OK、UDP_OPEN_ERR 或 UDP_CLOSE。
 `inner_payload` 是该帧类型不带帧头的规范 payload。完整的 SESSION_CONTROL payload
 （包括此封装）受 `max_control_payload` 限制。依赖序号 MUST 小于控制序号。
-只有 STREAM_OPEN、STREAM_OPEN_CLASS、UDP_OPEN 和 UDP_OPEN_CLASS 可以携带非空的
+只有 STREAM_OPEN 和 UDP_OPEN 可以携带非空的
 eligible Path 列表。空列表表示没有显式 Path 限制；否则承载打开操作的 Path MUST 在列表内。
 Egress 将此列表应用于该 flow 的两个方向。列出的 Path 使用前仍必须独立加入同一 Session。
 每个发送方向拥有独立的 Session 范围控制序号，从零开始。接收方按序应用操作并
@@ -413,25 +435,34 @@ STATUS_REPORT 是经过认证的 Egress 到 Ingress 健康样本。v1 payload �
 ~~~text
 connected                    u8 (0 or 1)
 service_state                u8 (0=down, 1=up, 2=degraded, 3=draining)
+admission_allowed            u8 (0 or 1)
+admission_reason             u8 (stable reason registry)
 load_basis_points            u16, 0..=10000
 connection_utilization_bp    u16, 0..=10000
 bandwidth_utilization_bp     u16, 0..=10000
 active_sessions              varint
 active_streams               varint
 active_target_connections    varint
-capacity_bps                 varint
-recommended_path_count       varint
+configured_capacity_bps      varint
+effective_capacity_bps       varint（unknown 或 stale 时可为零）
+current_wire_rate_bps        varint
+replication_allowance_bps    varint
+capacity_state               u8（0=unknown, 1=provisional, 2=measured, 3=stale）
 report_seqno                 varint
 sample_age_ms                varint
 expires_after_ms             varint, positive
 ~~~
 
-`connected` MUST 等价于 `service_state != down`：当且仅当 `service_state=down` 时
-`connected=0`，其他服务状态 MUST 使用 `connected=1`。比率使用 basis
-points，不使用浮点数。当 sample_age_ms > expires_after_ms 时，Ingress MUST
-将报告视为过期；过期报告不能准入新流，也不能触发缩容。报告按 report_seqno
-顺序应用，重复或更旧的报告忽略。省略 v1 服务状态、利用率、序列和新鲜度字段的
-状态 payload 不是 v1 payload，与本 profile 不互操作。
+`connected` MUST 等价于 `service_state != down`。`admission_allowed` 为真时
+`admission_reason` MUST 为 `none`。比率使用 basis points，不使用浮点数。
+`effective_capacity_bps` 仅在 `unknown` 或 `stale` 状态下可以为零；复制 allowance
+不得超过配置容量。当 sample_age_ms > expires_after_ms 时，Ingress MUST 将报告视为
+过期；过期报告不能准入新流，也不能触发缩容。报告按 report_seqno 顺序应用，重复或
+更旧的报告忽略。省略容量、准入、服务状态、利用率、序列或新鲜度字段的状态 payload
+不是 v1 payload，与本 profile 不互操作。
+
+准入原因注册表为：`none`、`resource_limit`、`connection_limit`、`bandwidth_limit`、
+`administrative_drain`、`authorization_failure`。
 
 #### TCP Stream
 
@@ -504,6 +535,7 @@ UDP_DATAGRAM 由 association_id、datagram_seq（varint）和 payload
 | 2 | PATH_FAILURE | 该 Path 无法承载流量 |
 | 3 | EGRESS_FAILURE | Egress 或 Session 不可用，包括授权/能力拒绝 |
 | 4 | TARGET_FAILURE | Egress 到目标的操作失败 |
+| 5 | RESOURCE_LIMIT | 有界 Egress 或本地资源耗尽 |
 
 reason 字节仅用于诊断，MUST NOT 作为分支 API。格式错误帧、未知强制类型、
 不支持的版本、无效错误类别或限制违规都属于协议错误：丢弃该帧、产生诊断

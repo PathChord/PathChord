@@ -8,7 +8,9 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-use pathchord_core::management::ManagementDispatcher;
+use pathchord_core::management::{
+    ErrorBody, ErrorCode, GenerationExpectation, ManagementDispatcher, ResponseEnvelope,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Semaphore};
@@ -147,23 +149,14 @@ where
     {
         validate_concurrency(max_concurrent)?;
         let permits = Arc::new(Semaphore::new(max_concurrent));
+        let rejection_permits = Arc::new(Semaphore::new(max_concurrent));
         let mut tasks = JoinSet::new();
         let mut shutdown = Box::pin(shutdown);
 
         loop {
             reap_completed(&mut tasks)?;
-            let permit = tokio::select! {
-                () = shutdown.as_mut() => break,
-                result = Arc::clone(&permits).acquire_owned() => result.map_err(|_| {
-                    LocalServerError::Io(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "control request budget closed",
-                    ))
-                })?,
-            };
             let accepted = tokio::select! {
                 () = shutdown.as_mut() => {
-                    drop(permit);
                     break;
                 }
                 result = self.listener.accept() => result,
@@ -176,10 +169,25 @@ where
                 }
             };
             let dispatcher = Arc::clone(&self.dispatcher);
-            tasks.spawn(async move {
-                let _permit = permit;
-                let _ = serve_connection(stream, dispatcher).await;
-            });
+            match Arc::clone(&permits).try_acquire_owned() {
+                Ok(permit) => {
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        let _ = serve_connection(stream, dispatcher).await;
+                    });
+                }
+                Err(_) => {
+                    let Ok(rejection_permit) = Arc::clone(&rejection_permits).try_acquire_owned()
+                    else {
+                        drop(stream);
+                        continue;
+                    };
+                    tasks.spawn(async move {
+                        let _permit = rejection_permit;
+                        let _ = serve_rejected_connection(stream).await;
+                    });
+                }
+            }
         }
 
         stop_tasks(&mut tasks).await;
@@ -288,23 +296,14 @@ where
     {
         validate_concurrency(max_concurrent)?;
         let permits = Arc::new(Semaphore::new(max_concurrent));
+        let rejection_permits = Arc::new(Semaphore::new(max_concurrent));
         let mut tasks = JoinSet::new();
         let mut shutdown = Box::pin(shutdown);
 
         loop {
             reap_completed(&mut tasks)?;
-            let permit = tokio::select! {
-                () = shutdown.as_mut() => break,
-                result = Arc::clone(&permits).acquire_owned() => result.map_err(|_| {
-                    LocalServerError::Io(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "control request budget closed",
-                    ))
-                })?,
-            };
             let connected = tokio::select! {
                 () = shutdown.as_mut() => {
-                    drop(permit);
                     break;
                 }
                 result = self.listener.accept() => result,
@@ -317,10 +316,25 @@ where
                 }
             };
             let dispatcher = Arc::clone(&self.dispatcher);
-            tasks.spawn(async move {
-                let _permit = permit;
-                let _ = serve_connection(connected, dispatcher).await;
-            });
+            match Arc::clone(&permits).try_acquire_owned() {
+                Ok(permit) => {
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        let _ = serve_connection(connected, dispatcher).await;
+                    });
+                }
+                Err(_) => {
+                    let Ok(rejection_permit) = Arc::clone(&rejection_permits).try_acquire_owned()
+                    else {
+                        drop(connected);
+                        continue;
+                    };
+                    tasks.spawn(async move {
+                        let _permit = rejection_permit;
+                        let _ = serve_rejected_connection(connected).await;
+                    });
+                }
+            }
         }
 
         stop_tasks(&mut tasks).await;
@@ -410,6 +424,37 @@ where
     })
     .await
     .map_err(|_| LocalProtocolError::Io("dispatcher deadline exceeded".into()))?;
+    timeout(
+        CONTROL_RESPONSE_WRITE_DEADLINE,
+        write_object(&mut stream, &response),
+    )
+    .await
+    .map_err(|_| LocalProtocolError::Io("response write deadline exceeded".into()))??;
+    Ok(())
+}
+
+async fn serve_rejected_connection<S>(mut stream: S) -> Result<(), LocalServerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request: RequestEnvelope = read_object_with_deadlines(
+        &mut stream,
+        CONTROL_PREFIX_READ_DEADLINE,
+        CONTROL_PAYLOAD_READ_DEADLINE,
+    )
+    .await?;
+    let response = ResponseEnvelope::failure(
+        request.request_id,
+        GenerationExpectation {
+            scope: "configuration".to_owned(),
+            value: 0,
+        },
+        ErrorBody {
+            code: ErrorCode::ResourceLimit,
+            message: "local control request concurrency is exhausted".to_owned(),
+            details: Some(serde_json::json!({"retryable": true})),
+        },
+    );
     timeout(
         CONTROL_RESPONSE_WRITE_DEADLINE,
         write_object(&mut stream, &response),

@@ -10,7 +10,12 @@ Define the byte-exact `wire-profile-v1` record and frame envelopes, payload regi
 
 ### Requirement: Complete canonical wire contract
 
-A v1 implementation SHALL satisfy every layout, registry, limit, failure rule, and conformance-vector obligation in the [detailed contract](#detailed-contract). It SHALL NOT replace registered bytes, field order, numeric codes, or extension rules with an implementation-specific alternative.
+A v1 implementation SHALL satisfy every layout, registry, limit, failure rule, and conformance-vector obligation in the detailed contract. The unreleased v1 registry SHALL use the finalized Session budget, status, and admission layouts and SHALL NOT expose provisional PathRebind or TrafficClass extensions.
+
+#### Scenario: Provisional frame is presented
+
+- **WHEN** a peer presents a frame code reserved for the removed `PathRebind`, `PathRebindAck`, `STREAM_OPEN_CLASS`, or `UDP_OPEN_CLASS` extensions
+- **THEN** the receiver treats the code as unassigned v1 input and closes only the carrying Path according to malformed-frame rules
 
 #### Scenario: Deterministic vector round trip
 
@@ -85,6 +90,33 @@ Stream and UDP payloads SHALL use the registered field order, target forms, addr
 
 - **WHEN** `sample_age_ms` exceeds `expires_after_ms`
 - **THEN** Ingress treats the report as stale and does not use it to admit a new flow or trigger scale-in
+
+### Requirement: Session replication cap is negotiated during attachment
+
+`SESSION_ATTACH` SHALL carry an Ingress requested Session replication cap, and `SESSION_ATTACH_OK` SHALL carry the Egress accepted effective cap. Both values SHALL be bounded wire byte rates; the effective cap SHALL be no greater than either peer's accepted hard limit and SHALL apply to every Path in the Session.
+
+#### Scenario: Egress accepts a lower cap
+
+- **WHEN** the Egress cannot accept the requested cap but can admit the Session with a lower cap
+- **THEN** it returns the lower effective cap, and both peers use that value as the Session hard ceiling while ordinary reliability remains available
+
+### Requirement: Global status carries explicit capacity and admission state
+
+`STATUS_REPORT` SHALL distinguish configured wire capacity, effective capacity, current aggregate wire rate, capacity state, service state, and global new-admission state. Effective capacity SHALL be explicitly unknown, provisional, measured, or stale; `admission_allowed` SHALL be independent of `service_state`.
+
+#### Scenario: Capacity has not been measured
+
+- **WHEN** Egress has insufficient fresh measurements for effective capacity
+- **THEN** it reports an unknown or provisional capacity state while Ingress may use the configured hard cap as a provisional scheduling ceiling
+
+### Requirement: ACK ranges cannot confirm unsent bytes
+
+A receiver of `STREAM_ACK` SHALL validate every acknowledged range against the sender's locally recorded set of emitted Stream offset intervals before releasing retransmission data. A range covering an unsent gap or future offset SHALL be a protocol violation.
+
+#### Scenario: Future ACK is authenticated
+
+- **WHEN** an authenticated ACK range covers an offset that the local sender has not emitted
+- **THEN** the receiver rejects the ACK as a Session semantic violation and does not release any retained range based on it
 
 ## Detailed contract
 
@@ -219,13 +251,11 @@ The frame type registry is:
 | 37 | STREAM_WINDOW | control |
 | 38 | STREAM_FIN | control |
 | 39 | STREAM_RST | control |
-| 40 | STREAM_OPEN_CLASS | control |
 | 64 | UDP_OPEN | control |
 | 65 | UDP_OPEN_OK | control |
 | 66 | UDP_OPEN_ERR | control |
 | 67 | UDP_DATAGRAM | bulk |
 | 68 | UDP_CLOSE | control |
-| 69 | UDP_OPEN_CLASS | control |
 
 The v1 capability bitset carried by PATH_HELLO assigns bits as follows:
 
@@ -233,10 +263,6 @@ The v1 capability bitset carried by PATH_HELLO assigns bits as follows:
 |---:|---|
 | 0 | TCP_STREAM |
 | 1 | UDP_SESSION |
-| 2 | TRAFFIC_CLASSES |
-| 3 | CONTROL_REPLICATION |
-| 4 | ADDRESS_CANDIDATES |
-| 5 | EXTENDED_STATUS_REPORT |
 
 Unknown capability bits are ignored. A configured REQUIRED capability that is
 absent causes SESSION_ATTACH_REJECT with EGRESS_FAILURE; OPTIONAL capabilities
@@ -308,12 +334,19 @@ ingress_id           bytes(max_target_name), non-empty UTF-8
 session_id           id128; MUST equal the frame header SessionID
 egress_id            bytes(max_target_name), non-empty UTF-8
 control_seqno        varint
+replication_budget_bytes_per_second  varint
 ~~~
 
 SESSION_ATTACH_OK:
 
 ~~~text
 authorization_generation  varint
+replication_budget_bytes_per_second  varint
+
+The requested attachment budget is a bounded byte rate. Egress MAY return a
+lower effective value, including zero. Both peers apply the returned effective
+value as one Session hard ceiling shared by every Path; it is not a rule or
+TrafficClass identifier.
 ~~~
 
 SESSION_ATTACH_REJECT:
@@ -341,15 +374,6 @@ max_frame_payload        varint
 max_control_payload      varint
 max_session_buffering    varint
 capabilities             varint bitset
-~~~
-
-When `TRAFFIC_CLASSES` is negotiated, `STREAM_OPEN_CLASS` and `UDP_OPEN_CLASS`
-carry the legacy open payload followed by:
-
-~~~text
-class_name               bytes(256), non-empty UTF-8
-class_priority           varint, 0..=255
-class_share              varint, 1..=1000000
 ~~~
 
 PATH_DRAIN:
@@ -398,13 +422,13 @@ eligible_paths        repeated PathID, sorted and unique
 inner_payload         bytes(max_control_payload)
 ~~~
 
-`inner_frame_type` is one of SESSION_CLOSE, STREAM_OPEN, STREAM_OPEN_CLASS,
-STREAM_OPEN_OK, STREAM_OPEN_ERR, STREAM_ACK, STREAM_WINDOW, STREAM_FIN,
-STREAM_RST, UDP_OPEN, UDP_OPEN_CLASS, UDP_OPEN_OK, UDP_OPEN_ERR, or UDP_CLOSE.
+`inner_frame_type` is one of SESSION_CLOSE, STREAM_OPEN, STREAM_OPEN_OK,
+STREAM_OPEN_ERR, STREAM_ACK, STREAM_WINDOW, STREAM_FIN, STREAM_RST, UDP_OPEN,
+UDP_OPEN_OK, UDP_OPEN_ERR, or UDP_CLOSE.
 `inner_payload` is its canonical payload without a frame header. The complete
 SESSION_CONTROL payload, including this envelope, is bounded by
 `max_control_payload`. A dependency MUST be less than the control sequence.
-Only STREAM_OPEN, STREAM_OPEN_CLASS, UDP_OPEN, and UDP_OPEN_CLASS may carry a
+Only STREAM_OPEN and UDP_OPEN may carry a
 non-empty eligible Path list. An empty list means no explicit Path restriction;
 otherwise the Path carrying the opening operation MUST be in the list. The
 Egress applies the list to both directions of that flow. A listed Path must
@@ -451,14 +475,19 @@ payload is:
 ~~~text
 connected                    u8 (0 or 1)
 service_state                u8 (0=down, 1=up, 2=degraded, 3=draining)
+admission_allowed            u8 (0 or 1)
+admission_reason             u8 (stable reason registry)
 load_basis_points            u16, 0..=10000
 connection_utilization_bp    u16, 0..=10000
 bandwidth_utilization_bp     u16, 0..=10000
 active_sessions              varint
 active_streams               varint
 active_target_connections    varint
-capacity_bps                 varint
-recommended_path_count       varint
+configured_capacity_bps      varint
+effective_capacity_bps       varint (zero only when unknown or stale)
+current_wire_rate_bps        varint
+replication_allowance_bps    varint
+capacity_state               u8 (0=unknown, 1=provisional, 2=measured, 3=stale)
 report_seqno                 varint
 sample_age_ms                varint
 expires_after_ms             varint, positive
@@ -466,12 +495,26 @@ expires_after_ms             varint, positive
 
 `connected` MUST be equivalent to `service_state != down`: `connected=0` iff
 `service_state=down`, and every other service state MUST use `connected=1`.
-Ratios are basis points, not floating-point values. Ingress treats a report as
-stale when sample_age_ms > expires_after_ms; stale reports cannot admit a new
-flow or trigger scale-in. Reports are applied in report_seqno order and
-duplicate or older reports are ignored. A status payload that omits the v1
-service state, utilization, sequencing, and freshness fields is not a v1
+`admission_allowed` MUST be true exactly when `admission_reason=none`.
+Ratios are basis points, not floating-point values. `effective_capacity_bps`
+may be zero only for `unknown` or `stale` capacity. The replication allowance
+MUST NOT exceed the configured capacity. Ingress treats a report as stale when
+sample_age_ms > expires_after_ms; stale reports cannot admit a new flow or
+trigger scale-in. Reports are applied in report_seqno order and duplicate or
+older reports are ignored. A status payload that omits the v1 service state,
+capacity, admission, utilization, sequencing, and freshness fields is not a v1
 payload and is not interoperable with this profile.
+
+Admission reasons are stable status values:
+
+| Code | Name |
+|---:|---|
+| 0 | NONE |
+| 1 | RESOURCE_LIMIT |
+| 2 | CONNECTION_LIMIT |
+| 3 | BANDWIDTH_LIMIT |
+| 4 | ADMINISTRATIVE_DRAIN |
+| 5 | AUTHORIZATION_FAILURE |
 
 #### TCP Stream
 
@@ -548,6 +591,7 @@ Error classes are stable profile values:
 | 2 | PATH_FAILURE | This Path cannot carry traffic |
 | 3 | EGRESS_FAILURE | Egress or Session unavailable, including authorization/capability rejection |
 | 4 | TARGET_FAILURE | Egress-to-target operation failed |
+| 5 | RESOURCE_LIMIT | A bounded Egress or local resource is exhausted |
 
 The reason bytes are diagnostic and MUST NOT be used as a branching API. A
 malformed frame, unknown mandatory type, unsupported version, invalid error
@@ -597,4 +641,3 @@ per Path, and MUST reject a prologue or authorization mismatch before
 This document has no IANA actions. The PathChord maintainer owns the private
 registries in this profile; new assignments require a new versioned profile and
 an explicit update to the conformance vectors.
-

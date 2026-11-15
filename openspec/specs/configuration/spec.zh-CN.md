@@ -37,7 +37,7 @@ Ingress 必须（SHALL）先评估有效 Egress 规则，再评估普通 Proxy �
 
 ### Requirement: Bounded replication policy
 
-Session 复制预算必须（SHALL）是硬上限；类别预算不得（SHALL NOT）超过 Session 的剩余预算。`trafficClassRef` 必须（SHALL）解析到所选 TrafficPolicy 中的类别；缺少引用时必须（SHALL）使用默认类别。
+每个已准入 Stream 或 UDP Association SHALL 使用所选 TrafficPolicy 的不可变复制预算；一个协商的 Session 上限仍是硬上限。低预算 flow 不得永久降低同一 Session 后续 flow 的独立预算。`trafficClassRef` 必须解析到所选 TrafficPolicy 中的类别；缺少引用时使用默认类别。
 
 #### Scenario: Unknown traffic class is configured
 
@@ -70,6 +70,42 @@ Ingress 必须（SHALL）为每个已配置 Egress 维护一个 Session 槽位�
 
 - **WHEN** Egress 在先前 Session 已因硬故障销毁后重新上线
 - **THEN** Ingress 创建新的 Session 和 Path 集合，不得恢复旧 Session
+
+### Requirement: Ingress owns Path target decisions
+
+Ingress SHALL 根据匹配的 EgressRule 最小要求、合规 Transit 关系、方向性 demand、Path 质量和 Egress 硬资源上限计算 Path target。Egress 不提供或覆盖 Path recommendation。
+
+#### Scenario: Egress has no Path recommendation
+
+- **WHEN** Egress 只报告容量和准入状态而不提供 Path 数建议
+- **THEN** Ingress 仍根据自身策略和运行时观测为每条匹配 EgressRule 计算有界 target
+
+### Requirement: Rule-specific Path eligibility is enforced
+
+EgressRule SHALL 只统计其 TransitRule 集合在关系、能力、健康和当前准入状态上都合规的 Path。仅有 namespace 归属不得使 Path 对规则合规。
+
+#### Scenario: Warmup finds an ineligible Transit
+
+- **WHEN** ready Transit adapter 不匹配选定 EgressRule 的 TransitRule
+- **THEN** 该 adapter 不计入规则最小 Path 要求，也不被该规则的新 flow 选择
+
+### Requirement: Resource failure does not fall through silently
+
+当候选 Egress 在准入前以 `RESOURCE_LIMIT` 拒绝打开时，Ingress SHALL 在同一捕获代次中尝试其他合规候选；没有候选成功时返回类型化可重试资源错误，不得静默切换 direct 或无关 Proxy。
+
+#### Scenario: All candidates are saturated
+
+- **WHEN** 所有合规 Egress 候选在 Stream 准入前都返回资源限制
+- **THEN** 本地 flow 失败并返回可重试资源错误，不使用未配置的 fallback
+
+### Requirement: Rule demand aggregation is bounded
+
+Ingress SHALL 按 Session 作用域的 rule、policy 和 class key 使用有界 counter 和低频窗口聚合 demand，不得保留无界 per-flow 历史，也不得将规则元数据发送给 Egress。
+
+#### Scenario: A Session reconnects
+
+- **WHEN** 新 SessionID 替换失败 Session
+- **THEN** 新 Session 的 demand counter 和 EWMA 从空状态开始，旧值只能作为有界观测保留
 
 ## Detailed contract
 

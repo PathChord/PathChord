@@ -54,17 +54,22 @@ impl AnyTlsAdapter {
         timeout: Duration,
         tls: Arc<rustls::ClientConfig>,
     ) -> Result<Self, TransitError> {
+        let mut config = config.clone();
         if config.protocol != "anytls" {
             return Err(unsupported("AnyTLS adapter requires protocol anytls"));
         }
-        if !config
+        let tls_options = config
             .options
             .tls
-            .as_ref()
-            .is_some_and(|value| value.enabled)
-        {
+            .clone()
+            .unwrap_or(pathchord_policy::TransitTls {
+                enabled: true,
+                ..Default::default()
+            });
+        if !tls_options.enabled {
             return Err(unsupported("native AnyTLS requires TLS"));
         }
+        config.options.tls = Some(tls_options);
         let mut allowed = vec!["password"];
         if let Some(field) = config
             .options
@@ -79,7 +84,7 @@ impl AnyTlsAdapter {
             .field("password")
             .filter(|value| !value.is_empty())
             .ok_or_else(|| unsupported("AnyTLS password is missing"))?;
-        let transport = NativeTransport::new(config, credential, tls, timeout)?;
+        let transport = NativeTransport::new(&config, credential, tls, timeout)?;
         Ok(Self {
             metadata: TransitMetadata {
                 adapter_id: config.id.as_str().to_owned(),

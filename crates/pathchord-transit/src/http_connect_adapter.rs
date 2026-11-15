@@ -159,19 +159,44 @@ impl HttpsConnectTransitAdapter {
         allowed.extend(key);
         crate::adapter_registry::validate_credentials(credential, &allowed)?;
         validate_headers(&config.options.headers)?;
-        if config
-            .options
-            .tls
-            .as_ref()
-            .is_some_and(|tls| tls.alpn.iter().any(|protocol| protocol != "http/1.1"))
+        let configure_options = config.options.tls.clone();
+        let tls_options = match configure_options.clone() {
+            None => pathchord_policy::TransitTls {
+                enabled: true,
+                ..Default::default()
+            },
+            Some(options)
+                if !options.enabled && options == pathchord_policy::TransitTls::default() =>
+            {
+                pathchord_policy::TransitTls {
+                    enabled: true,
+                    ..options
+                }
+            }
+            Some(options) if !options.enabled => {
+                return Err(TransitError::Unsupported(
+                    "HTTPS TLS options must enable TLS".into(),
+                ));
+            }
+            Some(options) => options,
+        };
+        if tls_options
+            .alpn
+            .iter()
+            .any(|protocol| protocol != "http/1.1")
         {
             return Err(TransitError::Unsupported(
                 "native HTTPS CONNECT requires HTTP/1.1 ALPN".into(),
             ));
         }
-        let server_name =
-            crate::tls::server_name(&config.endpoint.host, config.options.tls.as_ref())?;
-        let tls = crate::tls::configure(tls, config.options.tls.as_ref(), credential)?;
+        let server_name = crate::tls::server_name(&config.endpoint.host, Some(&tls_options))?;
+        let tls = crate::tls::configure(
+            tls,
+            configure_options.as_ref().filter(|options| {
+                options.enabled || **options != pathchord_policy::TransitTls::default()
+            }),
+            credential,
+        )?;
         Ok(Self {
             metadata: metadata(config, "https"),
             proxy: Endpoint {

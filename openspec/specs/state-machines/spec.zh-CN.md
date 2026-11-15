@@ -76,6 +76,60 @@
 - **WHEN** 容量富余持续达到配置的非零缩容窗口，且仍有另一条合规 Path
 - **THEN** 选中的 Path 在移除前进入 `DRAINING`，并保留规定的滞回和预算守卫
 
+### Requirement: One owner validates lifecycle transitions
+
+一个 Session/Path lifecycle owner SHALL 校验每个 Path 和 Session 转换、更新状态并发出转换事件。协议处理器、调度器和控制适配器 SHALL 通过该 owner 请求转换，不得直接修改生命周期状态。
+
+#### Scenario: A peer requests an invalid transition
+
+- **WHEN** 对端消息试图将 draining Session 恢复为 active
+- **THEN** owner 拒绝请求、保持当前状态，并发出类型化诊断
+
+### Requirement: Service state and admission state are independent
+
+Egress service state SHALL 表示生命周期和健康；独立的 admission state SHALL 表示是否接受新的目标连接。`degraded` 可以允许或拒绝新工作；`draining` 和 `down` 必须拒绝，`down` 还必须关闭相关资源。
+
+#### Scenario: Capacity is exhausted while a Session remains healthy
+
+- **WHEN** Egress 有 ready Path 但没有目标连接余量
+- **THEN** 报告 `service_state=degraded`、`admission_allowed=false`，保留已有工作，并对新打开返回类型化资源限制结果
+
+### Requirement: Reconnected Sessions start fresh
+
+Session 因 Egress 故障、Path 丢失、授权失败或协议信任失败关闭时，替代 Session SHALL 使用新的 SessionID，并重置 demand、Path target、复制用量和生命周期观测。
+
+#### Scenario: Egress recovers after Session closure
+
+- **WHEN** Ingress 重新连接同一配置 Egress
+- **THEN** 新 Session 从规则最小值和新鲜观测开始，不复用旧 Session 状态
+
+### Requirement: Rule-specific Path targets share Path instances
+
+Ingress SHALL 为每个匹配 EgressRule 独立计算 Path 要求，同时允许一条合规 Path 实例满足多条规则。只有关系、能力、健康和策略资格都满足时，Path 才能计入规则。
+
+#### Scenario: Two rules share a Session
+
+- **WHEN** 一条规则需要三条合规 Path，另一条需要一条，且有两条 Path 同时合规
+- **THEN** Session 保持满足两条规则的最小物理 Path 集合，不把不合规 Path 计入任一规则
+
+### Requirement: Directional Path capacity drives scaling
+
+Ingress SHALL 分别维护上行和下行 Path 观测。双向 Session target SHALL 覆盖两个方向需求中较大的一个，各方向调度使用自身输入。
+
+#### Scenario: Downstream is the bottleneck
+
+- **WHEN** 上行需求适合一条 Path 而下行需求需要三条
+- **THEN** 物理 Path target 至少为三，且上下行调度分别使用各自观测
+
+### Requirement: Autoscaling remains bounded and low-frequency
+
+Path 健康采样和规则 demand 聚合 SHALL 使用有界 counter 和低频窗口。自动扩缩容 SHALL 对扩容和缩容使用独立滞回，缩容保留合规 Path，并排除新增容量低于调度开销的候选。
+
+#### Scenario: Unknown capacity at startup
+
+- **WHEN** Session 尚未收集足够新鲜的有效容量测量
+- **THEN** Ingress 使用配置 Egress 上限作为临时调度上限，标记 provisional，不创建无界额外 Path
+
 ## Detailed contract
 
 本文档定义可观察的生命周期状态，以及使状态转换有效的守卫和动作。管理器MAY 在内部
@@ -128,6 +182,10 @@ DOWN → CONNECTING
 MUST 关闭相关 Session、Stream、UDP Association、本地连接和 Egress 目标连接。配置和授权允许
 时，管理器MAY 使用有界指数退避重试 `DOWN → CONNECTING`。
 
+Egress authored resource limit 只有全局 aggregate wire capacity 和全局入站目标连接容量。
+pending target dial 在拨号前预留 slot，并在成功、失败、超时或 reset 时释放。资源耗尽报告
+degraded、拒绝准入和稳定的 `RESOURCE_LIMIT`/connection-limit 原因，不关闭已有工作。
+
 ### Path
 
 ```text
@@ -167,6 +225,10 @@ SessionID 创建新的 `CONFIGURED` 记录。
 端点重启、Egress 硬故障或授权 disable/revoke 会关闭 Session 和所有相关目标资源。端点重启
 和授权失败MUST NOT 自动恢复旧 SessionID。心跳及其确认属于 Path 本地消息。Session 控制重传
 使用 ready 且符合策略的 Path，并由 Session 控制序列去重。
+
+认证的 future Stream ACK 若覆盖本地已发送区间集合之外的字节，属于 Session 信任失败，而不是
+单独的 Path 故障。owner 关闭全部 Path 和业务资源、废弃 SessionID，并允许使用新 SessionID
+进行有界恢复；窗口内重复信任失败会打开断路器，但不会自动撤销授权。
 
 ### TCP Stream
 
@@ -260,8 +322,8 @@ FAILED → APPLYING
 
 ### 调度和自动扩缩容守卫
 
-协商可选 traffic-class capability 后，每个准入的 Stream 和 UDP Association 保存不可变的类别快照。
-未协商 capability 时打开需要类别的 flow 必须拒绝。调度器先提供有界优先级偏好，再按 `share` 提供
+每个准入的 Stream 和 UDP Association 可以保存 Ingress-local TrafficPolicy 类别快照，类别身份不跨 wire。
+调度器先提供有界优先级偏好，再按 `share` 提供
 加权公平服务，并在同一类别的有待发送 Stream 之间轮询。Stream 只有在其排队 DATA 已发送并确认后
 才能发出 FIN；已关闭 Stream 的观测可以保留在有界的近期历史中。
 
@@ -276,9 +338,9 @@ score(path) = relationship_weight
 
 `quality_factor` 是由拥塞窗口、RTT、抖动、丢包和乱序推导出的有界值。具体系数属于配置，但MUST
 单调，即质量变差不能提高 Path 评分。同一关系的多条 Path 在分配关系权重后再按 Path 评分分配。
-控制流量优先预留并计入 Session replication budget；业务类别复制MUST NOT 超过剩余预算。
+必要控制和普通重传优先于可选业务复制；可选副本 MUST NOT 超过剩余 Session allowance。
 
-自动扩缩容MUST 使用滞回：只有当聚合容量低于需求（或 Egress 建议数量超过活跃数量）并持续达到配置的
+自动扩缩容MUST 使用滞回：只有当聚合容量低于需求或规则 target 超过活跃数量，并持续达到配置的
 连续采样窗口时才能增加 Path；只有当容量富余持续达到另一个非零窗口且至少保留一条其他合规 Path 时
 才能移除 Path。缩容前MUST 进入 `DRAINING`。当新增容量低于调度开销时MUST 排除 Path，并在观测中暴露原因。
 状态变化或探测失败后MUST 重置反向计数器。阈值和窗口MAY 配置，但这些守卫、滞回、排空动作和预算计费规则

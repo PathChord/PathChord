@@ -671,7 +671,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     let reloader = ConfigHotReloader::bind(source.path.clone(), 1)
         .await
         .map_err(|error| CliError::ConfigurationLoad {
-            path: source.path,
+            path: source.path.clone(),
             source: error,
         })?;
     let reload_handle = reloader.handle();
@@ -696,10 +696,20 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         .await?;
     std::fs::create_dir_all(&args.data_dir)?;
     let credentials = Arc::new(FileTransitCredentialProvider::new(&args.credentials_dir)?);
+    let source_dir = if source.directory {
+        source.path.clone()
+    } else {
+        source
+            .path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    };
     let adapter_registry = AdapterRegistry::with_native_roots(
         Arc::clone(&credentials),
         pathchord_ingress::DEFAULT_PATH_CONNECT_TIMEOUT,
-    )?;
+    )?
+    .with_source_dir(source_dir);
     let adapter_registry = Arc::new(adapter_registry);
     for proxy in &policy_config.transit_proxies {
         let adapter = adapter_registry.build(proxy).await?;
@@ -1161,8 +1171,6 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
                 max_concurrent_paths: args.max_concurrent_paths,
                 capacity_bps: args.max_wire_bandwidth_bps,
                 max_inbound_target_connections: args.max_inbound_target_connections,
-                recommended_path_count: 1,
-                max_streams_per_ingress: 4096,
                 remote_dns_only: args.remote_dns_only,
                 quota_remaining: args.quota_remaining,
                 traffic_multiplier_basis_points: args.traffic_multiplier_basis_points,
