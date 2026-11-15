@@ -1394,6 +1394,22 @@ async fn complete_snapshot_for_sse<D>(state: &WebState<D>) -> Result<Value, Erro
 where
     D: ManagementDispatcher,
 {
+    for attempt in 0..3 {
+        match complete_snapshot_for_sse_once(state).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(ErrorCode::GenerationConflict) if attempt < 2 => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(ErrorCode::GenerationConflict)
+}
+
+async fn complete_snapshot_for_sse_once<D>(state: &WebState<D>) -> Result<Value, ErrorCode>
+where
+    D: ManagementDispatcher,
+{
     let metrics = dispatch_for_sse(state, "metrics.snapshot", json!({})).await;
     if !metrics.ok {
         return Err(metrics
@@ -1403,6 +1419,7 @@ where
     let Some(metrics_result) = metrics.result.filter(Value::is_object) else {
         return Err(ErrorCode::PersistenceUnavailable);
     };
+    let expected_generation = metrics.observed_generation.clone();
     let mut resources = Map::new();
     let mut operations = vec![
         ("nodes", "nodes.list"),
@@ -1438,6 +1455,9 @@ where
                     break;
                 }
                 return Err(code);
+            }
+            if response.observed_generation != expected_generation {
+                return Err(ErrorCode::GenerationConflict);
             }
             let Some(result) = response.result else {
                 return Err(ErrorCode::PersistenceUnavailable);

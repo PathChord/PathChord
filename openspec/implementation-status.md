@@ -35,6 +35,15 @@ reservation pool; local control saturation returns a typed resource-limit
 response. Relative truststore sources are resolved from the selected config
 source and all TLS-capable adapters consume the resolved truststore.
 
+The typed observation slice now publishes Session creation/change timestamps,
+UDP and pending-control counts, Path Egress/Transit identity, directional Path
+throughput, available capacity, and control retransmission fields where the
+runtime owns those facts. Admission-generation and Path-ready timestamps remain
+explicitly null because no authoritative producer owns those values yet. SSE
+recovery retries bounded resource snapshots when their observation generations
+do not match; the resource queries are still not one cross-resource atomic
+transaction.
+
 Final v1 contract validation in this checkout:
 
 - `cargo fmt --all -- --check` passed.
@@ -317,6 +326,14 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   remain validation work. SSR and other unregistered protocols stay explicitly
   unavailable. Cross-machine Reality and long-running protocol soak evidence
   remain validation work.
+- The authenticated Prometheus endpoint now exports aggregate Egress configured,
+  effective, current-wire-rate, replication-allowance, denied-admission, and
+  stale-report gauges from the same observation snapshot. A deployed Prometheus
+  scrape, alert rules, and dashboard smoke test still require an external
+  monitoring environment.
+- Production probe/autoscaler constant measurements are not available from this
+  local checkout. Local deterministic tests remain regression evidence only;
+  no fixture values are recorded as production measurements.
   Third-party policy groups, rules, and scripts are not imported as PathChord
   policy.
 

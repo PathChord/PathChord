@@ -414,8 +414,14 @@ pub struct SessionObservation {
     pub session_id: SessionId,
     pub egress_id: String,
     pub state: SessionState,
+    pub admission_generation: Option<u64>,
+    pub created_at_ms: Option<u64>,
+    pub last_change_at_ms: Option<u64>,
+    pub close_reason: Option<String>,
     pub ready_paths: usize,
     pub active_streams: usize,
+    pub active_udp_associations: usize,
+    pub pending_session_controls: usize,
     pub retained_outbound_bytes: usize,
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -446,12 +452,21 @@ pub struct StreamObservation {
 pub struct PathObservation {
     pub path_id: PathId,
     pub session_id: SessionId,
+    pub egress_id: Option<String>,
+    pub transit_proxy_id: Option<String>,
     pub state: PathState,
+    pub ready_since_ms: Option<u64>,
+    pub last_change_at_ms: Option<u64>,
     pub rtt_ms: Option<u64>,
     pub jitter_ms: Option<u64>,
     pub loss_ppm: Option<u32>,
     pub throughput_bps: Option<u64>,
+    pub upstream_throughput_bps: Option<u64>,
+    pub downstream_throughput_bps: Option<u64>,
+    pub available_capacity_bps: Option<u64>,
     pub reordering_events: Option<u64>,
+    pub control_pending: Option<u64>,
+    pub control_retransmissions: Option<u64>,
     pub exclusion_reason: Option<String>,
 }
 
@@ -705,7 +720,7 @@ impl IngressObservationHandle {
         let mut changes = Vec::new();
         for (id, session) in &sessions {
             if state.sessions.get(id) != Some(session) {
-                changes.push((ControlEventKind::SessionChanged, id.to_string(), json!({"session_id": id.to_string(), "egress_id": session.egress_id, "state": format!("{:?}", session.state).to_ascii_lowercase(), "ready_path_count": session.ready_paths, "active_streams": session.active_streams})));
+                changes.push((ControlEventKind::SessionChanged, id.to_string(), json!({"session_id": id.to_string(), "egress_id": session.egress_id, "state": format!("{:?}", session.state).to_ascii_lowercase(), "admission_generation": session.admission_generation, "created_at_ms": session.created_at_ms, "last_change_at_ms": session.last_change_at_ms, "close_reason": session.close_reason, "ready_path_count": session.ready_paths, "active_streams": session.active_streams, "active_udp_associations": session.active_udp_associations, "pending_session_controls": session.pending_session_controls})));
             }
         }
         for id in state
@@ -721,7 +736,7 @@ impl IngressObservationHandle {
         }
         for (id, path) in &paths {
             if state.paths.get(id) != Some(path) {
-                changes.push((ControlEventKind::PathChanged, id.to_string(), json!({"path_id": id.to_string(), "session_id": path.session_id.to_string(), "state": format!("{:?}", path.state).to_ascii_lowercase(), "rtt_ms": path.rtt_ms, "jitter_ms": path.jitter_ms, "loss_ppm": path.loss_ppm, "throughput_bps": path.throughput_bps, "exclusion_reason": path.exclusion_reason})));
+                changes.push((ControlEventKind::PathChanged, id.to_string(), json!({"path_id": id.to_string(), "session_id": path.session_id.to_string(), "egress_id": path.egress_id, "transit_proxy_id": path.transit_proxy_id, "state": format!("{:?}", path.state).to_ascii_lowercase(), "ready_since_ms": path.ready_since_ms, "last_change_at_ms": path.last_change_at_ms, "rtt_ms": path.rtt_ms, "jitter_ms": path.jitter_ms, "loss_ppm": path.loss_ppm, "throughput_bps": path.throughput_bps, "upstream_throughput_bps": path.upstream_throughput_bps, "downstream_throughput_bps": path.downstream_throughput_bps, "available_capacity_bps": path.available_capacity_bps, "control_pending": path.control_pending, "control_retransmissions": path.control_retransmissions, "exclusion_reason": path.exclusion_reason})));
             }
         }
         for id in state.paths.keys().filter(|id| !paths.contains_key(*id)) {
@@ -3215,8 +3230,14 @@ mod tests {
                     session_id,
                     egress_id: "egress-a".into(),
                     state: SessionState::Active,
+                    admission_generation: None,
+                    created_at_ms: None,
+                    last_change_at_ms: None,
+                    close_reason: None,
                     ready_paths: 1,
                     active_streams: 2,
+                    active_udp_associations: 0,
+                    pending_session_controls: 0,
                     retained_outbound_bytes: 3,
                     bytes_sent: 4,
                     bytes_received: 5,
@@ -3224,12 +3245,21 @@ mod tests {
                 [PathObservation {
                     path_id,
                     session_id,
+                    egress_id: Some("egress-a".into()),
+                    transit_proxy_id: Some("transit-a".into()),
                     state: PathState::Degraded,
+                    ready_since_ms: None,
+                    last_change_at_ms: None,
                     rtt_ms: Some(12),
                     jitter_ms: Some(3),
                     loss_ppm: Some(4_000),
                     throughput_bps: Some(5_000_000),
+                    upstream_throughput_bps: None,
+                    downstream_throughput_bps: None,
+                    available_capacity_bps: None,
                     reordering_events: Some(6),
+                    control_pending: None,
+                    control_retransmissions: None,
                     exclusion_reason: Some("status_stale".into()),
                 }],
             )
