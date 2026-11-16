@@ -566,7 +566,7 @@ cargo test --locked -p netlink-packet-utils
 cargo deny --all-features --locked check advisories
 cargo check --locked --workspace --all-targets --target x86_64-pc-windows-gnu
 cargo check --locked --workspace --all-targets --target x86_64-unknown-freebsd
-cargo build --locked -p pathchord-cli --target x86_64-unknown-freebsd
+cargo build --locked --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl --target x86_64-unknown-freebsd
 git diff --check
 ```
 
