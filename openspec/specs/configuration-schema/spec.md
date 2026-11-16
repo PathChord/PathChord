@@ -117,6 +117,43 @@ A Subscription source SHALL accept an optional `userAgent` field. Its value SHAL
 - **WHEN** a Subscription declares a User-Agent containing a line break
 - **THEN** configuration validation rejects the candidate bundle
 
+### Requirement: Geodata resources and references
+
+The configuration schema SHALL support namespace-scoped geosite and geoip database resources and typed named-set references in flow matches. Validation SHALL resolve every reference against the complete resource graph and reject invalid or ambiguous data before publication.
+
+#### Scenario: Reference an absent database
+
+- **WHEN** a rule refers to a geodata resource or named set absent from its namespace
+- **THEN** the candidate configuration is rejected with a diagnostic identifying the field and resource rather than publishing a partial rule
+
+#### Scenario: Existing exact host matches remain valid
+
+- **WHEN** an existing configuration uses only `targetHosts`
+- **THEN** it retains its existing exact hostname or IP-literal matching semantics without requiring geodata resources
+
+### Requirement: Geodata updates publish atomically
+
+The loader SHALL read and validate each referenced database as part of the complete candidate and publish geodata and rules in one immutable generation. Replacing a configured database file SHALL trigger a bounded reload, and a failed candidate SHALL retain the previous generation.
+
+#### Scenario: Replace a referenced database
+
+- **WHEN** an operator atomically replaces a referenced geodata file with valid content
+- **THEN** Ingress validates the complete candidate and publishes the changed data and rules together as a new generation
+
+#### Scenario: Start with missing geodata
+
+- **WHEN** initial configuration references a missing or unreadable geodata database
+- **THEN** startup reports a typed configuration failure and does not silently disable that predicate
+
+### Requirement: Detailed geodata contract
+
+Geodata configuration SHALL follow the complete [detailed contract](#geodata-databases).
+
+#### Scenario: Apply the detailed contract
+
+- **WHEN** geodata configuration or matching is processed
+- **THEN** the schema, limits, and failure semantics in the detailed contract are enforced
+
 ## Detailed contract
 
 This document is the normative versioned schema for the human-authored YAML
@@ -171,8 +208,8 @@ control plane.
 
 The supported resource kinds are `Egress`, `TransitProxy`, `Subscription`,
 `EgressRule`, `TransitRule`, `ProxyRule`, `TrafficPolicy`, `Listener`,
-`DNSPolicy`, `FallbackPolicy`, `EgressService`, and `NodeProbePolicy`. The
-last two are role-specific service resources: `EgressService` selects the
+`DNSPolicy`, `FallbackPolicy`, `GeoSiteDatabase`, `GeoIpDatabase`,
+`EgressService`, and `NodeProbePolicy`. The last two are role-specific service resources: `EgressService` selects the
 Egress identity, listener, authorization store, and service limits for one
 Egress process; `NodeProbePolicy` configures the optional bounded Transit node
 probe. Ingress consumes `NodeProbePolicy` and Egress consumes `EgressService`;
@@ -359,6 +396,39 @@ from new selections, and remain until their Paths drain or fail. A successful
 refresh publishes one dynamic generation. A failed refresh publishes no
 configuration generation.
 
+### Geodata databases
+
+A `kind: GeoSiteDatabase` or `kind: GeoIpDatabase` resource has the common
+`apiVersion`, `metadata.name`, optional namespace, and a `spec.path` string
+naming a local V2Fly protobuf file. A namespace MUST contain at most one
+resource of each kind. Files are read-only inputs; matching never downloads or
+modifies them. Relative paths resolve against the selected configuration file's
+parent directory or the selected configuration directory root. Database files
+are external inputs, not resource documents, and MUST be outside a scanned
+configuration directory or use an unscanned extension.
+
+`targetGeoSites` and `targetGeoIps` are optional non-empty sequences of at most
+256 strings on an EgressRule, TransitRule, or ProxyRule `match`. A geosite
+reference is `set` or `set@attribute`, optionally prefixed `geosite:`; a geoip
+reference is `set`, optionally prefixed `geoip:`. The appropriate prefix is
+normalized away; an incompatible prefix is rejected. Set and attribute names use
+nonempty ASCII letters, digits, `.`, `_`, `-`, and `!`, and are interpreted
+case-insensitively. Each referenced database resource MUST exist in the rule's
+namespace. Duplicate references after normalization are invalid. Values within
+one field are ORed; populated match fields, including `targetHosts`,
+`targetGeoSites`, and `targetGeoIps`, are ANDed. An unavailable original
+target fact makes its predicate false. A rule combining geosite and geoip
+requires both facts; separate ordered rules express an OR between them.
+
+External database paths and contents participate in candidate validation,
+reload observation, generation identity, and bounded diagnostics. Changing a
+referenced file, including atomic replacement, triggers complete graph
+validation. Decode, validate and index data before publication; no flow may
+observe old rules mixed with new data. Startup without a valid candidate fails;
+a later failure retains the last good generation. Update and data-file read
+limits follow the [geodata routing contract](../geodata-routing/spec.md).
+Configurations without geodata references require no database files.
+
 ### Rules and selectors
 
 Rules are ordered by the REQUIRED `spec.order` integer; List item order has no
@@ -368,8 +438,8 @@ selector. A present `match: {}` is invalid; omit `match`
 only when an explicit catch-all rule is intended. Match fields are ANDed, and
 multiple values within one field are ORed. Supported match fields are
 `flowTags`, `protocols`, `listenerRefs`, `sourceNetworks`,
-`authenticationIdentities`, `processExecutables`, `targetHosts`, and
-`targetPorts`.
+`authenticationIdentities`, `processExecutables`, `targetHosts`, `targetGeoSites`,
+`targetGeoIps`, and `targetPorts`.
 
 An Egress target is exactly one of:
 

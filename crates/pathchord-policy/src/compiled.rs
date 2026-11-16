@@ -1,13 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::geodata::{
+    CompileBudget, GeoIpDatabase, GeoIpMatcher, GeoSiteDatabase, GeoSiteMatcher, GeodataError,
+    MAX_DATABASE_BYTES,
+};
 use crate::{
     Capabilities, EgressConfig, EgressId, EgressRule, EgressSelection, FlowMatch, FlowProtocol,
-    Generation, ListenerId, PolicyContext, ProxyRule, ProxySelection, RuleId, Selector,
-    TargetEndpoint, TargetHost, TrafficPolicy, TrafficPolicyId, TransitProxyConfig, TransitProxyId,
-    TransitRule, ValidatedPolicySnapshot,
+    Generation, ListenerId, PolicyConfig, PolicyContext, ProxyRule, ProxySelection, RuleId,
+    Selector, TargetEndpoint, TargetHost, TrafficPolicy, TrafficPolicyId, TransitProxyConfig,
+    TransitProxyId, TransitRule, ValidatedPolicySnapshot,
 };
 
 /// Runtime state that controls whether a configured node can admit new work.
@@ -164,6 +171,12 @@ pub enum CompileError {
     InvalidSourceNetwork { rule_id: String, network: String },
     #[error("rule {rule_id} contains an empty selector")]
     EmptySelector { rule_id: String },
+    #[error("geodata database {database} {reason}")]
+    InvalidGeodata {
+        database: String,
+        set: Option<String>,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -171,10 +184,16 @@ struct CompiledMatch {
     namespace: String,
     source: FlowMatch,
     source_networks: Vec<Network>,
+    geo_sites: Vec<GeoSiteMatcher>,
+    geo_ips: Vec<GeoIpMatcher>,
 }
 
 impl CompiledMatch {
-    fn compile(rule_id: &RuleId, source: &FlowMatch) -> Result<Self, CompileError> {
+    fn compile(
+        rule_id: &RuleId,
+        source: &FlowMatch,
+        geodata: &CompiledGeodata,
+    ) -> Result<Self, CompileError> {
         let source_networks = source
             .source_networks
             .iter()
@@ -189,6 +208,36 @@ impl CompiledMatch {
             namespace: rule_id.namespace().to_owned(),
             source: source.clone(),
             source_networks,
+            geo_sites: source
+                .target_geo_sites
+                .iter()
+                .map(|set| {
+                    geodata
+                        .sites
+                        .get(&(rule_id.namespace().to_owned(), set.clone()))
+                        .cloned()
+                        .ok_or_else(|| CompileError::InvalidGeodata {
+                            database: rule_id.namespace().to_owned(),
+                            set: Some(set.clone()),
+                            reason: "has an unavailable geosite set",
+                        })
+                })
+                .collect::<Result<_, _>>()?,
+            geo_ips: source
+                .target_geo_ips
+                .iter()
+                .map(|set| {
+                    geodata
+                        .ips
+                        .get(&(rule_id.namespace().to_owned(), set.clone()))
+                        .cloned()
+                        .ok_or_else(|| CompileError::InvalidGeodata {
+                            database: rule_id.namespace().to_owned(),
+                            set: Some(set.clone()),
+                            reason: "has an unavailable geoip set",
+                        })
+                })
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -224,6 +273,22 @@ impl CompiledMatch {
                     .target_hosts
                     .iter()
                     .any(|candidate| target_host_matches(candidate, &context.target.host)))
+            && (self.geo_sites.is_empty()
+                || match &context.target.host {
+                    TargetHost::Hostname(hostname) => self
+                        .geo_sites
+                        .iter()
+                        .any(|matcher| matcher.matches(hostname)),
+                    TargetHost::Ip(_) => false,
+                })
+            && (self.geo_ips.is_empty()
+                || match &context.target.host {
+                    TargetHost::Ip(ip) => self
+                        .geo_ips
+                        .iter()
+                        .any(|matcher| matcher.matches(Some(*ip))),
+                    TargetHost::Hostname(_) => false,
+                })
             && (self.source.target_ports.is_empty()
                 || self.source.target_ports.contains(&context.target.port))
     }
@@ -247,10 +312,219 @@ struct CompiledProxyRule {
     matches: CompiledMatch,
 }
 
+#[derive(Debug, Default)]
+struct CompiledGeodata {
+    sites: BTreeMap<(String, String), GeoSiteMatcher>,
+    ips: BTreeMap<(String, String), GeoIpMatcher>,
+    fingerprint: BTreeMap<String, [u8; 32]>,
+}
+
+fn referenced_sets(
+    config: &PolicyConfig,
+) -> (
+    BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, BTreeSet<String>>,
+) {
+    let mut sites: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut ips: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (id, matches) in config
+        .egress_rules
+        .iter()
+        .map(|r| (&r.id, &r.matches))
+        .chain(config.transit_rules.iter().map(|r| (&r.id, &r.matches)))
+        .chain(config.proxy_rules.iter().map(|r| (&r.id, &r.matches)))
+    {
+        if !matches.target_geo_sites.is_empty() {
+            sites
+                .entry(id.namespace().to_owned())
+                .or_default()
+                .extend(matches.target_geo_sites.iter().cloned());
+        }
+        if !matches.target_geo_ips.is_empty() {
+            ips.entry(id.namespace().to_owned())
+                .or_default()
+                .extend(matches.target_geo_ips.iter().cloned());
+        }
+    }
+    (sites, ips)
+}
+
+fn geodata_error(database: &str, set: Option<&str>, reason: &'static str) -> CompileError {
+    CompileError::InvalidGeodata {
+        database: database.to_owned(),
+        set: set.map(str::to_owned),
+        reason,
+    }
+}
+
+fn geodata_failure_reason(error: &GeodataError) -> &'static str {
+    match error {
+        GeodataError::DatabaseTooLarge | GeodataError::LimitExceeded(_) => {
+            "exceeds a geodata resource limit"
+        }
+        GeodataError::Malformed => "contains malformed or unsupported geodata",
+        GeodataError::DuplicateSet(_) => "contains duplicate geodata sets",
+        GeodataError::InvalidReference => "contains an invalid set reference",
+        GeodataError::UnknownSet(_) => "does not contain the referenced set",
+        GeodataError::UnknownAttribute { .. } => "does not contain the referenced attribute",
+        GeodataError::UnsupportedAttribute { .. } => "contains an unsupported attribute",
+        GeodataError::InvalidRegex(_) => "contains an unsupported regular expression",
+    }
+}
+
+/// Resolve the containing directory to a stable watch target, while keeping
+/// the database filename itself available for atomic file replacements.
+fn geodata_path(
+    path: &str,
+    source_dir: Option<&Path>,
+    database: &str,
+) -> Result<PathBuf, CompileError> {
+    let path = Path::new(path);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        source_dir
+            .ok_or_else(|| {
+                geodata_error(database, None, "requires a configuration source directory")
+            })?
+            .join(path)
+    };
+    let name = full
+        .file_name()
+        .ok_or_else(|| geodata_error(database, None, "has an invalid source"))?;
+    let parent = full
+        .parent()
+        .ok_or_else(|| geodata_error(database, None, "has an invalid source"))?;
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|_| geodata_error(database, None, "source directory is unavailable"))?;
+    Ok(parent.join(name))
+}
+
+/// Read a bounded complete file and reject a candidate if its identity or
+/// metadata changes during the read, including an atomic replacement.
+fn read_geodata(path: &Path, database: &str) -> Result<Vec<u8>, CompileError> {
+    let error = || {
+        geodata_error(
+            database,
+            None,
+            "source is unavailable or changed during reading",
+        )
+    };
+    let before = std::fs::symlink_metadata(path).map_err(|_| error())?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(error());
+    }
+    if before.len() > MAX_DATABASE_BYTES as u64 {
+        return Err(geodata_error(database, None, "exceeds the file limit"));
+    }
+    let file = std::fs::File::open(path).map_err(|_| error())?;
+    let opened = file.metadata().map_err(|_| error())?;
+    if !same_file_metadata(&before, &opened) {
+        return Err(error());
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    let mut reader = file.take(MAX_DATABASE_BYTES as u64 + 1);
+    reader.read_to_end(&mut bytes).map_err(|_| error())?;
+    if bytes.len() > MAX_DATABASE_BYTES {
+        return Err(geodata_error(database, None, "exceeds the file limit"));
+    }
+    let after_handle = reader.into_inner().metadata().map_err(|_| error())?;
+    let after_path = std::fs::symlink_metadata(path).map_err(|_| error())?;
+    if !same_file_metadata(&opened, &after_handle)
+        || !same_file_metadata(&opened, &after_path)
+        || bytes.len() as u64 != opened.len()
+    {
+        return Err(error());
+    }
+    Ok(bytes)
+}
+
+fn same_file_metadata(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    if !a.is_file() || !b.is_file() || a.len() != b.len() || a.modified().ok() != b.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if a.dev() != b.dev()
+            || a.ino() != b.ino()
+            || a.ctime() != b.ctime()
+            || a.ctime_nsec() != b.ctime_nsec()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+impl CompiledGeodata {
+    fn load(config: &PolicyConfig, source_dir: Option<&Path>) -> Result<Self, CompileError> {
+        let (site_refs, ip_refs) = referenced_sets(config);
+        let mut result = Self::default();
+        let mut budget = CompileBudget::default();
+        for database in &config.geo_site_databases {
+            let Some(sets) = site_refs.get(database.id.namespace()) else {
+                continue;
+            };
+            let id = database.id.as_str();
+            let path = geodata_path(&database.path, source_dir, id)?;
+            let bytes = read_geodata(&path, id)?;
+            let digest = orion::hazardous::hash::sha2::sha256::Sha256::digest(&bytes)
+                .map_err(|_| geodata_error(id, None, "could not be hashed"))?;
+            result.fingerprint.insert(
+                format!("site:{id}"),
+                digest.as_ref().try_into().expect("SHA-256 length"),
+            );
+            let data = GeoSiteDatabase::decode(&bytes)
+                .map_err(|error| geodata_error(id, None, geodata_failure_reason(&error)))?;
+            for set in sets {
+                let matcher = data
+                    .compile_with_budget(set, &mut budget)
+                    .map_err(|error| {
+                        geodata_error(id, Some(set), geodata_failure_reason(&error))
+                    })?;
+                result
+                    .sites
+                    .insert((database.id.namespace().to_owned(), set.clone()), matcher);
+            }
+        }
+        for database in &config.geo_ip_databases {
+            let Some(sets) = ip_refs.get(database.id.namespace()) else {
+                continue;
+            };
+            let id = database.id.as_str();
+            let path = geodata_path(&database.path, source_dir, id)?;
+            let bytes = read_geodata(&path, id)?;
+            let digest = orion::hazardous::hash::sha2::sha256::Sha256::digest(&bytes)
+                .map_err(|_| geodata_error(id, None, "could not be hashed"))?;
+            result.fingerprint.insert(
+                format!("ip:{id}"),
+                digest.as_ref().try_into().expect("SHA-256 length"),
+            );
+            let data = GeoIpDatabase::decode(&bytes)
+                .map_err(|error| geodata_error(id, None, geodata_failure_reason(&error)))?;
+            for set in sets {
+                let matcher = data
+                    .compile_with_budget(set, &mut budget)
+                    .map_err(|error| {
+                        geodata_error(id, Some(set), geodata_failure_reason(&error))
+                    })?;
+                result
+                    .ips
+                    .insert((database.id.namespace().to_owned(), set.clone()), matcher);
+            }
+        }
+        Ok(result)
+    }
+}
+
 /// Immutable, deterministic and I/O-free evaluator for one configuration generation.
 #[derive(Debug, Clone)]
 pub struct CompiledPolicy {
     generation: Generation,
+    source_config: Arc<PolicyConfig>,
+    geodata_fingerprint: BTreeMap<String, [u8; 32]>,
     fallback: crate::FallbackAction,
     egresses: BTreeMap<EgressId, EgressConfig>,
     transit_proxies: BTreeMap<TransitProxyId, TransitProxyConfig>,
@@ -262,7 +536,15 @@ pub struct CompiledPolicy {
 
 impl CompiledPolicy {
     pub fn compile(snapshot: &ValidatedPolicySnapshot) -> Result<Self, CompileError> {
+        Self::compile_with_source(snapshot, None)
+    }
+
+    pub fn compile_with_source(
+        snapshot: &ValidatedPolicySnapshot,
+        source_dir: Option<&Path>,
+    ) -> Result<Self, CompileError> {
         let config = snapshot.config();
+        let geodata = CompiledGeodata::load(config, source_dir)?;
         let egress_rules = config
             .egress_rules
             .iter()
@@ -271,7 +553,7 @@ impl CompiledPolicy {
                     ensure_selector(rule.id.as_str(), selector)?;
                 }
                 Ok(CompiledEgressRule {
-                    matches: CompiledMatch::compile(&rule.id, &rule.matches)?,
+                    matches: CompiledMatch::compile(&rule.id, &rule.matches, &geodata)?,
                     rule: rule.clone(),
                 })
             })
@@ -281,7 +563,7 @@ impl CompiledPolicy {
             .iter()
             .map(|rule| {
                 Ok(CompiledTransitRule {
-                    matches: CompiledMatch::compile(&rule.id, &rule.matches)?,
+                    matches: CompiledMatch::compile(&rule.id, &rule.matches, &geodata)?,
                     rule: rule.clone(),
                 })
             })
@@ -294,7 +576,7 @@ impl CompiledPolicy {
                     ensure_selector(rule.id.as_str(), selector)?;
                 }
                 Ok(CompiledProxyRule {
-                    matches: CompiledMatch::compile(&rule.id, &rule.matches)?,
+                    matches: CompiledMatch::compile(&rule.id, &rule.matches, &geodata)?,
                     rule: rule.clone(),
                 })
             })
@@ -302,6 +584,8 @@ impl CompiledPolicy {
 
         Ok(Self {
             generation: snapshot.generation(),
+            source_config: Arc::clone(&snapshot.config),
+            geodata_fingerprint: geodata.fingerprint,
             fallback: snapshot.fallback(),
             egresses: config
                 .egresses
@@ -330,6 +614,47 @@ impl CompiledPolicy {
     #[must_use]
     pub const fn generation(&self) -> Generation {
         self.generation
+    }
+
+    /// Ensure a precompiled policy and its validated resource graph belong to
+    /// the same generation before publishing them together.
+    #[must_use]
+    pub fn matches_snapshot(&self, snapshot: &ValidatedPolicySnapshot) -> bool {
+        self.generation == snapshot.generation() && self.source_config == snapshot.config
+    }
+
+    #[must_use]
+    pub fn geodata_fingerprint(&self) -> &BTreeMap<String, [u8; 32]> {
+        &self.geodata_fingerprint
+    }
+
+    /// Resolve the referenced files for watching without reading their
+    /// contents. The loader uses the same paths to build the generation.
+    pub fn referenced_geodata_paths(
+        config: &PolicyConfig,
+        source_dir: Option<&Path>,
+    ) -> Result<BTreeSet<PathBuf>, CompileError> {
+        let (sites, ips) = referenced_sets(config);
+        let mut paths = BTreeSet::new();
+        for database in &config.geo_site_databases {
+            if sites.contains_key(database.id.namespace()) {
+                paths.insert(geodata_path(
+                    &database.path,
+                    source_dir,
+                    database.id.as_str(),
+                )?);
+            }
+        }
+        for database in &config.geo_ip_databases {
+            if ips.contains_key(database.id.namespace()) {
+                paths.insert(geodata_path(
+                    &database.path,
+                    source_dir,
+                    database.id.as_str(),
+                )?);
+            }
+        }
+        Ok(paths)
     }
 
     #[must_use]
@@ -914,6 +1239,167 @@ mod tests {
     }
 
     #[test]
+    fn geodata_predicates_apply_to_all_rule_kinds_without_resolving_hosts() {
+        fn field(tag: u8, bytes: &[u8]) -> Vec<u8> {
+            assert!(bytes.len() < 128);
+            let mut out = vec![tag, bytes.len() as u8];
+            out.extend_from_slice(bytes);
+            out
+        }
+        let mut site_rule = vec![8, 2]; // RootDomain
+        site_rule.extend(field(18, b"hf.co"));
+        let mut site = field(10, b"huggingface");
+        site.extend(field(18, &site_rule));
+        let site_db = GeoSiteDatabase::decode(&field(10, &site)).unwrap();
+        let mut cidr = field(10, &[192, 0, 2, 0]);
+        cidr.extend([16, 24]);
+        let mut ip = field(10, b"example");
+        ip.extend(field(18, &cidr));
+        let ip_db = GeoIpDatabase::decode(&field(10, &ip)).unwrap();
+        let mut geodata = CompiledGeodata::default();
+        geodata.sites.insert(
+            ("default".into(), "huggingface".into()),
+            site_db.compile("huggingface").unwrap(),
+        );
+        geodata.ips.insert(
+            ("default".into(), "example".into()),
+            ip_db.compile("example").unwrap(),
+        );
+
+        let site_match = FlowMatch {
+            target_geo_sites: BTreeSet::from(["huggingface".into()]),
+            ..Default::default()
+        };
+        let ip_match = FlowMatch {
+            target_geo_ips: BTreeSet::from(["example".into()]),
+            ..Default::default()
+        };
+        for prefix in ["egress", "transit", "proxy"] {
+            let site = CompiledMatch::compile(
+                &RuleId::new(format!("{prefix}-site")),
+                &site_match,
+                &geodata,
+            )
+            .unwrap();
+            let ip =
+                CompiledMatch::compile(&RuleId::new(format!("{prefix}-ip")), &ip_match, &geodata)
+                    .unwrap();
+            for protocol in [FlowProtocol::Tcp, FlowProtocol::Udp] {
+                let mut ctx = context();
+                ctx.protocol = protocol;
+                ctx.target.host = TargetHost::Hostname("US.AWS.CDN.HF.CO".into());
+                assert!(site.matches(&ctx));
+                assert!(!ip.matches(&ctx), "hostname alone must not trigger DNS");
+                ctx.target.host = TargetHost::Hostname("nothf.co".into());
+                assert!(!site.matches(&ctx));
+                ctx.target.host = TargetHost::Ip("192.0.2.42".parse().unwrap());
+                assert!(ip.matches(&ctx));
+                assert!(!site.matches(&ctx));
+                ctx.target.host = TargetHost::Ip("192.0.3.42".parse().unwrap());
+                assert!(!ip.matches(&ctx));
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_geodata_participates_in_ordered_egress_and_proxy_routes() {
+        fn field(tag: u8, bytes: &[u8]) -> Vec<u8> {
+            assert!(bytes.len() < 128);
+            let mut out = vec![tag, bytes.len() as u8];
+            out.extend_from_slice(bytes);
+            out
+        }
+        let mut domain = vec![8, 2];
+        domain.extend(field(18, b"hf.co"));
+        let mut site = field(10, b"huggingface");
+        site.extend(field(18, &domain));
+        let mut cidr = field(10, &[192, 0, 2, 0]);
+        cidr.extend([16, 24]);
+        let mut ip = field(10, b"example");
+        ip.extend(field(18, &cidr));
+        let dir = std::env::temp_dir().join(format!(
+            "pathchord-geodata-routing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sites.dat"), field(10, &site)).unwrap();
+        std::fs::write(dir.join("ips.dat"), field(10, &ip)).unwrap();
+
+        let mut route = egress_rule("geo-egress", "edge", 1);
+        route.matches.target_geo_sites.insert("huggingface".into());
+        let mut transit = transit_rule("geo-transit", "edge", Selector::default());
+        transit
+            .matches
+            .target_geo_sites
+            .insert("huggingface".into());
+        let config = PolicyConfig {
+            egresses: vec![egress("edge", &[], true, true)],
+            transit_proxies: vec![proxy("node", &[], &[], 100)],
+            geo_site_databases: vec![crate::GeoSiteDatabaseConfig {
+                id: crate::GeoSiteDatabaseId::new("sites"),
+                path: "sites.dat".into(),
+            }],
+            geo_ip_databases: vec![crate::GeoIpDatabaseConfig {
+                id: crate::GeoIpDatabaseId::new("ips"),
+                path: "ips.dat".into(),
+            }],
+            egress_rules: vec![route],
+            transit_rules: vec![transit],
+            proxy_rules: vec![ProxyRule {
+                id: RuleId::new("geo-proxy"),
+                matches: FlowMatch {
+                    target_geo_ips: BTreeSet::from(["example".into()]),
+                    ..Default::default()
+                },
+                require: Selector::default(),
+                select: ProxySelection::Any,
+            }],
+            traffic_policies: vec![traffic_policy("default")],
+            fallback: Some(crate::FallbackAction::Reject),
+            ..Default::default()
+        };
+        let snapshot = ValidatedPolicySnapshot::new(Generation::new(1), config.clone()).unwrap();
+        let compiled = CompiledPolicy::compile_with_source(&snapshot, Some(&dir)).unwrap();
+        let mut runtime = RuntimeCatalog::default();
+        runtime.set_egress(EgressId::new("edge"), ready_egress(1));
+        runtime.set_transit_proxy(
+            TransitProxyId::new("node"),
+            ready_proxy(&[FlowProtocol::Tcp, FlowProtocol::Udp], 1),
+        );
+        for protocol in [FlowProtocol::Tcp, FlowProtocol::Udp] {
+            let mut ctx = context();
+            ctx.protocol = protocol;
+            ctx.target.host = TargetHost::Hostname("us.aws.cdn.hf.co".into());
+            assert!(matches!(
+                compiled.evaluate(&ctx, &runtime),
+                Evaluation::Route(RoutePlan::Egress(_))
+            ));
+            ctx.target.host = TargetHost::Ip("192.0.2.42".parse().unwrap());
+            assert!(matches!(
+                compiled.evaluate(&ctx, &runtime),
+                Evaluation::Route(RoutePlan::Proxy(_))
+            ));
+            ctx.target.host = TargetHost::Hostname("unknown.test".into());
+            assert!(matches!(
+                compiled.evaluate(&ctx, &runtime),
+                Evaluation::Reject {
+                    reason: RejectReason::GlobalFallback,
+                    ..
+                }
+            ));
+        }
+        let mut invalid = config;
+        invalid.egress_rules[0].matches.target_geo_sites = BTreeSet::from(["missing".into()]);
+        let snapshot = ValidatedPolicySnapshot::new(Generation::new(2), invalid).unwrap();
+        assert!(matches!(
+            CompiledPolicy::compile_with_source(&snapshot, Some(&dir)),
+            Err(CompileError::InvalidGeodata { set: Some(_), .. })
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn implicit_transit_policy_allows_one_candidate_but_rejects_dynamic_multipath() {
         let input = r#"
 apiVersion: pathchord.io/v1
@@ -1020,6 +1506,7 @@ spec: {action: direct}
             dns_policy: None,
             node_probe: None,
             fallback: Some(FallbackAction::Reject),
+            ..PolicyConfig::default()
         });
         let mut runtime = RuntimeCatalog::default();
         runtime.set_egress(EgressId::new("first"), ready_egress(1));
@@ -1056,6 +1543,7 @@ spec: {action: direct}
             dns_policy: None,
             node_probe: None,
             fallback: Some(FallbackAction::Reject),
+            ..PolicyConfig::default()
         });
         let mut runtime = RuntimeCatalog::default();
         runtime.set_transit_proxy(
@@ -1139,6 +1627,7 @@ spec: {action: direct}
             dns_policy: None,
             node_probe: None,
             fallback: Some(FallbackAction::Reject),
+            ..PolicyConfig::default()
         });
         let mut status = ready_egress(1);
         status.labels.insert("region".into(), "jp".into());
@@ -1192,6 +1681,7 @@ spec: {action: direct}
             dns_policy: None,
             node_probe: None,
             fallback: Some(FallbackAction::Reject),
+            ..PolicyConfig::default()
         });
         let mut runtime = RuntimeCatalog::default();
         runtime.set_egress(EgressId::new("first"), ready_egress(1));
@@ -1225,6 +1715,7 @@ spec: {action: direct}
                 process_executables: BTreeSet::from(["browser".into()]),
                 target_hosts: BTreeSet::from(["WWW.EXAMPLE.TEST".into()]),
                 target_ports: BTreeSet::from([443]),
+                ..FlowMatch::default()
             },
             require: Selector::default(),
             select: ProxySelection::Direct,
@@ -1362,6 +1853,7 @@ spec: {action: direct}
             dns_policy: None,
             node_probe: None,
             fallback: Some(FallbackAction::Reject),
+            ..PolicyConfig::default()
         });
         let mut runtime = RuntimeCatalog::default();
         runtime.set_egress(EgressId::new("unused"), ready_egress(1));

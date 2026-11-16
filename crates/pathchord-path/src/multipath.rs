@@ -29,6 +29,9 @@ pub struct DemandKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MultipathConfig {
     pub max_paths: usize,
+    /// Rule-specific minimum for admitting a new flow. Existing flows retain
+    /// their own eligible paths and are not closed merely for falling below it.
+    pub minimum_usable_paths: usize,
     pub traffic_class: Option<pathchord_core::TrafficClassConfig>,
     pub demand_key: Option<DemandKey>,
     pub session_replication_budget_bytes: u64,
@@ -42,6 +45,7 @@ impl Default for MultipathConfig {
     fn default() -> Self {
         Self {
             max_paths: 8,
+            minimum_usable_paths: 1,
             traffic_class: None,
             demand_key: None,
             session_replication_budget_bytes: DEFAULT_SESSION_REPLICATION_BUDGET_BYTES_PER_SECOND,
@@ -354,17 +358,29 @@ impl MultipathSession {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn has_admissible_path(
         &self,
         eligible: Option<&BTreeMap<PathId, u32>>,
         require_fresh_status: bool,
     ) -> bool {
-        self.paths.iter().any(|(path_id, path)| {
-            eligible.is_none_or(|paths| paths.contains_key(path_id))
-                && (!require_fresh_status || path.status.latest().is_some())
-                && self.path_is_schedulable_by_id(*path_id, path)
-                && quality_exclusion(&path.observation).is_none()
-        })
+        self.admissible_path_count(eligible, require_fresh_status) > 0
+    }
+
+    pub(crate) fn admissible_path_count(
+        &self,
+        eligible: Option<&BTreeMap<PathId, u32>>,
+        require_fresh_status: bool,
+    ) -> usize {
+        self.paths
+            .iter()
+            .filter(|(path_id, path)| {
+                eligible.is_none_or(|paths| paths.contains_key(*path_id))
+                    && (!require_fresh_status || path.status.latest().is_some())
+                    && self.path_is_schedulable_by_id(**path_id, path)
+                    && quality_exclusion(&path.observation).is_none()
+            })
+            .count()
     }
 
     #[must_use]

@@ -52,6 +52,14 @@ impl ConfigurationSource {
         &self.path
     }
 
+    pub(crate) fn base_directory(&self) -> &Path {
+        if self.directory {
+            &self.path
+        } else {
+            self.path.parent().expect("a canonical file has a parent")
+        }
+    }
+
     pub(crate) fn is_directory(&self) -> bool {
         self.directory
     }

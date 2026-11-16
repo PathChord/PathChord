@@ -136,6 +136,8 @@ pub enum DataPlaneError {
     InvalidEgressKey,
     #[error("policy compilation failed: {0}")]
     PolicyCompile(#[from] pathchord_policy::CompileError),
+    #[error("compiled policy does not match its validated configuration generation")]
+    PolicyGenerationMismatch,
     #[error("local policy rejected the flow")]
     PolicyRejected,
     #[error("no usable route is available")]
@@ -317,10 +319,22 @@ impl std::fmt::Debug for IngressDataPlane {
 
 impl IngressDataPlane {
     pub fn new(config: IngressDataPlaneConfig) -> Result<Self, DataPlaneError> {
+        let compiled = CompiledPolicy::compile(&config.policy)?;
+        Self::new_with_compiled(config, compiled)
+    }
+
+    /// Construct the runtime with the exact policy already validated and
+    /// compiled by the configuration loader, including external data.
+    pub fn new_with_compiled(
+        config: IngressDataPlaneConfig,
+        compiled: CompiledPolicy,
+    ) -> Result<Self, DataPlaneError> {
         if !valid_identifier(config.ingress_id.as_bytes()) {
             return Err(DataPlaneError::InvalidIngressIdentity);
         }
-        let compiled = CompiledPolicy::compile(&config.policy)?;
+        if !compiled.matches_snapshot(&config.policy) {
+            return Err(DataPlaneError::PolicyGenerationMismatch);
+        }
         let generation = config.policy.generation();
         let policy = config.policy.config();
         let egresses: BTreeMap<_, _> = policy
@@ -451,13 +465,29 @@ impl IngressDataPlane {
     where
         P: TransitCredentialProvider + 'static,
     {
+        let compiled = snapshot.compile()?;
+        self.prepare_static_snapshot_with_compiled(snapshot, compiled, registry)
+            .await
+    }
+
+    pub async fn prepare_static_snapshot_with_compiled<P>(
+        &self,
+        snapshot: &ValidatedPolicySnapshot,
+        compiled: CompiledPolicy,
+        registry: &AdapterRegistry<P>,
+    ) -> Result<PreparedStaticReload, DataPlaneError>
+    where
+        P: TransitCredentialProvider + 'static,
+    {
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(DataPlaneError::ShuttingDown);
         }
-        let compiled = snapshot.compile()?;
+        if !compiled.matches_snapshot(snapshot) {
+            return Err(DataPlaneError::PolicyGenerationMismatch);
+        }
         let desired: BTreeMap<_, _> = snapshot
             .config()
             .transit_proxies
@@ -1532,17 +1562,27 @@ impl IngressDataPlane {
         // the deficit on the next maintenance tick without waiting for the
         // autoscaler's hysteresis window; this keeps an admitted Stream on a
         // surviving Path while a fresh connection is established.
+        let rules = slot.rule_targets.lock().await.clone();
+        let current = slot.transit_paths.lock().await.clone();
+        let ready: BTreeSet<_> = session.as_ref().map_or_else(BTreeSet::new, |current| {
+            current.snapshot().ready_path_ids.into_iter().collect()
+        });
+        let rule_shortfall = has_rule_path_shortfall(&rules, &current, &ready);
+        let max_paths = slot.autoscaler.lock().await.config().max_paths;
         if session.is_some()
             && input.hard_available
             && input.admission_allowed
-            && input
-                .target_path_count
-                .is_some_and(|target| input.ready_paths < target)
+            && input.ready_paths < max_paths
+            && (rule_shortfall
+                || input
+                    .target_path_count
+                    .is_some_and(|target| input.ready_paths < target))
         {
             let target = input.target_path_count.expect("checked above");
-            let deficit = target.saturating_sub(input.ready_paths);
+            let deficit = target
+                .saturating_sub(input.ready_paths)
+                .max(usize::from(rule_shortfall));
             let eligible = slot.eligible_transits.lock().await.clone();
-            let rules = slot.rule_targets.lock().await.clone();
             let available: BTreeMap<_, _> = self
                 .transit_adapters
                 .read()
@@ -1551,7 +1591,6 @@ impl IngressDataPlane {
                 .filter(|id| eligible.contains_key(*id))
                 .map(|id| (id.clone(), eligible[id]))
                 .collect();
-            let current = slot.transit_paths.lock().await.clone();
             let start = slot
                 .warmup_cursor
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1856,6 +1895,11 @@ impl IngressDataPlane {
                             candidate.traffic_class.as_deref(),
                         )
                         .await;
+                    multipath_config.minimum_usable_paths = route
+                        .min_usable_paths
+                        .max(slot.egress.status_requirements.min_usable_paths)
+                        .max(1)
+                        as usize;
                     multipath_config.demand_key = Some(pathchord_path::DemandKey {
                         rule_id: route.egress_rule_id.as_str().to_owned(),
                         policy_id: candidate.traffic_policy_id.as_str().to_owned(),
@@ -1969,6 +2013,10 @@ impl IngressDataPlane {
                     candidate.traffic_class.as_deref(),
                 )
                 .await;
+            multipath_config.minimum_usable_paths = route
+                .min_usable_paths
+                .max(slot.egress.status_requirements.min_usable_paths)
+                .max(1) as usize;
             multipath_config.demand_key = Some(pathchord_path::DemandKey {
                 rule_id: route.egress_rule_id.as_str().to_owned(),
                 policy_id: candidate.traffic_policy_id.as_str().to_owned(),
@@ -2825,6 +2873,23 @@ fn reserved_path_target(required: usize, max_paths: usize) -> usize {
         .min(max_paths.max(1))
 }
 
+fn has_rule_path_shortfall(
+    rules: &BTreeMap<String, RulePathRequirement>,
+    current: &BTreeMap<TransitProxyId, BTreeSet<PathId>>,
+    ready: &BTreeSet<PathId>,
+) -> bool {
+    rules.values().any(|rule| {
+        !rule.eligible_transits.is_empty()
+            && rule
+                .eligible_transits
+                .keys()
+                .flat_map(|id| current.get(id).into_iter().flatten())
+                .filter(|path| ready.contains(path))
+                .count()
+                < rule.minimum_paths
+    })
+}
+
 fn plan_transit_candidates(
     rules: &BTreeMap<String, RulePathRequirement>,
     eligible: &BTreeMap<TransitProxyId, u32>,
@@ -2971,6 +3036,7 @@ fn flow_error(error: DataPlaneError) -> FlowBridgeError {
         DataPlaneError::InvalidIngressIdentity
         | DataPlaneError::InvalidEgressKey
         | DataPlaneError::PolicyCompile(_)
+        | DataPlaneError::PolicyGenerationMismatch
         | DataPlaneError::Admission(_)
         | DataPlaneError::Session(_)
         | DataPlaneError::Stream(OpenStreamError::SessionClosed)
@@ -3183,6 +3249,41 @@ mod tests {
         let next = plan_transit_candidates(&BTreeMap::new(), &eligible, &current, 1, 2);
         assert_eq!(first, vec![b]);
         assert_eq!(next, vec![c]);
+    }
+
+    #[test]
+    fn rule_shortfall_is_not_hidden_by_other_transits_ready_paths() {
+        let a = TransitProxyId::new("a");
+        let b = TransitProxyId::new("b");
+        let rules = BTreeMap::from([(
+            "a-only".into(),
+            RulePathRequirement {
+                minimum_paths: 3,
+                eligible_transits: BTreeMap::from([(a.clone(), 100)]),
+            },
+        )]);
+        let current = BTreeMap::from([
+            (a.clone(), BTreeSet::from([PathId::new(1)])),
+            (
+                b,
+                BTreeSet::from([PathId::new(2), PathId::new(3), PathId::new(4)]),
+            ),
+        ]);
+        let ready = BTreeSet::from([
+            PathId::new(1),
+            PathId::new(2),
+            PathId::new(3),
+            PathId::new(4),
+        ]);
+        assert!(has_rule_path_shortfall(&rules, &current, &ready));
+        let mut complete = current;
+        complete
+            .get_mut(&a)
+            .unwrap()
+            .extend([PathId::new(5), PathId::new(6)]);
+        let mut ready = ready;
+        ready.extend([PathId::new(5), PathId::new(6)]);
+        assert!(!has_rule_path_shortfall(&rules, &complete, &ready));
     }
 
     #[test]

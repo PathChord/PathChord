@@ -12,6 +12,7 @@ use thiserror::Error;
 
 mod compiled;
 mod config;
+pub mod geodata;
 mod resource;
 mod service_config;
 mod transit_options;
@@ -81,6 +82,8 @@ id_type!(TrafficPolicyId);
 id_type!(ListenerId);
 id_type!(SubscriptionId);
 id_type!(DnsPolicyId);
+id_type!(GeoSiteDatabaseId);
+id_type!(GeoIpDatabaseId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -380,6 +383,12 @@ pub struct FlowMatch {
     pub authentication_identities: BTreeSet<String>,
     pub process_executables: BTreeSet<String>,
     pub target_hosts: BTreeSet<String>,
+    /// Canonical geosite set names, optionally followed by `@attribute`.
+    #[serde(default)]
+    pub target_geo_sites: BTreeSet<String>,
+    /// Canonical geoip set names.
+    #[serde(default)]
+    pub target_geo_ips: BTreeSet<String>,
     pub target_ports: BTreeSet<u16>,
 }
 
@@ -525,12 +534,30 @@ pub enum FallbackAction {
     Direct,
 }
 
+/// A namespace-owned, operator-provided V2Fly geosite database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeoSiteDatabaseConfig {
+    pub id: GeoSiteDatabaseId,
+    pub path: String,
+}
+
+/// A namespace-owned, operator-provided V2Fly geoip database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeoIpDatabaseConfig {
+    pub id: GeoIpDatabaseId,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PolicyConfig {
     pub node_probe: Option<NodeProbePolicySpec>,
     pub egresses: Vec<EgressConfig>,
     pub transit_proxies: Vec<TransitProxyConfig>,
     pub subscriptions: Vec<SubscriptionConfig>,
+    #[serde(default)]
+    pub geo_site_databases: Vec<GeoSiteDatabaseConfig>,
+    #[serde(default)]
+    pub geo_ip_databases: Vec<GeoIpDatabaseConfig>,
     pub egress_rules: Vec<EgressRule>,
     pub transit_rules: Vec<TransitRule>,
     pub proxy_rules: Vec<ProxyRule>,
@@ -605,6 +632,8 @@ pub enum ValidationError {
         policy_id: String,
         reason: &'static str,
     },
+    #[error("geodata configuration for {owner} is invalid: {reason}")]
+    InvalidGeoData { owner: String, reason: &'static str },
 }
 
 /// Immutable, validated configuration input for [`CompiledPolicy`].
@@ -616,7 +645,16 @@ pub struct ValidatedPolicySnapshot {
 }
 
 impl ValidatedPolicySnapshot {
-    pub fn new(generation: Generation, config: PolicyConfig) -> Result<Self, ValidationError> {
+    pub fn new(generation: Generation, mut config: PolicyConfig) -> Result<Self, ValidationError> {
+        for rule in &mut config.egress_rules {
+            normalize_flow_geodata(&mut rule.matches, rule.id.as_str())?;
+        }
+        for rule in &mut config.transit_rules {
+            normalize_flow_geodata(&mut rule.matches, rule.id.as_str())?;
+        }
+        for rule in &mut config.proxy_rules {
+            normalize_flow_geodata(&mut rule.matches, rule.id.as_str())?;
+        }
         validate(&config)?;
         let fallback = config.fallback.ok_or(ValidationError::MissingFallback)?;
         Ok(Self {
@@ -676,6 +714,69 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         "listener",
         config.listeners.iter().map(|item| item.id.as_str()),
     )?;
+    validate_unique(
+        "geosite database",
+        config
+            .geo_site_databases
+            .iter()
+            .map(|item| item.id.as_str()),
+    )?;
+    validate_unique(
+        "geoip database",
+        config.geo_ip_databases.iter().map(|item| item.id.as_str()),
+    )?;
+
+    let mut site_namespaces = HashSet::new();
+    for database in &config.geo_site_databases {
+        validate_geodata_path(database.id.as_str(), &database.path)?;
+        if !site_namespaces.insert(database.id.namespace()) {
+            return Err(ValidationError::InvalidGeoData {
+                owner: database.id.as_str().to_owned(),
+                reason: "only one geosite database is permitted per namespace",
+            });
+        }
+    }
+    let mut ip_namespaces = HashSet::new();
+    for database in &config.geo_ip_databases {
+        validate_geodata_path(database.id.as_str(), &database.path)?;
+        if !ip_namespaces.insert(database.id.namespace()) {
+            return Err(ValidationError::InvalidGeoData {
+                owner: database.id.as_str().to_owned(),
+                reason: "only one geoip database is permitted per namespace",
+            });
+        }
+    }
+    for (id, matches) in config
+        .egress_rules
+        .iter()
+        .map(|rule| (&rule.id, &rule.matches))
+        .chain(
+            config
+                .transit_rules
+                .iter()
+                .map(|rule| (&rule.id, &rule.matches)),
+        )
+        .chain(
+            config
+                .proxy_rules
+                .iter()
+                .map(|rule| (&rule.id, &rule.matches)),
+        )
+    {
+        validate_flow_geodata(matches, id.as_str())?;
+        if !matches.target_geo_sites.is_empty() && !site_namespaces.contains(id.namespace()) {
+            return Err(ValidationError::InvalidGeoData {
+                owner: id.as_str().to_owned(),
+                reason: "targetGeoSites requires a geosite database in the rule namespace",
+            });
+        }
+        if !matches.target_geo_ips.is_empty() && !ip_namespaces.contains(id.namespace()) {
+            return Err(ValidationError::InvalidGeoData {
+                owner: id.as_str().to_owned(),
+                reason: "targetGeoIps requires a geoip database in the rule namespace",
+            });
+        }
+    }
 
     for egress in &config.egresses {
         validate_port("egress", egress.id.as_str(), egress.endpoint.port)?;
@@ -833,6 +934,76 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
     }
 
     Ok(())
+}
+
+fn validate_geodata_path(owner: &str, path: &str) -> Result<(), ValidationError> {
+    if path.trim().is_empty() || path.len() > 4096 || path.chars().any(char::is_control) {
+        return Err(ValidationError::InvalidGeoData {
+            owner: owner.to_owned(),
+            reason: "database path must be non-empty, bounded and contain no control characters",
+        });
+    }
+    Ok(())
+}
+
+/// Normalizes a conventional prefixed or bare geodata set reference.
+pub fn normalize_geodata_reference(value: &str, geosite: bool) -> Result<String, &'static str> {
+    let value = value.to_ascii_lowercase();
+    let prefix = if geosite { "geosite:" } else { "geoip:" };
+    let value = value.strip_prefix(prefix).unwrap_or(&value);
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 255
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-!".contains(&byte))
+    };
+    let mut parts = value.split('@');
+    if !valid_part(parts.next().unwrap_or_default()) {
+        return Err("invalid set name");
+    }
+    if let Some(attribute) = parts.next()
+        && (!geosite || !valid_part(attribute) || parts.next().is_some())
+    {
+        return Err("invalid attribute");
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_flow_geodata(matches: &mut FlowMatch, owner: &str) -> Result<(), ValidationError> {
+    for (values, geosite) in [
+        (&mut matches.target_geo_sites, true),
+        (&mut matches.target_geo_ips, false),
+    ] {
+        if values.len() > 256 {
+            return Err(ValidationError::InvalidGeoData {
+                owner: owner.to_owned(),
+                reason: "a geodata match field exceeds 256 references",
+            });
+        }
+        let mut normalized = BTreeSet::new();
+        for value in std::mem::take(values) {
+            let value = normalize_geodata_reference(&value, geosite).map_err(|reason| {
+                ValidationError::InvalidGeoData {
+                    owner: owner.to_owned(),
+                    reason,
+                }
+            })?;
+            if !normalized.insert(value) {
+                return Err(ValidationError::InvalidGeoData {
+                    owner: owner.to_owned(),
+                    reason: "duplicate geodata reference after normalization",
+                });
+            }
+        }
+        *values = normalized;
+    }
+    Ok(())
+}
+
+fn validate_flow_geodata(matches: &FlowMatch, owner: &str) -> Result<(), ValidationError> {
+    let mut matches = matches.clone();
+    normalize_flow_geodata(&mut matches, owner)
 }
 
 fn validate_unique<'a>(
@@ -1051,6 +1222,34 @@ mod tests {
     }
 
     #[test]
+    fn constructed_geodata_configuration_is_normalized_and_namespace_checked() {
+        let mut config = base_config();
+        config.geo_site_databases.push(GeoSiteDatabaseConfig {
+            id: GeoSiteDatabaseId::in_namespace("tenant-a", "domains"),
+            path: "../geosite.dat".into(),
+        });
+        config.proxy_rules.push(ProxyRule {
+            id: RuleId::in_namespace("tenant-a", "site-route"),
+            matches: FlowMatch {
+                target_geo_sites: BTreeSet::from(["GeoSite:HuggingFace".into()]),
+                ..Default::default()
+            },
+            require: Selector::default(),
+            select: ProxySelection::Direct,
+        });
+        let snapshot = ValidatedPolicySnapshot::new(Generation::new(1), config.clone()).unwrap();
+        assert_eq!(
+            snapshot.config().proxy_rules[0].matches.target_geo_sites,
+            BTreeSet::from(["huggingface".into()])
+        );
+        config.proxy_rules[0].id = RuleId::in_namespace("tenant-b", "site-route");
+        assert!(matches!(
+            ValidatedPolicySnapshot::new(Generation::new(1), config),
+            Err(ValidationError::InvalidGeoData { .. })
+        ));
+    }
+
+    #[test]
     fn requires_an_explicit_global_fallback() {
         let mut config = base_config();
         config.fallback = None;
@@ -1238,6 +1437,7 @@ mod tests {
                 process_executables: BTreeSet::from(["game.exe".into()]),
                 target_hosts: BTreeSet::from(["game.example".into()]),
                 target_ports: BTreeSet::from([443]),
+                ..FlowMatch::default()
             },
             egress: EgressSelection::Selector(Selector {
                 labels: BTreeMap::from([("region".into(), "jp".into())]),
