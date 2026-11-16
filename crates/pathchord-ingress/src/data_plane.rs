@@ -22,7 +22,7 @@ use pathchord_policy::{
 };
 use pathchord_transit::{
     AdapterRegistry, ConnectRequest, DirectTransitAdapter, Endpoint as TransitEndpoint,
-    TransitAdapter, TransitCredentialProvider, TransitError,
+    TransitAdapter, TransitCredentialProvider, TransitError, ValidatedTransitAdapter,
 };
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,6 +36,7 @@ use crate::{
 };
 
 pub const DEFAULT_PATH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ORDINARY_PROXY_ATTEMPTS: usize = 8;
 const TCP_CAPABILITY: u64 = 1;
 const UDP_CAPABILITY: u64 = 1 << 1;
 const STATIC_PATH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -111,6 +112,14 @@ pub struct DataPlaneSessionSnapshot {
     pub egress_id: String,
     pub session: SessionSnapshot,
     pub path_transit: BTreeMap<PathId, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicTransitRegistration {
+    Registered,
+    SourceBlocked,
+    StaticConflict,
+    StaleAdmission,
 }
 
 #[derive(Debug, Error)]
@@ -262,6 +271,7 @@ pub struct IngressDataPlane {
     configuration_gate: RwLock<()>,
     traffic_policies: RwLock<BTreeMap<TrafficPolicyId, TrafficPolicy>>,
     dynamic_transit_configs: RwLock<BTreeMap<TransitProxyId, TransitProxyConfig>>,
+    dynamic_admissions: RwLock<BTreeMap<TransitProxyId, ValidatedTransitAdapter>>,
     blocked_subscriptions: RwLock<BTreeSet<String>>,
     transit_adapters: RwLock<BTreeMap<TransitProxyId, Arc<dyn TransitAdapter>>>,
     runtime: RwLock<RuntimeCatalog>,
@@ -367,6 +377,7 @@ impl IngressDataPlane {
             configuration_gate: RwLock::new(()),
             traffic_policies: RwLock::new(traffic_policies),
             dynamic_transit_configs: RwLock::new(BTreeMap::new()),
+            dynamic_admissions: RwLock::new(BTreeMap::new()),
             blocked_subscriptions: RwLock::new(BTreeSet::new()),
             transit_adapters: RwLock::new(transit_adapters),
             runtime: RwLock::new(runtime),
@@ -385,7 +396,7 @@ impl IngressDataPlane {
         adapter: Arc<dyn TransitAdapter>,
         mut status: TransitProxyRuntimeStatus,
     ) -> Result<(), DataPlaneError> {
-        let _configuration = self.configuration_gate.read().await;
+        let _configuration = self.configuration_gate.write().await;
         let config = self.transit_configs.read().await.get(&id).cloned();
         let Some(config) = config else {
             return Err(DataPlaneError::TransitUnavailable(id.as_str().to_owned()));
@@ -641,6 +652,7 @@ impl IngressDataPlane {
                     && !blocked_subscriptions.contains(&source.subscription);
                 if !enabled {
                     blocked_subscriptions.insert(source.subscription.clone());
+                    probes.cancel(&config.id);
                 }
                 if let Some(mut status) = next_runtime.transit_proxy(&config.id).cloned() {
                     if !enabled {
@@ -736,30 +748,52 @@ impl IngressDataPlane {
                 return;
             }
             let start = probes.cursor % adapters.len();
+            let admissions = self.dynamic_admissions.read().await;
             let candidates: Vec<_> = adapters
                 .iter()
                 .cycle()
                 .skip(start)
                 .take(config.max_nodes_per_batch.min(adapters.len()))
-                .cloned()
+                .map(|(id, adapter)| crate::node_probe::ProbeCandidate {
+                    id: id.clone(),
+                    adapter: Arc::clone(adapter),
+                    admission: admissions.get(id).map(|admission| admission.revocation()),
+                    cancelled: probes.arm(id),
+                })
                 .collect();
             probes.cursor = (start + candidates.len()) % adapters.len();
             (config, candidates)
         };
-        let expected: BTreeMap<_, _> = candidates.iter().cloned().collect();
+        let expected: BTreeMap<_, _> = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.id.clone(),
+                    (Arc::clone(&candidate.adapter), candidate.admission.clone()),
+                )
+            })
+            .collect();
         let results = crate::node_probe::probe_batch(config.clone(), candidates).await;
         let _configuration = self.configuration_gate.read().await;
         let current = self.transit_adapters.read().await;
+        let runtime = self.runtime.read().await;
         let mut probes = self.probes.lock().await;
+        probes.finish_batch();
         if probes.config.as_ref() != Some(&config) {
             return;
         }
         for (id, outcome) in results {
-            if current
-                .get(&id)
-                .zip(expected.get(&id))
-                .is_some_and(|(current, expected)| Arc::ptr_eq(current, expected))
-            {
+            if current.get(&id).zip(expected.get(&id)).is_some_and(
+                |(current, (expected, admission))| {
+                    Arc::ptr_eq(current, expected)
+                        && admission.as_ref().is_none_or(|token| token.is_valid())
+                },
+            ) && runtime.transit_proxy(&id).is_some_and(|status| {
+                matches!(
+                    status.state,
+                    RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+                )
+            }) {
                 probes.record(id, outcome, config.window_size);
             }
         }
@@ -792,15 +826,47 @@ impl IngressDataPlane {
         self.probes.lock().await.observations(nodes)
     }
 
-    pub async fn register_dynamic_transit_adapter(
+    #[cfg(test)]
+    pub(crate) async fn register_dynamic_transit_adapter(
+        &self,
+        config: TransitProxyConfig,
+        adapter: Arc<dyn TransitAdapter>,
+        status: TransitProxyRuntimeStatus,
+    ) -> DynamicTransitRegistration {
+        self.register_dynamic_transit_inner(config, adapter, status, None)
+            .await
+    }
+
+    pub async fn register_verified_dynamic_transit_adapter(
+        &self,
+        config: TransitProxyConfig,
+        admission: ValidatedTransitAdapter,
+        status: TransitProxyRuntimeStatus,
+    ) -> DynamicTransitRegistration {
+        if !admission.matches_config(&config) {
+            return DynamicTransitRegistration::StaleAdmission;
+        }
+        let adapter = admission.adapter();
+        self.register_dynamic_transit_inner(config, adapter, status, Some(admission))
+            .await
+    }
+
+    async fn register_dynamic_transit_inner(
         &self,
         config: TransitProxyConfig,
         adapter: Arc<dyn TransitAdapter>,
         mut status: TransitProxyRuntimeStatus,
-    ) {
-        let _configuration = self.configuration_gate.read().await;
+        admission: Option<ValidatedTransitAdapter>,
+    ) -> DynamicTransitRegistration {
+        let _configuration = self.configuration_gate.write().await;
         if self.transit_configs.read().await.contains_key(&config.id) {
-            return;
+            return DynamicTransitRegistration::StaticConflict;
+        }
+        if admission
+            .as_ref()
+            .is_some_and(|value| !value.matches_config(&config))
+        {
+            return DynamicTransitRegistration::StaleAdmission;
         }
         if !adapter.supports_udp() || config.options.udp == Some(false) {
             status.capabilities.remove(&FlowProtocol::Udp);
@@ -808,20 +874,65 @@ impl IngressDataPlane {
         if !adapter.supports_tcp() {
             status.capabilities.remove(&FlowProtocol::Tcp);
         }
-        if self.subscription_is_blocked(&config).await {
+        let previous = self
+            .dynamic_admissions
+            .read()
+            .await
+            .get(&config.id)
+            .cloned();
+        let identity_changed = previous.as_ref().is_some_and(|old| {
+            admission
+                .as_ref()
+                .is_none_or(|next| !old.same_connection(next))
+        });
+        let mut path_draining = false;
+        for slot in self.sessions.values() {
+            if slot
+                .draining_paths
+                .lock()
+                .await
+                .values()
+                .any(|(id, _)| id == &config.id)
+            {
+                path_draining = true;
+                break;
+            }
+        }
+        if identity_changed || path_draining {
+            self.retire_replaced_transit_paths_inner(std::slice::from_ref(&config.id))
+                .await;
+        }
+        let blocked = self.subscription_is_blocked(&config).await;
+        if blocked {
             status.state = RuntimeNodeState::Draining;
+            if let Some(admission) = &admission {
+                admission.revocation().revoke();
+            }
         }
         let id = config.id.clone();
         self.probes.lock().await.forget(&id);
-        self.dynamic_transit_configs
-            .write()
-            .await
-            .insert(id.clone(), config.clone());
-        self.transit_adapters.write().await.insert(id, adapter);
-        self.runtime
-            .write()
-            .await
-            .set_dynamic_transit_proxy(config, status);
+        let mut configs = self.dynamic_transit_configs.write().await;
+        let mut adapters = self.transit_adapters.write().await;
+        let mut admissions = self.dynamic_admissions.write().await;
+        let mut runtime = self.runtime.write().await;
+        if let Some(previous) = admissions.remove(&id)
+            && admission
+                .as_ref()
+                .is_none_or(|next| !previous.revocation().same(&next.revocation()))
+        {
+            previous.revocation().revoke();
+        }
+        if let Some(admission) = admission {
+            admissions.insert(id.clone(), admission);
+        }
+        configs.insert(id.clone(), config.clone());
+        adapters.insert(id, adapter);
+        runtime.set_dynamic_transit_proxy(config, status);
+        if blocked {
+            DynamicTransitRegistration::SourceBlocked
+        } else {
+            DynamicTransitRegistration::Registered
+        }
     }
 
     pub async fn publish_dynamic_transit_status(
@@ -829,21 +940,45 @@ impl IngressDataPlane {
         config: TransitProxyConfig,
         mut status: TransitProxyRuntimeStatus,
     ) {
-        let _configuration = self.configuration_gate.read().await;
+        let _configuration = self.configuration_gate.write().await;
         if self.transit_configs.read().await.contains_key(&config.id) {
             return;
+        }
+        // Status-only publication never admits a node; readiness requires a
+        // validated adapter registration with its bound admission token.
+        if matches!(
+            status.state,
+            RuntimeNodeState::Ready | RuntimeNodeState::Degraded
+        ) {
+            status.state = RuntimeNodeState::Down;
+            status.capabilities.clear();
         }
         if self.subscription_is_blocked(&config).await {
             status.state = RuntimeNodeState::Draining;
         }
-        self.dynamic_transit_configs
-            .write()
-            .await
-            .insert(config.id.clone(), config.clone());
-        self.runtime
-            .write()
-            .await
-            .set_dynamic_transit_proxy(config, status);
+        if status.state != RuntimeNodeState::Ready
+            && self
+                .dynamic_admissions
+                .read()
+                .await
+                .contains_key(&config.id)
+        {
+            self.retire_replaced_transit_paths_inner(std::slice::from_ref(&config.id))
+                .await;
+        }
+        if status.state != RuntimeNodeState::Ready {
+            self.probes.lock().await.cancel(&config.id);
+        }
+        let mut configs = self.dynamic_transit_configs.write().await;
+        let admissions = self.dynamic_admissions.read().await;
+        let mut runtime = self.runtime.write().await;
+        if status.state != RuntimeNodeState::Ready
+            && let Some(admission) = admissions.get(&config.id)
+        {
+            admission.revocation().revoke();
+        }
+        configs.insert(config.id.clone(), config.clone());
+        runtime.set_dynamic_transit_proxy(config, status);
     }
 
     async fn subscription_is_blocked(&self, config: &TransitProxyConfig) -> bool {
@@ -868,7 +1003,9 @@ impl IngressDataPlane {
         let static_configs = self.transit_configs.read().await;
         let dynamic_configs = self.dynamic_transit_configs.read().await;
         let mut blocked = self.blocked_subscriptions.write().await;
+        let admissions = self.dynamic_admissions.read().await;
         let mut runtime = self.runtime.write().await;
+        let mut probes = self.probes.lock().await;
         let (result, enabled) = commit();
         if let Some(enabled) = enabled
             && !enabled
@@ -881,6 +1018,10 @@ impl IngressDataPlane {
                     .is_some_and(|source| source.subscription == subscription)
                     && let Some(mut status) = runtime.transit_proxy(&config.id).cloned()
                 {
+                    if let Some(admission) = admissions.get(&config.id) {
+                        admission.revocation().revoke();
+                    }
+                    probes.cancel(&config.id);
                     status.state = RuntimeNodeState::Draining;
                     runtime.set_transit_proxy(config.id.clone(), status);
                 }
@@ -974,6 +1115,58 @@ impl IngressDataPlane {
         }
     }
 
+    /// Remove old Paths from future route eligibility before replacing the
+    /// adapter behind an existing dynamic node identity.
+    pub async fn retire_replaced_transit_paths(&self, ids: &[TransitProxyId]) {
+        let _configuration = self.configuration_gate.write().await;
+        self.retire_replaced_transit_paths_inner(ids).await;
+    }
+
+    async fn retire_replaced_transit_paths_inner(&self, ids: &[TransitProxyId]) {
+        let mut retirement = self.retired_paths.lock().await;
+        while retirement.try_join_next().is_some() {}
+        for slot in self.sessions.values() {
+            let mut session_guard = slot.session.lock().await;
+            let session = session_guard.clone();
+            let mut paths = slot.transit_paths.lock().await;
+            let mut draining = slot.draining_paths.lock().await;
+            let mut eligible = slot.eligible_transits.lock().await;
+            let mut removed_paths = BTreeSet::new();
+            for id in ids {
+                let path_ids = paths.remove(id).unwrap_or_default();
+                eligible.remove(id);
+                for path_id in path_ids {
+                    draining.remove(&path_id);
+                    removed_paths.insert(path_id);
+                }
+            }
+            if let Some(session) = session {
+                let ready = session.snapshot().ready_path_ids;
+                if !removed_paths.is_empty() && ready.iter().all(|id| removed_paths.contains(id)) {
+                    // The last drained Path cannot return its Session to
+                    // Active; preserve the old actor for admitted flows and
+                    // let the next open establish a fresh Session.
+                    session_guard.take();
+                    paths.clear();
+                    draining.clear();
+                    slot.rule_targets.lock().await.clear();
+                    slot.autoscaler.lock().await.reset();
+                }
+                for path_id in removed_paths {
+                    let session = Arc::clone(&session);
+                    retirement.spawn(async move {
+                        // The Path was removed from new-route eligibility
+                        // above; existing admitted Streams may still use it
+                        // until the grace period expires.
+                        tokio::time::sleep(STATIC_PATH_DRAIN_TIMEOUT).await;
+                        let _ = timeout(Duration::from_secs(1), session.drain_path(path_id)).await;
+                        let _ = timeout(Duration::from_secs(1), session.close_path(path_id)).await;
+                    });
+                }
+            }
+        }
+    }
+
     pub async fn transit_in_use(&self, id: &TransitProxyId) -> bool {
         for slot in self.sessions.values() {
             if slot.transit_paths.lock().await.contains_key(id)
@@ -991,19 +1184,22 @@ impl IngressDataPlane {
     }
 
     pub async fn remove_dynamic_transit(&self, id: &TransitProxyId) {
-        let _configuration = self.configuration_gate.read().await;
-        if self
-            .dynamic_transit_configs
-            .write()
-            .await
-            .remove(id)
-            .is_none()
-        {
+        let _configuration = self.configuration_gate.write().await;
+        let mut configs = self.dynamic_transit_configs.write().await;
+        if !configs.contains_key(id) {
             return;
         }
-        self.transit_adapters.write().await.remove(id);
-        self.runtime.write().await.remove_dynamic_transit_proxy(id);
-        self.probes.lock().await.forget(id);
+        let mut adapters = self.transit_adapters.write().await;
+        let mut admissions = self.dynamic_admissions.write().await;
+        let mut runtime = self.runtime.write().await;
+        let mut probes = self.probes.lock().await;
+        configs.remove(id);
+        adapters.remove(id);
+        if let Some(admission) = admissions.remove(id) {
+            admission.revocation().revoke();
+        }
+        runtime.remove_dynamic_transit_proxy(id);
+        probes.forget(id);
     }
 
     pub fn dns_route_adapter(self: &Arc<Self>) -> Arc<dyn DnsRouteAdapter> {
@@ -1510,43 +1706,7 @@ impl IngressDataPlane {
                 )));
             }
             Evaluation::Route(RoutePlan::Proxy(route)) => {
-                let disabled = self
-                    .transit_configs
-                    .read()
-                    .await
-                    .get(&route.transit_proxy_id)
-                    .is_some_and(|config| config.options.udp == Some(false))
-                    || self
-                        .dynamic_transit_configs
-                        .read()
-                        .await
-                        .get(&route.transit_proxy_id)
-                        .is_some_and(|config| config.options.udp == Some(false));
-                if disabled {
-                    return Err(DataPlaneError::NoUsableRoute);
-                }
-                let adapter = self
-                    .transit_adapters
-                    .read()
-                    .await
-                    .get(&route.transit_proxy_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        DataPlaneError::TransitUnavailable(
-                            route.transit_proxy_id.as_str().to_owned(),
-                        )
-                    })?;
-                if !adapter.supports_udp() {
-                    return Err(DataPlaneError::NoUsableRoute);
-                }
-                let datagram = adapter
-                    .connect_udp(ConnectRequest {
-                        destination: transit_target(&policy_context)?,
-                    })
-                    .await?;
-                return Ok(Box::new(crate::udp_flow::TransitUdpFlowHandle::new(
-                    datagram,
-                )));
+                return self.connect_proxy_udp(&route, &policy_context).await;
             }
             Evaluation::Route(RoutePlan::Egress(route)) => route,
         };
@@ -1737,21 +1897,116 @@ impl IngressDataPlane {
         route: &ProxyRoutePlan,
         context: &PolicyContext,
     ) -> Result<BoxedLocalConnection, DataPlaneError> {
-        let adapter = self
-            .transit_adapters
-            .read()
+        // `open_tcp` holds the configuration gate, so this ordered set and
+        // its adapters belong to the same publication as the policy decision.
+        // Only errors before connect returns are eligible for another attempt.
+        let destination = transit_target(context)?;
+        let candidates: Vec<_> = {
+            let adapters = self.transit_adapters.read().await;
+            route
+                .candidates
+                .iter()
+                .take(MAX_ORDINARY_PROXY_ATTEMPTS)
+                .map(|id| (id, adapters.get(id).cloned()))
+                .collect()
+        };
+        let mut last_error = DataPlaneError::NoUsableRoute;
+        let deadline = Instant::now() + self.path_connect_timeout;
+        let total_candidates = candidates.len();
+        for (index, (id, adapter)) in candidates.into_iter().enumerate() {
+            let Some(adapter) = adapter else {
+                last_error = DataPlaneError::TransitUnavailable(id.as_str().to_owned());
+                continue;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let budget = remaining / (total_candidates - index) as u32;
+            if budget.is_zero() {
+                return Err(TransitError::Connection("connection timed out".into()).into());
+            }
+            match timeout(
+                budget,
+                adapter.connect(ConnectRequest {
+                    destination: destination.clone(),
+                }),
+            )
             .await
-            .get(&route.transit_proxy_id)
-            .cloned()
-            .ok_or_else(|| {
-                DataPlaneError::TransitUnavailable(route.transit_proxy_id.as_str().to_owned())
-            })?;
-        let stream = adapter
-            .connect(ConnectRequest {
-                destination: transit_target(context)?,
-            })
-            .await?;
-        Ok(Box::new(stream) as BoxedLocalConnection)
+            {
+                Ok(Ok(stream)) => return Ok(Box::new(stream) as BoxedLocalConnection),
+                Ok(Err(error)) => last_error = error.into(),
+                Err(_) => {
+                    last_error = TransitError::Connection("connection timed out".into()).into();
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    async fn connect_proxy_udp(
+        &self,
+        route: &ProxyRoutePlan,
+        context: &PolicyContext,
+    ) -> Result<BoxedUdpFlowHandle, DataPlaneError> {
+        // Do not retry a datagram after an association has been returned: its
+        // payload may already have reached the previous target.
+        let destination = transit_target(context)?;
+        let candidates: Vec<_> = {
+            let configs = self.transit_configs.read().await;
+            let dynamic = self.dynamic_transit_configs.read().await;
+            let adapters = self.transit_adapters.read().await;
+            route
+                .candidates
+                .iter()
+                .take(MAX_ORDINARY_PROXY_ATTEMPTS)
+                .map(|id| {
+                    let disabled = configs
+                        .get(id)
+                        .or_else(|| dynamic.get(id))
+                        .is_some_and(|config| config.options.udp == Some(false));
+                    (id, disabled, adapters.get(id).cloned())
+                })
+                .collect()
+        };
+        let mut last_error = DataPlaneError::NoUsableRoute;
+        let deadline = Instant::now() + self.path_connect_timeout;
+        let total_candidates = candidates.len();
+        for (index, (id, disabled, adapter)) in candidates.into_iter().enumerate() {
+            if disabled {
+                last_error = DataPlaneError::NoUsableRoute;
+                continue;
+            }
+            let Some(adapter) = adapter else {
+                last_error = DataPlaneError::TransitUnavailable(id.as_str().to_owned());
+                continue;
+            };
+            if !adapter.supports_udp() {
+                last_error = DataPlaneError::NoUsableRoute;
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let budget = remaining / (total_candidates - index) as u32;
+            if budget.is_zero() {
+                return Err(TransitError::Connection("connection timed out".into()).into());
+            }
+            match timeout(
+                budget,
+                adapter.connect_udp(ConnectRequest {
+                    destination: destination.clone(),
+                }),
+            )
+            .await
+            {
+                Ok(Ok(datagram)) => {
+                    return Ok(Box::new(crate::udp_flow::TransitUdpFlowHandle::new(
+                        datagram,
+                    )));
+                }
+                Ok(Err(error)) => last_error = error.into(),
+                Err(_) => {
+                    last_error = TransitError::Connection("connection timed out".into()).into();
+                }
+            }
+        }
+        Err(last_error)
     }
 
     async fn ensure_session(

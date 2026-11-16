@@ -7,6 +7,7 @@ use shadowsocks::ProxyClientStream;
 use shadowsocks::config::{ServerConfig, ServerType};
 use shadowsocks::context::{Context, SharedContext};
 use shadowsocks::crypto::CipherKind;
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
 use crate::{
@@ -14,14 +15,65 @@ use crate::{
     TransitError, TransitMetadata,
 };
 
-/// TCP Transit adapter backed by the maintained `shadowsocks-rust` core.
-#[derive(Debug)]
+#[path = "shadowsocks_aes192.rs"]
+mod shadowsocks_aes192;
+#[path = "shadowsocks_legacy_common.rs"]
+mod shadowsocks_legacy_common;
+#[path = "shadowsocks_v2ray_mux.rs"]
+mod shadowsocks_v2ray_mux;
+#[path = "shadowsocks_v2ray_plugin.rs"]
+mod shadowsocks_v2ray_plugin;
+#[path = "shadowsocks_xchacha20.rs"]
+mod shadowsocks_xchacha20;
+#[path = "simple_obfs.rs"]
+mod simple_obfs;
+
+/// TCP and UDP Transit adapter backed by the maintained `shadowsocks-rust` core.
 pub struct ShadowsocksTransitAdapter {
     metadata: TransitMetadata,
     context: SharedContext,
-    server: ServerConfig,
+    server: ShadowsocksServer,
     connect_timeout: Duration,
     udp_enabled: bool,
+    udp_over_tcp_version: Option<u8>,
+    plugin: Option<Plugin>,
+}
+
+impl std::fmt::Debug for ShadowsocksTransitAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShadowsocksTransitAdapter")
+            .field("metadata", &self.metadata)
+            .field("udp_enabled", &self.udp_enabled)
+            .field("plugin_configured", &self.plugin.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+enum Plugin {
+    Simple(simple_obfs::Config),
+    V2ray(shadowsocks_v2ray_plugin::Config),
+}
+
+impl Plugin {
+    async fn wrap(
+        &self,
+        stream: BoxedTransitConnection,
+        duration: Duration,
+    ) -> Result<BoxedTransitConnection, TransitError> {
+        match self {
+            Self::Simple(config) => Ok(Box::new(simple_obfs::Stream::new(stream, config.clone()))),
+            Self::V2ray(config) => config.wrap(stream, duration).await,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ShadowsocksServer {
+    Native(Box<ServerConfig>),
+    Aes192(shadowsocks_aes192::Config),
+    XChaCha20(shadowsocks_xchacha20::Config),
 }
 
 impl ShadowsocksTransitAdapter {
@@ -35,42 +87,95 @@ impl ShadowsocksTransitAdapter {
                 "Shadowsocks adapter requires protocol ss".into(),
             ));
         }
+        if config
+            .options
+            .udp_over_tcp
+            .is_some_and(|version| !matches!(version, 1 | 2))
+            || config.options.udp_over_tcp.is_some() && config.options.udp == Some(false)
+        {
+            return Err(TransitError::Unsupported(
+                "Shadowsocks UDP-over-TCP options are invalid".into(),
+            ));
+        }
         crate::adapter_registry::validate_native_options(config, false, false, true)?;
         crate::adapter_registry::validate_subscription_credentials(
             credential,
             &["cipher", "password", "plugin", "plugin_opts"],
         )?;
-        if credential
-            .field("plugin")
-            .is_some_and(|value| !value.is_empty())
-            || credential
-                .field("plugin_opts")
-                .is_some_and(|value| !value.is_empty())
-        {
-            return Err(TransitError::Unsupported(
-                "Shadowsocks plugins are not supported by this adapter".into(),
-            ));
-        }
+        let plugin = if credential.field("plugin") == Some("v2ray-plugin") {
+            Some(Plugin::V2ray(shadowsocks_v2ray_plugin::Config::parse(
+                config,
+                credential.field("plugin_opts"),
+            )?))
+        } else {
+            simple_obfs::Config::parse(
+                credential.field("plugin"),
+                credential.field("plugin_opts"),
+                config.endpoint.port,
+            )?
+            .map(Plugin::Simple)
+        };
         let cipher = credential
             .field("cipher")
             .ok_or_else(|| TransitError::Unsupported("Shadowsocks cipher is missing".into()))?;
-        let password = credential
-            .field("password")
-            .ok_or_else(|| TransitError::Unsupported("Shadowsocks password is missing".into()))?;
-        let method = CipherKind::from_str(cipher)
-            .map_err(|_| TransitError::Unsupported("Shadowsocks cipher is unsupported".into()))?;
-        if !method.is_aead() && !method.is_aead_2022() {
-            return Err(TransitError::Unsupported(
-                "legacy non-AEAD Shadowsocks ciphers are not supported".into(),
-            ));
-        }
-        let mut server = ServerConfig::new(
-            (config.endpoint.host.clone(), config.endpoint.port),
-            password,
-            method,
-        )
-        .map_err(|_| TransitError::Unsupported("Shadowsocks credentials are invalid".into()))?;
-        server.set_timeout(connect_timeout);
+        let server = if cipher == "aes-192-gcm" {
+            let password = credential.field("password").ok_or_else(|| {
+                TransitError::Unsupported("Shadowsocks password is missing".into())
+            })?;
+            ShadowsocksServer::Aes192(shadowsocks_aes192::Config::new(
+                crate::Endpoint {
+                    host: config.endpoint.host.clone(),
+                    port: config.endpoint.port,
+                },
+                password,
+            ))
+        } else if cipher == "xchacha20" {
+            let password = credential.field("password").ok_or_else(|| {
+                TransitError::Unsupported("Shadowsocks password is missing".into())
+            })?;
+            ShadowsocksServer::XChaCha20(shadowsocks_xchacha20::Config::new(
+                crate::Endpoint {
+                    host: config.endpoint.host.clone(),
+                    port: config.endpoint.port,
+                },
+                password,
+            ))
+        } else {
+            let method = CipherKind::from_str(cipher).map_err(|_| {
+                TransitError::Unsupported("Shadowsocks cipher is unsupported".into())
+            })?;
+            if !method.is_none()
+                && !method.is_aead()
+                && !method.is_aead_2022()
+                && !supported_stream_cipher(method)
+            {
+                return Err(TransitError::Unsupported(
+                    "Shadowsocks cipher is unsupported".into(),
+                ));
+            }
+            let password = match credential.field("password") {
+                Some(password) if method.is_none() && !password.is_empty() => {
+                    return Err(TransitError::Unsupported(
+                        "Shadowsocks none does not use a password".into(),
+                    ));
+                }
+                Some(password) => password,
+                None if method.is_none() => "",
+                None => {
+                    return Err(TransitError::Unsupported(
+                        "Shadowsocks password is missing".into(),
+                    ));
+                }
+            };
+            let mut server = ServerConfig::new(
+                (config.endpoint.host.clone(), config.endpoint.port),
+                password,
+                method,
+            )
+            .map_err(|_| TransitError::Unsupported("Shadowsocks credentials are invalid".into()))?;
+            server.set_timeout(connect_timeout);
+            ShadowsocksServer::Native(Box::new(server))
+        };
         Ok(Self {
             metadata: TransitMetadata {
                 adapter_id: config.id.as_str().to_owned(),
@@ -83,8 +188,100 @@ impl ShadowsocksTransitAdapter {
             server,
             connect_timeout,
             udp_enabled: config.options.udp != Some(false),
+            udp_over_tcp_version: config.options.udp_over_tcp,
+            plugin,
         })
     }
+    async fn connect_destination(
+        &self,
+        destination: crate::Endpoint,
+    ) -> Result<BoxedTransitConnection, TransitError> {
+        let server = match &self.server {
+            ShadowsocksServer::Aes192(config) => {
+                return config
+                    .connect(destination, self.plugin.as_ref(), self.connect_timeout)
+                    .await;
+            }
+            ShadowsocksServer::XChaCha20(config) => {
+                return config
+                    .connect(destination, self.plugin.as_ref(), self.connect_timeout)
+                    .await;
+            }
+            ShadowsocksServer::Native(server) => server,
+        };
+        let destination = (destination.host, destination.port);
+        let stream: BoxedTransitConnection = timeout(self.connect_timeout, async {
+            let mut stream = if let Some(Plugin::V2ray(plugin)) = &self.plugin {
+                let endpoint = crate::Endpoint {
+                    host: server.addr().host(),
+                    port: server.addr().port(),
+                };
+                let raw = crate::connect_tcp_endpoint(&endpoint, self.connect_timeout).await?;
+                let stream = plugin.wrap(Box::new(raw), self.connect_timeout).await?;
+                ProxyClientStream::from_stream(self.context.clone(), stream, server, destination)
+            } else {
+                ProxyClientStream::connect_map(
+                    self.context.clone(),
+                    server,
+                    destination,
+                    |stream| -> BoxedTransitConnection {
+                        match &self.plugin {
+                            Some(Plugin::Simple(config)) => {
+                                Box::new(simple_obfs::Stream::new(stream, config.clone()))
+                            }
+                            None => Box::new(stream),
+                            Some(Plugin::V2ray(_)) => unreachable!(),
+                        }
+                    },
+                )
+                .await
+                .map_err(|_| TransitError::Connection("Shadowsocks connection failed".into()))?
+            };
+            // Finish the address handshake before accepting caller data.
+            // The dependency batches its first write into one encrypted
+            // record, which can otherwise truncate a large first payload.
+            if stream
+                .write(&[])
+                .await
+                .map_err(|_| TransitError::Connection("Shadowsocks connection failed".into()))?
+                != 0
+            {
+                return Err(TransitError::Connection(
+                    "invalid Shadowsocks handshake write".into(),
+                ));
+            }
+            stream
+                .flush()
+                .await
+                .map_err(|_| TransitError::Connection("Shadowsocks connection failed".into()))?;
+            Ok::<BoxedTransitConnection, TransitError>(Box::new(stream))
+        })
+        .await
+        .map_err(|_| TransitError::Connection("Shadowsocks connection timed out".into()))??;
+        Ok(stream)
+    }
+}
+
+// Only methods included in the selected upstream client matrix are admitted.
+fn supported_stream_cipher(method: CipherKind) -> bool {
+    matches!(
+        method,
+        CipherKind::SS_RC4_MD5
+            | CipherKind::RC4
+            | CipherKind::CHACHA20
+            | CipherKind::AES_128_CTR
+            | CipherKind::AES_192_CTR
+            | CipherKind::AES_256_CTR
+            | CipherKind::AES_128_CFB128
+            | CipherKind::AES_192_CFB128
+            | CipherKind::AES_256_CFB128
+            | CipherKind::AES_128_OFB
+            | CipherKind::AES_192_OFB
+            | CipherKind::AES_256_OFB
+            | CipherKind::CAMELLIA_128_CFB128
+            | CipherKind::CAMELLIA_192_CFB128
+            | CipherKind::CAMELLIA_256_CFB128
+    )
 }
 
 #[async_trait]
@@ -97,20 +294,8 @@ impl TransitAdapter for ShadowsocksTransitAdapter {
         &self,
         request: ConnectRequest,
     ) -> Result<BoxedTransitConnection, TransitError> {
-        if request.destination.host.is_empty() || request.destination.port == 0 {
-            return Err(TransitError::Unsupported(
-                "Shadowsocks destination is invalid".into(),
-            ));
-        }
-        let destination = (request.destination.host, request.destination.port);
-        let stream = timeout(
-            self.connect_timeout,
-            ProxyClientStream::connect(self.context.clone(), &self.server, destination),
-        )
-        .await
-        .map_err(|_| TransitError::Connection("Shadowsocks connection timed out".into()))?
-        .map_err(|_| TransitError::Connection("Shadowsocks connection failed".into()))?;
-        Ok(Box::new(stream))
+        crate::validate_destination(&request.destination)?;
+        self.connect_destination(request.destination).await
     }
 
     fn supports_udp(&self) -> bool {
@@ -126,13 +311,43 @@ impl TransitAdapter for ShadowsocksTransitAdapter {
                 "Shadowsocks UDP is disabled".into(),
             ));
         }
-        crate::datagram::ss_connect_udp(
-            self.context.clone(),
-            &self.server,
-            &request.destination,
-            self.connect_timeout,
-        )
-        .await
+        if let Some(version) = self.udp_over_tcp_version {
+            crate::validate_destination(&request.destination)?;
+            let target = crate::Endpoint {
+                host: crate::uot::request_host(version).into(),
+                port: 0,
+            };
+            let stream = self.connect_destination(target).await?;
+            return timeout(
+                self.connect_timeout,
+                crate::uot::UotDatagram::connect(stream, request.destination, version),
+            )
+            .await
+            .map_err(|_| {
+                TransitError::Connection("Shadowsocks UDP-over-TCP handshake timed out".into())
+            })?;
+        }
+        match &self.server {
+            ShadowsocksServer::Aes192(config) => {
+                config
+                    .connect_udp(request.destination, self.connect_timeout)
+                    .await
+            }
+            ShadowsocksServer::XChaCha20(config) => {
+                config
+                    .connect_udp(request.destination, self.connect_timeout)
+                    .await
+            }
+            ShadowsocksServer::Native(server) => {
+                crate::datagram::ss_connect_udp(
+                    self.context.clone(),
+                    server,
+                    &request.destination,
+                    self.connect_timeout,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -177,12 +392,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_plugins_explicitly() {
+    fn rejects_unknown_plugins_explicitly() {
         let config = config(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8388));
         let credential = SubscriptionCredential::new(BTreeMap::from([
             ("cipher".into(), "aes-256-gcm".into()),
             ("password".into(), "test-password".into()),
-            ("plugin".into(), "obfs-local".into()),
+            ("plugin".into(), "unknown-plugin".into()),
         ]));
         assert!(matches!(
             ShadowsocksTransitAdapter::from_subscription(
@@ -195,29 +410,165 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_non_aead_ciphers() {
+    fn accepts_selected_upstream_stream_ciphers() {
         let config = config(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8388));
-        let credential = SubscriptionCredential::new(BTreeMap::from([
-            ("cipher".into(), "aes-256-ctr".into()),
-            ("password".into(), "test-password".into()),
-        ]));
-        assert!(matches!(
-            ShadowsocksTransitAdapter::from_subscription(
+        for cipher in [
+            "aes-128-ctr",
+            "aes-192-ctr",
+            "aes-256-ctr",
+            "aes-128-cfb",
+            "aes-192-cfb",
+            "aes-256-cfb",
+            "aes-128-ofb",
+            "aes-192-ofb",
+            "aes-256-ofb",
+            "camellia-128-cfb",
+            "camellia-192-cfb",
+            "camellia-256-cfb",
+            "rc4-md5",
+            "rc4",
+            "chacha20-ietf",
+        ] {
+            let credential = SubscriptionCredential::new(BTreeMap::from([
+                ("cipher".into(), cipher.into()),
+                ("password".into(), "test-password".into()),
+            ]));
+            let adapter = ShadowsocksTransitAdapter::from_subscription(
                 &config,
                 &credential,
-                Duration::from_secs(1)
-            ),
-            Err(TransitError::Unsupported(_))
-        ));
+                Duration::from_secs(1),
+            )
+            .unwrap_or_else(|error| panic!("{cipher}: {error}"));
+            assert!(adapter.supports_udp());
+        }
+    }
+
+    #[test]
+    fn accepts_aes_192_gcm_with_udp() {
+        let server = config(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8388));
+        let credential = SubscriptionCredential::new(BTreeMap::from([
+            ("cipher".into(), "aes-192-gcm".into()),
+            ("password".into(), "test-password".into()),
+        ]));
+        let adapter = ShadowsocksTransitAdapter::from_subscription(
+            &server,
+            &credential,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(adapter.supports_udp());
+    }
+
+    #[test]
+    fn accepts_xchacha20_with_udp() {
+        let server = config(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8388));
+        let credential = SubscriptionCredential::new(BTreeMap::from([
+            ("cipher".into(), "xchacha20".into()),
+            ("password".into(), "test-password".into()),
+        ]));
+        let adapter = ShadowsocksTransitAdapter::from_subscription(
+            &server,
+            &credential,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(adapter.supports_udp());
+    }
+
+    #[test]
+    fn accepts_explicit_none_without_ignoring_a_password() {
+        let config = config(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8388));
+        for cipher in ["none", "plain"] {
+            for password in [None, Some("")] {
+                let mut fields = BTreeMap::from([("cipher".into(), cipher.into())]);
+                if let Some(password) = password {
+                    fields.insert("password".into(), password.into());
+                }
+                let adapter = ShadowsocksTransitAdapter::from_subscription(
+                    &config,
+                    &SubscriptionCredential::new(fields),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+                assert!(adapter.supports_udp());
+            }
+            let credentials = SubscriptionCredential::new(BTreeMap::from([
+                ("cipher".into(), cipher.into()),
+                ("password".into(), "would-be-ignored".into()),
+            ]));
+            assert!(matches!(
+                ShadowsocksTransitAdapter::from_subscription(
+                    &config,
+                    &credentials,
+                    Duration::from_secs(1)
+                ),
+                Err(TransitError::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_unimplemented_methods() {
+        let config = config(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8388));
+        for cipher in [
+            "",
+            "table",
+            "chacha20",
+            "salsa20",
+            "rc4-md5-6",
+            "des-cfb",
+            "bf-cfb",
+            "cast5-cfb",
+            "idea-cfb",
+            "rc2-cfb",
+            "seed-cfb",
+        ] {
+            let credential = SubscriptionCredential::new(BTreeMap::from([
+                ("cipher".into(), cipher.into()),
+                ("password".into(), "test-password".into()),
+            ]));
+            assert!(
+                matches!(
+                    ShadowsocksTransitAdapter::from_subscription(
+                        &config,
+                        &credential,
+                        Duration::from_secs(1),
+                    ),
+                    Err(TransitError::Unsupported(_))
+                ),
+                "{cipher} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_destination_before_opening_socket() {
+        let adapter = ShadowsocksTransitAdapter::from_subscription(
+            &config(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8388)),
+            &credentials(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        for host in ["a".repeat(256), "bad host".into()] {
+            assert!(matches!(
+                adapter
+                    .connect(ConnectRequest {
+                        destination: crate::Endpoint { host, port: 443 },
+                    })
+                    .await,
+                Err(TransitError::Unsupported(_))
+            ));
+        }
     }
 
     #[tokio::test]
     async fn carries_tcp_bytes_through_a_real_shadowsocks_server() {
+        const PAYLOAD_LENGTH: usize = 65_537;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_address = target.local_addr().unwrap();
         let target_task = tokio::spawn(async move {
             let (mut stream, _) = target.accept().await.unwrap();
-            let mut payload = [0_u8; 5];
+            let mut payload = vec![0_u8; PAYLOAD_LENGTH];
             stream.read_exact(&mut payload).await.unwrap();
             stream.write_all(&payload).await.unwrap();
         });
@@ -266,10 +617,13 @@ mod tests {
             })
             .await
             .unwrap();
-        stream.write_all(b"hello").await.unwrap();
-        let mut echoed = [0_u8; 5];
+        let payload: Vec<_> = (0..PAYLOAD_LENGTH)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        stream.write_all(&payload).await.unwrap();
+        let mut echoed = vec![0; PAYLOAD_LENGTH];
         stream.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"hello");
+        assert_eq!(echoed, payload);
         drop(stream);
 
         target_task.await.unwrap();

@@ -60,6 +60,7 @@ fn config() -> SubscriptionConfig {
             source_type: SubscriptionSourceType::Auto,
             url: "https://root.invalid/sub".to_owned(),
             credentials_ref: Some("opaque-reference".to_owned()),
+            user_agent: None,
         },
         refresh,
         cache: None,
@@ -95,14 +96,21 @@ async fn fetches_nested_http_providers_with_one_bound_and_no_local_file_reads() 
     );
     fetcher.document("https://provider.invalid/inner", &node("inner-node"));
     let mut manager = manager(fetcher.clone());
-    let RefreshOutcome::Published { diff, .. } = manager.refresh(&config()).await else {
+    let mut subscription = config();
+    subscription.source.user_agent = Some("TestAgent/1.0".into());
+    let RefreshOutcome::Published { diff, .. } = manager.refresh(&subscription).await else {
         panic!("provider expansion");
     };
     assert_eq!(diff.added.len(), 3);
     assert!(diff.unavailable.is_empty());
-    assert_eq!(manager.snapshot.selectable_nodes().count(), 3);
+    assert_eq!(manager.snapshot.candidate_nodes().count(), 3);
     let requests = fetcher.requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.user_agent.as_deref() == Some("TestAgent/1.0"))
+    );
     assert_eq!(
         requests[0].credentials_ref.as_deref(),
         Some("opaque-reference")
@@ -149,8 +157,11 @@ async fn failed_provider_retains_its_last_good_nodes_and_other_sources_continue(
         panic!("partial refresh");
     };
     assert!(!diff.draining.contains(&old));
-    assert_eq!(manager.snapshot.selectable_nodes().count(), 2);
-    assert_eq!(manager.snapshot.nodes[&old].state, DynamicNodeState::Active);
+    assert_eq!(manager.snapshot.candidate_nodes().count(), 2);
+    assert_eq!(
+        manager.snapshot.nodes[&old].state,
+        DynamicNodeState::Pending
+    );
     assert!(manager.snapshot.nodes.values().any(|node| {
         node.diagnostic
             .as_ref()
@@ -177,7 +188,7 @@ proxy-providers:
         manager.refresh(&config()).await,
         RefreshOutcome::Published { .. }
     ));
-    assert_eq!(manager.snapshot.selectable_nodes().count(), 1);
+    assert_eq!(manager.snapshot.candidate_nodes().count(), 1);
     assert_eq!(fetcher.requests.lock().unwrap().len(), 1);
     assert_eq!(manager.snapshot.nodes.len(), 5);
     let debug = format!("{:?}", manager.snapshot);
@@ -210,7 +221,7 @@ async fn provider_depth_reference_count_and_total_bytes_are_bounded() {
         fetcher.requests.lock().unwrap().len(),
         1 + MAX_PROVIDER_DEPTH
     );
-    assert_eq!(instance.snapshot.selectable_nodes().count(), 0);
+    assert_eq!(instance.snapshot.candidate_nodes().count(), 0);
 
     let fetcher = Arc::new(Fetcher::default());
     let mut body = String::from("proxy-providers:\n");
@@ -234,7 +245,7 @@ async fn provider_depth_reference_count_and_total_bytes_are_bounded() {
         1 + MAX_PROVIDER_REFERENCES
     );
     assert_eq!(
-        instance.snapshot.selectable_nodes().count(),
+        instance.snapshot.candidate_nodes().count(),
         MAX_PROVIDER_REFERENCES
     );
 
@@ -255,7 +266,7 @@ async fn provider_depth_reference_count_and_total_bytes_are_bounded() {
         instance.refresh(&config()).await,
         RefreshOutcome::Published { .. }
     ));
-    assert_eq!(instance.snapshot.selectable_nodes().count(), 1);
+    assert_eq!(instance.snapshot.candidate_nodes().count(), 1);
     assert!(fetcher.requests.lock().unwrap()[1].max_bytes < MAX_SUBSCRIPTION_BYTES);
 }
 
@@ -298,13 +309,19 @@ async fn provider_fetch_credentials_do_not_cross_origin_boundaries() {
     fetcher.document("https://external.invalid/nodes", &node("cross"));
     fetcher.document("http://root.invalid/nodes", &node("downgrade"));
     let mut instance = manager(fetcher.clone());
+    let mut subscription = config();
+    subscription.source.user_agent = Some("CustomProviderClient/1".into());
     assert!(matches!(
-        instance.refresh(&config()).await,
+        instance.refresh(&subscription).await,
         RefreshOutcome::Published { .. }
     ));
     let requests = fetcher.requests.lock().unwrap();
     assert_eq!(requests.len(), 4);
     for request in requests.iter() {
+        assert_eq!(
+            request.user_agent.as_deref(),
+            Some("CustomProviderClient/1")
+        );
         if request.url.starts_with("https://root.invalid/") {
             assert_eq!(request.credentials_ref.as_deref(), Some("opaque-reference"));
         } else {
@@ -356,6 +373,11 @@ async fn interrupted_chunked_providers_share_one_refresh_body_budget() {
                 request.push(stream.read_u8().await.unwrap());
                 assert!(request.len() < 8192);
             }
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .to_ascii_lowercase()
+                    .contains("user-agent: providerbudget/1\r\n")
+            );
             if index == 0 {
                 stream.write_all(format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{root}", root.len()
@@ -381,6 +403,7 @@ async fn interrupted_chunked_providers_share_one_refresh_body_budget() {
     let mut subscription = config();
     subscription.source.url = format!("http://{endpoint}/sub");
     subscription.source.credentials_ref = None;
+    subscription.source.user_agent = Some("ProviderBudget/1".into());
     let mut manager = SubscriptionManager::new(
         fetcher.clone(),
         std::env::temp_dir(),
@@ -391,7 +414,7 @@ async fn interrupted_chunked_providers_share_one_refresh_body_budget() {
         RefreshOutcome::Published { .. }
     ));
     server.await.unwrap();
-    assert_eq!(manager.snapshot().selectable_nodes().count(), 1);
+    assert_eq!(manager.snapshot().candidate_nodes().count(), 1);
     let requests = fetcher.requests.lock().unwrap();
     assert_eq!(
         requests.len(),
@@ -447,7 +470,7 @@ async fn same_name_subscriptions_keep_namespace_identity_through_refresh_cache_a
             RefreshOutcome::Published { .. }
         ));
     }
-    assert_eq!(manager.snapshot().selectable_nodes().count(), 4);
+    assert_eq!(manager.snapshot().candidate_nodes().count(), 4);
     for subscription in &configs {
         let owned = manager
             .snapshot()
@@ -504,11 +527,11 @@ async fn same_name_subscriptions_keep_namespace_identity_through_refresh_cache_a
         restored.refresh(&disabled).await,
         RefreshOutcome::Disabled { .. }
     ));
-    assert_eq!(restored.snapshot().selectable_nodes().count(), 2);
+    assert_eq!(restored.snapshot().candidate_nodes().count(), 2);
     assert!(
         restored
             .snapshot()
-            .selectable_nodes()
+            .candidate_nodes()
             .all(|node| node.config.id.namespace() == "beta")
     );
 
@@ -533,11 +556,11 @@ async fn same_name_subscriptions_keep_namespace_identity_through_refresh_cache_a
         isolated.load_cache(&configs[0]).await.unwrap_err(),
         SubscriptionError::InvalidCache
     );
-    assert_eq!(isolated.snapshot().selectable_nodes().count(), 2);
+    assert_eq!(isolated.snapshot().candidate_nodes().count(), 2);
     assert!(
         isolated
             .snapshot()
-            .selectable_nodes()
+            .candidate_nodes()
             .all(|node| node.config.id.namespace() == "beta")
     );
     std::fs::remove_dir_all(directory).unwrap();
@@ -581,7 +604,7 @@ async fn long_same_prefix_sources_keep_nodes_isolated_through_cache_refresh_and_
             RefreshOutcome::Published { .. }
         ));
     }
-    assert_eq!(manager.snapshot().selectable_nodes().count(), 4);
+    assert_eq!(manager.snapshot().candidate_nodes().count(), 4);
     for node in manager.snapshot().nodes.values() {
         assert_eq!(node.config.id.namespace(), "tenant");
         assert!(node.config.id.resource_name().len() <= 63);
@@ -605,11 +628,11 @@ async fn long_same_prefix_sources_keep_nodes_isolated_through_cache_refresh_and_
         restored.refresh(&disabled).await,
         RefreshOutcome::Disabled { .. }
     ));
-    assert_eq!(restored.snapshot().selectable_nodes().count(), 2);
+    assert_eq!(restored.snapshot().candidate_nodes().count(), 2);
     assert!(
         restored
             .snapshot()
-            .selectable_nodes()
+            .candidate_nodes()
             .all(|node| node.source_subscription == configs[1].id)
     );
     let draining: BTreeSet<_> = restored
@@ -625,7 +648,7 @@ async fn long_same_prefix_sources_keep_nodes_isolated_through_cache_refresh_and_
         RefreshOutcome::Published { .. }
     ));
     restored.complete_draining(&draining);
-    assert_eq!(restored.snapshot().selectable_nodes().count(), 4);
+    assert_eq!(restored.snapshot().candidate_nodes().count(), 4);
 
     // Old cache IDs are readable; refresh retires them under the same source
     // instead of stealing another source's nodes or resurrecting old Paths.
@@ -670,7 +693,7 @@ async fn long_same_prefix_sources_keep_nodes_isolated_through_cache_refresh_and_
         legacy_ids
     );
     migrated.complete_draining(&legacy_ids);
-    assert_eq!(migrated.snapshot().selectable_nodes().count(), 2);
+    assert_eq!(migrated.snapshot().candidate_nodes().count(), 2);
     assert!(
         migrated
             .snapshot()

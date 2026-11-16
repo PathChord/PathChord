@@ -13,6 +13,8 @@ use crate::{
     TransitCredential, TransitError, TransitMetadata, connect_tcp_endpoint, validate_destination,
 };
 
+use crate::uot;
+
 const SOCKS_VERSION: u8 = 5;
 const NO_AUTH: u8 = 0;
 const USERNAME_PASSWORD: u8 = 2;
@@ -29,6 +31,7 @@ pub struct Socks5TransitAdapter {
         rustls::pki_types::ServerName<'static>,
     )>,
     udp_enabled: bool,
+    udp_over_tcp_version: Option<u8>,
 }
 
 impl std::fmt::Debug for Socks5TransitAdapter {
@@ -58,6 +61,30 @@ impl Socks5TransitAdapter {
         credential: Option<&TransitCredential>,
         connect_timeout: Duration,
     ) -> Result<Self, TransitError> {
+        Self::from_config_with_udp_over_tcp(
+            config,
+            credential,
+            connect_timeout,
+            config.options.udp_over_tcp,
+        )
+    }
+
+    fn from_config_with_udp_over_tcp(
+        config: &TransitProxyConfig,
+        credential: Option<&TransitCredential>,
+        connect_timeout: Duration,
+        udp_over_tcp_version: Option<u8>,
+    ) -> Result<Self, TransitError> {
+        if udp_over_tcp_version.is_some_and(|version| !matches!(version, 1 | 2)) {
+            return Err(TransitError::Unsupported(
+                "SOCKS5 UDP-over-TCP version must be 1 or 2".into(),
+            ));
+        }
+        if udp_over_tcp_version.is_some() && config.options.udp == Some(false) {
+            return Err(TransitError::Unsupported(
+                "SOCKS5 UDP-over-TCP conflicts with disabled UDP".into(),
+            ));
+        }
         if config.protocol != "socks5" {
             return Err(TransitError::Unsupported(
                 "SOCKS5 adapter requires protocol socks5".to_owned(),
@@ -90,12 +117,13 @@ impl Socks5TransitAdapter {
             }
             None => None,
         };
-        if tls.is_some() && config.options.udp == Some(true) {
+        if tls.is_some() && config.options.udp == Some(true) && udp_over_tcp_version.is_none() {
             return Err(TransitError::Unsupported(
                 "SOCKS UDP over a TLS control connection is unsupported".into(),
             ));
         }
-        let udp_enabled = config.options.udp != Some(false) && tls.is_none();
+        let udp_enabled =
+            config.options.udp != Some(false) && (tls.is_none() || udp_over_tcp_version.is_some());
         let username = credential.and_then(|value| value.field("username"));
         let password = credential.and_then(|value| value.field("password"));
         let credentials = match (username, password) {
@@ -128,28 +156,15 @@ impl Socks5TransitAdapter {
             credentials,
             connect_timeout,
             tls,
-            // SOCKS UDP ASSOCIATE is a separate plaintext UDP relay. A TLS
-            // control connection cannot safely imply TLS for that relay, so
-            // the native adapter disables UDP unless the control channel is
-            // also plaintext. An explicit `udp: true` with TLS is rejected
-            // above; an omitted value remains unavailable rather than
-            // silently downgrading the transport.
             udp_enabled,
+            udp_over_tcp_version,
         })
     }
-}
 
-#[async_trait]
-impl TransitAdapter for Socks5TransitAdapter {
-    fn metadata(&self) -> &TransitMetadata {
-        &self.metadata
-    }
-
-    async fn connect(
+    async fn open_tunnel(
         &self,
-        request: ConnectRequest,
+        destination: &Endpoint,
     ) -> Result<BoxedTransitConnection, TransitError> {
-        validate_destination(&request.destination)?;
         let stream = connect_tcp_endpoint(&self.proxy, self.connect_timeout).await?;
         let mut stream: BoxedTransitConnection = if let Some((tls, name)) = &self.tls {
             let stream = timeout(
@@ -165,15 +180,30 @@ impl TransitAdapter for Socks5TransitAdapter {
         };
         timeout(
             self.connect_timeout,
-            establish_socks5_tunnel(&mut stream, &request.destination, self.credentials.as_ref()),
+            establish_socks5_tunnel(&mut stream, destination, self.credentials.as_ref()),
         )
         .await
         .map_err(|_| TransitError::Connection("SOCKS5 handshake timed out".to_owned()))??;
         Ok(stream)
     }
+}
+
+#[async_trait]
+impl TransitAdapter for Socks5TransitAdapter {
+    fn metadata(&self) -> &TransitMetadata {
+        &self.metadata
+    }
+
+    async fn connect(
+        &self,
+        request: ConnectRequest,
+    ) -> Result<BoxedTransitConnection, TransitError> {
+        validate_destination(&request.destination)?;
+        self.open_tunnel(&request.destination).await
+    }
 
     fn supports_udp(&self) -> bool {
-        self.udp_enabled && self.tls.is_none()
+        self.udp_enabled
     }
 
     async fn connect_udp(
@@ -184,6 +214,22 @@ impl TransitAdapter for Socks5TransitAdapter {
             return Err(TransitError::Unsupported(
                 "SOCKS UDP is disabled or unavailable over TLS".into(),
             ));
+        }
+        if let Some(version) = self.udp_over_tcp_version {
+            validate_destination(&request.destination)?;
+            let destination = Endpoint {
+                host: uot::request_host(version).to_owned(),
+                port: 0,
+            };
+            let stream = self.open_tunnel(&destination).await?;
+            return timeout(
+                self.connect_timeout,
+                uot::UotDatagram::connect(stream, request.destination, version),
+            )
+            .await
+            .map_err(|_| {
+                TransitError::Connection("SOCKS5 UDP-over-TCP handshake timed out".into())
+            })?;
         }
         crate::datagram::socks5_connect_udp(
             &self.proxy,
@@ -203,13 +249,13 @@ async fn establish_socks5_tunnel<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let methods: &[u8] = if credentials.is_some() {
-        &[SOCKS_VERSION, 2, NO_AUTH, USERNAME_PASSWORD]
+    let method = if credentials.is_some() {
+        USERNAME_PASSWORD
     } else {
-        &[SOCKS_VERSION, 1, NO_AUTH]
+        NO_AUTH
     };
     stream
-        .write_all(methods)
+        .write_all(&[SOCKS_VERSION, 1, method])
         .await
         .map_err(|_| TransitError::Connection("SOCKS5 greeting write failed".to_owned()))?;
     let mut selection = [0_u8; 2];
@@ -222,13 +268,19 @@ where
             "SOCKS5 proxy rejected authentication methods".to_owned(),
         ));
     }
+    if selection[1] != method {
+        return Err(TransitError::Protocol(
+            "SOCKS5 proxy selected an unoffered authentication method".to_owned(),
+        ));
+    }
     match selection[1] {
         NO_AUTH => {}
         USERNAME_PASSWORD => {
             let (username, password) = credentials.ok_or_else(|| {
                 TransitError::Protocol("SOCKS5 proxy unexpectedly requires credentials".to_owned())
             })?;
-            let mut authentication = Vec::with_capacity(3 + username.len() + password.len());
+            let mut authentication =
+                zeroize::Zeroizing::new(Vec::with_capacity(3 + username.len() + password.len()));
             authentication.push(1);
             authentication.push(username.len() as u8);
             authentication.extend_from_slice(username.as_bytes());
@@ -469,5 +521,54 @@ mod tests {
     #[tokio::test]
     async fn socks5_username_password_carries_raw_tunnel_bytes() {
         run_case(true).await;
+    }
+
+    #[tokio::test]
+    async fn configured_credentials_cannot_be_silently_downgraded_to_no_auth() {
+        for udp in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut greeting = [0; 3];
+                socket.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 2]);
+                socket.write_all(&[5, 0]).await.unwrap();
+                let mut byte = [0; 1];
+                assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+            });
+            let mut cfg = config(proxy);
+            cfg.options.udp_over_tcp = Some(2);
+            let adapter = Socks5TransitAdapter::from_config(
+                &cfg,
+                Some(&credential()),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            let request = ConnectRequest {
+                destination: Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: 53,
+                },
+            };
+            if udp {
+                assert!(adapter.connect_udp(request).await.is_err());
+            } else {
+                assert!(adapter.connect(request).await.is_err());
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn udp_over_tcp_rejects_unknown_versions_and_disabled_udp() {
+        let mut cfg = config("127.0.0.1:1080".parse().unwrap());
+        for version in [0, 3, u8::MAX] {
+            cfg.options.udp_over_tcp = Some(version);
+            assert!(Socks5TransitAdapter::from_config(&cfg, None, Duration::from_secs(1)).is_err());
+        }
+        cfg.options.udp_over_tcp = Some(2);
+        cfg.options.udp = Some(false);
+        assert!(Socks5TransitAdapter::from_config(&cfg, None, Duration::from_secs(1)).is_err());
     }
 }

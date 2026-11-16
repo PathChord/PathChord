@@ -26,6 +26,15 @@ Ingress 必须（SHALL）先评估有效 Egress 规则，再评估普通 Proxy �
 - **WHEN** 有序的有效 Egress 规则没有为新 flow 选出可准入路由
 - **THEN** Ingress 按顺序评估普通 Proxy 规则，然后应用配置的全局回退
 
+### Requirement: Bounded ordinary Proxy pre-admission failover
+
+普通 Proxy 规则必须（SHALL）在同一策略代次内按稳定的评分和 ID 顺序尝试合格 Transit 节点，最多八次且共享配置的连接超时。适配器返回 stream 或数据报 handle 后，后续失败不得（SHALL NOT）触发替换或重试。
+
+#### Scenario: The preferred ordinary Transit node fails before admission
+
+- **WHEN** 评分最高的合格节点在新 TCP 或 UDP flow 准入前打开失败
+- **THEN** Ingress 在有界尝试次数内按编译顺序尝试下一个合格节点，不选择 Direct，也不改变策略代次
+
 ### Requirement: Immutable decision generation
 
 新连接必须（SHALL）在规则求值前捕获一个单调编号的快照代次，并在完整 Egress 和 Proxy 决策中使用该代次。现有 Session、Stream 和 Path 必须（SHALL）保留准入时的代次，除非硬撤销或 Egress 故障将其关闭。
@@ -38,6 +47,11 @@ Ingress 必须（SHALL）先评估有效 Egress 规则，再评估普通 Proxy �
 ### Requirement: Bounded replication policy
 
 每个已准入 Stream 或 UDP Association SHALL 使用所选 TrafficPolicy 的不可变复制预算；一个协商的 Session 上限仍是硬上限。低预算 flow 不得永久降低同一 Session 后续 flow 的独立预算。`trafficClassRef` 必须解析到所选 TrafficPolicy 中的类别；缺少引用时使用默认类别。
+
+#### Scenario: Two flows use different policies
+
+- **WHEN** 低复制预算 flow 和高复制预算 flow 共用一个 Session
+- **THEN** 每个 flow 使用自身的策略和类别预算，仅共享 Session 全局剩余上限
 
 #### Scenario: Unknown traffic class is configured
 

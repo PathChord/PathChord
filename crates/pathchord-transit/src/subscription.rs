@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use pathchord_policy::{
-    Endpoint, FlowProtocol, RuntimeCatalog, RuntimeNodeState, SubscriptionConfig, SubscriptionId,
-    SubscriptionSourceType, TransitProxyConfig, TransitProxyId, TransitProxyRuntimeStatus,
-    TransitSource,
+    DEFAULT_SUBSCRIPTION_USER_AGENT, Endpoint, FlowProtocol, RuntimeCatalog, RuntimeNodeState,
+    SubscriptionConfig, SubscriptionId, SubscriptionSourceType, TransitProxyConfig, TransitProxyId,
+    TransitProxyRuntimeStatus, TransitSource,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,6 +33,7 @@ const MAX_BACKOFF_SECONDS: u64 = 3_600;
 pub struct SubscriptionFetchRequest {
     pub url: String,
     pub credentials_ref: Option<String>,
+    pub user_agent: Option<String>,
     pub timeout: Duration,
     pub max_bytes: usize,
 }
@@ -92,6 +93,8 @@ pub enum SubscriptionError {
     InvalidUrl,
     #[error("subscription credential is unavailable")]
     MissingCredential,
+    #[error("subscription User-Agent is invalid")]
+    InvalidUserAgent,
     #[error("subscription request timed out")]
     Timeout,
     #[error("subscription HTTP request failed")]
@@ -196,6 +199,7 @@ impl HttpSubscriptionFetcher {
     ) -> Result<Self, SubscriptionError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))
+            .user_agent(DEFAULT_SUBSCRIPTION_USER_AGENT)
             .build()
             .map_err(|_| SubscriptionError::Fetch)?;
         Ok(Self {
@@ -221,6 +225,14 @@ impl HttpSubscriptionFetcher {
         }
 
         let mut builder = self.client.get(parsed).timeout(request.timeout);
+        if let Some(user_agent) = &request.user_agent {
+            if !pathchord_policy::valid_subscription_user_agent(user_agent) {
+                return Err(SubscriptionError::InvalidUserAgent);
+            }
+            let value = reqwest::header::HeaderValue::from_str(user_agent)
+                .map_err(|_| SubscriptionError::InvalidUserAgent)?;
+            builder = builder.header(reqwest::header::USER_AGENT, value);
+        }
         if let Some(reference) = request.credentials_ref.as_deref() {
             let token = self
                 .credentials
@@ -352,6 +364,8 @@ pub struct NodeDiagnostic {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DynamicNodeState {
+    /// Imported or restored configuration awaiting adapter preparation.
+    Pending,
     Active,
     Draining,
     Unavailable(NodeUnavailableReason),
@@ -392,17 +406,219 @@ impl DynamicTransitNode {
     }
 }
 
+/// Shared revocation fence for one validated adapter admission.
+#[derive(Clone, Debug)]
+pub struct AdmissionRevocation(Arc<AtomicBool>);
+
+impl AdmissionRevocation {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    pub fn revoke(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+    #[must_use]
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// An adapter and its immutable validated node identity share one revocation fence.
+#[derive(Clone)]
+pub struct ValidatedTransitAdapter {
+    config: TransitProxyConfig,
+    source_fingerprint: String,
+    credential: SubscriptionCredential,
+    adapter: Arc<dyn crate::TransitAdapter>,
+    revocation: AdmissionRevocation,
+}
+
+impl fmt::Debug for ValidatedTransitAdapter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidatedTransitAdapter")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ValidatedTransitAdapter {
+    #[must_use]
+    pub fn matches_config(&self, config: &TransitProxyConfig) -> bool {
+        self.revocation.is_valid() && &self.config == config
+    }
+    #[must_use]
+    pub fn adapter(&self) -> Arc<dyn crate::TransitAdapter> {
+        Arc::clone(&self.adapter)
+    }
+    #[must_use]
+    pub fn revocation(&self) -> AdmissionRevocation {
+        self.revocation.clone()
+    }
+    #[must_use]
+    pub fn same_connection(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.source_fingerprint == other.source_fingerprint
+            && self.credential == other.credential
+    }
+}
+
+#[derive(Clone)]
+struct AdmittedNode {
+    original: DynamicTransitNode,
+    adapter: Arc<dyn crate::TransitAdapter>,
+    capabilities: BTreeSet<FlowProtocol>,
+    valid: AdmissionRevocation,
+}
+
+impl fmt::Debug for AdmittedNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdmittedNode")
+            .field("capabilities", &self.capabilities)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for AdmittedNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.original == other.original
+            && self.capabilities == other.capabilities
+            && Arc::ptr_eq(&self.adapter, &other.adapter)
+            && self.valid.same(&other.valid)
+    }
+}
+impl Eq for AdmittedNode {}
+
+impl AdmittedNode {
+    fn matches(&self, node: &DynamicTransitNode) -> bool {
+        self.valid.is_valid()
+            && node.state == DynamicNodeState::Active
+            && node.diagnostic.is_none()
+            && node.config == self.original.config
+            && node.source_subscription == self.original.source_subscription
+            && node.source_fingerprint == self.original.source_fingerprint
+            && node.credential == self.original.credential
+    }
+
+    fn revoke(&self) {
+        self.valid.revoke();
+    }
+}
+
+/// Opaque adapter preparation bound to one subscription snapshot.
+type PreparedAdapterResult = (
+    DynamicTransitNode,
+    Result<Arc<dyn crate::TransitAdapter>, ()>,
+);
+
+pub struct PreparedDynamicSnapshot {
+    generation: u64,
+    nodes: Vec<PreparedAdapterResult>,
+}
+
+impl fmt::Debug for PreparedDynamicSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedDynamicSnapshot")
+            .field("generation", &self.generation)
+            .field("node_count", &self.nodes.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DynamicTransitSnapshot {
     pub generation: u64,
     pub nodes: BTreeMap<TransitProxyId, DynamicTransitNode>,
+    admissions: BTreeMap<TransitProxyId, AdmittedNode>,
 }
 
 impl DynamicTransitSnapshot {
+    #[cfg(test)]
+    fn candidate_nodes(&self) -> impl Iterator<Item = &DynamicTransitNode> {
+        self.nodes.values().filter(|node| {
+            matches!(
+                node.state,
+                DynamicNodeState::Pending | DynamicNodeState::Active
+            )
+        })
+    }
     pub fn selectable_nodes(&self) -> impl Iterator<Item = &DynamicTransitNode> {
-        self.nodes
-            .values()
-            .filter(|node| node.state == DynamicNodeState::Active)
+        self.nodes.iter().filter_map(|(id, node)| {
+            self.admissions
+                .get(id)
+                .filter(|admission| admission.matches(node))
+                .map(|_| node)
+        })
+    }
+
+    /// Returns the exact prepared adapter only while its source and node are current.
+    pub fn validated_adapter(&self, id: &TransitProxyId) -> Option<Arc<dyn crate::TransitAdapter>> {
+        let node = self.nodes.get(id)?;
+        let admission = self
+            .admissions
+            .get(id)
+            .filter(|admission| admission.matches(node))?;
+        Some(Arc::clone(&admission.adapter))
+    }
+
+    pub fn validated_admission(&self, id: &TransitProxyId) -> Option<ValidatedTransitAdapter> {
+        let node = self.nodes.get(id)?;
+        let admission = self
+            .admissions
+            .get(id)
+            .filter(|admission| admission.matches(node))?;
+        Some(ValidatedTransitAdapter {
+            config: node.config.clone(),
+            source_fingerprint: node.source_fingerprint.clone(),
+            credential: node.credential.clone(),
+            adapter: Arc::clone(&admission.adapter),
+            revocation: admission.valid.clone(),
+        })
+    }
+
+    /// Prepare pending candidates without mutating the live snapshot.
+    pub async fn prepare_adapters<P>(
+        &self,
+        registry: &crate::AdapterRegistry<P>,
+    ) -> PreparedDynamicSnapshot
+    where
+        P: crate::TransitCredentialProvider + 'static,
+    {
+        self.prepare_source_adapters(registry, None).await
+    }
+
+    /// Prepare pending candidates from one source, or every source if absent.
+    pub async fn prepare_source_adapters<P>(
+        &self,
+        registry: &crate::AdapterRegistry<P>,
+        source: Option<&SubscriptionId>,
+    ) -> PreparedDynamicSnapshot
+    where
+        P: crate::TransitCredentialProvider + 'static,
+    {
+        use futures_util::{StreamExt, stream};
+        let nodes = stream::iter(
+            self.nodes
+                .values()
+                .filter(|node| {
+                    node.state == DynamicNodeState::Pending
+                        && source.is_none_or(|source| &node.source_subscription == source)
+                })
+                .cloned(),
+        )
+        .map(|node| async move {
+            let result = registry.prepare_dynamic(&node).await.map_err(|_| ());
+            (node, result)
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await;
+        PreparedDynamicSnapshot {
+            generation: self.generation,
+            nodes,
+        }
     }
 
     /// Adds the current dynamic node configuration and admission state to an
@@ -410,15 +626,23 @@ impl DynamicTransitSnapshot {
     pub fn extend_runtime_catalog(&self, catalog: &mut RuntimeCatalog) {
         for node in self.nodes.values() {
             let state = match node.state {
-                DynamicNodeState::Active => RuntimeNodeState::Ready,
+                DynamicNodeState::Active
+                    if self
+                        .admissions
+                        .get(&node.config.id)
+                        .is_some_and(|admission| admission.matches(node)) =>
+                {
+                    RuntimeNodeState::Ready
+                }
+                DynamicNodeState::Pending | DynamicNodeState::Active => RuntimeNodeState::Down,
                 DynamicNodeState::Draining => RuntimeNodeState::Draining,
                 DynamicNodeState::Unavailable(_) => RuntimeNodeState::Down,
             };
-            let capabilities = if node.state == DynamicNodeState::Active {
-                BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp])
-            } else {
-                BTreeSet::new()
-            };
+            let capabilities = self
+                .admissions
+                .get(&node.config.id)
+                .filter(|admission| admission.matches(node))
+                .map_or_else(BTreeSet::new, |admission| admission.capabilities.clone());
             catalog.set_dynamic_transit_proxy(
                 node.config.clone(),
                 TransitProxyRuntimeStatus {
@@ -503,6 +727,37 @@ impl fmt::Debug for PreparedSubscriptionRefresh {
     }
 }
 
+impl PreparedSubscriptionRefresh {
+    /// Existing node IDs whose effective adapter identity changes or disappears.
+    #[must_use]
+    pub fn invalidated_adapters(&self, snapshot: &DynamicTransitSnapshot) -> Vec<TransitProxyId> {
+        let next: BTreeMap<_, _> = self
+            .nodes
+            .iter()
+            .map(|node| (&node.config.id, node))
+            .collect();
+        snapshot
+            .nodes
+            .iter()
+            .filter_map(|(id, previous)| {
+                if previous.source_subscription != self.config.id {
+                    return None;
+                }
+                let unchanged = next.get(id).is_some_and(|candidate| {
+                    matches!(
+                        candidate.state,
+                        DynamicNodeState::Active | DynamicNodeState::Pending
+                    ) && candidate.diagnostic.is_none()
+                        && candidate.config == previous.config
+                        && candidate.credential == previous.credential
+                        && previous.source_fingerprint == self.source_fingerprint
+                });
+                (!unchanged).then(|| id.clone())
+            })
+            .collect()
+    }
+}
+
 #[async_trait]
 trait RetrySleeper: Send + Sync {
     async fn sleep(&self, duration: Duration);
@@ -580,7 +835,110 @@ impl SubscriptionManager {
         &self.snapshot
     }
 
+    /// Publish adapter preparation only if the complete captured snapshot and
+    /// its subscription sources are still current.
+    pub fn commit_prepared_adapters(
+        &mut self,
+        prepared: PreparedDynamicSnapshot,
+    ) -> Result<(), SubscriptionError> {
+        if self.snapshot.generation != prepared.generation {
+            return Err(SubscriptionError::StaleCandidate);
+        }
+        for (candidate, _) in &prepared.nodes {
+            if self.snapshot.nodes.get(&candidate.config.id) != Some(candidate)
+                || self.current_sources.get(&candidate.source_subscription)
+                    != Some(&candidate.source_fingerprint)
+            {
+                return Err(SubscriptionError::StaleCandidate);
+            }
+        }
+        let changed = !prepared.nodes.is_empty();
+        for (candidate, result) in prepared.nodes {
+            let id = candidate.config.id.clone();
+            let node = self
+                .snapshot
+                .nodes
+                .get_mut(&id)
+                .expect("candidate was checked");
+            match result {
+                Ok(adapter) => {
+                    let mut capabilities = BTreeSet::new();
+                    if adapter.supports_tcp() {
+                        capabilities.insert(FlowProtocol::Tcp);
+                    }
+                    if adapter.supports_udp() && candidate.config.options.udp != Some(false) {
+                        capabilities.insert(FlowProtocol::Udp);
+                    }
+                    node.state = DynamicNodeState::Active;
+                    self.snapshot.admissions.insert(
+                        id,
+                        AdmittedNode {
+                            original: candidate,
+                            adapter,
+                            capabilities,
+                            valid: AdmissionRevocation(Arc::new(AtomicBool::new(true))),
+                        },
+                    );
+                }
+                Err(()) => {
+                    node.state =
+                        DynamicNodeState::Unavailable(NodeUnavailableReason::AdapterUnavailable);
+                    node.diagnostic = Some(adapter_diagnostic());
+                }
+            }
+        }
+        if changed {
+            self.snapshot.generation = self.snapshot.generation.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Revoke an admission that the data plane could not install.
+    pub fn reject_admitted_adapter(&mut self, id: &TransitProxyId) {
+        self.revoke_admission(id);
+        if let Some(node) = self.snapshot.nodes.get_mut(id) {
+            node.state = DynamicNodeState::Unavailable(NodeUnavailableReason::AdapterUnavailable);
+            node.diagnostic = Some(adapter_diagnostic());
+            self.snapshot.generation = self.snapshot.generation.saturating_add(1);
+        }
+    }
+
+    /// Fence the old adapters while a source refresh is being committed.
+    pub fn suspend_source_admissions(&mut self, source: &SubscriptionId) {
+        let mut suspended = Vec::new();
+        for (id, node) in &mut self.snapshot.nodes {
+            if &node.source_subscription == source && node.state == DynamicNodeState::Active {
+                node.state = DynamicNodeState::Pending;
+                suspended.push(id.clone());
+            }
+        }
+        for id in &suspended {
+            self.revoke_admission(id);
+        }
+        if !suspended.is_empty() {
+            self.snapshot.generation = self.snapshot.generation.saturating_add(1);
+        }
+    }
+
+    fn revoke_admission(&mut self, id: &TransitProxyId) {
+        if let Some(admission) = self.snapshot.admissions.remove(id) {
+            admission.revoke();
+        }
+    }
+
     pub async fn refresh(&mut self, config: &SubscriptionConfig) -> RefreshOutcome {
+        if config
+            .source
+            .user_agent
+            .as_deref()
+            .is_some_and(|value| !pathchord_policy::valid_subscription_user_agent(value))
+        {
+            return RefreshOutcome::Retained {
+                generation: self.snapshot.generation,
+                attempts: 0,
+                error: SubscriptionError::InvalidUserAgent,
+            };
+        }
         if !config.enabled {
             return RefreshOutcome::Disabled {
                 diff: self.disable(&config.id),
@@ -602,6 +960,18 @@ impl SubscriptionManager {
         config: &SubscriptionConfig,
         captured_control_generation: u64,
     ) -> Result<PreparedSubscriptionRefresh, RefreshOutcome> {
+        if config
+            .source
+            .user_agent
+            .as_deref()
+            .is_some_and(|value| !pathchord_policy::valid_subscription_user_agent(value))
+        {
+            return Err(RefreshOutcome::Retained {
+                generation: self.snapshot.generation,
+                attempts: 0,
+                error: SubscriptionError::InvalidUserAgent,
+            });
+        }
         if !config.enabled || config.source.source_type == SubscriptionSourceType::Static {
             return Err(RefreshOutcome::Retained {
                 generation: self.snapshot.generation,
@@ -622,6 +992,7 @@ impl SubscriptionManager {
             let request = SubscriptionFetchRequest {
                 url: config.source.url.clone(),
                 credentials_ref: config.source.credentials_ref.clone(),
+                user_agent: config.source.user_agent.clone(),
                 timeout: Duration::from_secs(config.refresh.timeout_seconds.clamp(1, 300)),
                 max_bytes: budget.remaining(),
             };
@@ -755,6 +1126,14 @@ impl SubscriptionManager {
         &mut self,
         config: &SubscriptionConfig,
     ) -> Result<CacheLoadOutcome, SubscriptionError> {
+        if config
+            .source
+            .user_agent
+            .as_deref()
+            .is_some_and(|value| !pathchord_policy::valid_subscription_user_agent(value))
+        {
+            return Err(SubscriptionError::InvalidUserAgent);
+        }
         if !config.enabled {
             return Ok(CacheLoadOutcome::Disabled {
                 diff: self.disable(&config.id),
@@ -817,15 +1196,24 @@ impl SubscriptionManager {
         let nodes = cached
             .nodes
             .into_iter()
-            .map(|node| NormalizedNode {
-                config: node.config,
-                credential: node.credential,
-                state: node.diagnostic.as_ref().map_or_else(
-                    || adapter_state(&node.protocol, &self.available_adapters),
+            .map(|node| {
+                let state = node.diagnostic.as_ref().map_or_else(
+                    || {
+                        if node.credential.field("sing_box_outbound").is_some() {
+                            DynamicNodeState::Unavailable(NodeUnavailableReason::AdapterUnavailable)
+                        } else {
+                            adapter_state(&node.protocol, &self.available_adapters)
+                        }
+                    },
                     |diagnostic| DynamicNodeState::Unavailable(diagnostic.code),
-                ),
-                diagnostic: node.diagnostic,
-                usage: node.usage,
+                );
+                NormalizedNode {
+                    config: node.config,
+                    credential: node.credential,
+                    state,
+                    diagnostic: node.diagnostic,
+                    usage: node.usage,
+                }
             })
             .collect();
         let diff = self.publish(&config.id, &source_fingerprint, nodes)?;
@@ -849,6 +1237,9 @@ impl SubscriptionManager {
                 draining.push(id.clone());
             }
         }
+        for id in &draining {
+            self.revoke_admission(id);
+        }
         self.current_sources = enabled;
         if !draining.is_empty() {
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
@@ -870,6 +1261,9 @@ impl SubscriptionManager {
             !remove
         });
         let removed_ids: BTreeSet<_> = removed.iter().cloned().collect();
+        for id in &removed {
+            self.revoke_admission(id);
+        }
         let mut promoted = Vec::new();
         for (subscription_id, pending) in &mut self.pending_nodes {
             if self.current_sources.get(subscription_id) != Some(&pending.source_fingerprint) {
@@ -899,7 +1293,7 @@ impl SubscriptionManager {
                 DynamicTransitNode {
                     config: normalized.config,
                     source_subscription: subscription_id,
-                    state: normalized.state,
+                    state: pending_state(normalized.state),
                     diagnostic: normalized.diagnostic,
                     usage: normalized.usage,
                     source_fingerprint,
@@ -930,17 +1324,20 @@ impl SubscriptionManager {
         {
             self.pending_nodes.remove(id);
         }
-        let mut changed = false;
-        for node in self.snapshot.nodes.values_mut() {
+        let mut draining = Vec::new();
+        for (node_id, node) in &mut self.snapshot.nodes {
             if &node.source_subscription == id
                 && node.source_fingerprint != fingerprint
                 && node.state != DynamicNodeState::Draining
             {
                 node.state = DynamicNodeState::Draining;
-                changed = true;
+                draining.push(node_id.clone());
             }
         }
-        if changed {
+        for node_id in &draining {
+            self.revoke_admission(node_id);
+        }
+        if !draining.is_empty() {
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
         }
     }
@@ -954,6 +1351,9 @@ impl SubscriptionManager {
                 node.state = DynamicNodeState::Draining;
                 draining.push(node_id.clone());
             }
+        }
+        for node_id in &draining {
+            self.revoke_admission(node_id);
         }
         if !draining.is_empty() {
             self.snapshot.generation = self.snapshot.generation.saturating_add(1);
@@ -1020,6 +1420,9 @@ impl SubscriptionManager {
                 }
             }
         }
+        for id in &diff.draining {
+            self.revoke_admission(id);
+        }
         let mut deferred = BTreeMap::new();
         for normalized in nodes {
             let id = normalized.config.id.clone();
@@ -1032,7 +1435,7 @@ impl SubscriptionManager {
                 deferred.insert(id, normalized);
                 continue;
             }
-            let node = DynamicTransitNode {
+            let mut node = DynamicTransitNode {
                 config: normalized.config,
                 source_subscription: subscription_id.clone(),
                 state: normalized.state,
@@ -1041,6 +1444,23 @@ impl SubscriptionManager {
                 source_fingerprint: source_fingerprint.to_owned(),
                 credential: normalized.credential,
             };
+            if matches!(
+                node.state,
+                DynamicNodeState::Active | DynamicNodeState::Pending
+            ) {
+                node.state = DynamicNodeState::Active;
+                if !self
+                    .snapshot
+                    .admissions
+                    .get(&id)
+                    .is_some_and(|admission| admission.matches(&node))
+                {
+                    self.revoke_admission(&id);
+                    node.state = DynamicNodeState::Pending;
+                }
+            } else {
+                self.revoke_admission(&id);
+            }
             match self.snapshot.nodes.insert(id.clone(), node) {
                 Some(previous) if self.snapshot.nodes[&id] != previous => {
                     diff.updated.push(id.clone())
@@ -1148,6 +1568,17 @@ fn subscription_source_fingerprint(config: &SubscriptionConfig) -> String {
             None => digest.update([0]),
         }
     }
+    // The older cache format had no default User-Agent. Even the default now
+    // changes the representation requested from a provider, so old hashes
+    // must not be accepted for this source.
+    let user_agent = config
+        .source
+        .user_agent
+        .as_deref()
+        .unwrap_or(DEFAULT_SUBSCRIPTION_USER_AGENT);
+    digest.update(b"\0PathChord/subscription-user-agent/v1\0");
+    digest.update((user_agent.len() as u64).to_be_bytes());
+    digest.update(user_agent.as_bytes());
     let mut result = String::with_capacity(64);
     for byte in digest.finalize() {
         write!(result, "{byte:02x}").expect("writing to a String cannot fail");
@@ -1315,6 +1746,22 @@ fn adapter_state(protocol: &str, available_adapters: &BTreeSet<String>) -> Dynam
     }
 }
 
+fn pending_state(state: DynamicNodeState) -> DynamicNodeState {
+    if state == DynamicNodeState::Active {
+        DynamicNodeState::Pending
+    } else {
+        state
+    }
+}
+
+fn adapter_diagnostic() -> NodeDiagnostic {
+    NodeDiagnostic {
+        code: NodeUnavailableReason::AdapterUnavailable,
+        fields: Vec::new(),
+        message: "node adapter could not be prepared".to_owned(),
+    }
+}
+
 fn backoff_delay(base_seconds: u64, failed_attempt: u32) -> Duration {
     let exponent = failed_attempt.saturating_sub(1).min(31);
     let multiplier = 1_u64 << exponent;
@@ -1464,6 +1911,7 @@ mod tests {
                 source_type,
                 url: "https://subscription.example.test/nodes".into(),
                 credentials_ref: None,
+                user_agent: None,
             },
             refresh: SubscriptionRefresh {
                 interval_seconds: 3_600,
@@ -1553,6 +2001,303 @@ proxies:
     ]"#;
 
     #[tokio::test]
+    async fn imported_nodes_are_not_selectable_until_their_adapters_are_prepared() {
+        let fetcher = Arc::new(ScriptedFetcher::new([Ok(CLASH.as_bytes().to_vec())]));
+        let mut manager = SubscriptionManager::new(
+            fetcher,
+            temp_directory("unprepared-nodes"),
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        assert!(matches!(
+            manager
+                .refresh(&config(SubscriptionSourceType::Clash, None))
+                .await,
+            RefreshOutcome::Published { .. }
+        ));
+        assert_eq!(manager.snapshot().nodes.len(), 2);
+        assert_eq!(manager.snapshot().selectable_nodes().count(), 0);
+        let mut catalog = RuntimeCatalog::default();
+        manager.snapshot().extend_runtime_catalog(&mut catalog);
+        for node in manager.snapshot().nodes.values() {
+            let status = catalog.transit_proxy(&node.config.id).unwrap();
+            assert_ne!(status.state, RuntimeNodeState::Ready);
+            assert!(status.capabilities.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn only_prepared_adapters_become_selectable_with_real_capabilities() {
+        let document = br#"proxies:
+  - {name: tcp, type: http, server: proxy.test, port: 8080}
+  - {name: no-udp, type: socks5, server: proxy.test, port: 1080, udp: false}
+  - {name: invalid, type: vless, server: proxy.test, port: 443, uuid: not-a-uuid}
+"#;
+        let mut manager = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([Ok(document.to_vec())])),
+            temp_directory("prepared-adapters"),
+            BTreeSet::from(["http".into(), "socks5".into(), "vless".into()]),
+        );
+        manager
+            .refresh(&config(SubscriptionSourceType::Clash, None))
+            .await;
+        let registry = crate::AdapterRegistry::for_configs(
+            Arc::new(crate::NoTransitCredentials),
+            Duration::from_secs(1),
+            manager.snapshot().nodes.values().map(|node| &node.config),
+        )
+        .unwrap();
+        let prepared = manager.snapshot().prepare_adapters(&registry).await;
+        manager.commit_prepared_adapters(prepared).unwrap();
+        let selected: Vec<_> = manager.snapshot().selectable_nodes().collect();
+        assert_eq!(selected.len(), 2);
+        let mut catalog = RuntimeCatalog::default();
+        manager.snapshot().extend_runtime_catalog(&mut catalog);
+        for node in &selected {
+            let status = catalog.transit_proxy(&node.config.id).unwrap();
+            assert_eq!(status.state, RuntimeNodeState::Ready);
+            assert_eq!(status.capabilities, BTreeSet::from([FlowProtocol::Tcp]));
+        }
+        let invalid = manager
+            .snapshot()
+            .nodes
+            .values()
+            .find(|node| node.config.protocol == "vless")
+            .unwrap();
+        assert_eq!(
+            invalid.state,
+            DynamicNodeState::Unavailable(NodeUnavailableReason::AdapterUnavailable)
+        );
+        assert!(!format!("{:?}", invalid.diagnostic).contains("not-a-uuid"));
+
+        let mut changed = manager.snapshot().clone();
+        let id = selected
+            .iter()
+            .find(|node| node.config.protocol == "http")
+            .unwrap()
+            .config
+            .id
+            .clone();
+        changed.nodes.get_mut(&id).unwrap().config.endpoint.port = 9999;
+        assert_eq!(changed.selectable_nodes().count(), 1);
+        assert!(changed.validated_adapter(&id).is_none());
+        let old = manager.snapshot().clone();
+        manager.reconcile(&[]);
+        assert_eq!(old.selectable_nodes().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_prepared_adapters_cannot_survive_a_source_change_or_disable() {
+        for disable in [false, true] {
+            let mut manager = SubscriptionManager::new(
+                Arc::new(ScriptedFetcher::new([Ok(CLASH.as_bytes().to_vec())])),
+                temp_directory("stale-adapters"),
+                BTreeSet::from(["vless".into(), "ss".into()]),
+            );
+            let current = config(SubscriptionSourceType::Clash, None);
+            manager.refresh(&current).await;
+            let registry = crate::AdapterRegistry::for_configs(
+                Arc::new(crate::NoTransitCredentials),
+                Duration::from_secs(1),
+                manager.snapshot().nodes.values().map(|node| &node.config),
+            )
+            .unwrap();
+            let prepared = manager.snapshot().prepare_adapters(&registry).await;
+            if disable {
+                manager.reconcile(&[]);
+            } else {
+                let mut replacement = current.clone();
+                replacement.source.url = "https://replacement.example.test/subscription".into();
+                manager.reconcile(&[replacement]);
+            }
+            assert_eq!(
+                manager.commit_prepared_adapters(prepared),
+                Err(SubscriptionError::StaleCandidate)
+            );
+            assert_eq!(manager.snapshot().selectable_nodes().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_reload_requires_fresh_adapter_preparation() {
+        let directory = temp_directory("adapter-cache-revalidation");
+        let cache = SubscriptionCache {
+            path: "nodes.json".into(),
+            max_age_seconds: 3600,
+        };
+        let subscription = config(SubscriptionSourceType::Clash, Some(cache));
+        let mut manager = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([Ok(CLASH.as_bytes().to_vec())])),
+            &directory,
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        manager.refresh(&subscription).await;
+        let registry = crate::AdapterRegistry::for_configs(
+            Arc::new(crate::NoTransitCredentials),
+            Duration::from_secs(1),
+            manager.snapshot().nodes.values().map(|node| &node.config),
+        )
+        .unwrap();
+        let prepared = manager.snapshot().prepare_adapters(&registry).await;
+        manager.commit_prepared_adapters(prepared).unwrap();
+        assert_eq!(manager.snapshot().selectable_nodes().count(), 2);
+        let mut restored = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([])),
+            &directory,
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        assert!(matches!(
+            restored.load_cache(&subscription).await,
+            Ok(CacheLoadOutcome::Loaded { .. })
+        ));
+        assert_eq!(restored.snapshot().selectable_nodes().count(), 0);
+        let prepared = restored.snapshot().prepare_adapters(&registry).await;
+        restored.commit_prepared_adapters(prepared).unwrap();
+        assert_eq!(restored.snapshot().selectable_nodes().count(), 2);
+
+        let mut changed_backend = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([])),
+            &directory,
+            BTreeSet::from(["vless".into()]),
+        );
+        assert!(matches!(
+            changed_backend.load_cache(&subscription).await,
+            Ok(CacheLoadOutcome::Loaded { .. })
+        ));
+        assert_eq!(changed_backend.snapshot().selectable_nodes().count(), 0);
+        let prepared = changed_backend.snapshot().prepare_adapters(&registry).await;
+        changed_backend.commit_prepared_adapters(prepared).unwrap();
+        assert_eq!(changed_backend.snapshot().selectable_nodes().count(), 1);
+        let unsupported = changed_backend
+            .snapshot()
+            .nodes
+            .values()
+            .find(|node| node.config.protocol == "ss")
+            .unwrap();
+        assert_eq!(
+            unsupported.state,
+            DynamicNodeState::Unavailable(NodeUnavailableReason::AdapterUnavailable)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_id_credential_replacement_revokes_old_proofs_and_stale_preparations() {
+        let first = b"proxies: [{name: node, type: http, server: proxy.test, port: 8080, username: user, password: first-secret}]";
+        let second = b"proxies: [{name: node, type: http, server: proxy.test, port: 8080, username: user, password: second-secret}]";
+        let mut manager = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([
+                Ok(first.to_vec()),
+                Ok(second.to_vec()),
+                Ok(first.to_vec()),
+            ])),
+            temp_directory("replacement-admission"),
+            BTreeSet::from(["http".into()]),
+        );
+        let config = config(SubscriptionSourceType::Clash, None);
+        manager.refresh(&config).await;
+        let registry = crate::AdapterRegistry::for_configs(
+            Arc::new(crate::NoTransitCredentials),
+            Duration::from_secs(1),
+            manager.snapshot().nodes.values().map(|node| &node.config),
+        )
+        .unwrap();
+        let stale = manager.snapshot().prepare_adapters(&registry).await;
+        manager.refresh(&config).await;
+        assert_eq!(
+            manager.commit_prepared_adapters(stale),
+            Err(SubscriptionError::StaleCandidate)
+        );
+        let current = manager.snapshot().prepare_adapters(&registry).await;
+        manager.commit_prepared_adapters(current).unwrap();
+        let before = manager.snapshot().clone();
+        assert_eq!(before.selectable_nodes().count(), 1);
+        let expected = before.selectable_nodes().next().unwrap().config.id.clone();
+        let replacement = manager.prepare_refresh(&config, 0).await.unwrap();
+        assert_eq!(replacement.invalidated_adapters(&before), vec![expected]);
+        assert!(matches!(
+            manager.commit_prepared_refresh(replacement, 0).await,
+            RefreshOutcome::Published { .. }
+        ));
+        assert_eq!(before.selectable_nodes().count(), 0);
+        assert_eq!(manager.snapshot().selectable_nodes().count(), 0);
+        assert!(
+            manager
+                .snapshot()
+                .nodes
+                .values()
+                .all(|node| node.state == DynamicNodeState::Pending)
+        );
+        let current = manager.snapshot().prepare_adapters(&registry).await;
+        manager.commit_prepared_adapters(current).unwrap();
+        assert_eq!(manager.snapshot().selectable_nodes().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn overlapping_refresh_rejects_an_old_inflight_adapter_preparation() {
+        struct BlockingAdapter {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl crate::TransitAdapter for BlockingAdapter {
+            fn metadata(&self) -> &crate::TransitMetadata {
+                panic!("metadata is not used")
+            }
+            async fn prepare(&self) -> Result<(), crate::TransitError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+            async fn connect(
+                &self,
+                _: crate::ConnectRequest,
+            ) -> Result<crate::BoxedTransitConnection, crate::TransitError> {
+                panic!("connections are not opened by this test")
+            }
+        }
+        let first=b"proxies: [{name: node, type: http, server: proxy.test, port: 8080, username: user, password: first}]";
+        let second=b"proxies: [{name: node, type: http, server: proxy.test, port: 8080, username: user, password: second}]";
+        let mut manager = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([
+                Ok(first.to_vec()),
+                Ok(second.to_vec()),
+            ])),
+            temp_directory("overlap-preparation"),
+            BTreeSet::from(["http".into()]),
+        );
+        let config = config(SubscriptionSourceType::Clash, None);
+        manager.refresh(&config).await;
+        let snapshot = manager.snapshot().clone();
+        let candidate = snapshot.nodes.values().next().unwrap().clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let adapter: Arc<dyn crate::TransitAdapter> = Arc::new(BlockingAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let pending = tokio::spawn(async move {
+            crate::adapter_registry::prepare_adapter(adapter.as_ref(), Duration::from_secs(2))
+                .await
+                .unwrap();
+            PreparedDynamicSnapshot {
+                generation: snapshot.generation,
+                nodes: vec![(candidate, Ok(adapter))],
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        manager.refresh(&config).await;
+        release.notify_one();
+        let stale = pending.await.unwrap();
+        assert_eq!(
+            manager.commit_prepared_adapters(stale),
+            Err(SubscriptionError::StaleCandidate)
+        );
+        assert_eq!(manager.snapshot().selectable_nodes().count(), 0);
+    }
+
+    #[tokio::test]
     async fn normalizes_clash_nodes_and_keeps_credentials_redacted() {
         let fetcher = Arc::new(ScriptedFetcher::new([Ok(CLASH.as_bytes().to_vec())]));
         let mut manager = SubscriptionManager::new(
@@ -1568,7 +2313,8 @@ proxies:
             RefreshOutcome::Published { attempts: 1, .. }
         ));
         assert_eq!(manager.snapshot().generation, 1);
-        assert_eq!(manager.snapshot().selectable_nodes().count(), 2);
+        assert_eq!(manager.snapshot().candidate_nodes().count(), 2);
+        assert_eq!(manager.snapshot().selectable_nodes().count(), 0);
         let ss = manager
             .snapshot()
             .nodes
@@ -1686,7 +2432,8 @@ proxies:
             restored.load_cache(&subscription).await.unwrap(),
             CacheLoadOutcome::Loaded { .. }
         ));
-        assert_eq!(restored.snapshot().selectable_nodes().count(), 2);
+        assert_eq!(restored.snapshot().candidate_nodes().count(), 2);
+        assert_eq!(restored.snapshot().selectable_nodes().count(), 0);
 
         let mut envelope: CacheEnvelope =
             serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
@@ -1713,6 +2460,17 @@ proxies:
             max_age_seconds: 86_400,
         };
         let subscription = config(SubscriptionSourceType::Clash, Some(cache.clone()));
+        let old_fingerprint = "f5ca1fabc6f80a87d8717c2ff1b5696c00b0ec3c25a21a7c674779970721c053";
+        assert_ne!(
+            subscription_source_fingerprint(&subscription),
+            old_fingerprint
+        );
+        let mut explicit_default = subscription.clone();
+        explicit_default.source.user_agent = Some("clash.meta".into());
+        assert_eq!(
+            subscription_source_fingerprint(&subscription),
+            subscription_source_fingerprint(&explicit_default)
+        );
         let mut manager = SubscriptionManager::new(
             Arc::new(ScriptedFetcher::new([Ok(CLASH.as_bytes().to_vec())])),
             &directory,
@@ -1744,10 +2502,30 @@ proxies:
             changed.load_cache(&changed_url).await.unwrap(),
             CacheLoadOutcome::SourceMismatch
         );
+        let mut changed_agent = subscription.clone();
+        changed_agent.source.user_agent = Some("CustomClient/1.0".into());
+        assert_eq!(
+            changed.load_cache(&changed_agent).await.unwrap(),
+            CacheLoadOutcome::SourceMismatch
+        );
 
         let cache_path = directory.join(&cache.path);
         let mut envelope: CacheEnvelope =
             serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        envelope.source_fingerprint = Some(old_fingerprint.to_owned());
+        atomic_write(&cache_path, &serde_json::to_vec(&envelope).unwrap())
+            .await
+            .unwrap();
+        let mut old_cache = SubscriptionManager::new(
+            Arc::new(ScriptedFetcher::new([])),
+            &directory,
+            BTreeSet::from(["vless".into(), "ss".into()]),
+        );
+        assert_eq!(
+            old_cache.load_cache(&subscription).await.unwrap(),
+            CacheLoadOutcome::SourceMismatch
+        );
+        assert!(old_cache.snapshot().nodes.is_empty());
         envelope.version = 1;
         envelope.source_fingerprint = None;
         atomic_write(&cache_path, &serde_json::to_vec(&envelope).unwrap())
@@ -1762,6 +2540,38 @@ proxies:
             legacy.load_cache(&subscription).await.unwrap(),
             CacheLoadOutcome::UnverifiedSource
         );
+    }
+
+    #[tokio::test]
+    async fn changing_user_agent_invalidates_prepared_refresh_even_at_same_control_generation() {
+        let fetcher = Arc::new(ScriptedFetcher::new([Ok(CLASH.as_bytes().to_vec())]));
+        let mut manager =
+            SubscriptionManager::new(fetcher, temp_directory("ua-candidate"), BTreeSet::new());
+        let original = config(SubscriptionSourceType::Clash, None);
+        manager.reconcile(std::slice::from_ref(&original));
+        let prepared = manager.prepare_refresh(&original, 7).await.unwrap();
+        let mut invalid = original.clone();
+        invalid.source.user_agent = Some("invalid\r\nheader".into());
+        assert!(matches!(
+            manager.refresh(&invalid).await,
+            RefreshOutcome::Retained {
+                error: SubscriptionError::InvalidUserAgent,
+                attempts: 0,
+                ..
+            }
+        ));
+        assert!(manager.snapshot().nodes.is_empty());
+        let mut changed = original.clone();
+        changed.source.user_agent = Some("CustomClient/1.0".into());
+        manager.reconcile(&[changed]);
+        assert!(matches!(
+            manager.commit_prepared_refresh(prepared, 7).await,
+            RefreshOutcome::Retained {
+                error: SubscriptionError::StaleCandidate,
+                ..
+            }
+        ));
+        assert!(manager.snapshot().nodes.is_empty());
     }
 
     #[tokio::test]
@@ -1797,7 +2607,7 @@ proxies:
         );
         let promoted = manager.complete_draining(&old_ids);
         assert_eq!(promoted.added.len(), old_ids.len());
-        assert!(manager.snapshot.selectable_nodes().count() == old_ids.len());
+        assert!(manager.snapshot.candidate_nodes().count() == old_ids.len());
         assert!(
             manager
                 .snapshot
@@ -1874,6 +2684,14 @@ proxies:
         );
         let subscription = config(SubscriptionSourceType::Clash, None);
         manager.refresh(&subscription).await;
+        let registry = crate::AdapterRegistry::for_configs(
+            Arc::new(crate::NoTransitCredentials),
+            Duration::from_secs(1),
+            manager.snapshot().nodes.values().map(|node| &node.config),
+        )
+        .unwrap();
+        let prepared = manager.snapshot().prepare_adapters(&registry).await;
+        manager.commit_prepared_adapters(prepared).unwrap();
         let first_id = manager.snapshot().nodes.keys().next().unwrap().clone();
         let mut ready_catalog = RuntimeCatalog::default();
         manager
@@ -1926,6 +2744,7 @@ proxies:
             .fetch(SubscriptionFetchRequest {
                 url: format!("http://{address}/nodes"),
                 credentials_ref: None,
+                user_agent: None,
                 timeout: Duration::from_secs(1),
                 max_bytes: 16,
             })
@@ -1935,6 +2754,118 @@ proxies:
             Err(SubscriptionError::ResponseTooLarge { maximum: 16 })
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_http_fetcher_sends_per_request_user_agents_without_cross_talk() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for _ in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
+                        request.push(stream.read_u8().await.unwrap());
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    let agent = request
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("user-agent")
+                                .then(|| value.trim())
+                        })
+                        .expect("User-Agent header");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{agent}",
+                        agent.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let fetcher = HttpSubscriptionFetcher::new().unwrap();
+            let request = |user_agent: Option<&str>| SubscriptionFetchRequest {
+                url: format!("http://{address}/sub"),
+                credentials_ref: None,
+                user_agent: user_agent.map(str::to_owned),
+                timeout: Duration::from_secs(2),
+                max_bytes: 1024,
+            };
+            let (default, first, second) = tokio::join!(
+                fetcher.fetch(request(None)),
+                fetcher.fetch(request(Some("Client-A/1"))),
+                fetcher.fetch(request(Some("Client-B/2"))),
+            );
+            assert_eq!(default.unwrap(), b"clash.meta");
+            assert_eq!(first.unwrap(), b"Client-A/1");
+            assert_eq!(second.unwrap(), b"Client-B/2");
+            let invalid = fetcher.fetch(request(Some("bad\r\nInjected: x"))).await;
+            assert_eq!(invalid, Err(SubscriptionError::InvalidUserAgent));
+            server.await.unwrap();
+        })
+        .await
+        .expect("HTTP User-Agent test timed out");
+    }
+
+    #[tokio::test]
+    async fn concurrent_subscriptions_import_the_format_selected_by_their_user_agent() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
+                        request.push(stream.read_u8().await.unwrap());
+                    }
+                    let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                    let body = if request.contains("\r\nuser-agent: client-a/1\r\n") {
+                        "proxies: [{name: yaml-node, type: http, server: proxy.test, port: 8080}]"
+                    } else {
+                        assert!(request.contains("\r\nuser-agent: client-b/1\r\n"));
+                        "http://proxy.test:8081#uri-node"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let fetcher = Arc::new(HttpSubscriptionFetcher::new().unwrap());
+            let mut first = config(SubscriptionSourceType::Auto, None);
+            first.source.url = format!("http://{address}/sub");
+            first.source.user_agent = Some("Client-A/1".into());
+            let mut second = first.clone();
+            second.id = SubscriptionId::new("provider-b");
+            second.source.user_agent = Some("Client-B/1".into());
+            let mut a = SubscriptionManager::new(
+                fetcher.clone(),
+                std::env::temp_dir(),
+                BTreeSet::from(["http".into()]),
+            );
+            let mut b = SubscriptionManager::new(
+                fetcher,
+                std::env::temp_dir(),
+                BTreeSet::from(["http".into()]),
+            );
+            let (first_result, second_result) = tokio::join!(a.refresh(&first), b.refresh(&second));
+            assert!(matches!(first_result, RefreshOutcome::Published { .. }));
+            assert!(matches!(second_result, RefreshOutcome::Published { .. }));
+            assert_eq!(
+                a.snapshot().candidate_nodes().next().unwrap().config.labels["source.name"],
+                "yaml-node"
+            );
+            assert_eq!(
+                b.snapshot().candidate_nodes().next().unwrap().config.labels["source.name"],
+                "uri-node"
+            );
+            server.await.unwrap();
+        })
+        .await
+        .expect("parallel subscription test timed out");
     }
 
     struct LegacyUnknownFailure;
@@ -1960,6 +2891,7 @@ proxies:
         let request = SubscriptionFetchRequest {
             url: "https://provider.invalid/sub".into(),
             credentials_ref: None,
+            user_agent: None,
             timeout: Duration::from_secs(1),
             max_bytes: 1024,
         };

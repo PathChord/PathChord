@@ -54,7 +54,60 @@ pathchord ingress
 
 将私有身份、节点/监听器凭据 JSON、订阅缓存和服务数据目录放在资源树外。目录加载器也会读取 JSON，因此将私有 JSON 文档混入配置资源可能使整个配置集合无效。使用不透明的 `credentialsRef` 引用本地凭据存储。不要把密码和订阅 token 写入已提交的示例；含凭据的 provider URL 应按私有配置处理。
 
+订阅服务器可能根据 HTTP 客户端返回不同格式。可以在 Subscription 的 `spec.source.userAgent`
+中设置提供方要求的值；默认值为 `clash.meta`。改变该值会触发新来源刷新，不会复用使用其他值获取的缓存。
+
 凭据文件的设置方法见[部署指南](deployment.zh-CN.md)。[Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)定义各选项由哪个适配器消费，以及如何报告不支持的节点。导入订阅后应检查单节点诊断；仅导入了协议名称并不代表节点可用。
+
+Hysteria2 Gecko 可使用私有凭据中的可选字段 `gecko_min_packet_size` 和
+`gecko_max_packet_size` 选择长头分片的填充范围；字段缺省或为零时分别使用 512 和 1200 字节。
+对端需要接受所选的线上包长。本地测试中 sing-box 1.14.4 对端可以交换固定 1452 字节的
+Gecko 包，但其 2048 字节设置无法完成握手；独立 sing-quic relay 可以接受 2048 字节。
+所选包长还必须适合网络路径。Linux 上 PathChord 的 QUIC socket 禁止 IP 分片；在 MTU 为
+1500 字节且没有额外封装时，IPv4 的 UDP 载荷超过 1472 字节或 IPv6 的 UDP 载荷超过
+1452 字节就无法装入一个 IP 包。这类 Gecko 分片可能被丢弃，表现为握手超时。隧道或更小的
+路径 MTU 可能要求更低的设置。本地 2048 字节 relay 测试使用回环接口，不能证明该设置适用于
+1500 字节的路径。
+
+SOCKS5 或 Shadowsocks UDP-over-TCP 可将 `spec.options.udpOverTcp` 设为 `1` 或 `2`；省略时
+使用适配器的普通 UDP 传输。导入的 Clash 节点启用 UDP-over-TCP 但省略版本时使用 v1，
+导入的 sing-box 节点使用 v2；还要确保节点启用了 UDP。VMess 的 `spec.options.vmess.globalPadding` 和 `authenticatedLength` 用于启用
+对应的 AEAD 帧选项。Meek 节点使用 `spec.options.transport.type: meek`，完整 URL 放在凭据
+JSON 的私有 `meek_url` 字段中。HTTP CONNECT 请求路径同样放在私有 `http_path` 凭据字段中。
+不要将这些 URL 和路径放入公开资源文档。
+
+Shadowsocks、VLESS、VMess 或 Trojan 节点可以将 `spec.options.multiplex.enabled` 设为
+`true`，并在 `spec.options.multiplex.protocol` 中选择 `h2mux`、`yamux` 或 `smux`；省略协议时使用
+`h2mux`。Multiplex 不能与显式 `packetEncoding` 或 `udpOverTcp` 同时使用；对端要求 sing-mux
+padding 时，将 `spec.options.multiplex.padding` 设为 `true`。
+不可用的组合会在节点诊断中说明。导入的 Clash/Mihomo 和 sing-box VLESS 节点通常默认使用 XUDP，
+启用 multiplex 后使用其 UDP 帧。手写的 VLESS 节点不启用 multiplex 且省略 `packetEncoding` 时，
+普通节点使用 VLESS UDP，设置 Vision flow 的节点使用 XUDP。Vision 不能使用 `packetaddr`；
+节点需要承载到 UDP 443 端口的流量时，应使用 `xtls-rprx-vision-udp443` flow。
+如果 multiplex UDP Association 在对端确认前关闭，关闭操作会报错，但已发送的数据报可能已经到达目标。
+
+只有应用能够接受整流关闭语义时才使用 `smux`：FIN 不提供可靠的 TCP 写端半关闭，目标在
+该 FIN 后发送的响应可能无法到达。每个 smux 会话最多支持 256 条流，接收和发送队列各有
+4 MiB 预算。慢接收流可能以资源错误关闭并发送 FIN，以便其他流继续运行。活动流所在的载体
+停滞时需要调用方或上层超时取消；最后一条流释放后，待完成 I/O 共用十秒的排空期限。完整限制和失败语义见
+[Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)。
+
+Hysteria2 的 `up_mbps` 和 `down_mbps` 是私有凭据中可选的非负整数 Mbps 字段。
+`down_mbps` 是接收速率提示，服务端可以忽略。上传设置参与认证协商：例如配置
+`up_mbps: 10` 时，服务端返回数值零会选择 10 Mbps 的 Brutal 目标，返回正数则选择两者中
+较小的速率。`up_mbps` 缺省或为零时，即使服务端返回正数速率，客户端也使用 BBR。服务端
+返回 `auto` 时，无论 `up_mbps` 如何配置，客户端同样使用 BBR。
+
+Trojan-Go 分享链接会规范化为原生 Trojan 适配器。原始/TCP、WebSocket、gRPC 和
+HTTPUpgrade 形式在已验证的选项范围内支持。WebSocket SS 加密使用私有凭据
+`trojan_go_ss_method` 和 `trojan_go_ss_password`，支持 AES-128-GCM、AES-256-GCM
+和 ChaCha20-IETF-Poly1305。带此加密的原始/TCP 暂不可用：参考 Trojan-Go 服务端的
+HTTP 请求嗅探在短加密流上可能无限等待。不支持的组合会保留为带诊断的不可用节点。
+
+Brutal 会补偿丢包，正常经过 pacing 的 QUIC 发包速率最高可达目标的 1.25 倍。PTO 探测包和
+纯 ACK 包可以绕过 pacing，突发和外层协议开销也会增加流量。因此该设置既不是严格的物理
+带宽上限，也不是吞吐保证；极短 RTT 和 ACK 时序也可能降低实际速率。完整协商规则和选项边界
+见 [Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)。
 
 ## 配置 Egress 资源上限
 

@@ -47,7 +47,7 @@ impl std::fmt::Display for RealityCodecError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::InvalidPublicKey => "REALITY public key must be 32-byte hex or base64",
-            Self::InvalidShortId => "REALITY short ID must contain 1..=8 bytes",
+            Self::InvalidShortId => "REALITY short ID must contain 0..=8 bytes",
             Self::InvalidSessionId => "REALITY Session ID must contain exactly 16 bytes",
             Self::InvalidRandom => "REALITY ClientHello random must contain 32 bytes",
             Self::InvalidProof => "REALITY proof authentication failed",
@@ -61,8 +61,12 @@ impl std::error::Error for RealityCodecError {}
 impl RealityConfig {
     pub fn parse(public_key: &str, short_id: &str) -> Result<Self, RealityCodecError> {
         let public_key = parse_public_key(public_key)?;
-        let short = decode_hex(short_id).ok_or(RealityCodecError::InvalidShortId)?;
-        if short.is_empty() || short.len() > 8 {
+        let short = if short_id.is_empty() {
+            Vec::new()
+        } else {
+            decode_hex(short_id).ok_or(RealityCodecError::InvalidShortId)?
+        };
+        if short.len() > 8 {
             return Err(RealityCodecError::InvalidShortId);
         }
         let mut short_id = [0_u8; 8];
@@ -223,6 +227,7 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let base64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        assert_eq!(RealityConfig::parse(&base64, "").unwrap().short_id, [0; 8]);
         assert_eq!(RealityConfig::parse(&hex, "abcd").unwrap().short_id_len, 2);
         assert_eq!(
             RealityConfig::parse(&base64, "abcdef0123456789")

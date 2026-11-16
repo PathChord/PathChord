@@ -26,7 +26,7 @@ use crate::enums::{
     CertificateCompressionAlgorithm, CertificateType, CipherSuite, HandshakeType, ProtocolVersion,
     SignatureScheme,
 };
-use crate::error::InvalidMessage;
+use crate::error::{InvalidMessage, PeerMisbehaved};
 use crate::sync::Arc;
 use crate::verify::DigitallySignedStruct;
 
@@ -835,6 +835,7 @@ fn sample_server_hello_payload() -> ServerHelloPayload {
             encrypted_client_hello_ack: Some(ServerEncryptedClientHello {
                 retry_configs: vec![],
             }),
+            record_size_limit: None,
             extended_master_secret_ack: Some(()),
             certificate_status_request_ack: Some(()),
             selected_version: Some(ProtocolVersion::TLSv1_2),
@@ -962,9 +963,53 @@ fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
                 status: Some(CertificateStatus {
                     ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
                 }),
+                sct: None,
             },
         }],
     }
+}
+
+#[test]
+fn sct_certificate_extensions_require_well_formed_unique_entries() {
+    let valid = [0, 9, 0, 18, 0, 5, 0, 3, 0, 1, 1];
+    assert!(CertificateExtensions::read(&mut Reader::init(&valid)).is_ok());
+    let malformed = [0, 9, 0, 18, 0, 5, 0, 3, 0, 4, 1];
+    assert!(CertificateExtensions::read(&mut Reader::init(&malformed)).is_err());
+    let empty = [0, 6, 0, 18, 0, 2, 0, 0];
+    assert!(CertificateExtensions::read(&mut Reader::init(&empty)).is_err());
+    let duplicate = [
+        0, 18, 0, 18, 0, 5, 0, 3, 0, 1, 1, 0, 18, 0, 5, 0, 3, 0, 1, 1,
+    ];
+    assert!(matches!(
+        CertificateExtensions::read(&mut Reader::init(&duplicate)),
+        Err(InvalidMessage::DuplicateExtension(18))
+    ));
+}
+
+#[test]
+fn sct_certificate_extensions_require_a_request_and_end_entity_x509() {
+    let valid = [0, 9, 0, 18, 0, 5, 0, 3, 0, 1, 1];
+    let extensions = CertificateExtensions::read(&mut Reader::init(&valid)).unwrap();
+    let mut chain = sample_certificate_payload_tls13();
+    chain.entries[0].extensions = extensions.clone();
+    assert_eq!(chain.validate_sct_extensions(true, false), Ok(()));
+    assert_eq!(
+        chain.validate_sct_extensions(false, false),
+        Err(PeerMisbehaved::UnsolicitedSctList)
+    );
+    assert_eq!(
+        chain.validate_sct_extensions(true, true),
+        Err(PeerMisbehaved::UnsolicitedCertExtension)
+    );
+    chain.entries[0].extensions = CertificateExtensions::default();
+    chain.entries.push(CertificateEntry {
+        cert: CertificateDer::from(vec![6, 7, 8]),
+        extensions,
+    });
+    assert_eq!(
+        chain.validate_sct_extensions(true, false),
+        Err(PeerMisbehaved::UnsolicitedCertExtension)
+    );
 }
 
 fn sample_compressed_certificate() -> CompressedCertificatePayload<'static> {

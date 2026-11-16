@@ -99,6 +99,15 @@ Ingress SHALL 区分资源限制、目标失败和策略失败。资源限制结
 - **WHEN** 准入前 Egress open 返回 `RESOURCE_LIMIT`
 - **THEN** 有可用候选时尝试同一捕获代次中的其他合规 Egress，否则返回类型化可重试错误
 
+### Requirement: Subscription User-Agent persists through control operations
+
+订阅控制 API SHALL 接受并返回配置的 User-Agent，且在重启后保留该值。没有此字段的旧订阅 SHALL 保留管理决定并使用默认 User-Agent。
+
+#### Scenario: A managed subscription is restarted
+
+- **WHEN** 客户端创建带有效 User-Agent 的订阅，随后 Ingress 重启
+- **THEN** 后续控制读取和刷新保留该值
+
 ## Detailed contract
 
 本文档定义用于操作 Ingress 的本地控制平面，以及供前端使用的可选 Web 网关。它独立于
@@ -297,7 +306,8 @@ system_proxy.disable
   "source": {
     "type": "clash",
     "url": "https://example.invalid/subscription",
-    "credentials_ref": "provider-a-token"
+    "credentials_ref": "provider-a-token",
+    "user_agent": "clash.meta"
   },
   "refresh": {
     "interval_seconds": 3600,
@@ -314,7 +324,8 @@ system_proxy.disable
 
 `source.type` 必须是规范[订阅类型](../transit-proxies/spec.zh-CN.md#订阅文档类型)或已定义输入别名；
 `source.url` 必须是不能包含内嵌凭据的
-HTTP(S) URL；`credentials_ref` 必须是不透明引用，不能是机密值。刷新和缓存字段使用配置
+HTTP(S) URL；`credentials_ref` 必须是不透明引用，不能是机密值。`source.user_agent` 可选，
+其范围与默认值遵循配置 schema。刷新和缓存字段使用配置
 schema 中相同的边界；`cache` 可以为 null。列表读模型返回来源类型和凭据引用，但不解析或
 返回所引用的机密值。由于 URL 路径、查询参数和片段可能包含凭据，`source.url` 返回为
 `null`，`source.url_redaction_reason` 设置为 `sensitive_source`；`source.origin` 只包含

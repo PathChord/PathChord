@@ -34,3 +34,15 @@ fi
 
 env "$binary_var=$binary" cargo test --locked -p pathchord-transit \
     --test external_core_servers -- --ignored "$test_name" "$@"
+if [ "$core_kind" = v2fly ]; then
+    env "$binary_var=$binary" cargo test --locked -p pathchord-transit \
+        --test meek_external -- --ignored "$@"
+    env "$binary_var=$binary" cargo test --locked -p pathchord-transit \
+        --lib -- --ignored native_vmess_alter_id_interoperates_with_v2fly "$@"
+fi
+if [ "$core_kind" = xray ]; then
+    env "$binary_var=$binary" cargo test --locked -p pathchord-transit \
+        --test vision_external -- --ignored "$@"
+    env "$binary_var=$binary" cargo test --locked -p pathchord-transit \
+        --test grpc_external -- --ignored xray_ "$@"
+fi

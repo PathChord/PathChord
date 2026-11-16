@@ -38,13 +38,15 @@ for recorded capabilities and validation evidence.
 Node imports support automatic detection, Clash/Mihomo providers, SIP008,
 URI/Base64 lists, sing-box JSON, and supported Surge/Quantumult X/Loon node
 lines. Native transports support typed TLS settings, VLESS/Trojan TCP/TLS/
-WebSocket transports, VLESS + REALITY, VMess TCP/TLS/WebSocket with AEAD body
+WebSocket and HTTPUpgrade transports, VLESS + REALITY and XTLS Vision flows, VMess TCP/TLS/WebSocket/HTTPUpgrade with AEAD or AES-128-CFB body
 records and single-target UDP, AnyTLS TCP plus UDP-over-TCP framing, native
 Hysteria2 TCP/UDP with Salamander and port hopping, and TUIC TCP/UDP with
-heartbeats and optional 0-RTT. Direct/SOCKS5/Shadowsocks UDP, including SS2022,
-remain available. Unsupported protocols and parameters remain explicit
-diagnostics.
-Unsupported nodes and parameters expose individual diagnostics. See the
+heartbeats. Native h2mux, yamux and smux support eligible Shadowsocks, VLESS,
+VMess, and Trojan nodes. smux FIN follows the peer's full-close semantics and
+does not provide TCP half-close compatibility. Direct/SOCKS5/Shadowsocks UDP,
+including SS2022, remain available. The REALITY adapter supports dae Chrome 133, iOS 14,
+Safari 16, Edge 85, QQ 11.1 and Firefox 120 fingerprints;
+other unsupported options produce individual diagnostics. See the
 [Transit Proxy and subscription contract](openspec/specs/transit-proxies/spec.md) for
 the exact compatibility boundaries and [deployment guide](docs/guides/deployment.md)
 for runnable configurations.
@@ -104,6 +106,7 @@ implementation or native-host validation.
 | --- | --- |
 | [Native platforms](openspec/changes/validate-native-platforms/tasks.md) | Windows/FreeBSD listeners and local control; privileged Linux transparent/TUN/eBPF checks. |
 | [Providers and runtime reliability](openspec/changes/validate-provider-and-runtime-reliability/tasks.md) | Real provider exports, independent peers, cross-machine flows, and failure/restart soak tests. |
+| [Existing proxy compatibility](openspec/changes/support-sing-box-dae-transit-protocols/tasks.md) | Complete the existing native protocols and connection options used by sing-box and dae. |
 | [Scheduling and observability](openspec/changes/complete-scheduling-and-observability/tasks.md) | Policy/class budgets, Egress coordination, typed observations, and deployed monitoring. |
 | [Native packages](openspec/changes/validate-native-packages/tasks.md) | Debian, Alpine, Arch Linux, FreeBSD, and NSIS package-host acceptance. |
 

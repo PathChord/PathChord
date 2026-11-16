@@ -787,41 +787,58 @@ impl CapacityEstimator {
         total_bytes: u64,
         now: Instant,
         active_targets: u64,
+        active_streams: u64,
     ) -> (CapacityState, u64, u64) {
-        let elapsed_ms = now.duration_since(self.last_sample_at).as_millis().max(1) as u64;
-        let delta = total_bytes.saturating_sub(self.last_total_bytes);
-        let rate_bps = delta
-            .saturating_mul(8)
-            .saturating_mul(1_000)
-            .checked_div(elapsed_ms)
-            .unwrap_or(0)
-            .min(configured_capacity_bps);
-        if delta > 0 {
-            self.last_activity_at = Some(now);
-            self.measured_samples = self.measured_samples.saturating_add(1);
-            if self.effective_capacity_bps == 0 {
-                self.effective_capacity_bps = rate_bps.max(1);
-            } else if rate_bps.saturating_mul(10_000)
-                < self.effective_capacity_bps.saturating_mul(7_500)
-            {
-                // Capacity can disappear quickly; follow a sharp decline in
-                // one sample so new work stops before queues grow.
-                self.effective_capacity_bps = rate_bps.max(1);
-            } else if rate_bps > self.effective_capacity_bps {
-                // Recovery is deliberately slow and bounded.
-                let step = (rate_bps - self.effective_capacity_bps).div_ceil(4);
-                self.effective_capacity_bps = self
-                    .effective_capacity_bps
-                    .saturating_add(step)
-                    .min(configured_capacity_bps);
+        let elapsed = now.duration_since(self.last_sample_at);
+        // Several Sessions and incoming Paths can request status in the same
+        // interval. Retain the prior rate until a complete sampling window has
+        // elapsed, then let an empty window accurately report zero wire rate.
+        if elapsed >= Duration::from_secs(1) {
+            let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+            let delta = total_bytes.saturating_sub(self.last_total_bytes);
+            let rate_bps = delta
+                .saturating_mul(8)
+                .saturating_mul(1_000)
+                .checked_div(elapsed_ms)
+                .unwrap_or(0)
+                .min(configured_capacity_bps);
+            if delta > 0 {
+                self.last_activity_at = Some(now);
+                self.measured_samples = self.measured_samples.saturating_add(1);
+                if self.effective_capacity_bps == 0 {
+                    self.effective_capacity_bps = rate_bps.max(1);
+                } else if rate_bps.saturating_mul(10_000)
+                    < self.effective_capacity_bps.saturating_mul(7_500)
+                {
+                    // Capacity can disappear quickly; follow a sharp decline
+                    // in one sample so new work stops before queues grow.
+                    self.effective_capacity_bps = rate_bps.max(1);
+                } else if rate_bps > self.effective_capacity_bps {
+                    // Recovery is deliberately slow and bounded.
+                    let step = (rate_bps - self.effective_capacity_bps).div_ceil(4);
+                    self.effective_capacity_bps = self
+                        .effective_capacity_bps
+                        .saturating_add(step)
+                        .min(configured_capacity_bps);
+                }
             }
             self.last_rate_bps = rate_bps;
+            self.last_total_bytes = total_bytes;
+            self.last_sample_at = now;
         }
-        self.last_total_bytes = total_bytes;
-        self.last_sample_at = now;
-        let stale = self
+        let mut stale = self
             .last_activity_at
             .is_some_and(|last| now.duration_since(last) > Duration::from_secs(10));
+        if stale && active_targets == 0 && active_streams == 0 {
+            // No live work can produce a new sample. Discard the expired
+            // estimate so a fresh Session can use the configured ceiling
+            // provisionally instead of remaining blocked forever.
+            self.last_activity_at = None;
+            self.effective_capacity_bps = 0;
+            self.measured_samples = 0;
+            self.last_rate_bps = 0;
+            stale = false;
+        }
         let state = if self.measured_samples == 0 {
             if active_targets == 0 {
                 CapacityState::Unknown
@@ -885,6 +902,7 @@ impl EgressStatusProvider for NodeStatusProvider {
                     self.wire_budget.total_reserved_bytes(),
                     now,
                     active_targets,
+                    active_streams,
                 )
             })
             .unwrap_or((CapacityState::Stale, 0, 0));
@@ -908,8 +926,10 @@ impl EgressStatusProvider for NodeStatusProvider {
                 AdmissionReason::None
             } else if bandwidth_utilization >= 10_000 {
                 AdmissionReason::BandwidthLimit
-            } else {
+            } else if active_targets >= maximum_connections {
                 AdmissionReason::ConnectionLimit
+            } else {
+                AdmissionReason::ResourceLimit
             },
             load_basis_points: utilization.max(bandwidth_utilization),
             connection_utilization_basis_points: utilization,
@@ -1684,21 +1704,21 @@ mod tests {
         let mut estimator = CapacityEstimator::new(start);
         let configured = 80_000;
         assert_eq!(
-            estimator.observe(configured, 0, start, 1).0,
+            estimator.observe(configured, 0, start, 1, 1).0,
             CapacityState::Provisional
         );
         assert_eq!(
             estimator
-                .observe(configured, 1_000, start + Duration::from_secs(1), 1)
+                .observe(configured, 1_000, start + Duration::from_secs(1), 1, 1)
                 .0,
             CapacityState::Provisional
         );
         let (_, measured_capacity, rate) =
-            estimator.observe(configured, 2_000, start + Duration::from_secs(2), 1);
+            estimator.observe(configured, 2_000, start + Duration::from_secs(2), 1, 1);
         assert_eq!(estimator.measured_samples, 2);
         assert_eq!(
             estimator
-                .observe(configured, 2_100, start + Duration::from_secs(3), 1)
+                .observe(configured, 2_100, start + Duration::from_secs(3), 1, 1)
                 .0,
             CapacityState::Measured
         );
@@ -1706,10 +1726,77 @@ mod tests {
         assert!(rate > 0);
         assert_eq!(
             estimator
-                .observe(configured, 2_100, start + Duration::from_secs(14), 1)
+                .observe(configured, 2_100, start + Duration::from_secs(14), 1, 1)
                 .0,
             CapacityState::Stale
         );
+        assert_eq!(
+            estimator.observe(configured, 2_100, start + Duration::from_secs(15), 0, 1),
+            (CapacityState::Stale, 0, 0)
+        );
+        assert_eq!(
+            estimator.observe(configured, 2_100, start + Duration::from_secs(16), 0, 0),
+            (CapacityState::Unknown, 0, 0)
+        );
+        assert_eq!(
+            estimator.observe(configured, 3_100, start + Duration::from_secs(17), 1, 1),
+            (CapacityState::Provisional, configured, 8_000)
+        );
+    }
+
+    #[test]
+    fn capacity_rate_decays_after_a_complete_idle_sample_window() {
+        let start = Instant::now();
+        let mut estimator = CapacityEstimator::new(start);
+        let configured = 80_000;
+        let first = estimator.observe(configured, 1_000, start + Duration::from_secs(1), 1, 1);
+        assert_eq!(first.2, 8_000);
+        let short = estimator.observe(
+            configured,
+            1_000,
+            start + Duration::from_millis(1_500),
+            1,
+            1,
+        );
+        assert_eq!(short.2, 8_000);
+        let idle = estimator.observe(configured, 1_000, start + Duration::from_secs(2), 1, 1);
+        assert_eq!(idle.2, 0);
+    }
+
+    #[test]
+    fn stale_capacity_blocks_admission_while_targets_remain_active() {
+        let now = Instant::now();
+        let previous = now - Duration::from_secs(11);
+        let observations = Arc::new(NodeObservations::default());
+        observations.active_targets.store(1, Ordering::Relaxed);
+        let mut estimator = CapacityEstimator::new(previous);
+        estimator.last_activity_at = Some(previous);
+        estimator.effective_capacity_bps = 8_000;
+        estimator.measured_samples = 2;
+        estimator.last_rate_bps = 8_000;
+        let provider = NodeStatusProvider {
+            runtime: Arc::new(Mutex::new(NodeRuntimeState::default())),
+            observations: Arc::clone(&observations),
+            status: EgressStatusConfig {
+                capacity_bps: 80_000,
+                max_inbound_target_connections: 10,
+                ..EgressStatusConfig::default()
+            },
+            wire_budget: Arc::new(WireBudget::new(80_000).unwrap()),
+            estimator: Mutex::new(estimator),
+        };
+        let stale = provider.sample();
+        assert_eq!(stale.capacity_state, CapacityState::Stale);
+        assert_eq!(stale.effective_capacity_bps, 0);
+        assert_eq!(stale.current_wire_rate_bps, 0);
+        assert!(!stale.admission_allowed);
+        assert_eq!(stale.admission_reason, AdmissionReason::ResourceLimit);
+
+        observations.active_targets.store(0, Ordering::Relaxed);
+        let idle = provider.sample();
+        assert_eq!(idle.capacity_state, CapacityState::Unknown);
+        assert!(idle.admission_allowed);
+        assert_eq!(idle.admission_reason, AdmissionReason::None);
     }
 
     #[tokio::test]
@@ -2071,6 +2158,94 @@ mod tests {
         drop(node);
         drop(store);
         std::fs::remove_file(database).expect("remove authorization database");
+    }
+
+    #[tokio::test]
+    async fn loopback_node_readmits_after_idle_capacity_expires() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let ingress_key = generate_static_keypair().expect("Ingress key");
+            let egress_key = Arc::new(generate_static_keypair().expect("Egress key"));
+            let store = Arc::new(
+                AuthorizationStore::open(
+                    ":memory:",
+                    EgressId::new("runtime-egress"),
+                    *egress_key.public(),
+                )
+                .unwrap(),
+            );
+            enroll(&store, &ingress_key);
+            let connector = EchoConnector::default();
+            let node = Arc::new(
+                EgressNode::bind(
+                    node_config(Arc::clone(&egress_key), store),
+                    connector.clone(),
+                )
+                .await
+                .unwrap(),
+            );
+            let (shutdown, shutdown_rx) = oneshot::channel();
+            let runner = tokio::spawn(run_node(Arc::clone(&node), shutdown_rx));
+            let target = TargetEndpoint {
+                hostname: b"echo.test".to_vec(),
+                port: 443,
+                resolved_addresses: Vec::new(),
+            };
+
+            let PathAdmissionOutcome::Ready(path) =
+                dial_ingress(&node, &ingress_key, &egress_key, 1, 1).await
+            else {
+                panic!("initial Path should be admitted");
+            };
+            let ingress = IngressSessionHandle::start(path).unwrap();
+            let mut stream = ingress.open_tcp(target.clone()).await.unwrap();
+            stream.write_all(b"first").await.unwrap();
+            let mut reply = [0; 5];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"first");
+            drop(stream);
+            ingress.shutdown().await.unwrap();
+            loop {
+                let snapshot = node.snapshot().unwrap();
+                if snapshot.active_sessions == 0 && snapshot.active_target_connections == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
+            // Preserve the actual wire counter while advancing the estimator's
+            // previous samples beyond their freshness period, without sleeping.
+            let total = node.status_provider.wire_budget.total_reserved_bytes();
+            assert!(total > 0);
+            let previous = Instant::now() - Duration::from_secs(11);
+            {
+                let mut estimator = node.status_provider.estimator.lock().unwrap();
+                estimator.last_sample_at = previous;
+                estimator.last_activity_at = Some(previous);
+                estimator.last_total_bytes = total;
+                estimator.measured_samples = 2;
+                estimator.effective_capacity_bps = node.config.capacity_bps;
+                estimator.last_rate_bps = node.config.capacity_bps;
+            }
+
+            let PathAdmissionOutcome::Ready(path) =
+                dial_ingress(&node, &ingress_key, &egress_key, 2, 2).await
+            else {
+                panic!("idle Egress should admit a new Path");
+            };
+            let ingress = IngressSessionHandle::start(path).unwrap();
+            let mut stream = ingress.open_tcp(target).await.unwrap();
+            stream.write_all(b"again").await.unwrap();
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"again");
+            drop(stream);
+            ingress.shutdown().await.unwrap();
+            shutdown.send(()).unwrap();
+            let snapshot = runner.await.unwrap().unwrap();
+            assert_eq!(snapshot.admitted_paths, 2);
+            connector.join().await;
+        })
+        .await
+        .expect("idle recovery should complete");
     }
 
     #[tokio::test]

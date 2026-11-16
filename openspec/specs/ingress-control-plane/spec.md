@@ -99,6 +99,15 @@ Ingress SHALL distinguish resource-limit failures from target failures and polic
 - **WHEN** a pre-admission Egress open returns `RESOURCE_LIMIT`
 - **THEN** Ingress tries another compliant Egress candidate in the captured generation when available, otherwise returns the typed retryable error
 
+### Requirement: Subscription User-Agent persists through control operations
+
+The subscription control API SHALL accept and return the configured User-Agent and persist it across restart. Legacy subscriptions without the field SHALL retain their management decisions and use the default User-Agent.
+
+#### Scenario: A managed subscription is restarted
+
+- **WHEN** a client creates a subscription with a valid User-Agent and Ingress restarts
+- **THEN** subsequent control reads and refreshes retain that value
+
 ## Detailed contract
 
 This document defines the local control plane used to operate Ingress and the
@@ -321,7 +330,8 @@ The canonical `subscriptions.create` body is:
   "source": {
     "type": "clash",
     "url": "https://example.invalid/subscription",
-    "credentials_ref": "provider-a-token"
+    "credentials_ref": "provider-a-token",
+    "user_agent": "clash.meta"
   },
   "refresh": {
     "interval_seconds": 3600,
@@ -339,7 +349,9 @@ The canonical `subscriptions.create` body is:
 `source.type` MUST be a canonical [subscription type](../transit-proxies/spec.md#subscription-document-families)
 or a documented input alias; `source.url` MUST be an
 HTTP(S) URL without embedded credentials; and `credentials_ref` MUST be an
-opaque reference rather than a secret value. Refresh and cache fields use the
+opaque reference rather than a secret value. `source.user_agent` is optional
+and follows the User-Agent bounds and default in the configuration schema.
+Refresh and cache fields use the
 same bounds as the configuration schema. `cache` MAY be null. The list read
 model returns the source type and credential reference without resolving the
 secret. Since URL paths, queries, and fragments can contain credentials,

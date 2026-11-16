@@ -19,6 +19,7 @@ pub use service_config::{EgressServiceSpec, NodeProbePolicySpec};
 
 pub use transit_options::{
     TransitMultiplex, TransitOptions, TransitReality, TransitTls, TransitTransport,
+    TransitVmessOptions, parse_certificate_sha256,
 };
 
 pub use compiled::{
@@ -240,6 +241,18 @@ pub struct SubscriptionSource {
     pub source_type: SubscriptionSourceType,
     pub url: String,
     pub credentials_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+}
+
+pub const DEFAULT_SUBSCRIPTION_USER_AGENT: &str = "clash.meta";
+
+/// Keep configured User-Agent values bounded and valid as HTTP header values.
+#[must_use]
+pub fn valid_subscription_user_agent(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 1024
+        && value.bytes().all(|byte| (b' '..=b'~').contains(&byte))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -888,6 +901,17 @@ fn validate_subscription(subscription: &SubscriptionConfig) -> Result<(), Valida
         return Err(ValidationError::InvalidSubscription {
             subscription_id: subscription.id.as_str().to_owned(),
             reason: "source URL must use HTTP(S) without embedded credentials",
+        });
+    }
+    if subscription
+        .source
+        .user_agent
+        .as_deref()
+        .is_some_and(|value| !valid_subscription_user_agent(value))
+    {
+        return Err(ValidationError::InvalidSubscription {
+            subscription_id: subscription.id.as_str().to_owned(),
+            reason: "source User-Agent is invalid",
         });
     }
     let refresh = &subscription.refresh;

@@ -4,9 +4,12 @@ exclude = ["vendor/netlink-packet-utils"]
 resolver = "3"
 
 [patch.crates-io]
-# REALITY needs a narrowly scoped ClientHello hook that upstream rustls does
-# not expose. The local fork only adds that callback and X25519 secret seam.
+# REALITY needs ClientHello and key-exchange seams not exposed by upstream.
+# See vendor/rustls/PATHCHORD-PATCH.md for the patch and verification scope.
 rustls = { path = "vendor/rustls" }
+# Hysteria2 Brutal needs per-packet pacing and loss notifications.
+# See vendor/quinn-proto/PATHCHORD-PATCH.md for the patch and scope.
+quinn-proto = { path = "vendor/quinn-proto" }
 # netsock's Netlink dependencies require the 0.5 API. Keep its source intact
 # while replacing the unmaintained paste macro dependency with pastey.
 netlink-packet-utils = { path = "vendor/netlink-packet-utils" }
@@ -48,7 +51,7 @@ serde_json = "1.0.145"
 # Preserve the `serde_yaml` source namespace while using the maintained,
 # pure-Rust compatibility facade; keep its parser and facade lockstep-pinned.
 serde_yaml = { package = "noyalib-serde-yaml", version = "=0.0.60" }
-shadowsocks = { version = "1.25.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "aead-cipher-extra"] }
+shadowsocks = { version = "1.25.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "aead-cipher-extra", "stream-cipher"] }
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 subtle = "2.6.1"

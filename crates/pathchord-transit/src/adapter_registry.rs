@@ -60,6 +60,7 @@ where
             "socks5",
             "ss",
             "vless",
+            "xtls",
             "trojan",
             "vmess",
             "anytls",
@@ -164,6 +165,75 @@ where
         config: &TransitProxyConfig,
         credential: &TransitCredential,
     ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
+        let mut normalized = config.clone();
+        if normalized.protocol == "xtls" {
+            if crate::vision::VisionFlow::parse(credential.field("flow"))
+                .map_err(|reason| TransitError::Unsupported(reason.to_owned()))?
+                .is_none()
+            {
+                return Err(TransitError::Unsupported(
+                    "XTLS alias requires a supported Vision flow".to_owned(),
+                ));
+            }
+            normalized.protocol = "vless".to_owned();
+        }
+        let multiplex = normalized
+            .options
+            .multiplex
+            .clone()
+            .filter(|option| option.enabled);
+        if multiplex.is_some() {
+            if !matches!(
+                normalized.protocol.as_str(),
+                "ss" | "vless" | "vmess" | "trojan"
+            ) {
+                return Err(TransitError::Unsupported(
+                    "multiplex is not supported for this Transit protocol".into(),
+                ));
+            }
+            if normalized.options.udp_over_tcp.is_some()
+                || normalized.options.packet_encoding.is_some()
+            {
+                return Err(TransitError::Unsupported(
+                    "multiplex conflicts with the configured UDP encoding".into(),
+                ));
+            }
+            normalized.options.multiplex = None;
+        }
+        let config = &normalized;
+        if let Some(tls) = config.options.tls.as_ref()
+            && tls
+                .fingerprint
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("android"))
+        {
+            if tls.reality.is_some()
+                || config.protocol == "vless"
+                    && credential
+                        .field("flow")
+                        .is_some_and(|flow| !flow.is_empty())
+            {
+                return Err(TransitError::Unsupported(
+                    "Android fingerprint supports TLS 1.2 only; Vision and REALITY require TLS 1.3"
+                        .into(),
+                ));
+            }
+            if !tls.alpn.is_empty() {
+                return Err(TransitError::Unsupported(
+                    "Android TLS fingerprint cannot carry ALPN".into(),
+                ));
+            }
+            if config
+                .options
+                .transport
+                .as_ref()
+                .is_some_and(|transport| transport.kind != "tcp")
+            {
+                return Err(TransitError::Unsupported(
+                    "Android TLS fingerprint cannot use transports requiring ALPN".into(),
+                ));
+            }
+        }
         let adapter: Arc<dyn TransitAdapter> = match config.protocol.as_str() {
             "direct" => {
                 validate_native_options(config, false, false, true)?;
@@ -251,12 +321,6 @@ where
                 self.connect_timeout,
                 Arc::clone(&self.tls),
             )?),
-            "xtls" => {
-                return Err(TransitError::AdapterUnavailable {
-                    protocol: "xtls".to_owned(),
-                    reason: "XTLS Vision requires an encrypting outer transport not represented by the v1 config",
-                });
-            }
             protocol => {
                 return Err(TransitError::AdapterUnavailable {
                     protocol: protocol.to_owned(),
@@ -264,14 +328,31 @@ where
                 });
             }
         };
-        Ok(adapter)
+        if let Some(multiplex) = multiplex {
+            let allow_udp_443 = config.protocol != "vless"
+                || !crate::vision::VisionFlow::parse(credential.field("flow"))
+                    .map_err(|reason| TransitError::Unsupported(reason.to_owned()))?
+                    .is_some_and(|flow| !flow.allow_udp_443);
+            Ok(Arc::new(crate::sing_mux::MultiplexAdapter::new(
+                adapter,
+                &multiplex,
+                config.options.udp != Some(false),
+                allow_udp_443,
+                self.connect_timeout,
+            )?))
+        } else {
+            Ok(adapter)
+        }
     }
 
     pub fn build_dynamic(
         &self,
         node: &DynamicTransitNode,
     ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
-        if node.state != DynamicNodeState::Active {
+        if !matches!(
+            node.state,
+            DynamicNodeState::Pending | DynamicNodeState::Active
+        ) {
             return Err(TransitError::AdapterUnavailable {
                 protocol: node.config.protocol.clone(),
                 reason: "dynamic Transit node is not active",
@@ -280,6 +361,24 @@ where
         let credential = TransitCredential::new(node.credential().fields());
         self.build_with_credential(&node.config, &credential)
     }
+
+    pub(crate) async fn prepare_dynamic(
+        &self,
+        node: &DynamicTransitNode,
+    ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
+        let adapter = self.build_dynamic(node)?;
+        prepare_adapter(adapter.as_ref(), self.connect_timeout).await?;
+        Ok(adapter)
+    }
+}
+
+pub(crate) async fn prepare_adapter(
+    adapter: &dyn TransitAdapter,
+    duration: Duration,
+) -> Result<(), TransitError> {
+    tokio::time::timeout(duration, adapter.prepare())
+        .await
+        .map_err(|_| TransitError::Connection("Transit adapter preparation timed out".into()))?
 }
 
 fn nonempty_credential(credential: &TransitCredential) -> Option<&TransitCredential> {
@@ -359,6 +458,8 @@ pub(crate) fn validate_native_options(
         || options.bind_interface.is_some()
         || options.routing_mark.is_some()
         || options.packet_encoding.is_some()
+        || options.udp_over_tcp.is_some() && !matches!(config.protocol.as_str(), "socks5" | "ss")
+        || options.vmess.is_some()
     {
         return Err(TransitError::Unsupported(
             "node options require a compatible configured outbound engine".into(),
@@ -374,6 +475,64 @@ mod tests {
     use pathchord_policy::{Endpoint, TransitProxyId};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn adapter_preparation_timeout_and_abort_cancel_the_pending_operation() {
+        struct BlockingAdapter {
+            cancelled: Arc<std::sync::atomic::AtomicBool>,
+            entered: Arc<tokio::sync::Notify>,
+        }
+        struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        #[async_trait]
+        impl TransitAdapter for BlockingAdapter {
+            fn metadata(&self) -> &crate::TransitMetadata {
+                panic!("not used")
+            }
+            async fn prepare(&self) -> Result<(), TransitError> {
+                let _signal = DropSignal(Arc::clone(&self.cancelled));
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+            async fn connect(
+                &self,
+                _: crate::ConnectRequest,
+            ) -> Result<crate::BoxedTransitConnection, TransitError> {
+                panic!("not used")
+            }
+        }
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adapter = BlockingAdapter {
+            cancelled: Arc::clone(&cancelled),
+            entered: Arc::new(tokio::sync::Notify::new()),
+        };
+        assert!(
+            prepare_adapter(&adapter, Duration::from_millis(20))
+                .await
+                .is_err()
+        );
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let adapter = Arc::new(BlockingAdapter {
+            cancelled: Arc::clone(&cancelled),
+            entered: Arc::clone(&entered),
+        });
+        let task =
+            tokio::spawn(
+                async move { prepare_adapter(adapter.as_ref(), Duration::from_secs(2)).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     struct Credentials {
         requested: Mutex<Vec<String>>,
@@ -525,6 +684,30 @@ mod tests {
                     .supports_udp()
             );
         }
+    }
+
+    #[test]
+    fn xtls_alias_requires_an_explicit_supported_vision_flow() {
+        let registry = registry(Arc::new(Credentials {
+            requested: Mutex::new(Vec::new()),
+        }));
+        let mut node = config("xtls");
+        node.options.tls = Some(pathchord_policy::TransitTls {
+            enabled: true,
+            ..Default::default()
+        });
+        let mut fields =
+            BTreeMap::from([("uuid".into(), "6cbf3f72-3417-4922-bde6-67820d041f25".into())]);
+        assert!(matches!(
+            registry.build_with_credential(&node, &TransitCredential::new(fields.clone())),
+            Err(TransitError::Unsupported(_))
+        ));
+        fields.insert("flow".into(), crate::vision::FLOW_VISION_UDP443.into());
+        assert!(
+            registry
+                .build_with_credential(&node, &TransitCredential::new(fields))
+                .is_ok()
+        );
     }
 
     #[tokio::test]

@@ -251,7 +251,7 @@ enum KeyExchangeChoice {
 }
 
 impl KeyExchangeChoice {
-    /// Decide between `our_key_share` or `our_key_share.hybrid_component()`
+    /// Decide between `our_key_share` or `our_key_share.alternate_key_share()`
     /// based on the selection of the server expressed in `their_key_share`.
     fn new(
         config: &Arc<ClientConfig>,
@@ -264,7 +264,7 @@ impl KeyExchangeChoice {
         }
 
         let (component_group, _) = our_key_share
-            .hybrid_component()
+            .alternate_key_share()
             .ok_or(())?;
 
         if component_group != their_key_share.group {
@@ -284,7 +284,7 @@ impl KeyExchangeChoice {
     fn complete(self, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
         match self {
             Self::Whole(akx) => akx.complete(peer_pub_key),
-            Self::Component(akx) => akx.complete_hybrid_component(peer_pub_key),
+            Self::Component(akx) => akx.complete_alternate_key_share(peer_pub_key),
         }
     }
 }
@@ -450,7 +450,14 @@ fn validate_encrypted_extensions(
     common: &mut CommonState,
     hello: &ClientHelloDetails,
     exts: &ServerExtensions<'_>,
+    unsupported_alps: Option<u16>,
 ) -> Result<(), Error> {
+    if unsupported_alps.is_some_and(|extension| exts.unknown_extensions.contains(&extension)) {
+        return Err(common.send_fatal_alert(
+            AlertDescription::UnsupportedExtension,
+            Error::General("ClientHello profile server ALPS is unsupported".into()),
+        ));
+    }
     if hello.server_sent_unsolicited_extensions(exts, &[]) {
         return Err(common.send_fatal_alert(
             AlertDescription::UnsupportedExtension,
@@ -497,7 +504,15 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         debug!("TLS1.3 encrypted extensions: {exts:?}");
         self.transcript.add_message(&m);
 
-        validate_encrypted_extensions(cx.common, &self.hello, exts)?;
+        let unsupported_alps = match self.config.client_hello_profile {
+            Some(super::ClientHelloProfile::Chrome133 | super::ClientHelloProfile::Chrome133Classic) => Some(0x44cd),
+            Some(super::ClientHelloProfile::Qq111) => Some(0x4469),
+            _ => None,
+        };
+        validate_encrypted_extensions(cx.common, &self.hello, exts, unsupported_alps)?;
+        if let Some(limit) = exts.record_size_limit {
+            hs::apply_record_size_limit(cx.common, limit, ProtocolVersion::TLSv1_3, self.config.max_fragment_size)?;
+        }
         hs::process_alpn_protocol(
             cx.common,
             &self.hello.alpn_protocols,
@@ -1118,6 +1133,20 @@ impl State<ClientConnectionData> for ExpectCertificate {
                 InvalidMessage::InvalidCertRequest,
             ));
         }
+
+        // The profile's SCT request applies to the end-entity X.509
+        // certificate.  Never accept it unsolicited, on an intermediate, or
+        // in a raw-public-key handshake.  The chain, signature and Finished
+        // verification below remain unchanged.
+        cert_chain
+            .validate_sct_extensions(
+                cx.data.offered_profile_sct,
+                self.config.verifier.requires_raw_public_keys(),
+            )
+            .map_err(|err| {
+                cx.common
+                    .send_fatal_alert(AlertDescription::UnsupportedExtension, err)
+            })?;
 
         let end_entity_ocsp = cert_chain.end_entity_ocsp().to_vec();
         let server_cert = ServerCertDetails::new(

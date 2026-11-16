@@ -469,7 +469,8 @@ async fn received_drain_deadline_closes_a_path_with_an_unacknowledged_open() {
         &mut sequence,
         Message::PathDrain(PathDrain {
             drain_reason: 1,
-            deadline_ms: 50,
+            // Keep the Path draining across at least one health tick.
+            deadline_ms: 300,
         }),
     )
     .await;

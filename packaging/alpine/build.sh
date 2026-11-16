@@ -52,6 +52,7 @@ cp "$root_dir/packaging/common/pathchord.1" "$work/pathchord.1"
 cp "$root_dir/packaging/common/default-config.yaml" "$work/default-config.yaml"
 cp "$root_dir/packaging/alpine/pathchord.initd" "$work/pathchord.initd"
 cp "$root_dir/packaging/alpine/pathchord-egress.initd" "$work/pathchord-egress.initd"
+cp "$root_dir/packaging/alpine/pathchord.pre-install" "$work/pathchord.pre-install"
 
 cat >"$work/APKBUILD" <<'EOF'
 pkgname=pathchord
@@ -65,6 +66,7 @@ depends=""
 makedepends=""
 pkgusers="pathchord"
 pkggroups="pathchord"
+install="$pkgname.pre-install"
 source="pathchord LICENSE pathchord.1 default-config.yaml pathchord.initd pathchord-egress.initd"
 sha256sums="
 SKIP
@@ -94,7 +96,7 @@ sed -i \
 	-e "s/__PATHCHORD_ARCH__/$arch/g" \
 	"$work/APKBUILD"
 
-(cd "$work" && SRCDEST="$work" abuild -r)
+(cd "$work" && SRCDEST="$work" abuild checksum && SRCDEST="$work" abuild -r)
 package=$(find "$work" "${HOME:-/nonexistent}/packages" -type f \
 	-name 'pathchord-*.apk' -print 2>/dev/null | sort | tail -n 1)
 if [ -z "$package" ]; then

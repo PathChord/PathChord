@@ -82,6 +82,7 @@ pub(super) async fn normalize_fetched(
                     .then(|| config.source.credentials_ref.clone())
                     .flatten()
             }),
+            user_agent: config.source.user_agent.clone(),
             timeout: Duration::from_secs(config.refresh.timeout_seconds.clamp(1, 300)),
             max_bytes: budget.remaining(),
         });

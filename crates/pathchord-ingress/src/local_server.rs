@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::read_object;
 use crate::{
     LocalControlDispatcher, LocalProtocolError, RequestEnvelope, read_object_with_deadlines,

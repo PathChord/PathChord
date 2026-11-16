@@ -125,11 +125,30 @@ async fn run_core(core: CoreKind) {
         ],
     };
     for protocol in protocols {
-        run_protocol(core, protocol).await;
+        if matches!(protocol, Protocol::Vmess) {
+            // Current Xray removed its plaintext VMess server modes; the
+            // other peers still accept and test these explicit choices.
+            let securities: &[&str] = if matches!(core, CoreKind::Xray) {
+                &["aes-128-gcm", "chacha20-poly1305"]
+            } else {
+                &[
+                    "aes-128-gcm",
+                    "chacha20-poly1305",
+                    "aes-128-cfb",
+                    "none",
+                    "zero",
+                ]
+            };
+            for &security in securities {
+                run_protocol(core, protocol, Some(security)).await;
+            }
+        } else {
+            run_protocol(core, protocol, None).await;
+        }
     }
 }
 
-async fn run_protocol(core: CoreKind, protocol: Protocol) {
+async fn run_protocol(core: CoreKind, protocol: Protocol, vmess_security: Option<&str>) {
     let binary = PathBuf::from(
         std::env::var_os(core.env_name())
             .unwrap_or_else(|| panic!("{} is required", core.env_name())),
@@ -205,7 +224,7 @@ async fn run_protocol(core: CoreKind, protocol: Protocol) {
         [&config],
     )
     .unwrap();
-    let credentials = credentials(protocol);
+    let credentials = credentials(protocol, vmess_security);
     let adapter = registry
         .build_with_credential(&config, &credentials)
         .unwrap_or_else(|error| {
@@ -258,7 +277,11 @@ async fn run_protocol(core: CoreKind, protocol: Protocol) {
         .await
         .unwrap_or_else(|_| panic!("{} {} client read timeout", core.label(), protocol.label()))
         .unwrap_or_else(|error| {
-            panic!("{} {} client read: {error}", core.label(), protocol.label())
+            panic!(
+                "{} {} client read ({vmess_security:?}): {error}",
+                core.label(),
+                protocol.label()
+            )
         });
     assert_eq!(&echoed, payload);
     drop(connection);
@@ -271,7 +294,7 @@ async fn run_protocol(core: CoreKind, protocol: Protocol) {
     }
 }
 
-fn credentials(protocol: Protocol) -> TransitCredential {
+fn credentials(protocol: Protocol, vmess_security: Option<&str>) -> TransitCredential {
     match protocol {
         Protocol::Shadowsocks => TransitCredential::new(BTreeMap::from([
             ("cipher".to_owned(), "aes-256-gcm".to_owned()),
@@ -285,7 +308,12 @@ fn credentials(protocol: Protocol) -> TransitCredential {
                 "uuid".to_owned(),
                 "6cbf3f72-3417-4922-bde6-67820d041f25".to_owned(),
             ),
-            ("security".to_owned(), "aes-128-gcm".to_owned()),
+            (
+                "security".to_owned(),
+                vmess_security
+                    .expect("VMess security is supplied")
+                    .to_owned(),
+            ),
             ("alter_id".to_owned(), "0".to_owned()),
         ])),
         Protocol::Vless => TransitCredential::new(BTreeMap::from([(

@@ -69,7 +69,12 @@ Ingress 必须（SHALL）先选择命令行配置，再选择环境配置和账�
 
 ### Requirement: Validated adapter options
 
-Transit Proxy 配置必须（SHALL）保留类型化连接选项，并验证所选适配器支持这些选项。适配器不得（SHALL NOT）忽略不支持的连接选项或静默降级 TLS；未知 YAML 选项字段必须（SHALL）拒绝。
+Transit Proxy 配置必须（SHALL）保留类型化连接选项，并验证所选适配器支持这些选项。支持 TLS 的适配器必须默认加载系统根证书，接受有序本地 PEM/DER truststore 来源列表，并在任一配置来源无效时原子拒绝候选；未知 YAML 选项字段必须拒绝。
+
+#### Scenario: Custom truststore sources are configured
+
+- **WHEN** TLS 节点将 truststore 来源配置为 `system` 和本地 PEM/DER 文件
+- **THEN** 适配器使用这些来源的并集，从选定配置来源解析相对路径，并在任一来源不可读或无效时拒绝候选
 
 #### Scenario: Adapter cannot consume a connection option
 
@@ -102,6 +107,15 @@ Schema SHALL 区分配置的 aggregate wire 硬上限、运行时有效容量和
 
 - **WHEN** Egress 启动时没有足够新鲜的容量测量
 - **THEN** 配置上限仍是硬上限，有效容量报告为 provisional 或 unknown，不能伪造 measured
+
+### Requirement: Subscription User-Agent is bounded
+
+Subscription 来源 SHALL 接受可选 `userAgent` 字段。其值 SHALL 是非空白的可打印 ASCII HTTP header 值，最多 1024 字节。省略时 SHALL 使用 Transit 契约规定的默认值。
+
+#### Scenario: User-Agent contains a line break
+
+- **WHEN** Subscription 声明的 User-Agent 包含换行符
+- **THEN** 配置验证拒绝候选配置集合
 
 ## Detailed contract
 
@@ -246,7 +260,8 @@ spec:
 ```
 
 节点 protocol 遵循[适配器契约](../transit-proxies/spec.zh-CN.md#适配器选择与失败)，可执行支持必须单独验证。
-`options` 默认 `{}`，包含类型化 TLS、transport、header、UDP、multiplex 和拨号选项。
+`options` 默认 `{}`，包含类型化 TLS、transport、header、UDP、SOCKS5/SS `udpOverTcp`、
+VMess 帧、multiplex 和拨号选项。
 `source.type` 遵循[订阅文档类型](../transit-proxies/spec.zh-CN.md#订阅文档类型)，包括 `static`、`auto`、
 `clash`、`sip008`、`uri`、`sing_box`、`surge`、`quantumult` 和 `loon`；非 static 来源必须引用现有 Subscription。
 导入的 source、observed 和 quota 属性由运行时拥有，不能写入 Proxy spec。`direct` 没有第三方端点，
@@ -269,6 +284,7 @@ spec:
     type: clash
     url: https://example.invalid/subscription
     credentialsRef: provider-a-token
+    userAgent: clash.meta
   refresh:
     intervalSeconds: 3600
     timeoutSeconds: 30
@@ -281,7 +297,8 @@ spec:
 
 `enabled` 默认 true；intervalSeconds 默认 3600 且范围 `60..=604800`；timeoutSeconds 默认 30 且范围
 `1..=300`；maxAttempts 默认 3 且范围 `1..=10`；backoffSeconds 默认 5 且范围 `1..=3600`；
-maxAgeSeconds 默认 86400 且范围 `60..=2592000`。URL 不得包含凭据。刷新先验证文档与每个节点再发布；
+maxAgeSeconds 默认 86400 且范围 `60..=2592000`。`source.userAgent` 可选，默认 `clash.meta`，
+必须是非空白且不超过 1024 字节的可打印 ASCII 值。URL 不得包含凭据。刷新先验证文档与每个节点再发布；
 无效或不支持节点保持可见且不可选，有效节点仍可发布；文档格式错误或获取失败保留上一快照。刷新失败
 保留上一成功快照，记录类型化错误并使用有界指数退避。删除或禁用订阅会阻止后续刷新，仅由该来源导入
 的节点进入排空并排除新选择。成功刷新发布一个动态代次，失败不发布代次。
@@ -307,9 +324,10 @@ TrafficPolicy spec 支持 `scheduler`（默认 `effectiveCapacityWeighted`）、
 （默认 0）、可选 `classReplicationBudgetBps`、`retransmissionReplication`（默认 disabled）以及
 `classes`（priority/share 映射）。预算不得超过 `10^12`，priority 为 `0..=255`，share 为 `1..=1_000_000`。
 Session 预算是硬上限且包含控制流量；调度器应用关系权重、billing 倍率、有效容量、拥塞窗口、RTT、抖动和丢包，
-`TransitRule.spec.trafficClassRef` 可以将准入 flow 分配到所选 `TrafficPolicy.classes` 中的一个 key。未知类别引用属于验证错误；缺少引用时使用默认类别。
-
 不得超过 Path 的流控上报限制。
+
+`TransitRule.spec.trafficClassRef` 可以将准入 flow 分配到所选 `TrafficPolicy.classes` 中的一个 key。
+未知类别引用属于验证错误；缺少引用时使用默认类别。
 
 ### Listener
 

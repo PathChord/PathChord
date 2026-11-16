@@ -54,7 +54,86 @@ Resources refer to one another by `metadata.name` within their namespace. Names 
 
 Store private identities, node/listener credential JSON, subscription caches, and the service data directory outside the resource tree. The directory loader also reads JSON, so placing a private JSON document among configuration resources can make the bundle invalid. Use opaque `credentialsRef` values to refer to the local credential store. Keep passwords and subscription tokens out of committed examples; treat provider URLs that contain credentials as private configuration.
 
+Subscription servers may return different formats for different HTTP clients.
+Set the optional `spec.source.userAgent` on a Subscription to the value your
+provider expects; it defaults to `clash.meta`. Changing it triggers a new
+source refresh and prevents reuse of cached content fetched with another value.
+
 The [deployment guide](deployment.md) explains credential-file setup. The [Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md) defines which adapter consumes each option and how unsupported nodes are reported. Check individual node diagnostics after importing a subscription; an imported protocol name alone does not establish that the node is usable.
+
+For Hysteria2 Gecko, optional private credential fields
+`gecko_min_packet_size` and `gecko_max_packet_size` select the long-header
+fragment padding range; omitted or zero values use 512 and 1200 bytes. The
+peer must accept the chosen wire size. In local tests, sing-box 1.14.4 peers
+could exchange fixed 1452-byte Gecko packets but their 2048-byte setting did
+not complete a handshake; an independent sing-quic relay did accept 2048.
+The chosen size must also fit the network path. On Linux, PathChord's QUIC
+socket disables IP fragmentation; with a 1500-byte MTU and no additional
+encapsulation, UDP payloads above 1472 bytes over IPv4 or 1452 bytes over IPv6
+do not fit. Such Gecko fragments can be dropped and appear as a handshake
+timeout. Tunnels or smaller path MTUs can require lower settings. The local
+2048-byte relay test used loopback and does not verify a 1500-byte path.
+
+For SOCKS5 or Shadowsocks UDP-over-TCP, set `spec.options.udpOverTcp` to `1` or
+`2`; omit it for the adapter's ordinary UDP transport. When an imported Clash
+node enables UDP-over-TCP without a version it uses v1; an imported sing-box
+node uses v2. Ensure UDP is enabled on the node. For VMess, `spec.options.vmess.globalPadding` and
+`authenticatedLength` enable the corresponding AEAD framing options. A Meek
+node uses `spec.options.transport.type: meek` and a private `meek_url` field in
+its credential JSON. An HTTP CONNECT request path likewise belongs in the
+private `http_path` credential field. Keep these URLs and paths out of public
+resource documents.
+
+To use native multiplexing for a Shadowsocks, VLESS, VMess, or Trojan node,
+set `spec.options.multiplex.enabled: true` and select `h2mux`, `yamux`, or `smux` in
+`spec.options.multiplex.protocol`; omission selects `h2mux`. Multiplex cannot
+be combined with explicit `packetEncoding` or `udpOverTcp`; set
+`spec.options.multiplex.padding: true` when the peer requires sing-mux padding.
+An unavailable combination is reported in the node diagnostic. Imported
+Clash/Mihomo and sing-box VLESS nodes normally default to XUDP, but when they
+enable multiplex its UDP framing is used. For an authored VLESS node without
+multiplex, omitting `packetEncoding` selects plain VLESS UDP, or XUDP when a
+Vision flow is set. Vision cannot use `packetaddr`; use the
+`xtls-rprx-vision-udp443` flow when the node must carry UDP to port 443.
+If a multiplexed UDP association closes before the peer confirms it, close
+reports an error even though a sent datagram may already have arrived.
+
+Use `smux` only when its full-close behavior fits the application: a FIN does
+not provide a reliable TCP write-half close, and a response sent by the target
+after that FIN may not arrive. Each smux session supports up to 256 streams and
+has separate 4 MiB receive and transmit queue budgets. A slow receiver can be
+closed with a resource error and FIN to keep other streams moving. An active
+stream on a stalled carrier needs cancellation by its caller or a higher-level
+timeout. After the last stream is released, pending I/O shares a ten-second
+drain deadline. See the
+[Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md) for
+the full limits and failure behavior.
+
+For Hysteria2, `up_mbps` and `down_mbps` are optional nonnegative integer Mbps
+fields in the private credential. `down_mbps` is a receive-rate hint that the
+server can ignore. The upload setting participates in authentication: with
+`up_mbps: 10`, a numeric server response of zero selects a 10 Mbps Brutal
+target, while a positive response selects the smaller rate. If `up_mbps` is
+omitted or zero, the client uses BBR even when the server supplies a positive
+rate. The client's BBR is also used when the server responds `auto`, regardless
+of `up_mbps`.
+
+Trojan-Go share links are normalized to the native Trojan adapter. Original/TCP,
+WebSocket, gRPC and HTTPUpgrade forms are supported within the tested option
+set. WebSocket SS encryption uses private `trojan_go_ss_method` and
+`trojan_go_ss_password` credentials and supports AES-128-GCM, AES-256-GCM and
+ChaCha20-IETF-Poly1305. Original/TCP with this encryption remains unavailable:
+the reference Trojan-Go server's HTTP request sniffing can wait indefinitely on
+short encrypted streams. Unsupported combinations remain unavailable with a
+diagnostic.
+
+Brutal compensates for packet loss and can pace ordinary QUIC data up to 1.25
+times its target. PTO probes and ACK-only packets can bypass pacing, and bursts
+and outer-protocol overhead add further traffic. The setting is therefore
+neither a strict physical bandwidth cap nor a guaranteed throughput; very
+short RTTs and ACK timing can also reduce the achieved rate. See the
+[Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md) for the
+complete negotiation rules and option boundaries.
 
 ## Configure Egress resource ceilings
 

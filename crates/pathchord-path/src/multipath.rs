@@ -128,6 +128,12 @@ pub struct PathSchedule {
     pub score: u128,
 }
 
+#[derive(Clone, Copy)]
+enum SchedulePurpose {
+    Admission,
+    Existing,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamRetransmission {
     pub path_id: PathId,
@@ -340,9 +346,34 @@ impl MultipathSession {
             .collect()
     }
 
+    pub(crate) fn existing_path_ids(&self) -> Vec<PathId> {
+        self.paths
+            .iter()
+            .filter(|(path_id, path)| self.path_can_carry_existing(**path_id, path))
+            .map(|(path_id, _)| *path_id)
+            .collect()
+    }
+
+    pub(crate) fn has_admissible_path(
+        &self,
+        eligible: Option<&BTreeMap<PathId, u32>>,
+        require_fresh_status: bool,
+    ) -> bool {
+        self.paths.iter().any(|(path_id, path)| {
+            eligible.is_none_or(|paths| paths.contains_key(path_id))
+                && (!require_fresh_status || path.status.latest().is_some())
+                && self.path_is_schedulable_by_id(*path_id, path)
+                && quality_exclusion(&path.observation).is_none()
+        })
+    }
+
     #[must_use]
     pub fn path_states(&self) -> BTreeMap<PathId, PathState> {
         self.lifecycle.path_states()
+    }
+
+    pub(crate) fn is_draining(&self, path_id: PathId) -> bool {
+        self.lifecycle.path_state(path_id) == Some(PathState::Draining)
     }
 
     /// Drain lifecycle events emitted by the Session/Path owner.
@@ -666,7 +697,7 @@ impl MultipathSession {
         direction: ScheduleDirection,
         bytes: usize,
     ) -> Result<PathSchedule, MultipathError> {
-        self.schedule_excluding(direction, bytes, None, None)
+        self.schedule_excluding(direction, bytes, None, None, SchedulePurpose::Admission)
     }
 
     pub fn schedule_eligible(
@@ -675,7 +706,36 @@ impl MultipathSession {
         bytes: usize,
         eligible: &BTreeMap<PathId, u32>,
     ) -> Result<PathSchedule, MultipathError> {
-        self.schedule_excluding(direction, bytes, None, Some(eligible))
+        self.schedule_excluding(
+            direction,
+            bytes,
+            None,
+            Some(eligible),
+            SchedulePurpose::Admission,
+        )
+    }
+
+    pub(crate) fn schedule_existing(
+        &mut self,
+        direction: ScheduleDirection,
+        bytes: usize,
+    ) -> Result<PathSchedule, MultipathError> {
+        self.schedule_excluding(direction, bytes, None, None, SchedulePurpose::Existing)
+    }
+
+    pub(crate) fn schedule_existing_eligible(
+        &mut self,
+        direction: ScheduleDirection,
+        bytes: usize,
+        eligible: &BTreeMap<PathId, u32>,
+    ) -> Result<PathSchedule, MultipathError> {
+        self.schedule_excluding(
+            direction,
+            bytes,
+            None,
+            Some(eligible),
+            SchedulePurpose::Existing,
+        )
     }
 
     pub fn retain_stream_data(
@@ -769,8 +829,13 @@ impl MultipathSession {
                 .ok_or(MultipathError::ConflictingRetainedRange)?;
             retained.data.data.len() as u64
         };
-        let schedule =
-            self.schedule_excluding(direction, length as usize, excluded_path, eligible)?;
+        let schedule = self.schedule_excluding(
+            direction,
+            length as usize,
+            excluded_path,
+            eligible,
+            SchedulePurpose::Existing,
+        )?;
         let retained = self
             .retained
             .get_mut(&key)
@@ -814,8 +879,13 @@ impl MultipathSession {
         let charge = (data.data.len() as u64).saturating_add(REPLICATION_COPY_OVERHEAD_BYTES);
         let (session_next, stream_next, class_next) =
             self.replication_totals(stream_id, &class, charge, stream_budget, class_budget)?;
-        let schedule =
-            self.schedule_excluding(direction, data.data.len(), excluded_path, eligible)?;
+        let schedule = self.schedule_excluding(
+            direction,
+            data.data.len(),
+            excluded_path,
+            eligible,
+            SchedulePurpose::Existing,
+        )?;
         self.session_replication_used = session_next;
         self.stream_replication_used.insert(stream_id, stream_next);
         self.class_replication_used.insert(class, class_next);
@@ -950,6 +1020,7 @@ impl MultipathSession {
         bytes: usize,
         excluded: Option<PathId>,
         eligible: Option<&BTreeMap<PathId, u32>>,
+        purpose: SchedulePurpose,
     ) -> Result<PathSchedule, MultipathError> {
         if self.lifecycle.session_state() == SessionState::Closed {
             return Err(MultipathError::SessionClosed);
@@ -960,7 +1031,12 @@ impl MultipathSession {
             .filter(|(path_id, path)| {
                 Some(**path_id) != excluded
                     && eligible.is_none_or(|eligible| eligible.contains_key(path_id))
-                    && self.path_is_schedulable_by_id(**path_id, path)
+                    && match purpose {
+                        SchedulePurpose::Admission => {
+                            self.path_is_schedulable_by_id(**path_id, path)
+                        }
+                        SchedulePurpose::Existing => self.path_can_carry_existing(**path_id, path),
+                    }
                     && quality_exclusion(&path.observation).is_none()
             })
             .map(|(path_id, path)| {
@@ -1002,6 +1078,18 @@ impl MultipathSession {
     }
 
     fn path_is_schedulable_by_id(&self, path_id: PathId, path: &ManagedPath) -> bool {
+        if !self.path_can_carry_existing(path_id, path) {
+            return false;
+        }
+        let Some(status) = path.status.latest() else {
+            return !self.config.require_fresh_status_report;
+        };
+        status.admission_allowed
+            && status.sample_age_ms.saturating_add(path.status_elapsed_ms)
+                <= status.expires_after_ms
+    }
+
+    fn path_can_carry_existing(&self, path_id: PathId, path: &ManagedPath) -> bool {
         if !self
             .lifecycle
             .path_state(path_id)
@@ -1013,16 +1101,13 @@ impl MultipathSession {
             return false;
         }
         let Some(status) = path.status.latest() else {
-            return !self.config.require_fresh_status_report;
+            return true;
         };
         status.connected
-            && status.admission_allowed
             && matches!(
                 status.service_state,
                 EgressServiceState::Up | EgressServiceState::Degraded
             )
-            && status.sample_age_ms.saturating_add(path.status_elapsed_ms)
-                <= status.expires_after_ms
     }
 }
 
@@ -1593,7 +1678,7 @@ mod tests {
         session
             .add_path(PathId::new(1), observation(1_000, 10, 0))
             .unwrap();
-        let report = StatusReport {
+        let mut report = StatusReport {
             connected: true,
             service_state: EgressServiceState::Up,
             admission_allowed: true,
@@ -1614,7 +1699,9 @@ mod tests {
             expires_after_ms: 100,
         };
         assert_eq!(
-            session.apply_status_report(PathId::new(1), report).unwrap(),
+            session
+                .apply_status_report(PathId::new(1), report.clone())
+                .unwrap(),
             StatusReportDisposition::Accepted
         );
         assert!(session.schedule(ScheduleDirection::Upstream, 1).is_ok());
@@ -1623,6 +1710,19 @@ mod tests {
             session.schedule(ScheduleDirection::Upstream, 1),
             Err(MultipathError::NoSchedulablePath)
         );
+        assert!(!session.has_admissible_path(None, true));
+        assert_eq!(session.existing_path_ids(), vec![PathId::new(1)]);
+        assert!(
+            session
+                .schedule_existing(ScheduleDirection::Upstream, 1)
+                .is_ok()
+        );
+        report.report_seqno += 1;
+        assert_eq!(
+            session.apply_status_report(PathId::new(1), report).unwrap(),
+            StatusReportDisposition::Accepted
+        );
+        assert!(session.has_admissible_path(None, true));
     }
 
     #[test]

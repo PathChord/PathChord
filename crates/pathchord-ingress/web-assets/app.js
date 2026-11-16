@@ -208,12 +208,13 @@ function renderListeners(result) {
 function renderSubscriptions(result) {
   const body = $("subscriptions-body");
   const items = result.items || [];
-  if (!items.length) return emptyRow(body, 6, "No subscriptions");
+  if (!items.length) return emptyRow(body, 7, "No subscriptions");
   body.replaceChildren();
   items.forEach((item) => {
     const row = body.insertRow();
     cell(row, resourceName(item), "mono");
     cell(row, item.source_type);
+    cell(row, item.source?.user_agent || "clash.meta", "mono");
     cell(row, item.state, `state ${stateClass(item.state)}`);
     cell(row, item.revision, "mono");
     cell(row, item.last_error, item.last_error ? "state bad" : "muted");
@@ -330,6 +331,7 @@ $("subscription-form").addEventListener("submit", async (event) => {
           type: $("subscription-type").value,
           url: $("subscription-url").value.trim(),
           credentials_ref: $("subscription-credentials").value.trim() || null,
+          user_agent: $("subscription-user-agent").value || null,
         },
         refresh: {
           interval_seconds: Number($("subscription-interval").value),

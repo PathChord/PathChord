@@ -146,7 +146,7 @@ fn configuration(provider: u16, proxy: u16, path: &str) -> String {
 kind: Subscription
 metadata: {{name: provider}}
 spec:
-  source: {{type: clash, url: 'http://127.0.0.1:{provider}/{path}'}}
+  source: {{type: clash, url: 'http://127.0.0.1:{provider}/{path}', userAgent: 'PathChord-Test/1'}}
   refresh: {{intervalSeconds: 3600, timeoutSeconds: 2, maxAttempts: 1, backoffSeconds: 1}}
   cache: {{path: provider.snapshot, maxAgeSeconds: 86400}}
 ---
@@ -195,7 +195,9 @@ async fn disabled_and_deleted_subscriptions_stay_unselectable_across_process_res
         let provider = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let provider_port = provider.local_addr().unwrap().port();
         let fetches = Arc::new(AtomicUsize::new(0));
+        let wrong_agents = Arc::new(AtomicUsize::new(0));
         let fetch_count = Arc::clone(&fetches);
+        let wrong_agent_count = Arc::clone(&wrong_agents);
         let provider_task = tokio::spawn(async move {
             loop {
                 let (mut stream, _) = provider.accept().await.unwrap();
@@ -203,6 +205,9 @@ async fn disabled_and_deleted_subscriptions_stay_unselectable_across_process_res
                 let mut header = Vec::new();
                 while !header.ends_with(b"\r\n\r\n") && header.len() < 8192 {
                     match stream.read_u8().await { Ok(byte) => header.push(byte), Err(_) => break }
+                }
+                if !String::from_utf8_lossy(&header).to_ascii_lowercase().contains("\r\nuser-agent: pathchord-test/1\r\n") {
+                    wrong_agent_count.fetch_add(1, Ordering::SeqCst);
                 }
                 let body = format!("proxies: [{{name: relay, type: http, server: 127.0.0.1, port: {relay_port}}}]\n");
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
@@ -264,6 +269,7 @@ async fn disabled_and_deleted_subscriptions_stay_unselectable_across_process_res
             }
             assert!(fetches.load(Ordering::SeqCst) > before_restart);
         }
+        assert_eq!(wrong_agents.load(Ordering::SeqCst), 0, "custom User-Agent must survive configuration and restart");
         provider_task.abort();
         relay_task.abort();
     }).await.expect("bounded subscription restart test");

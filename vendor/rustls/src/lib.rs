@@ -586,6 +586,11 @@ pub mod client {
     mod ech;
     pub(super) mod handy;
     mod hs;
+    mod reality_apple;
+    mod reality_android;
+    mod reality_chrome;
+    mod reality_edge;
+    mod reality_firefox;
     #[cfg(test)]
     mod test;
     #[cfg(feature = "tls12")]
@@ -595,7 +600,7 @@ pub mod client {
     pub use builder::WantsClientCert;
     pub use client_conn::{
         ClientConfig, ClientConnectionData, ClientSessionStore, EarlyDataError, RealityCallback,
-        ResolvesClientCert, Resumption, TicketRequest, Tls12Resumption,
+        ClientHelloProfile, ResolvesClientCert, Resumption, TicketRequest, Tls12Resumption,
         UnbufferedClientConnection,
     };
     #[cfg(feature = "std")]

@@ -19,10 +19,14 @@ mod anytls_adapter;
 mod anytls_codec;
 mod credential_provider;
 mod datagram;
+mod grpc_transport;
 mod http_connect_adapter;
+mod http_transport;
+mod http_upgrade;
 mod hysteria2_adapter;
 #[allow(dead_code)]
 mod hysteria2_codec;
+mod meek_transport;
 mod native_protocol;
 mod native_transport;
 mod reality_adapter;
@@ -33,13 +37,24 @@ mod reality_codec;
 #[allow(dead_code)]
 mod reality_tls;
 mod shadowsocks_adapter;
+mod sing_mux;
+mod sing_mux_padding;
+mod sing_smux;
 mod socks5_adapter;
 mod subscription;
 mod tls;
 mod tuic_adapter;
 #[allow(dead_code)]
 mod tuic_codec;
+#[path = "socks5_uot.rs"]
+mod uot;
+mod v2ray_quic;
+mod vision;
+mod vision_transport;
 mod vmess;
+mod websocket_early;
+mod xudp;
+mod yamux_session;
 
 pub use adapter_registry::AdapterRegistry;
 pub use credential_provider::FileTransitCredentialProvider;
@@ -47,12 +62,13 @@ pub use http_connect_adapter::{HttpConnectTransitAdapter, HttpsConnectTransitAda
 pub use shadowsocks_adapter::ShadowsocksTransitAdapter;
 pub use socks5_adapter::Socks5TransitAdapter;
 pub use subscription::{
-    CacheLoadOutcome, DynamicNodeState, DynamicTransitNode, DynamicTransitSnapshot,
-    HttpSubscriptionFetcher, MAX_SUBSCRIPTION_BYTES, MAX_SUBSCRIPTION_NODES,
-    NoSubscriptionCredentials, NodeDiagnostic, NodeUnavailableReason, PreparedSubscriptionRefresh,
-    RefreshOutcome, SnapshotDiff, SubscriptionCredential, SubscriptionCredentialProvider,
-    SubscriptionDocument, SubscriptionDownloadBudget, SubscriptionError, SubscriptionFetchRequest,
-    SubscriptionFetcher, SubscriptionManager, SubscriptionUsage,
+    AdmissionRevocation, CacheLoadOutcome, DynamicNodeState, DynamicTransitNode,
+    DynamicTransitSnapshot, HttpSubscriptionFetcher, MAX_SUBSCRIPTION_BYTES,
+    MAX_SUBSCRIPTION_NODES, NoSubscriptionCredentials, NodeDiagnostic, NodeUnavailableReason,
+    PreparedDynamicSnapshot, PreparedSubscriptionRefresh, RefreshOutcome, SnapshotDiff,
+    SubscriptionCredential, SubscriptionCredentialProvider, SubscriptionDocument,
+    SubscriptionDownloadBudget, SubscriptionError, SubscriptionFetchRequest, SubscriptionFetcher,
+    SubscriptionManager, SubscriptionUsage, ValidatedTransitAdapter,
 };
 
 pub trait TransitConnection: AsyncRead + AsyncWrite + Send + Unpin {}

@@ -51,6 +51,58 @@ impl AuthHeaders {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerReceiveRate {
+    Auto,
+    BytesPerSecond(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthResponse {
+    pub udp_enabled: bool,
+    pub receive_rate: ServerReceiveRate,
+}
+
+impl AuthResponse {
+    pub fn parse(headers: &http::HeaderMap) -> Result<Self, &'static str> {
+        fn single<'a>(
+            headers: &'a http::HeaderMap,
+            name: &'static str,
+        ) -> Result<&'a str, &'static str> {
+            let mut values = headers.get_all(name).iter();
+            let value = values
+                .next()
+                .ok_or("Hysteria2 authentication response is missing a required header")?;
+            if values.next().is_some() {
+                return Err("Hysteria2 authentication response has duplicate headers");
+            }
+            value
+                .to_str()
+                .map_err(|_| "Hysteria2 authentication response has an invalid header")
+        }
+        let udp_enabled = match single(headers, "hysteria-udp")? {
+            "true" => true,
+            "false" => false,
+            _ => return Err("Hysteria2 authentication UDP flag is invalid"),
+        };
+        let rate = single(headers, "hysteria-cc-rx")?;
+        let receive_rate = if rate == "auto" {
+            ServerReceiveRate::Auto
+        } else if !rate.is_empty() && rate.bytes().all(|byte| byte.is_ascii_digit()) {
+            ServerReceiveRate::BytesPerSecond(
+                rate.parse()
+                    .map_err(|_| "Hysteria2 server receive rate is invalid")?,
+            )
+        } else {
+            return Err("Hysteria2 server receive rate is invalid");
+        };
+        Ok(Self {
+            udp_enabled,
+            receive_rate,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpMessage {
     pub session_id: u32,
@@ -324,6 +376,46 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn authentication_response_requires_unambiguous_udp_and_receive_rate() {
+        for (udp, rate, expected) in [
+            ("true", "auto", ServerReceiveRate::Auto),
+            ("false", "0", ServerReceiveRate::BytesPerSecond(0)),
+            ("true", "125000", ServerReceiveRate::BytesPerSecond(125_000)),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("hysteria-udp", udp.parse().unwrap());
+            headers.insert("hysteria-cc-rx", rate.parse().unwrap());
+            let response = AuthResponse::parse(&headers).unwrap();
+            assert_eq!(response.udp_enabled, udp == "true");
+            assert_eq!(response.receive_rate, expected);
+        }
+        for (udp, rate) in [
+            (None, Some("0")),
+            (Some("true"), None),
+            (Some("maybe"), Some("0")),
+            (Some("true"), Some("-1")),
+            (Some("true"), Some("1.0")),
+            (Some("true"), Some("18446744073709551616")),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            if let Some(value) = udp {
+                headers.insert("hysteria-udp", value.parse().unwrap());
+            }
+            if let Some(value) = rate {
+                headers.insert("hysteria-cc-rx", value.parse().unwrap());
+            }
+            assert!(AuthResponse::parse(&headers).is_err());
+        }
+        for duplicate in ["hysteria-udp", "hysteria-cc-rx"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("hysteria-udp", "true".parse().unwrap());
+            headers.insert("hysteria-cc-rx", "0".parse().unwrap());
+            headers.append(duplicate, "0".parse().unwrap());
+            assert!(AuthResponse::parse(&headers).is_err());
+        }
     }
 
     #[test]

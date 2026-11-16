@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if ! grep -q '^pathchord:' /etc/group; then
+	addgroup -S pathchord
+fi
+if ! grep -q '^pathchord:' /etc/passwd; then
+	adduser -S -D -H -G pathchord -s /sbin/nologin pathchord
+fi
