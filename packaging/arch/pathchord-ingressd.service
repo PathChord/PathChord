@@ -1,6 +1,6 @@
 [Unit]
 Description=PathChord Ingress proxy runtime
-Documentation=man:pathchord(1)
+Documentation=man:pathchordctl(1)
 Wants=network-online.target
 After=network-online.target
 

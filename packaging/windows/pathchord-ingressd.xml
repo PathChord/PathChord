@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- WinSW service definition. Keep this file beside the matching WinSW
-     executable (pathchord-ingress-service.exe) before installing it. -->
+     executable (pathchord-ingressd-service.exe) before installing it. -->
 <service>
-  <id>PathChordIngress</id>
-  <name>PathChord Ingress</name>
+  <id>PathChordIngressd</id>
+  <name>PathChord Ingressd</name>
   <description>PathChord local HTTP and SOCKS ingress listeners.</description>
   <startmode>Manual</startmode>
   <executable>%ProgramFiles%\PathChord\pathchord-ingressd.exe</executable>

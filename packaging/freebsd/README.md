@@ -21,8 +21,8 @@ The assembler calls `pkg create` and therefore must run on a host with
 FreeBSD `pkg(8)`. A Linux cross-build or a successful ELF link does not prove
 that the package installs or that rc.d/service behavior works on FreeBSD.
 
-Enable Ingress in `/etc/rc.conf` with `pathchord_enable="YES"`. The Egress
-service is separately controlled by `pathchord_egress_enable` and requires an
+Enable Ingress in `/etc/rc.conf` with `pathchord_ingressd_enable="YES"`. The Egress
+service is separately controlled by `pathchord_egressd_enable` and requires an
 operator-provisioned identity under `/var/db/pathchord-egress`.
 
 The rc.d wrappers pass `/var/run/pathchord/ingress.sock` and

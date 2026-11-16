@@ -53,9 +53,9 @@ install -m 0644 "$root_dir/packaging/common/pathchord.1" \
   "$stage_dir/usr/local/share/man/man1/pathchord.1"
 sed 's/%%PREFIX%%/\/usr\/local/g' "$root_dir/packaging/freebsd/pkg-message" \
   > "$stage_dir/usr/local/share/pathchord/pkg-message"
-cp "$root_dir/packaging/freebsd/pathchord.in" "$stage_dir/usr/local/etc/rc.d/pathchord"
-cp "$root_dir/packaging/freebsd/pathchord-egress.in" "$stage_dir/usr/local/etc/rc.d/pathchord-egress"
-chmod 0755 "$stage_dir/usr/local/etc/rc.d/pathchord" "$stage_dir/usr/local/etc/rc.d/pathchord-egress"
+cp "$root_dir/packaging/freebsd/pathchord-ingressd.in" "$stage_dir/usr/local/etc/rc.d/pathchord-ingressd"
+cp "$root_dir/packaging/freebsd/pathchord-egressd.in" "$stage_dir/usr/local/etc/rc.d/pathchord-egressd"
+chmod 0755 "$stage_dir/usr/local/etc/rc.d/pathchord-ingressd" "$stage_dir/usr/local/etc/rc.d/pathchord-egressd"
 
 cat > "$stage_dir/+PRE-INSTALL" <<'EOF'
 #!/bin/sh

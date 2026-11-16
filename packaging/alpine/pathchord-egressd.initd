@@ -1,13 +1,13 @@
 #!/sbin/openrc-run
 
-name="pathchord-egress"
+name="pathchord-egressd"
 description="PathChord Egress proxy runtime"
-rcvar="pathchord_egress_enable"
+rcvar="pathchord_egressd_enable"
 command="/usr/bin/pathchord-egressd"
 command_args="--config-dir /etc/pathchord/egress --egress-id egress --identity /var/lib/pathchord-egress/egress.key.json --authorization-db /var/lib/pathchord-egress/authorizations.db --control-socket /run/pathchord/egress.sock"
 command_user="pathchord:pathchord"
 command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
+	pidfile="/run/${RC_SVCNAME}.pid"
 retry="TERM/30/KILL/5"
 
 depend() {

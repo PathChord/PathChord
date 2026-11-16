@@ -14,7 +14,7 @@ if (-not (Test-Path -LiteralPath $WinSW -PathType Leaf)) {
     throw "WinSW executable was not found at '$WinSW'. Download and audit WinSW, then pass -WinSW or copy it to the PathChord installation directory."
 }
 
-$services = @('pathchord-ingress', 'pathchord-egress')
+$services = @('pathchord-ingressd', 'pathchord-egressd')
 foreach ($name in $services) {
     $wrapper = Join-Path $root "$name-service.exe"
     $config = Join-Path $PSScriptRoot "$name.xml"

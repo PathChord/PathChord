@@ -17,11 +17,11 @@ must remain outside the configuration directory.
 
 | Target | Recipe | Service definition | Package output |
 | --- | --- | --- | --- |
-| Debian | `debian/` | `pathchord-ingress.service`, `pathchord-egress.service` | `.deb` |
-| Alpine | `alpine/APKBUILD` | OpenRC `pathchord` and `pathchord-egress` init scripts | `.apk` |
-| Arch Linux | `arch/PKGBUILD` | `pathchord-ingress.service`, `pathchord-egress.service` | `.pkg.tar.*` |
-| FreeBSD | `freebsd/Makefile` | `rc.d/pathchord`, `rc.d/pathchord-egress` | `.pkg` |
-| Windows | `windows/pathchord.nsi` | WinSW-compatible service XML and installer script | `.exe` |
+| Debian | `debian/` | `pathchord-ingressd.service`, `pathchord-egressd.service` | `.deb` |
+| Alpine | `alpine/APKBUILD` | OpenRC `pathchord-ingressd` and `pathchord-egressd` init scripts | `.apk` |
+| Arch Linux | `arch/PKGBUILD` | `pathchord-ingressd.service`, `pathchord-egressd.service` | `.pkg.tar.*` |
+| FreeBSD | `freebsd/Makefile` | `rc.d/pathchord-ingressd`, `rc.d/pathchord-egressd` | `.pkg` |
+| Windows | `windows/pathchord.nsi` | WinSW-compatible `pathchord-ingressd`/`pathchord-egressd` XML and installer script | `.exe` |
 
 All Unix recipes install `pathchord.1` for the `pathchordctl(1)` client and
 install `default-config.yaml` as `ingress/ingress.yaml` in the package's configuration

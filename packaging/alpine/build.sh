@@ -58,8 +58,8 @@ cp "$ctl_binary" "$work/pathchordctl"
 cp "$root_dir/LICENSE" "$work/LICENSE"
 cp "$root_dir/packaging/common/pathchord.1" "$work/pathchord.1"
 cp "$root_dir/packaging/common/default-config.yaml" "$work/default-config.yaml"
-cp "$root_dir/packaging/alpine/pathchord.initd" "$work/pathchord.initd"
-cp "$root_dir/packaging/alpine/pathchord-egress.initd" "$work/pathchord-egress.initd"
+cp "$root_dir/packaging/alpine/pathchord-ingressd.initd" "$work/pathchord-ingressd.initd"
+cp "$root_dir/packaging/alpine/pathchord-egressd.initd" "$work/pathchord-egressd.initd"
 cp "$root_dir/packaging/alpine/pathchord.pre-install" "$work/pathchord.pre-install"
 
 cat >"$work/APKBUILD" <<'EOF'
@@ -75,7 +75,7 @@ makedepends=""
 pkgusers="pathchord"
 pkggroups="pathchord"
 install="$pkgname.pre-install"
-source="pathchord-ingressd pathchord-egressd pathchordctl LICENSE pathchord.1 default-config.yaml pathchord.initd pathchord-egress.initd"
+source="pathchord-ingressd pathchord-egressd pathchordctl LICENSE pathchord.1 default-config.yaml pathchord-ingressd.initd pathchord-egressd.initd"
 sha256sums="
 SKIP
 SKIP
@@ -97,8 +97,8 @@ package() {
 	install -Dm0644 "$srcdir/pathchord.1" "$pkgdir/usr/share/man/man1/pathchord.1"
 	gzip -n -9 "$pkgdir/usr/share/man/man1/pathchord.1"
 	install -Dm0644 "$srcdir/default-config.yaml" "$pkgdir/etc/pathchord/ingress/ingress.yaml"
-	install -Dm0755 "$srcdir/pathchord.initd" "$pkgdir/etc/init.d/pathchord"
-	install -Dm0755 "$srcdir/pathchord-egress.initd" "$pkgdir/etc/init.d/pathchord-egress"
+	install -Dm0755 "$srcdir/pathchord-ingressd.initd" "$pkgdir/etc/init.d/pathchord-ingressd"
+	install -Dm0755 "$srcdir/pathchord-egressd.initd" "$pkgdir/etc/init.d/pathchord-egressd"
 }
 EOF
 sed -i \

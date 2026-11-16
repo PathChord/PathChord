@@ -17,8 +17,8 @@ and `pathchordctl.exe` files already exist. `build.ps1` reads the workspace
 version from `Cargo.toml` and passes it to NSIS; the generated installer name
 contains that version.
 
-The package includes WinSW-compatible `pathchord-ingress.xml` and
-`pathchord-egress.xml` definitions. WinSW is not redistributed by PathChord.
+The package includes WinSW-compatible `pathchord-ingressd.xml` and
+`pathchord-egressd.xml` definitions. WinSW is not redistributed by PathChord.
 Download and audit the WinSW release approved by the operator, copy its
 executable to the installation directory as `winsw.exe`, then run an elevated:
 

@@ -2,8 +2,8 @@ bin/pathchord-ingressd
 bin/pathchord-egressd
 bin/pathchordctl
 etc/pathchord/ingress/ingress.yaml
-etc/rc.d/pathchord
-etc/rc.d/pathchord-egress
+etc/rc.d/pathchord-ingressd
+etc/rc.d/pathchord-egressd
 share/licenses/pathchord/LICENSE
 share/man/man1/pathchord.1
 share/pathchord/pkg-message
