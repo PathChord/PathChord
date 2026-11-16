@@ -44,7 +44,7 @@
 
 ### Requirement: Egress status is global and policy-free
 
-Egress status SHALL 只描述全局 Egress 资源事实，不得包含 IngressRule、TransitRule、TrafficPolicy、规则 demand 或类别策略元数据。Path-local 质量观测由 Ingress 从本地 Path 流量和控制反馈推导并拥有。
+Egress status SHALL 只描述全局 Egress 资源事实，不得包含路由规则、Egress Transit selector、TrafficPolicy identity、业务类别策略或 Ingress demand 元数据。Path-local 质量观测由 Ingress 从本地 Path 流量和控制反馈推导并拥有。
 
 #### Scenario: Egress reports shared capacity
 
@@ -71,12 +71,31 @@ Egress 观测 SHALL 独立暴露 `admission_allowed` 和稳定、非敏感的 `a
 
 ### Requirement: Directional Path observations remain Ingress-owned
 
-Ingress SHALL 发布有界的上行/下行 Path 观测并用于规则调度和自动扩缩容；Egress status 不得复制这些 Path-local 观测成为第二权威来源。
+Ingress SHALL 发布有界的上行/下行 Path 观测，并在 Egress 绑定下用于 Session 级调度和自动扩缩容；Egress status 不得复制这些 Path-local 观测成为第二权威来源。规则身份或业务类别不得划分公共 Path target。
 
 #### Scenario: Path capacity is asymmetric
 
 - **WHEN** 一条 Path 的上行和下行观测不同
 - **THEN** Ingress 保留分离的方向值，并按需求较大方向计算物理 Path target
+
+### Requirement: Session Path-pool observations
+
+Session 观测 SHALL 标识所属 Egress、公共最小值、当前 target、合规 Transit 数量、不可变策略快照、聚合方向性 demand 和按发送方协商的复制额度。这些字段必须遵循现有授权、代次、基数和 unknown 规则，不为每条规则或业务类别分配观测。
+
+#### Scenario: Different routing rules use one Egress
+
+- **WHEN** 多条路由规则选择的 flow 共享一个 Session
+- **THEN** 查询暴露一个 Session 池 target、一个策略快照和聚合 demand，而不是规则级 target 或策略
+
+#### Scenario: The minimum cannot be met
+
+- **WHEN** 至少有一条认证 ready Path，但非排空可用 Path 低于最小值，或协商上限阻止达到最小值
+- **THEN** 观测同时展示最小值、有界 target、ready count、usable count 和类型化准入/短缺原因；只要仍有 ready Path 且无其他硬故障，保持 degraded
+
+#### Scenario: A measurement is not available
+
+- **WHEN** Session 尚未接受复制协商，或聚合 demand 窗口没有权威样本
+- **THEN** 对应字段返回 null 或显式 unknown，不伪造 measured zero
 
 ### Requirement: Authorized bounded aggregate metrics
 
@@ -227,7 +246,10 @@ admission_generation, created_at, last_change_at
 ready_path_count, active_streams, active_udp_associations
 control_pending, control_acked, control_retransmissions
 close_reason, reconnect_attempts
-traffic_class_name, traffic_class_priority, traffic_class_share
+minimum_usable_paths, target_path_count, usable_path_count
+eligible_transit_count, traffic_policy_id, traffic_policy_generation
+demand_upstream_bps, demand_downstream_bps
+replication_cap_bps, replication_upstream_used_bps, replication_downstream_used_bps
 ```
 
 Stream 视图暴露：
@@ -238,7 +260,6 @@ target_kind, target_port, admitted_generation
 bytes_sent, bytes_received, bytes_acked
 reorder_buffer_bytes, receive_window, retransmissions
 opened_at, closed_at, close_reason
-traffic_class_name, traffic_class_priority, traffic_class_share
 ```
 
 目标连接视图暴露稳定的本地连接 ID、SessionID 和 StreamID、生命周期状态、字节计数器、
@@ -252,7 +273,9 @@ Session/Stream/目标连接数量、配置/有效/当前容量、容量状态、
 和报告新鲜度。不得发布建议 Path 数量或 per-Ingress 配额。Ingress 的 Path 观测必须分别包含
 上行和下行 RTT、抖动、丢包、乱序、吞吐量、有效容量和连接建立质量。
 
-调度器使用这些类型化字段，不能使用人类可读日志。报告过期时，除非策略明确允许降级运行，
+观测提供器还必须暴露一个 Session 池最小值、有界 target、ready/usable 数量、合规关系、捕获的策略
+身份和代次、聚合上下行 demand 以及协商上限。上行用量来自本地发送方权威记账；下行用量在没有
+权威 Session 级生产者时返回 null。全局 Egress replication allowance 不能替代它。调度器使用这些类型化字段，不能使用人类可读日志。报告过期时，除非策略明确允许降级运行，
 否则 Egress 必须从新的准入中移除。质量下降时快速减少分配；恢复和缩容遵循状态机的排空及
 稳定化规则。当 Path 因新增容量低于自身开销而被排除时，观测 API 必须暴露原因。
 
@@ -289,7 +312,7 @@ pathchord_udp_associations_total{state}
 pathchord_target_connections_total{result}
 pathchord_frames_total{direction, result}
 pathchord_control_retransmissions_total{direction}
-pathchord_bytes_total{direction, class}
+pathchord_bytes_total{direction}
 pathchord_path_rtt_ms
 pathchord_path_jitter_ms
 pathchord_path_loss_ratio

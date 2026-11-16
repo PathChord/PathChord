@@ -457,6 +457,17 @@ pub struct SessionObservation {
     pub retained_outbound_bytes: usize,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub minimum_usable_paths: usize,
+    pub target_path_count: usize,
+    pub usable_paths: usize,
+    pub eligible_transit_count: usize,
+    pub traffic_policy_id: Option<String>,
+    pub traffic_policy_generation: Option<u64>,
+    pub demand_upstream_bps: Option<u64>,
+    pub demand_downstream_bps: Option<u64>,
+    pub replication_cap_bps: Option<u64>,
+    pub replication_upstream_used_bps: Option<u64>,
+    pub replication_downstream_used_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,9 +477,6 @@ pub struct StreamObservation {
     pub state: pathchord_core::StreamState,
     /// Hostname and port only; credentials and payloads are never represented.
     pub target_display: String,
-    pub traffic_class: Option<String>,
-    pub traffic_class_priority: Option<u8>,
-    pub traffic_class_share: Option<u32>,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub bytes_acked: u64,
@@ -752,7 +760,7 @@ impl IngressObservationHandle {
         let mut changes = Vec::new();
         for (id, session) in &sessions {
             if state.sessions.get(id) != Some(session) {
-                changes.push((ControlEventKind::SessionChanged, id.to_string(), json!({"session_id": id.to_string(), "egress_id": session.egress_id, "state": format!("{:?}", session.state).to_ascii_lowercase(), "admission_generation": session.admission_generation, "created_at_ms": session.created_at_ms, "last_change_at_ms": session.last_change_at_ms, "close_reason": session.close_reason, "ready_path_count": session.ready_paths, "active_streams": session.active_streams, "active_udp_associations": session.active_udp_associations, "pending_session_controls": session.pending_session_controls})));
+                changes.push((ControlEventKind::SessionChanged, id.to_string(), json!({"session_id": id.to_string(), "egress_id": session.egress_id, "state": format!("{:?}", session.state).to_ascii_lowercase(), "admission_generation": session.admission_generation, "created_at_ms": session.created_at_ms, "last_change_at_ms": session.last_change_at_ms, "close_reason": session.close_reason, "ready_path_count": session.ready_paths, "usable_path_count": session.usable_paths, "minimum_usable_paths": session.minimum_usable_paths, "target_path_count": session.target_path_count, "eligible_transit_count": session.eligible_transit_count, "traffic_policy_id": session.traffic_policy_id, "traffic_policy_generation": session.traffic_policy_generation, "active_streams": session.active_streams, "active_udp_associations": session.active_udp_associations, "pending_session_controls": session.pending_session_controls})));
             }
         }
         for id in state
@@ -817,7 +825,7 @@ impl IngressObservationHandle {
         let mut changes = Vec::new();
         for (key, stream) in &streams {
             if state.streams.get(key) != Some(stream) {
-                changes.push((format!("{}:{}", stream.session_id, stream.stream_id), json!({"session_id": stream.session_id.to_string(), "stream_id": stream.stream_id.to_string(), "state": format!("{:?}", stream.state).to_ascii_lowercase(), "bytes_sent": stream.bytes_sent, "bytes_received": stream.bytes_received, "bytes_acked": stream.bytes_acked, "traffic_class_name": stream.traffic_class, "traffic_class_priority": stream.traffic_class_priority, "traffic_class_share": stream.traffic_class_share, "close_reason": stream.close_reason})));
+                changes.push((format!("{}:{}", stream.session_id, stream.stream_id), json!({"session_id": stream.session_id.to_string(), "stream_id": stream.stream_id.to_string(), "state": format!("{:?}", stream.state).to_ascii_lowercase(), "bytes_sent": stream.bytes_sent, "bytes_received": stream.bytes_received, "bytes_acked": stream.bytes_acked, "close_reason": stream.close_reason})));
             }
         }
         for (session_id, stream_id) in state
@@ -3309,6 +3317,17 @@ mod tests {
                     retained_outbound_bytes: 3,
                     bytes_sent: 4,
                     bytes_received: 5,
+                    minimum_usable_paths: 1,
+                    target_path_count: 1,
+                    usable_paths: 1,
+                    eligible_transit_count: 0,
+                    traffic_policy_id: None,
+                    traffic_policy_generation: None,
+                    demand_upstream_bps: None,
+                    demand_downstream_bps: None,
+                    replication_cap_bps: None,
+                    replication_upstream_used_bps: None,
+                    replication_downstream_used_bps: None,
                 }],
                 [PathObservation {
                     path_id,

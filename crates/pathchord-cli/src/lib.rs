@@ -1013,6 +1013,28 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                             retained_outbound_bytes: entry.session.retained_outbound_bytes,
                             bytes_sent: entry.session.bytes_sent,
                             bytes_received: entry.session.bytes_received,
+                            minimum_usable_paths: entry.minimum_usable_paths,
+                            target_path_count: entry.session.target_path_count as usize,
+                            usable_paths: entry
+                                .session
+                                .path_states
+                                .values()
+                                .filter(|state| {
+                                    matches!(
+                                        state,
+                                        pathchord_core::PathState::Active
+                                            | pathchord_core::PathState::Degraded
+                                    )
+                                })
+                                .count(),
+                            eligible_transit_count: entry.eligible_transit_count,
+                            traffic_policy_id: entry.traffic_policy_id.clone(),
+                            traffic_policy_generation: None,
+                            demand_upstream_bps: None,
+                            demand_downstream_bps: None,
+                            replication_cap_bps: entry.replication_cap_bps,
+                            replication_upstream_used_bps: None,
+                            replication_downstream_used_bps: None,
                         }
                     });
                     let paths = session_snapshots.iter().flat_map(|entry| {
@@ -1073,12 +1095,6 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                                 stream_id: stream.stream_id,
                                 state: stream.state,
                                 target_display: format!("{hostname}:{}", stream.target.port),
-                                traffic_class: stream
-                                    .traffic_class
-                                    .as_ref()
-                                    .map(|class| class.name.clone()),
-                                traffic_class_priority: stream.traffic_class.as_ref().map(|class| class.priority),
-                                traffic_class_share: stream.traffic_class.as_ref().map(|class| class.share),
                                 bytes_sent: stream.bytes_sent,
                                 bytes_received: stream.bytes_received,
                                 bytes_acked: stream.bytes_acked,

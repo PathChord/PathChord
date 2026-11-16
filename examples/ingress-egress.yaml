@@ -7,6 +7,12 @@ spec:
   port: 9443
   publicKey: REPLACE_WITH_EGRESS_PUBLIC_KEY
   capabilities: {tcp: true, udp: true}
+  statusRequirements:
+    minUsablePaths: 1
+  transit:
+    require:
+      capabilities: [tcp]
+  trafficPolicyRef: default
 ---
 apiVersion: pathchord.io/v1
 kind: TransitProxy
@@ -30,16 +36,6 @@ spec:
   order: 10
   catchAll: true
   egressRef: exit
----
-apiVersion: pathchord.io/v1
-kind: TransitRule
-metadata:
-  name: transit-route
-spec:
-  order: 20
-  catchAll: true
-  egressRef: exit
-  trafficPolicyRef: default
 ---
 apiVersion: pathchord.io/v1
 kind: Listener

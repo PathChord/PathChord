@@ -1387,13 +1387,7 @@ impl LocalControlDispatcher {
         let query = match ListQuery::parse(
             &request.body,
             "metrics.streams",
-            &[
-                "stream_id",
-                "session_id",
-                "egress_id",
-                "state",
-                "traffic_class",
-            ],
+            &["stream_id", "session_id", "egress_id", "state"],
             &[
                 "stream_id",
                 "session_id",
@@ -1441,10 +1435,6 @@ impl LocalControlDispatcher {
                             None
                         },
                         "target_redacted": !reveal_targets,
-                        "traffic_class": stream.traffic_class,
-                        "traffic_class_name": stream.traffic_class,
-                        "traffic_class_priority": stream.traffic_class_priority,
-                        "traffic_class_share": stream.traffic_class_share,
                         "bytes_sent": stream.bytes_sent,
                         "bytes_received": stream.bytes_received,
                         "bytes_acked": stream.bytes_acked,
@@ -1937,6 +1927,17 @@ fn session_value(
         "close_reason": session.close_reason,
         "ready_paths": session.ready_paths,
         "ready_path_count": session.ready_paths,
+        "usable_path_count": session.usable_paths,
+        "minimum_usable_paths": session.minimum_usable_paths,
+        "target_path_count": session.target_path_count,
+        "eligible_transit_count": session.eligible_transit_count,
+        "traffic_policy_id": session.traffic_policy_id,
+        "traffic_policy_generation": session.traffic_policy_generation,
+        "demand_upstream_bps": session.demand_upstream_bps,
+        "demand_downstream_bps": session.demand_downstream_bps,
+        "replication_cap_bps": session.replication_cap_bps,
+        "replication_upstream_used_bps": session.replication_upstream_used_bps,
+        "replication_downstream_used_bps": session.replication_downstream_used_bps,
         "active_streams": session.active_streams,
         "active_udp_associations": session.active_udp_associations,
         "pending_session_controls": session.pending_session_controls,
@@ -2777,6 +2778,17 @@ mod tests {
                     retained_outbound_bytes: 3,
                     bytes_sent: 4,
                     bytes_received: 5,
+                    minimum_usable_paths: 1,
+                    target_path_count: 1,
+                    usable_paths: 1,
+                    eligible_transit_count: 0,
+                    traffic_policy_id: None,
+                    traffic_policy_generation: None,
+                    demand_upstream_bps: None,
+                    demand_downstream_bps: None,
+                    replication_cap_bps: None,
+                    replication_upstream_used_bps: None,
+                    replication_downstream_used_bps: None,
                 }],
                 [crate::PathObservation {
                     path_id,
@@ -2821,9 +2833,6 @@ mod tests {
                 stream_id: pathchord_core::StreamId::new(53).expect("stream id"),
                 state: pathchord_core::StreamState::Open,
                 target_display: "private.example:443".into(),
-                traffic_class: Some("interactive".into()),
-                traffic_class_priority: Some(10),
-                traffic_class_share: Some(2),
                 bytes_sent: 10,
                 bytes_received: 11,
                 bytes_acked: 9,
@@ -2840,7 +2849,7 @@ mod tests {
         let redacted = &redacted.result.expect("redacted stream metrics")["items"][0];
         assert!(redacted["target"].is_null());
         assert_eq!(redacted["target_redacted"], true);
-        assert_eq!(redacted["traffic_class"], "interactive");
+        assert!(redacted.get("traffic_class").is_none());
         let revealed = dispatcher.dispatch(request(
             "metrics.streams",
             &["metrics:read", "targets:read"],
@@ -3182,6 +3191,17 @@ mod tests {
                     retained_outbound_bytes: 0,
                     bytes_sent: 0,
                     bytes_received: 0,
+                    minimum_usable_paths: 1,
+                    target_path_count: 1,
+                    usable_paths: 1,
+                    eligible_transit_count: 0,
+                    traffic_policy_id: None,
+                    traffic_policy_generation: None,
+                    demand_upstream_bps: None,
+                    demand_downstream_bps: None,
+                    replication_cap_bps: None,
+                    replication_upstream_used_bps: None,
+                    replication_downstream_used_bps: None,
                 }],
                 [],
             )

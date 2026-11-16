@@ -66,12 +66,22 @@ v1 实现 SHALL 满足[详细契约](#detailed-contract)中的全部布局、注
 
 ### Requirement: Ordered Session control envelopes
 
-Session 控制 SHALL 使用已注册封装、每发送方序列空间、依赖顺序、符合条件的 Path 列表、确认规则和幂等取消编码。复制副本 SHALL 保留控制序号和 payload，同时使用新的 Path 帧序号和 Noise nonce。
+Session 控制 SHALL 使用已注册封装、每发送方序列空间、依赖顺序、确认规则和不透明幂等取消编码。新操作的编码器 SHALL 发送空的 eligible Path 列表；接收方必须在目标准入前拒绝已退休的非空打开限制。复制副本 SHALL 保留控制序号和 payload，同时使用新的 Path 帧序号和 Noise nonce。
 
 #### Scenario: Control operation is replicated
 
 - **WHEN** 一个 `SESSION_CONTROL` 操作的副本经多条符合条件的 Path 到达
 - **THEN** 接收方在应用其依赖后仅应用该控制序号一次，并通过 Session 控制序列空间确认
+
+#### Scenario: A new open uses the Session pool
+
+- **WHEN** 发送方在 Session 控制封装中编码 `STREAM_OPEN` 或 `UDP_OPEN`
+- **THEN** 写入 `eligible_path_count=0` 且没有 PathID，已准入 flow 在两个方向使用 Session 公共池
+
+#### Scenario: A peer supplies a retired per-flow list
+
+- **WHEN** 有效的 Stream 或 UDP 打开携带非空且规范的 eligible Path 列表
+- **THEN** 接收方以对应操作错误和 `LOCAL_POLICY` 拒绝打开，不创建目标连接，并以幂等方式处理拒绝和控制确认，不缩小公共池
 
 ### Requirement: Typed Stream and UDP payload semantics
 
@@ -93,12 +103,22 @@ Stream 和 UDP payload SHALL 使用已注册的字段顺序、目标形式、地
 
 ### Requirement: Session replication cap is negotiated during attachment
 
-`SESSION_ATTACH` SHALL 携带 Ingress 请求的 Session 复制上限，`SESSION_ATTACH_OK` SHALL 携带 Egress 接受的有效上限。两者都是有界的 wire 字节速率；有效值不得高于双方接受的硬上限，并适用于 Session 中每条 Path。
+`SESSION_ATTACH` SHALL 携带 Egress 策略请求的复制上限，`SESSION_ATTACH_OK` 携带接受值，均为 wire 字节速率。禁用复制时请求零；允许时请求策略 bit rate 除以 8 后向下取整且受 profile 限制。接受值不得超过请求值或任一端上限。每个发送方 SHALL 对其 outbound Session 流量执行该值；Session 中每条 Path 都保留该协商。
 
 #### Scenario: Egress accepts a lower cap
 
 - **WHEN** Egress 无法接受请求值，但可以用更低值准入 Session
 - **THEN** 返回更低的有效值，双方将其作为 Session 硬上限，同时保持普通可靠性可用
+
+#### Scenario: Replication is disabled with a positive configured budget
+
+- **WHEN** Egress 策略设置 `retransmissionReplication: disabled` 但 `sessionReplicationBudgetBps` 为正
+- **THEN** Ingress 请求零，Egress 接受零，双方不发送可选业务或控制副本，但首份数据、必要控制和普通可靠重传仍可用
+
+#### Scenario: A later Path joins the Session
+
+- **WHEN** 在 flow 已消耗复制额度后另一条 Path attach 到 Session
+- **THEN** 它使用已捕获的请求和有效上限，不替换策略、不提高上限，也不重置记账
 
 ### Requirement: Global status carries explicit capacity and admission state
 
@@ -399,9 +419,11 @@ STREAM_OPEN_ERR、STREAM_ACK、STREAM_WINDOW、STREAM_FIN、STREAM_RST、UDP_OPE
 UDP_OPEN_OK、UDP_OPEN_ERR 或 UDP_CLOSE。
 `inner_payload` 是该帧类型不带帧头的规范 payload。完整的 SESSION_CONTROL payload
 （包括此封装）受 `max_control_payload` 限制。依赖序号 MUST 小于控制序号。
-只有 STREAM_OPEN 和 UDP_OPEN 可以携带非空的
-eligible Path 列表。空列表表示没有显式 Path 限制；否则承载打开操作的 Path MUST 在列表内。
-Egress 将此列表应用于该 flow 的两个方向。列出的 Path 使用前仍必须独立加入同一 Session。
+发送方 MUST 编码 `eligible_path_count=0` 且不包含 PathID。对于 STREAM_OPEN 和 UDP_OPEN，
+零值表示两个方向都使用 Session 公共 Path 池，并仍受认证、ready、draining 和流控限制。
+格式正确的非空列表属于已退休的逐 flow 限制；接收方 MUST 在目标拨号前返回 STREAM_OPEN_ERR
+或 UDP_OPEN_ERR 和 LOCAL_POLICY，应用并确认控制序列，并对重复副本返回相同的幂等拒绝。
+不得缩小公共池，也不得阻塞后续有效控制操作。
 每个发送方向拥有独立的 Session 范围控制序号，从零开始。接收方按序应用操作并
 丢弃重复项；应用操作前必须先应用其依赖。发送方保留并重传操作直到收到确认。
 在其他符合条件的 Path 上发送副本时，使用新的 Path 帧序号和 Noise nonce，同时保留
@@ -414,8 +436,8 @@ SESSION_CONTROL_ACK 使用与 CONTROL_ACK 相同的 payload 编码，但其范�
 关闭 Session 时，接收方保留足够时间，以确认重传的 SESSION_CLOSE；发起方收到该 ACK
 或失去 Session transport 后关闭。
 
-当 flow 失去所有符合条件的 Path 时，SESSION_CONTROL_CANCEL 可用相同控制序号替换
-该 flow 尚未确认的操作；没有此类未确认操作时，也可使用新的序号：
+SESSION_CONTROL_CANCEL 可用相同控制序号替换 flow 尚未确认的操作；没有此类未确认操作时，
+也可使用新的序号：
 
 ~~~text
 control_seqno         varint

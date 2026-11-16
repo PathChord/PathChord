@@ -26,7 +26,7 @@ Transit A  Transit B  Transit C
            Target
 ```
 
-首先选择 Egress，随后为该 Egress 准入并调度 Transit Proxy。一个流绝不会跨越多个 Egress 节点。
+首先选择 Egress，随后由该 Egress 的 Ingress 侧 Transit 绑定提供公共候选集和 Session Path 池。一个流绝不会跨越多个 Egress 节点，路由规则也不选择 Transit 或 Path 子集。
 
 ## 3. 路由模式
 
@@ -43,11 +43,9 @@ Transit A  Transit B  Transit C
 
 如果没有有效的 Egress 规则，则评估普通 Proxy 规则。如果没有普通 Proxy 规则匹配，则执行全局回退。
 
-### Transit 阶段
+### Egress Path 阶段
 
-选择 Egress 后，按顺序评估该 Egress 专用的 Transit Proxy 规则。首个匹配规则决定准入和基础权重。若一个规则匹配多个可用 Proxy，在普通代理模式下可任选其一；节点顺序不具备语义。
-
-在 Egress 模式下，已准入的 Proxy 到 Egress 关系构成多路径候选集。权重作用于整个关系；经由同一 Proxy 的多条 Path 不会成倍增加其配置权重。
+选择 Egress 后，其 `transit` 绑定根据公共选择器和运行时状态筛选同 namespace 的 Transit Proxy。绑定及其 `trafficPolicyRef` 与 flow 匹配无关。已准入的 Proxy 到 Egress 关系构成多路径候选集。权重作用于整个关系；经由同一 Proxy 的多条 Path 不会成倍增加其配置权重。
 
 ## 5. 运行时状态
 
@@ -64,7 +62,7 @@ Transit A  Transit B  Transit C
 Egress 通过现有 Path 上报聚合资源事实：配置的 wire 容量上限、有效容量、
 当前 wire 速率、容量可信度、活跃目标连接数、服务状态和全局准入状态。
 Egress 不上报或解释 Ingress 规则。Ingress 拥有每条 Path 的方向性观测和
-每个 Session 的规则 demand。系统不保证跨 Ingress 的公平性。
+每个 Session 的聚合 demand。系统不保证跨 Ingress 的公平性。
 
 Egress 资源的 authored 配置只有全局资源上限：wire 带宽上限
 (`maxWireBandwidthBps`) 和入站目标连接上限
@@ -74,7 +72,7 @@ Egress 资源的 authored 配置只有全局资源上限：wire 带宽上限
 ## 6. 故障语义
 
 - Transit Path 故障：移除该 Path；现有 Stream 可以继续通过其他合规 Path 传输。
-- 某个流没有合规 Path：终止该流；共享 Session 中的其他流继续运行。
+- Egress Session 低于公共可用 Path 最小值：仍有 ready Path 时拒绝新业务，已有流继续运行。
 - Egress 故障：双方关闭所有相关 Path、Session、Stream、本地连接以及 Egress 到目标的连接。应用程序必须重试。
 - Ingress 或 Egress 任一进程重启都会使相关连接和 Session 失效。
 - 目标端的 FIN/RST 会反映给本地应用程序；代理层不会静默重建目标 TCP 连接。
@@ -91,11 +89,14 @@ Path。Session 管理器可以保留一条 Path 数量为零、正在重连的�
 可以承载多条独立 Path。关系权重只计算一次，再由这些 Path 实例共享该关系分配。
 
 Ingress 创建、扩展、排空和关闭 Path。Stream 和 UDP 会话独立于 Path 标识，
-可以在 Path 之间迁移。每条 EgressRule 单独计算自己的合规 Path 要求；同一条
-合规 Path 可以被多条规则复用，但不合规 Path 不得计入任何对应规则。
+可以在公共 Egress Session 池的 Path 之间迁移。Egress 的
+`statusRequirements.minUsablePaths` 是唯一的公共最小值；只有非排空的 ready
+Path 计入新业务准入。低于该值时 Session 进入 degraded 但保留已有工作；最后
+一条 ready Path 丢失时关闭 Session。
 
-Session 控制和可选额外复制使用协商出的 Session 硬上限。即使可选复制耗尽，
-第一份副本和普通可靠重传仍然可用。Egress 执行全局资源上限，并优先保障业务
+Session 控制和可选额外复制使用协商出的 Session 硬上限。每个发送方在所有 flow
+和 Path 之间共享一个 outbound allowance，上下行分别受该标量上限约束。即使
+可选复制耗尽，第一份副本和普通可靠重传仍然可用。Egress 执行全局资源上限，并优先保障业务
 主流量、普通重传和必要控制流量；它不解释 Ingress 规则，也不承诺跨 Ingress 公平性。
 经过认证的 future ACK 属于 Session 信任失败：关闭全部 Path 和业务资源，废弃旧
 SessionID，并通过有界退避和断路器使用新的 SessionID 恢复。
@@ -108,14 +109,14 @@ wire 速率、容量状态（`unknown`、`provisional`、`measured` 或 `stale`�
 不是 Egress 契约。
 
 Ingress 使用有界 counter、ACK、heartbeat、数据速率、丢包、重传、RTT、抖动
-和拥塞反馈，分别测量每条 Path 的上行和下行状态。它按 Session 作用域的规则、
-策略和类别 key 聚合 demand，但不保留无界的 per-Stream 历史。健康采样和
-demand 窗口以低频运行；数据路径只更新有界 counter。
+和拥塞反馈，分别测量每条 Path 的上行和下行状态。它每个 Session 聚合 demand，
+不保留无界的 per-Stream 或 per-rule 历史。健康采样和 demand 窗口以低频运行；
+数据路径只更新有界 counter。
 
-对于每条匹配的 EgressRule，Ingress 根据最小 Path 要求、合规 Transit 关系、
-方向性 demand、Path 质量和 Egress 硬安全上限计算 Path target。物理 Path target
-覆盖上行和下行中需求较大的方向。扩容和缩容使用迟滞，缩容时保留一条合规 Path，
-并排除新增容量低于调度开销的候选。
+对于每个 Egress Session，Ingress 根据公共最小值、合规 Transit 关系、聚合方向性
+demand、Path 质量和 Egress 硬安全上限计算一个 Path target。物理 Path target
+覆盖上行和下行中需求较大的方向。扩容和缩容使用迟滞，检查所有选定排空后仍剩余
+的非排空可用 Path，并排除新增容量低于调度开销的候选。
 
 Egress 的有效容量是全局 scheduler/resource 估计值，受配置 wire 上限约束，
 并通过 aggregate wire 速率、队列、重传和资源反馈被动计算；空闲吞吐不能伪造
@@ -160,7 +161,7 @@ Windows 系统代理集成是控制面开关，按 ID 选择一个 HTTP/SOCKS �
 一个文件或目录资源集合定义一张资源图。Ingress 按显式命令行来源、环境变量、账号默认值的
 优先级选择配置。目录文件按确定顺序加载、统一验证并发布为一个快照；候选失败时保留原图。
 
-Egress 拓扑、Egress 公钥和 Ingress 本地私钥属于静态配置，发生变更时需要重启 Ingress。Transit Proxy 列表是运行时数据，从订阅刷新到磁盘缓存并热重载。刷新失败时保留当前列表；订阅中已删除的 Proxy 进入排空状态。Egress 容量和全局连接限制是资源上限；期望 Path 数由 Ingress 运行时决定。
+Egress 拓扑、Egress 公钥、Transit 绑定、公共 Path 要求、已解析 TrafficPolicy 和 Ingress 本地私钥属于静态配置，发生变更时需要重启 Ingress。Transit Proxy 列表是运行时数据，从订阅刷新到磁盘缓存并热重载。刷新失败时保留当前列表；订阅中已删除的 Proxy 进入排空状态。Egress 容量和全局连接限制是资源上限；期望 Path 数由 Ingress 运行时决定。
 
 静态规则配置在启动时编译。订阅派生数据和获准的动态规则快照可以在后台编译并原子热重载。运行时分别维护策略、Egress、Proxy、认证和指标快照。Ingress 内部流量绕过自身的透明拦截，以防止形成环路。
 

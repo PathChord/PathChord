@@ -56,26 +56,45 @@ Egress UDP Association SHALL 在 Path 迁移期间保留一个 Egress 端套接�
 
 ### Requirement: Reliable control and flow Path restrictions
 
-Session 控制 SHALL 使用 Session 范围的序列空间、重复抑制、依赖顺序、保留和重传，直到收到确认或 Session transport 关闭。控制和数据操作 SHALL 遵循符合条件的 Path 限制；flow 失去全部符合条件的 Path 后进行的取消 SHALL 保留不透明取消边界。
+Session 控制 SHALL 使用 Session 范围的序列空间、重复抑制、依赖顺序、保留和重传，直到收到确认或 Session transport 关闭。控制和数据 SHALL 使用 Egress Session 的公共 Path 池，不得按 flow 指定 Path 子集；取消 SHALL 保留不透明取消边界。
 
 #### Scenario: Flow loses all eligible Paths
 
-- **WHEN** 一个 flow 失去所有符合条件的 Path，而 Session 仍有其他经过认证的 Path
-- **THEN** `SESSION_CONTROL_CANCEL` 可以仅使用不透明 flow ID 清理该 flow，不会把其目标或业务数据发送到其他 flow 的 Path，其他 flow 继续运行
+- **WHEN** 一个 flow 的公共 Session 池失去最后一条 ready Path
+- **THEN** Session 和所有相关业务资源关闭，不保留另一个 flow 的私有 Path 子集
 
-### Requirement: Policy compliant scheduling and replication
+#### Scenario: One flow is cancelled while the Session remains live
 
-调度 SHALL 保留关系权重、有效容量和质量输入、Session 范围的复制预算，以及任何更严格的流量类别预算。需要流量类别的 flow 在对应 capability 缺失时 SHALL 被拒绝，不能静默丢弃类别信息。
+- **WHEN** Session 中其他 flow 仍存活时，本地取消一个打开中或活动 flow
+- **THEN** 现有不透明取消编码可以替换或推进该 flow 的控制序列，不暴露目标或业务数据，其他 flow 继续运行
 
-#### Scenario: Traffic class policy is local
+### Requirement: Uniform Egress Session scheduling
 
-- **WHEN** Ingress 在 TrafficPolicy 类别下准入一个 flow
-- **THEN** 类别只影响 Ingress 本地调度和记账，不会作为元数据加入 `STREAM_OPEN` 或 `UDP_OPEN`
+所有已准入 Stream 和 UDP Association SHALL 使用其 Session 的公共 Path 池和不可变 Egress TrafficPolicy。调度 SHALL 保留关系权重、方向性有效容量与质量输入，并在有待发送 flow 之间提供有界公平服务。不得使用公开业务类别策略或逐 flow 的 Path/策略覆盖。
 
-#### Scenario: Class replication exceeds remaining Session budget
+#### Scenario: Several rules share one Session
 
-- **WHEN** 流量类别复制策略允许的额外副本数量超过 Session 范围预算的剩余额度
-- **THEN** 复制仍受 Session 范围剩余预算约束，控制复制也计入该预算
+- **WHEN** 不同路由规则选择同一个 Egress Session
+- **THEN** 两个方向都在同一合规 Path 池上使用一个策略调度，并遵循 Path 生命周期和每资源流控
+
+#### Scenario: One Path fails
+
+- **WHEN** 一条 Path 失败但公共池仍有另一条 ready Path
+- **THEN** TCP 数据可在剩余池上重传，UDP 套接字身份保持不变，不选择另一个 Egress
+
+### Requirement: Replication uses one shared Session allowance
+
+每个发送方 SHALL 为所有 flow 和控制在一个 outbound Session allowance 中记账，并受协商硬上限约束。Egress 执行该上限但不接收策略身份。必要控制和普通可靠重传优先于可选副本；可选副本耗尽不得导致 flow 失败或阻止首份发送。
+
+#### Scenario: Optional replication exhausts its budget
+
+- **WHEN** 一个发送方没有剩余 outbound Session 复制额度
+- **THEN** 首份或普通重传仍可发送，跳过可选副本，Stream 不因缺少复制单独失败
+
+#### Scenario: More flows or Paths are admitted
+
+- **WHEN** 另一个 flow 或 Path 加入现有 Session
+- **THEN** 它共享现有额度，不提高协商上限，也不重置已用量
 
 ### Requirement: Egress hard failure closes the Session
 
@@ -129,21 +148,12 @@ Ingress SHALL 在应用 ACK 前按本地 emitted Stream 区间校验。认证的
 
 ### Requirement: Egress does not interpret Ingress policy
 
-Egress SHALL 只接收 wire 所需的窄资源限制和调度数据，不得接收或求值 EgressRule、TransitRule、selector、TrafficPolicy identity 或规则 demand。
+Egress SHALL 只接收 wire 所需的窄资源限制和调度数据，不得接收或求值路由规则、Egress Transit selector、TrafficPolicy identity、业务类别策略或 Ingress demand 元数据。
 
 #### Scenario: Session carries a requested replication cap
 
 - **WHEN** Ingress 使用请求复制上限附加 Session
 - **THEN** Egress 将其作为不透明资源限制处理，不推断生成它的 Ingress 规则或策略
-
-### Requirement: Replication uses independent flow budgets under a Session cap
-
-Ingress SHALL 按 Stream/UDP policy scope 记账复制，同时执行协商的 Session 硬上限。控制副本共享该上限并优先于可选业务副本；可选复制耗尽时普通可靠重传仍可用。
-
-#### Scenario: Optional replication exhausts its budget
-
-- **WHEN** Session 没有额外复制 allowance
-- **THEN** 主副本或普通重传仍可发送，跳过可选副本，不因缺少复制单独失败 Stream
 
 ## Detailed contract
 
@@ -252,9 +262,7 @@ SESSION_CLOSE
 
 当剩余 Session allowance 允许时，Session 控制消息可以在当前多条可用且符合条件的 Path 上复制；必要控制和普通重传优先于可选副本。接收方对每个 `control_seqno` 最多应用一次。`SESSION_CONTROL_ACK` 报告已应用的最高连续序列号以及 OPTIONAL 的选择性范围。发送方保留未确认的 Session 控制消息，并持续重传，直至消息得到确认或 Session transport 关闭。`CONTROL_ACK` 用于确认 Path 本地心跳。
 
-当 flow 失去符合条件的 Path 而 Session 中仍有其他可用 Path 时，
-`SESSION_CONTROL_CANCEL` 仅使用不透明 flow ID 推进或替换其控制序号。它清理该 flow，
-不会将其目标或数据发送到其他 flow 的 Path。其他 flow 和 Session 控制序号继续运行。
+所有存活业务 flow 共享 Egress Session Path 池。`SESSION_CONTROL_CANCEL` 仍是本地取消或超时的通用 flow 清理操作，只使用不透明 flow ID 推进或替换控制序号，不携带目标或业务 payload。它不恢复私有 flow Path 子集，也不将已准入 flow 迁移到另一个 Egress。
 
 ### 5. TCP Stream
 
@@ -289,11 +297,7 @@ Ingress 负责 Path 的创建和准入。Path 状态对 Stream 和 UDP Session �
 
 每 Path 调度使用有效容量加权：配置的 Proxy 到 Egress 关系权重建立基线，随后每条 Path 报告的有效容量、拥塞窗口、RTT、抖动和丢包率会调整其当前份额。通过一个 Transit Proxy 的多条 Path 共享关系权重，而各自观测到的容量决定如何分配该关系的份额。
 
-重传复制受协商的 Session 硬上限和 Ingress 本地逐流/逐类别预算限制。控制消息
-使用必要控制优先级，可选业务副本只能使用剩余 allowance。Egress 不接收或解释
-TrafficPolicy、TrafficClass 身份。
-
-对于有待发送数据的业务类别，先提供有界优先级偏好，再提供加权公平服务；每个类别内部轮询 Stream，即使另一个类别拥有更多 Stream，也会获得有界服务机会。控制消息使用独立预算。
+重传复制受协商的 Session 硬上限和每个发送方在所有 flow、Path 之间共享的 outbound allowance 限制。上下行分别受已接受的标量上限约束，不存在同步的双向合并桶。必要控制和普通重传优先，可选业务和控制副本只能使用剩余 allowance。Egress 不接收或解释 TrafficPolicy、TrafficClass、规则或 demand 身份；每 flow 队列仍有界并公平服务，不再提供公开业务类别配置。
 
 ### 8. 版本控制
 

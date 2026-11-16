@@ -56,26 +56,45 @@ An Egress UDP Association SHALL retain one Egress-side socket context across Pat
 
 ### Requirement: Reliable control and flow Path restrictions
 
-Session control SHALL use its Session-wide sequence space, duplicate suppression, dependency ordering, retention, and retransmission until acknowledged or the Session transport closes. Control and data operations SHALL follow eligible Path restrictions; cancellation after a flow loses every eligible Path SHALL preserve the opaque cancellation boundary.
+Session control SHALL use its Session-wide sequence space, duplicate suppression, dependency ordering, retention, and retransmission until acknowledged or the Session transport closes. Control and data SHALL use the common Egress Session Path pool without per-flow eligible subsets; cancellation SHALL preserve the opaque cancellation boundary.
 
 #### Scenario: Flow loses all eligible Paths
 
-- **WHEN** one flow loses every eligible Path while other authenticated Session Paths remain
-- **THEN** `SESSION_CONTROL_CANCEL` can tear down that flow using only its opaque flow ID, without sending its target or business data on another flow's Path, while other flows continue
+- **WHEN** the last ready Path in a flow's common Session pool is lost
+- **THEN** the Session and all related business resources close instead of retaining another flow's private Path subset
 
-### Requirement: Policy compliant scheduling and replication
+#### Scenario: One flow is cancelled while the Session remains live
 
-Ingress SHALL preserve relationship weights, effective capacity and quality inputs, the Session-wide replication budget, and any stricter local traffic-class budget. Traffic-class policy SHALL remain local to Ingress and SHALL NOT be encoded as Egress wire metadata.
+- **WHEN** an opening or active flow is locally cancelled while other flows remain in the Session
+- **THEN** the existing opaque cancellation encoding can replace or advance that flow's control sequence without revealing its target or business data, and other flows continue
 
-#### Scenario: Traffic class policy is local
+### Requirement: Uniform Egress Session scheduling
 
-- **WHEN** Ingress admits a flow under a TrafficPolicy class
-- **THEN** the class affects Ingress scheduling and accounting without adding class metadata to `STREAM_OPEN` or `UDP_OPEN`
+All admitted Streams and UDP Associations SHALL use their Session's common Path pool and immutable Egress TrafficPolicy. Scheduling SHALL preserve relationship weights, directional effective capacity and quality inputs, and fair bounded service among backlogged flows. Public business-class policy and per-flow Path or policy overrides SHALL NOT be used.
 
-#### Scenario: Class replication exceeds remaining Session budget
+#### Scenario: Several rules share one Session
 
-- **WHEN** a traffic-class replication policy permits more extra copies than the remaining Session-wide budget
-- **THEN** the Session-wide remaining budget still bounds replication and control replication is accounted against that budget
+- **WHEN** flows selected by different routing rules use the same Egress Session
+- **THEN** both directions can schedule them over the same eligible pool under one policy, subject to Path lifecycle and per-resource flow control
+
+#### Scenario: One Path fails
+
+- **WHEN** a Path fails while another common ready Path remains
+- **THEN** affected TCP data can be retransmitted over the remaining pool and UDP socket identity is preserved without selecting a different Egress
+
+### Requirement: Replication uses one shared Session allowance
+
+Each sender SHALL account optional copies for all flows and control against one outbound Session allowance bounded by the negotiated hard cap. Egress SHALL enforce that cap without policy identity. Required control and ordinary reliable retransmission SHALL take priority over optional copies. Optional-copy exhaustion SHALL NOT fail a flow or prevent its primary transmission.
+
+#### Scenario: Optional replication exhausts its budget
+
+- **WHEN** a sender has no remaining outbound Session replication allowance for an extra copy
+- **THEN** the primary or ordinary retransmission remains eligible, the optional copy is skipped, and the Stream is not failed solely for lacking replication
+
+#### Scenario: More flows or Paths are admitted
+
+- **WHEN** another flow or Path is admitted to an existing Session
+- **THEN** it shares the existing allowance without increasing the negotiated cap or resetting consumed usage
 
 ### Requirement: Egress hard failure closes the Session
 
@@ -129,21 +148,12 @@ When a selected Egress candidate fails before `STREAM_OPEN` or `UDP_OPEN` is adm
 
 ### Requirement: Egress does not interpret Ingress policy
 
-Egress SHALL receive only the narrow Session resource limits and scheduler data required by the wire contract. It SHALL NOT receive or evaluate EgressRule, TransitRule, selector, TrafficPolicy identity, or rule-level demand metadata.
+Egress SHALL receive only the narrow Session resource limits and scheduler data required by the wire contract. It SHALL NOT receive or evaluate routing rules, Egress Transit selectors, TrafficPolicy identity, business-class policy, or Ingress demand metadata.
 
 #### Scenario: Session carries a requested replication cap
 
 - **WHEN** Ingress attaches a Session with a requested replication cap
 - **THEN** Egress treats the value as an opaque resource limit and does not infer the Ingress rule or policy that produced it
-
-### Requirement: Replication uses independent flow budgets under a Session cap
-
-Ingress SHALL account replication per Stream/UDP policy scope while enforcing one negotiated Session hard cap. Control copies SHALL share that cap and take priority over optional business copies; ordinary reliable retransmission SHALL remain available when optional replication is exhausted.
-
-#### Scenario: Optional replication exhausts its budget
-
-- **WHEN** a Session has no remaining replication allowance for an extra copy
-- **THEN** the primary or ordinary retransmission remains eligible, the optional copy is skipped, and the Stream is not failed solely for lacking replication
 
 ## Detailed contract
 
@@ -263,10 +273,11 @@ Control traffic has reserved capacity. A Session requires at least one active Pa
 
 Session control messages are replicated across multiple currently available, eligible Paths when the residual Session allowance permits; required control and ordinary retransmissions take priority over optional copies. The receiver applies each `control_seqno` at most once. `SESSION_CONTROL_ACK` reports the highest contiguous applied sequence and OPTIONAL selective ranges. The sender retains unacknowledged Session control messages and retransmits them until acknowledged or until the Session transport closes. `CONTROL_ACK` acknowledges Path-local heartbeats.
 
-When a flow loses its eligible Paths while other Session Paths survive,
-`SESSION_CONTROL_CANCEL` advances or replaces its control sequences using only
-the opaque flow ID. It tears down that flow without sending its target or data
-on another flow's Path. Other flows and Session control sequences continue.
+All live business flows share the Egress Session Path pool. `SESSION_CONTROL_CANCEL`
+remains a general flow teardown operation for local cancellation or timeout;
+it advances or replaces its control sequence using only the opaque flow ID,
+without carrying a target or business payload. It does not recover a private
+flow Path subset or migrate an admitted flow to another Egress.
 
 ### 5. TCP Streams
 
@@ -303,15 +314,14 @@ Ingress owns Path creation and admission. Path state is transparent to Streams a
 
 Per-Path scheduling uses effective-capacity weighting: the configured Proxy-to-Egress relationship weight establishes the baseline, then each Path's reported effective capacity, congestion window, RTT, jitter, and loss adjust its current share. Multiple Paths through one Transit Proxy share the relationship weight, while their observed capacities determine how that relationship's share is distributed.
 
-Replication is limited by one negotiated Session hard cap and local Ingress
-per-flow or per-class budgets. Control messages use the required-control
-priority and optional business copies consume only residual allowance. Egress
-does not receive or interpret TrafficPolicy or TrafficClass identity.
-
-Across backlogged business classes, bounded priority preference is followed by
-weighted fair service. Each class schedules its Streams round-robin and receives
-a bounded service opportunity even when another class has more Streams. Control
-messages use an independent budget.
+Replication is limited by one negotiated Session hard cap and one outbound
+allowance per sender shared across all flows and Paths. The two directions are
+bounded independently by the accepted scalar cap; there is no synchronized
+combined bidirectional bucket. Required control and ordinary retransmission
+take priority, while optional business and control copies consume only
+residual allowance. Egress does not receive or interpret TrafficPolicy,
+TrafficClass, rule, or demand identity. Per-flow queues remain bounded and
+fairly serviced without a public business-class configuration.
 
 ### 8. Versioning
 

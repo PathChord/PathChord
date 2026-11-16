@@ -183,6 +183,76 @@ async fn egress_rejects_authenticated_opens_outside_the_negotiated_protocols() {
     }
 }
 
+#[tokio::test]
+async fn non_empty_open_path_list_is_rejected_without_target_dial() {
+    let (ingress_key, egress_key) = keys();
+    let (path, peer_path) = admitted_pair_for(&ingress_key, &egress_key, 1).await;
+    let path_id = path.path_id();
+    let mut peer = path.into_transport();
+    let factory = EchoFactory::default();
+    let egress = EgressSessionHandle::start(peer_path, factory.clone()).unwrap();
+    let limits = ProtocolLimits::default();
+    let open = Message::StreamOpen(StreamOpen {
+        stream_id: StreamId::new(1).unwrap(),
+        request_id: RequestId::new(1),
+        target: target("retired-path-list.test"),
+    });
+    let rejected = Message::SessionControl(SessionControl {
+        sequence: 0,
+        depends_on: None,
+        frame_type: FrameType::StreamOpen,
+        eligible_paths: vec![PathId::new(999)],
+        payload: open.encode(limits).unwrap(),
+    });
+    let mut frame_sequence = 2;
+    send_peer_message(&mut peer, path_id, &mut frame_sequence, rejected.clone()).await;
+    let response = receive_session_operation(&mut peer).await;
+    assert_eq!(response.frame_type, FrameType::StreamOpenErr);
+    assert!(matches!(
+        Message::decode(response.frame_type, &response.payload, limits).unwrap(),
+        Message::StreamOpenErr(StreamOpenErr {
+            error: ErrorClass::LocalPolicy,
+            ..
+        })
+    ));
+    assert_eq!(factory.opened_count(), 0);
+
+    // A duplicate control sequence gets the same typed rejection and does not
+    // re-enter target admission.
+    send_peer_message(&mut peer, path_id, &mut frame_sequence, rejected).await;
+    let duplicate = receive_session_operation(&mut peer).await;
+    assert_eq!(duplicate.frame_type, FrameType::StreamOpenErr);
+    assert!(matches!(
+        Message::decode(duplicate.frame_type, &duplicate.payload, limits).unwrap(),
+        Message::StreamOpenErr(StreamOpenErr {
+            error: ErrorClass::LocalPolicy,
+            ..
+        })
+    ));
+    assert_eq!(factory.opened_count(), 0);
+
+    // The next Session-control sequence can use the whole pool normally.
+    let valid = Message::SessionControl(SessionControl {
+        sequence: 1,
+        depends_on: Some(0),
+        frame_type: FrameType::StreamOpen,
+        eligible_paths: Vec::new(),
+        payload: open.encode(limits).unwrap(),
+    });
+    send_peer_message(&mut peer, path_id, &mut frame_sequence, valid).await;
+    let accepted = receive_session_operation(&mut peer).await;
+    assert_eq!(accepted.frame_type, FrameType::StreamOpenOk);
+    assert!(matches!(
+        Message::decode(accepted.frame_type, &accepted.payload, limits).unwrap(),
+        Message::StreamOpenOk(_)
+    ));
+    assert_eq!(factory.opened_count(), 1);
+
+    drop(peer);
+    let _ = egress.wait().await;
+    factory.join().await;
+}
+
 async fn send_peer_message(
     peer: &mut NoiseRecordStream<DuplexStream>,
     path_id: PathId,
@@ -415,73 +485,6 @@ async fn target_io_reset_preserves_target_failure_on_the_peer() {
     assert_eq!(ingress.snapshot().ready_paths, 1);
     ingress.shutdown().await.unwrap();
     egress.wait().await.unwrap();
-}
-
-#[tokio::test]
-async fn received_drain_deadline_closes_a_path_with_an_unacknowledged_open() {
-    let (ingress_key, egress_key) = keys();
-    let (primary, peer) = admitted_pair_for(&ingress_key, &egress_key, 1).await;
-    let factory = EchoFactory::default();
-    let egress = EgressSessionHandle::start(peer, factory.clone()).unwrap();
-    let ingress = Arc::new(IngressSessionHandle::start(primary).unwrap());
-    let mut healthy = ingress
-        .open_tcp(target("survives-drain.test"))
-        .await
-        .unwrap();
-    let (secondary, peer) = admitted_pair_for(&ingress_key, &egress_key, 2).await;
-    ingress
-        .add_path(secondary, MultipathPathObservation::default())
-        .await
-        .unwrap();
-    let mut peer = peer.into_transport();
-    let pending = {
-        let ingress = Arc::clone(&ingress);
-        tokio::spawn(async move {
-            ingress
-                .open_tcp_routed(
-                    target("unacknowledged.test"),
-                    BTreeMap::from([(PathId::new(2), 1)]),
-                )
-                .await
-        })
-    };
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let frame = peer.receive_frame().await.unwrap().unwrap();
-            if let Message::SessionControl(control) = Message::decode(
-                frame.header().frame_type(),
-                frame.payload(),
-                ProtocolLimits::default(),
-            )
-            .unwrap()
-                && control.frame_type == FrameType::StreamOpen
-            {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    let mut sequence = 2;
-    send_peer_message(
-        &mut peer,
-        PathId::new(2),
-        &mut sequence,
-        Message::PathDrain(PathDrain {
-            drain_reason: 1,
-            // Keep the Path draining across at least one health tick.
-            deadline_ms: 300,
-        }),
-    )
-    .await;
-    wait_for_retired_path(&ingress, PathId::new(2), pathchord_core::PathState::Closed).await;
-    assert!(pending.await.unwrap().is_err());
-    assert_echo(&mut healthy, b"after-deadline").await;
-    healthy.shutdown().await.unwrap();
-    healthy.read_to_end(&mut Vec::new()).await.unwrap();
-    Arc::try_unwrap(ingress).unwrap().shutdown().await.unwrap();
-    egress.wait().await.unwrap();
-    factory.join().await;
 }
 
 #[tokio::test]

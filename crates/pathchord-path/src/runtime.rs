@@ -2033,7 +2033,7 @@ where
             IngressCommand::OpenUdp {
                 target,
                 datagrams,
-                eligible_paths,
+                eligible_paths: _requested_paths,
                 multipath_config,
                 reply,
             } => {
@@ -2052,7 +2052,7 @@ where
                     .map_or(1, |config| config.minimum_usable_paths.max(1));
                 if self
                     .multipath
-                    .admissible_path_count(eligible_paths.as_ref(), require_fresh_status)
+                    .admissible_path_count(None, require_fresh_status)
                     < minimum
                 {
                     let _ = reply.send(Err(OpenUdpError::ResourceLimit));
@@ -2125,11 +2125,11 @@ where
                         demand_key,
                         replication_budget,
                         datagrams,
-                        eligible_paths: eligible_paths.clone(),
+                        eligible_paths: None,
                         reply,
                     },
                 );
-                self.send_session_control(open, eligible_paths).await?;
+                self.send_session_control(open, None).await?;
                 Ok(false)
             }
             IngressCommand::SendUdp {
@@ -2288,7 +2288,7 @@ where
             IngressCommand::OpenTcp {
                 target,
                 io,
-                eligible_paths,
+                eligible_paths: _requested_paths,
                 multipath_config,
                 reply,
             } => {
@@ -2307,7 +2307,7 @@ where
                     .map_or(1, |config| config.minimum_usable_paths.max(1));
                 if self
                     .multipath
-                    .admissible_path_count(eligible_paths.as_ref(), require_fresh_status)
+                    .admissible_path_count(None, require_fresh_status)
                     < minimum
                 {
                     let _ = reply.send(Err(OpenStreamError::ResourceLimit));
@@ -2381,15 +2381,11 @@ where
                         demand_key,
                         replication_budget,
                         io,
-                        eligible_paths,
+                        eligible_paths: None,
                         reply,
                     },
                 );
-                let eligible = self
-                    .pending_ingress
-                    .get(&stream_id)
-                    .and_then(|pending| pending.eligible_paths.clone());
-                self.send_session_control(open, eligible).await?;
+                self.send_session_control(open, None).await?;
                 Ok(false)
             }
         }
@@ -3313,7 +3309,11 @@ where
         path_id: PathId,
         control: SessionControl,
     ) -> Result<bool, SessionRuntimeError> {
-        if !control.eligible_paths.is_empty() && !control.eligible_paths.contains(&path_id) {
+        let flow_open = matches!(
+            control.frame_type,
+            FrameType::StreamOpen | FrameType::UdpOpen
+        );
+        if !control.eligible_paths.is_empty() && !flow_open {
             return Err(SessionRuntimeError::InvalidRuntimeLimit);
         }
         self.queue_session_control(path_id, SessionControlEntry::Control(control))
@@ -3329,7 +3329,20 @@ where
         if sequence < self.next_session_control {
             match entry {
                 SessionControlEntry::Control(control) => {
-                    self.note_duplicate_open_path(path_id, &control)?
+                    let flow_open = matches!(
+                        control.frame_type,
+                        FrameType::StreamOpen | FrameType::UdpOpen
+                    );
+                    if matches!(self.role, ActorRole::Egress { .. })
+                        && flow_open
+                        && !control.eligible_paths.is_empty()
+                    {
+                        let inner =
+                            Message::decode(control.frame_type, &control.payload, self.limits)?;
+                        self.reject_retired_open(path_id, inner).await?;
+                    } else {
+                        self.note_duplicate_open_path(path_id, &control)?;
+                    }
                 }
                 SessionControlEntry::Cancel(cancel) => self.cancel_flow_local(cancel.flow).await?,
             }
@@ -3375,21 +3388,23 @@ where
                 }
                 SessionControlEntry::Control(control) => {
                     let inner = Message::decode(control.frame_type, &control.payload, self.limits)?;
-                    if matches!(self.role, ActorRole::Egress { .. })
-                        && matches!(
-                            control.frame_type,
-                            FrameType::StreamOpen | FrameType::UdpOpen
-                        )
+                    let flow_open = matches!(
+                        control.frame_type,
+                        FrameType::StreamOpen | FrameType::UdpOpen
+                    );
+                    let close = if matches!(self.role, ActorRole::Egress { .. })
+                        && flow_open
+                        && !control.eligible_paths.is_empty()
                     {
-                        self.active_control_eligible =
-                            Some((!control.eligible_paths.is_empty()).then(|| {
-                                control.eligible_paths.iter().map(|id| (*id, 100)).collect()
-                            }));
-                    }
-                    let result = self.handle_message(path, inner).await;
-                    self.active_control_eligible = None;
-                    let close = result?;
-                    self.configure_open_paths(&control)?;
+                        self.reject_retired_open(path, inner).await?;
+                        false
+                    } else {
+                        let result = self.handle_message(path, inner).await;
+                        self.active_control_eligible = None;
+                        let close = result?;
+                        self.configure_open_paths(&control)?;
+                        close
+                    };
                     for duplicate_path in paths.into_iter().skip(1) {
                         self.note_duplicate_open_path(duplicate_path, &control)?;
                     }
@@ -3407,6 +3422,37 @@ where
         }
         self.ack_session_controls(path_id).await?;
         Ok(false)
+    }
+
+    async fn reject_retired_open(
+        &mut self,
+        _received_path_id: PathId,
+        message: Message,
+    ) -> Result<(), SessionRuntimeError> {
+        match message {
+            Message::StreamOpen(request) => {
+                self.send_open_error(
+                    request.stream_id,
+                    ErrorClass::LocalPolicy,
+                    b"per-flow eligible Path lists are retired; use the Session Path pool".to_vec(),
+                )
+                .await
+            }
+            Message::UdpOpen(request) => {
+                self.send_udp_message(
+                    request.association_id,
+                    Message::UdpOpenErr(UdpOpenErr {
+                        association_id: request.association_id,
+                        error: ErrorClass::LocalPolicy,
+                        reason:
+                            b"per-flow eligible Path lists are retired; use the Session Path pool"
+                                .to_vec(),
+                    }),
+                )
+                .await
+            }
+            _ => Err(SessionRuntimeError::InvalidRuntimeLimit),
+        }
     }
 
     fn configure_open_paths(
@@ -5014,35 +5060,29 @@ where
     async fn send_session_control(
         &mut self,
         message: Message,
-        eligible_paths: Option<BTreeMap<PathId, u32>>,
+        _eligible_paths: Option<BTreeMap<PathId, u32>>,
     ) -> Result<u64, SessionRuntimeError> {
         let sequence = self.session_control_sender.next_sequence();
         let control = SessionControl {
             sequence,
             depends_on: sequence.checked_sub(1),
             frame_type: message.frame_type(),
-            eligible_paths: if matches!(
-                message.frame_type(),
-                FrameType::StreamOpen | FrameType::UdpOpen
-            ) {
-                eligible_paths
-                    .as_ref()
-                    .map_or_else(Vec::new, |paths| paths.keys().copied().collect())
-            } else {
-                Vec::new()
-            },
+            // A Session owns one common Path pool. The registered field stays
+            // in the envelope for profile compatibility, but new opens never
+            // install a per-flow restriction.
+            eligible_paths: Vec::new(),
             payload: message.encode(self.limits)?,
         };
         // Check the outer bound before consuming a sequence number.
         Message::SessionControl(control.clone()).encode(self.limits)?;
         let actual = self.session_control_sender.enqueue(PendingSessionControl {
             message: SessionControlEntry::Control(control.clone()),
-            eligible_paths: eligible_paths.clone(),
+            eligible_paths: None,
             last_sent_at: Instant::now(),
         })?;
         debug_assert_eq!(actual, sequence);
         if let Err(error) = self
-            .send_control_copies(Message::SessionControl(control), eligible_paths.as_ref())
+            .send_control_copies(Message::SessionControl(control), None)
             .await
         {
             if !matches!(
@@ -6863,6 +6903,10 @@ mod tests {
                 task.await.expect("echo task");
             }
         }
+
+        pub(super) fn opened_count(&self) -> usize {
+            self.tasks.lock().expect("echo task lock").len()
+        }
     }
 
     #[async_trait]
@@ -7310,34 +7354,17 @@ mod tests {
                 ..Default::default()
             };
             let only_one = BTreeMap::from([(PathId::new(401), 100)]);
-            assert!(matches!(
-                ingress
-                    .open_tcp_routed_with_config(
-                        target("minimum.test"),
-                        only_one.clone(),
-                        policy.clone()
-                    )
-                    .await,
-                Err(OpenStreamError::ResourceLimit)
-            ));
-            assert!(matches!(
-                ingress
-                    .open_udp_routed_with_config(
-                        target("minimum-udp.test"),
-                        only_one,
-                        policy.clone()
-                    )
-                    .await,
-                Err(OpenUdpError::ResourceLimit)
-            ));
             assert!(!ingress.snapshot().closed);
-            let both = BTreeMap::from([(PathId::new(401), 100), (PathId::new(402), 100)]);
             let mut stream = ingress
-                .open_tcp_routed_with_config(target("minimum.test"), both.clone(), policy.clone())
+                .open_tcp_routed_with_config(
+                    target("minimum.test"),
+                    only_one.clone(),
+                    policy.clone(),
+                )
                 .await
                 .unwrap();
             let mut udp = ingress
-                .open_udp_routed_with_config(target("minimum-udp.test"), both, policy)
+                .open_udp_routed_with_config(target("minimum-udp.test"), only_one, policy)
                 .await
                 .unwrap();
             ingress.close_path(PathId::new(401)).await.unwrap();
@@ -7606,7 +7633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routed_stream_never_uses_a_higher_score_ineligible_path() {
+    async fn routed_stream_uses_the_common_session_pool() {
         let (ingress_key, egress_key) = keys();
         let (ingress_primary, egress_primary) =
             admitted_pair_for(&ingress_key, &egress_key, 31).await;
@@ -7650,7 +7677,6 @@ mod tests {
         let mut echoed = [0_u8; 13];
         stream.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"eligible-only");
-        assert!(blocked.load(Ordering::Acquire));
         blocked.store(false, Ordering::Release);
         stream.shutdown().await.unwrap();
         stream.read_to_end(&mut Vec::new()).await.unwrap();
@@ -7757,7 +7783,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn losing_a_flow_only_path_cancels_its_control_and_other_flows_continue() {
+    async fn losing_one_path_does_not_cancel_other_flows_in_the_common_pool() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (ik, ek) = keys();
             let drop_next = Arc::new(AtomicBool::new(false));
@@ -7785,29 +7811,17 @@ mod tests {
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(150)).await;
-            drop_next.store(true, Ordering::Release);
-            let opening = ingress.open_tcp_routed(
-                target("private-lost.test"),
-                BTreeMap::from([(PathId::new(201), 1)]),
-            );
-            let fail = async {
-                for _ in 0..1000 {
-                    if !drop_next.load(Ordering::Acquire) {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                assert!(!drop_next.load(Ordering::Acquire));
-                ingress.close_path(PathId::new(201)).await.unwrap();
-            };
-            let (result, ()) = tokio::join!(opening, fail);
-            assert!(matches!(
-                result,
-                Err(OpenStreamError::Rejected {
-                    error: ErrorClass::PathFailure,
-                    ..
-                })
-            ));
+            let mut pooled = ingress
+                .open_tcp_routed(
+                    target("pooled-lost.test"),
+                    BTreeMap::from([(PathId::new(201), 1)]),
+                )
+                .await
+                .expect("common pool open");
+            pooled.write_all(b"pooled").await.unwrap();
+            let mut pooled_echo = [0_u8; 6];
+            pooled.read_exact(&mut pooled_echo).await.unwrap();
+            assert_eq!(&pooled_echo, b"pooled");
             healthy.write_all(b"still-live").await.unwrap();
             let mut echoed = [0_u8; 10];
             healthy.read_exact(&mut echoed).await.unwrap();
@@ -7825,9 +7839,11 @@ mod tests {
             assert_eq!(&later_echo, b"later");
             assert_eq!(
                 factory.tasks.lock().unwrap().len(),
-                2,
-                "lost target must never be opened"
+                3,
+                "all common-pool opens are admitted exactly once"
             );
+            pooled.shutdown().await.unwrap();
+            pooled.read_to_end(&mut Vec::new()).await.unwrap();
             healthy.shutdown().await.unwrap();
             later.shutdown().await.unwrap();
             healthy.read_to_end(&mut Vec::new()).await.unwrap();
@@ -7841,7 +7857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn losing_an_open_flow_path_closes_its_target_without_closing_other_flows() {
+    async fn losing_one_path_keeps_an_open_flow_on_the_common_pool() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (ik, ek) = keys();
             let (i1, e1) = admitted_pair_for(&ik, &ek, 203).await;
@@ -7869,29 +7885,17 @@ mod tests {
                 .open_tcp_routed(target("lost.test"), BTreeMap::from([(PathId::new(203), 1)]))
                 .await
                 .unwrap();
-            ingress.close_path(PathId::new(203)).await.unwrap();
-            let mut byte = [0_u8; 1];
-            assert_eq!(lost.read(&mut byte).await.unwrap(), 0);
+            lost.write_all(b"survives").await.unwrap();
+            let mut lost_echo = [0_u8; 8];
+            lost.read_exact(&mut lost_echo).await.unwrap();
+            assert_eq!(&lost_echo, b"survives");
             healthy.write_all(b"alive").await.unwrap();
             let mut echoed = [0_u8; 5];
             healthy.read_exact(&mut echoed).await.unwrap();
             assert_eq!(&echoed, b"alive");
-            for _ in 0..100 {
-                if factory
-                    .tasks
-                    .lock()
-                    .unwrap()
-                    .get(1)
-                    .is_some_and(JoinHandle::is_finished)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert!(
-                factory.tasks.lock().unwrap()[1].is_finished(),
-                "lost target must be closed"
-            );
+            assert!(!factory.tasks.lock().unwrap()[1].is_finished());
+            lost.shutdown().await.unwrap();
+            lost.read_to_end(&mut Vec::new()).await.unwrap();
             healthy.shutdown().await.unwrap();
             healthy.read_to_end(&mut Vec::new()).await.unwrap();
             ingress.shutdown().await.unwrap();

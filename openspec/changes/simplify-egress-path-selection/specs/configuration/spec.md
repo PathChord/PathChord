@@ -70,6 +70,11 @@ Ingress SHALL evaluate effective Egress rules before ordinary Proxy rules and th
 
 Each Session SHALL capture the TrafficPolicy selected by its Egress and share one replication allowance per sending direction, bounded by the negotiated Session cap. All admitted Streams and UDP Associations SHALL use that immutable policy without rule, flow, or business-class budget overrides. Separate Sessions SHALL account independently even when they reference the same TrafficPolicy.
 
+#### Scenario: Two flows use different Egress policies
+
+- **WHEN** two flows select Egresses with different TrafficPolicies
+- **THEN** each uses the policy and shared allowance of its own Session, without changing the other Session's budget
+
 #### Scenario: Two flows use different policies
 
 - **WHEN** two flows select Egresses with different TrafficPolicies
@@ -88,6 +93,11 @@ Each Session SHALL capture the TrafficPolicy selected by its Egress and share on
 ### Requirement: Session maintenance per Egress
 
 Ingress SHALL maintain one Session slot per configured Egress and establish its Paths from the Egress's Transit binding independently of business-flow matches. Live idle Sessions SHALL be reused by subsequent Streams and UDP Associations. Hard Egress failure SHALL destroy the Session and related business connections; recovery SHALL create a fresh Session.
+
+#### Scenario: Egress warms before a business match
+
+- **WHEN** Ingress starts with a valid Egress binding and no business flow has matched a route
+- **THEN** it can establish that Egress's initial Paths without synthesizing a target, listener, flow tag, or geodata match
 
 #### Scenario: Egress recovers after hard failure
 

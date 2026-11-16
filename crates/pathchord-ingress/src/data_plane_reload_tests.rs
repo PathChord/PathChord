@@ -2,8 +2,9 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use pathchord_policy::{
-    Endpoint, FallbackAction, FlowMatch, Generation, PolicyConfig, ProxyRule, ProxySelection,
-    RuleId,
+    Capabilities, EgressConfig, EgressStatusRequirements, EgressTransitBinding, Endpoint,
+    FallbackAction, FlowMatch, Generation, PolicyConfig, ProxyRule, ProxySelection,
+    RetransmissionReplication, RuleId, Scheduler, TrafficPolicy, TrafficPolicyId,
 };
 use pathchord_transit::{
     AdapterKind, BoxedTransitConnection, BoxedTransitDatagram, NoTransitCredentials,
@@ -60,6 +61,41 @@ fn plane(snapshot: ValidatedPolicySnapshot) -> Arc<IngressDataPlane> {
     )
 }
 
+fn egress_policy(generation: u64, budget_bps: u64) -> ValidatedPolicySnapshot {
+    ValidatedPolicySnapshot::new(
+        Generation::new(generation),
+        PolicyConfig {
+            egresses: vec![EgressConfig {
+                id: EgressId::new("edge"),
+                endpoint: Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: 7443,
+                },
+                public_key: "test-key".into(),
+                labels: BTreeMap::new(),
+                capabilities: Capabilities {
+                    tcp: true,
+                    udp: true,
+                },
+                status_requirements: EgressStatusRequirements::default(),
+                transit: EgressTransitBinding::default(),
+                traffic_policy: Some(TrafficPolicyId::new("edge-policy")),
+            }],
+            traffic_policies: vec![TrafficPolicy {
+                id: TrafficPolicyId::new("edge-policy"),
+                scheduler: Scheduler::EffectiveCapacityWeighted,
+                session_replication_budget_bps: budget_bps,
+                class_replication_budget_bps: None,
+                retransmission_replication: RetransmissionReplication::Allowed,
+                classes: BTreeMap::new(),
+            }],
+            fallback: Some(FallbackAction::Reject),
+            ..PolicyConfig::default()
+        },
+    )
+    .unwrap()
+}
+
 fn registry(configs: &[TransitProxyConfig]) -> AdapterRegistry<NoTransitCredentials> {
     AdapterRegistry::for_configs(
         Arc::new(NoTransitCredentials),
@@ -67,6 +103,18 @@ fn registry(configs: &[TransitProxyConfig]) -> AdapterRegistry<NoTransitCredenti
         configs,
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn referenced_egress_policy_changes_require_restart() {
+    let current = egress_policy(1, 8_000);
+    let next = egress_policy(2, 16_000);
+    let plane = plane(current.clone());
+    let registry = registry(&[]);
+    assert!(matches!(
+        plane.prepare_static_snapshot(&next, &registry).await,
+        Err(DataPlaneError::StaticReloadRequiresRestart)
+    ));
 }
 
 fn context() -> ConnectionContext {

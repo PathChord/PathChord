@@ -19,12 +19,17 @@ Configuration processing SHALL conform to the complete [detailed contract](#deta
 
 ### Requirement: Ordered routing and explicit fallback
 
-Ingress SHALL evaluate effective Egress rules before ordinary Proxy rules and the mandatory global fallback. Ordered Egress and Transit rules SHALL select the first admissible match, and an unsupported ordinary UDP route SHALL fail according to policy without a direct bypass.
+Ingress SHALL evaluate effective Egress rules before ordinary Proxy rules and the mandatory global fallback. An Egress rule SHALL select an Egress reference or selector, or explicitly enter ordinary Proxy mode with `mode: none`; Transit selection SHALL come from the selected Egress binding. An unsupported ordinary UDP route SHALL fail according to policy without a direct bypass.
 
 #### Scenario: No effective Egress route is selected
 
 - **WHEN** ordered effective Egress rules do not select an admissible route for a new flow
 - **THEN** Ingress evaluates ordinary Proxy rules and then the configured global fallback in that order
+
+#### Scenario: Different rules select the same Egress
+
+- **WHEN** two flows match different Egress rules that select the same Egress
+- **THEN** both use that Egress's Session Path pool and TrafficPolicy without deriving different Transit candidates or Path requirements from their rules
 
 ### Requirement: Bounded ordinary Proxy pre-admission failover
 
@@ -46,17 +51,27 @@ A new connection SHALL capture one monotonically numbered snapshot generation be
 
 ### Requirement: Bounded replication policy
 
-Each admitted Stream or UDP Association SHALL use the selected TrafficPolicy's immutable replication budget, while one negotiated Session cap remains the hard upper bound. A low-budget flow SHALL NOT permanently reduce the independent budget of later flows in the same Session.
+Each Session SHALL capture the TrafficPolicy selected by its Egress and share one replication allowance per sending direction, bounded by the negotiated Session cap. All admitted Streams and UDP Associations SHALL use that immutable policy without rule, flow, or business-class budget overrides. Separate Sessions SHALL account independently even when they reference the same TrafficPolicy.
+
+#### Scenario: Two flows use different Egress policies
+
+- **WHEN** two flows select Egresses with different TrafficPolicies
+- **THEN** each uses the policy and shared allowance of its own Session, without changing the other Session's budget
 
 #### Scenario: Two flows use different policies
 
-- **WHEN** a low-replication flow and a high-replication flow share a Session
-- **THEN** each flow uses its own policy/class budget, and only the Session-wide remaining cap is shared
+- **WHEN** two flows select Egresses with different TrafficPolicies
+- **THEN** each uses the policy and shared allowance of its own Session, without changing the other Session's budget
 
 #### Scenario: Unknown traffic class is configured
 
-- **WHEN** a TransitRule names a class that does not exist in its selected TrafficPolicy
-- **THEN** validation rejects the reference instead of admitting the flow under an arbitrary class
+- **WHEN** a configuration contains a traffic-class reference or retired class policy field
+- **THEN** validation rejects that field instead of admitting the flow under a default or arbitrary business class
+
+#### Scenario: Several flows share the replication allowance
+
+- **WHEN** Streams and UDP Associations in one Session request optional copies concurrently in the same sending direction
+- **THEN** their combined accounting stays within that direction's remaining Session allowance, after required control reservations, without multiplying it by the number of flows
 
 ### Requirement: Atomic dynamic updates and draining
 
@@ -85,23 +100,43 @@ Ingress SHALL maintain one Session slot per configured Egress, reuse live idle S
 - **WHEN** an Egress becomes online after its previous Session was destroyed by hard failure
 - **THEN** Ingress creates a new Session and Path set instead of resurrecting the old Session
 
+#### Scenario: Egress warms before a business match
+
+- **WHEN** Ingress starts with a valid Egress binding and no business flow has matched a route
+- **THEN** it can establish that Egress's initial Paths without synthesizing a target, listener, flow tag, or geodata match
+
+#### Scenario: Only destination-specific routing rules exist
+
+- **WHEN** Ingress starts with a valid Egress binding and no business flow has matched a rule
+- **THEN** it can establish that Egress's initial Paths without synthesizing a target, listener, flow tag, or geodata match
+
 ### Requirement: Ingress owns Path target decisions
 
-Ingress SHALL derive target Path counts from matching EgressRule minimums, eligible Transit relationships, directional demand, Path quality, and Egress hard resource ceilings. Egress recommendations SHALL NOT override the Ingress rule decision.
+Ingress SHALL derive one target Path count per Session from the selected Egress minimum, eligible Transit relationships, aggregate directional demand, Path quality, and Egress hard resource ceilings. Route identities and flow matches SHALL NOT define additional Path targets, and Egress recommendations SHALL NOT override the Ingress decision.
 
 #### Scenario: Egress has no Path recommendation
 
 - **WHEN** Egress reports capacity and admission state without a recommended Path count
-- **THEN** Ingress still computes a bounded target for each matching EgressRule from its own policy and runtime observations
+- **THEN** Ingress computes one bounded Session target from its Egress configuration and runtime observations
 
-### Requirement: Rule-specific Path eligibility is enforced
+### Requirement: Egress Session Path eligibility
 
-An EgressRule SHALL count only Paths whose Transit relationship, capabilities, health, and current admission state satisfy the rule's TransitRule set. Namespace membership alone SHALL NOT make a Path eligible for the rule.
+All Streams and UDP Associations in one Session SHALL share the Path eligibility defined by its Egress Transit binding, authenticated Path readiness, health, and lifecycle state. The flow's route, target, listener, or business protocol SHALL NOT narrow the Transit set. Egress protocol capability and per-resource flow control SHALL remain enforced.
 
 #### Scenario: Warmup finds an ineligible Transit
 
-- **WHEN** a ready Transit adapter does not match the selected EgressRule's TransitRule
-- **THEN** the adapter is not counted toward that rule's minimum Path requirement and is not selected for its new flow
+- **WHEN** a ready Transit adapter does not satisfy the Egress Transit binding
+- **THEN** it is excluded from the Session pool and does not count toward the Egress minimum
+
+#### Scenario: TCP-only Transit carries Egress UDP
+
+- **WHEN** a Transit provides an eligible byte stream and the selected Egress supports UDP
+- **THEN** UDP Associations can use the shared Path pool without requiring the Transit to support native UDP
+
+#### Scenario: One Transit carries several Paths
+
+- **WHEN** one eligible Transit relationship carries several independently authenticated Paths
+- **THEN** its non-draining `ACTIVE` or `DEGRADED` Paths can satisfy the Egress Path minimum while sharing that relationship's configured weight
 
 ### Requirement: Resource failure does not fall through silently
 
@@ -112,23 +147,28 @@ When a candidate Egress rejects a pre-admission open with `RESOURCE_LIMIT`, Ingr
 - **WHEN** every compliant Egress candidate reports a resource limit before Stream admission
 - **THEN** the local flow fails with a retryable resource error and no unconfigured fallback is used
 
-### Requirement: Rule demand aggregation is bounded
+### Requirement: Session demand aggregation is bounded
 
-Ingress SHALL aggregate demand by Session-scoped rule, policy, and class keys using bounded counters and low-frequency windows. It SHALL NOT retain unbounded per-flow demand history or send rule metadata to Egress.
+Ingress SHALL aggregate upstream and downstream demand once per Session using bounded counters and low-frequency windows. Route identities, policy IDs, and business classes SHALL NOT partition Path demand. A replacement Session SHALL start with empty counters and observations; no unbounded per-flow demand history or local policy metadata SHALL be sent to Egress.
 
 #### Scenario: A Session reconnects
 
 - **WHEN** a new SessionID replaces a failed Session
 - **THEN** its demand counters and EWMA start empty while prior values remain only in bounded observations
 
+#### Scenario: Many matching rules share an Egress
+
+- **WHEN** many routing rules send traffic to the same Egress
+- **THEN** their traffic contributes to the same Session directional demand windows without allocating a separate Path requirement or demand-history entry per rule
+
 ### Requirement: Geodata predicates participate in ordered routing
 
-EgressRule, TransitRule, and ProxyRule flow matches SHALL evaluate configured geosite and geoip predicates using the same immutable geodata generation as the rest of the routing decision. The predicates SHALL follow the [geodata routing contract](../geodata-routing/spec.md) without changing rule order or implicit fallback behavior.
+EgressRule and ProxyRule flow matches SHALL evaluate configured geosite and geoip predicates using the same immutable geodata generation as the rest of the routing decision. These predicates SHALL follow the [geodata routing contract](../geodata-routing/spec.md) without changing rule order or implicit fallback behavior, and SHALL NOT select Transit relationships within an Egress.
 
 #### Scenario: Hugging Face redirect uses the same Egress policy
 
 - **WHEN** an explicit proxy flow targets a hostname in a configured `huggingface` geosite set, including a CDN subdomain
-- **THEN** the matching Egress and Transit rules select their configured route without requiring every hostname to be enumerated
+- **THEN** the matching Egress rule selects its configured Egress and the flow uses that Egress's common Path pool
 
 #### Scenario: GeoIP predicate receives an original destination address
 
@@ -182,6 +222,15 @@ items:
       capabilities:
         tcp: true
         udp: true
+      statusRequirements:
+        minUsablePaths: 2
+      transit:
+        require:
+          labels:
+            region: jp
+        reject:
+          tags: [quota-exhausted]
+      trafficPolicyRef: jp-default
   - apiVersion: pathchord.io/v1
     kind: DNSPolicy
     metadata:
@@ -276,35 +325,15 @@ spec:
     flowTags: [gaming]
     protocols: [tcp, udp]
   egressRef: jp-1
-  requirements:
-    minUsablePaths: 1
 ```
 
-The first rule whose conditions match and whose Egress is currently usable wins. Egress usability is precomputed by the runtime state manager. Geosite and geoip predicates use the flow's original hostname or original destination IP and the immutable [geodata routing](../geodata-routing/spec.md) generation; missing facts do not match or trigger DNS.
-
-### Egress-specific Proxy rules
-
-```yaml
-apiVersion: pathchord.io/v1
-kind: TransitRule
-metadata:
-  name: jp-1-gaming
-spec:
-  order: 20
-  egressRef: jp-1
-  match:
-    flowTags: [gaming]
-  require:
-    labels:
-      region: jp
-    capabilities: [udp]
-  reject:
-    tags: [quota-exhausted]
-  weight: 100
-  trafficPolicyRef: gaming-default
-```
-
-Rules are ordered. The first matching rule determines admission and base relationship weight.
+The first Egress rule whose conditions match and whose selected Egress is
+currently usable wins. Egress usability is precomputed by the runtime state
+manager. Geosite and geoip predicates use the flow's original hostname or
+original destination IP and the immutable [geodata routing](../geodata-routing/spec.md)
+generation; missing facts do not match or trigger DNS. The rule selects an
+Egress only; it does not select a Transit relationship, Path subset, minimum,
+or TrafficPolicy.
 
 Traffic policies may define multipath scheduling and replication budgets:
 
@@ -316,20 +345,26 @@ metadata:
 spec:
   scheduler: effectiveCapacityWeighted
   sessionReplicationBudgetBps: 2000000
-  classReplicationBudgetBps: 1000000
   retransmissionReplication: allowed
 ```
 
-`TransitRule.spec.trafficClassRef` optionally assigns admitted flows to a class in the selected `TrafficPolicy`. Unknown references are rejected during validation; a missing reference uses the default class.
+`retransmissionReplication: disabled` requests a zero Session replication cap
+even when the authored budget is positive. `allowed` requests the policy bit
+rate divided by eight, rounded down to wire bytes per second, and Egress may
+accept a lower value. A zero cap disables optional business and control copies
+in both directions while preserving primary traffic, necessary control, and
+ordinary reliable retransmission. `TrafficPolicy.classes`,
+`classReplicationBudgetBps`, and rule-level `trafficClassRef` are retired.
 
-The Session budget is the hard upper bound. A traffic-class budget can reduce the allocation for that class but cannot exceed the remaining Session budget. Class identity and rule demand remain Ingress-local and never cross the Egress wire.
-
-Ingress computes Path targets from each matching EgressRule's minimum, its
-eligible Transit relationships, directional demand and Path observations, and
-the Egress global safety ceiling. Egress status has no recommended Path count
-and cannot override this decision. One compliant physical Path may satisfy
-multiple rules; a Path that is not eligible for a rule does not count toward
-that rule.
+The Session budget is the hard upper bound in each sending direction. All
+Streams and UDP Associations in one Session share the Egress policy and its
+allowance; route identities do not partition demand or replication accounting.
+Ingress computes one bounded Session Path target from the Egress minimum,
+eligible Transit relationships, aggregate directional demand, Path observations,
+and the Egress global safety ceiling. Egress status has no recommended Path
+count and cannot override this decision. A non-draining `ACTIVE` or `DEGRADED`
+Path counts toward new-business admission; a draining Path only completes
+existing work.
 
 ### Ordinary Proxy rules and fallback
 
@@ -360,8 +395,6 @@ metadata:
 spec:
   action: reject # or direct
 ```
-
-`TransitRule.spec.trafficClassRef` optionally selects the class snapshot used by the Session scheduler.
 
 Selection order is:
 
@@ -439,10 +472,14 @@ Rule evaluation produces only policy data:
 decision:
   egressSelector: { labels: { region: jp } }
   proxySelector: { tags: [gaming] }
-  trafficPolicyRef: gaming-default
 ```
 
-Rules do not embed a concrete dynamic Proxy identity. The scheduler resolves selectors against the current runtime state and applies health, capacity, weight, quota metadata, and Path policy.
+Rules do not embed a concrete dynamic Proxy identity, Transit selector, Path
+minimum, or TrafficPolicy. The scheduler resolves the selected Egress binding
+against current runtime state and applies health, capacity, relationship weight,
+quota metadata, and the immutable Session policy. The Egress binding and its
+resolved policy contents are startup configuration; subscription membership and
+administrator metadata remain dynamic and drain removed Paths.
 
 ### Label and tag namespaces
 
@@ -461,11 +498,12 @@ Local administrator attributes override imported source attributes. Observed att
 
 ### Dynamic update rules
 
-- Static Egress topology changes require an Ingress restart.
+- Static Egress topology, Transit binding, common Path requirements, and the referenced resolved TrafficPolicy require an Ingress restart when their normalized values change.
 - Transit Proxy subscription updates replace the dynamic snapshot atomically.
 - A failed subscription refresh retains the last successful snapshot.
 - Removed Transit Proxies enter draining and are excluded from new selections.
 - Existing Paths using a removed Transit Proxy remain until drain completion or failure.
+- Changes to Transit membership under an unchanged Egress binding publish dynamically and drain removed relationships.
 - Compiled rules are replaced atomically; a failed compilation retains the previous rule snapshot.
 - Runtime observations update independently from configuration generations.
 
@@ -489,4 +527,12 @@ logs are not the authoritative state store.
 
 ### Session maintenance
 
-Ingress maintains one Session slot per configured Egress. When Ingress starts, it attempts to establish Sessions for Egresses whose current effective state is online. A Session remains alive while idle and is reused by subsequent Streams and UDP Associations. When an Egress becomes offline or enters hard failure, its Session and all related business connections are destroyed. When the Egress becomes online again, Ingress creates a new Session and Path set.
+Ingress maintains one Session slot per configured Egress and can warm that slot
+from the Egress binding before any business flow matches a rule. A Session
+captures one immutable TrafficPolicy and negotiated replication cap, owns one
+common Path pool, and remains alive while idle for reuse by subsequent Streams,
+UDP Associations, and Egress-routed DNS. A Session below the common usable-Path
+minimum is degraded and denies new business while ready Paths remain; loss of
+the last ready Path or a hard Egress failure destroys the Session and related
+business connections. When the Egress becomes online again, Ingress creates a
+new Session and Path set.

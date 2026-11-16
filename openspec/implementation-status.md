@@ -60,6 +60,30 @@ recovery retries bounded resource snapshots when their observation generations
 do not match; the resource queries are still not one cross-resource atomic
 transaction.
 
+The Egress-scoped Path selection change is implemented in the local runtime.
+Ingress configuration now requires an Egress-owned Transit binding and one
+TrafficPolicy reference; EgressRule matching selects only the Egress, while
+warmup and autoscaling maintain one Session Path pool with one common minimum.
+Legacy TransitRule, EgressRule Path requirements, TrafficPolicy classes,
+classReplicationBudgetBps, and trafficClassRef are rejected by the authored
+configuration schema. The attachment replication request is derived from the
+captured Egress policy (disabled requests zero; enabled converts bits per
+second to wire bytes per second), and later Paths retain the Session policy.
+Stream/UDP opens encode an empty eligible-Path list; canonical non-empty legacy
+lists are rejected before target dialing with `LOCAL_POLICY`, while opaque
+cancel and control sequencing remain available. Session observations expose
+the Egress minimum, bounded target, usable Path count, eligible Transit count,
+policy identity, and nullable directional demand/replication fields. Changes
+to an Egress binding or referenced policy require restart; dynamic Transit
+membership continues to drain removed Paths.
+
+Local validation for this change includes policy/configuration unit tests,
+Path runtime alignment tests, Ingress reload and Session tests, the CLI
+multi-process HTTP/UDP smoke test, the complete locked workspace test suite,
+formatting, Clippy, strict OpenSpec validation, and documentation diff/link
+checks. Native-platform, external-peer, deployed monitoring, and production
+probe evidence remain separate and are not inferred from these local checks.
+
 Earlier local validation of the v1 contract, before the current uncommitted
 proxy-compatibility work:
 
@@ -131,8 +155,8 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   Capability selection uses the already registered `PATH_READY_CAPABILITIES`
   message. Update both endpoints together: older implementations can reject that
   message without the class bit or omit required selections in plain `PATH_READY`.
-- The Session runtime supports TCP and UDP Streams, multiple Paths, per-Stream
-  eligible Path sets, DATA/ACK/WINDOW/FIN/RST, bounded reordering and buffers,
+- The Session runtime supports TCP and UDP Streams, multiple Paths, a common
+  Egress Session Path pool, DATA/ACK/WINDOW/FIN/RST, bounded reordering and buffers,
   Path drain/close, bounded timer retransmission, cross-Path re-framing, and
   supervised shutdown. Session control messages use a separate ordered,
   acknowledged and retransmitted envelope. Duplicate or stale authenticated
@@ -150,16 +174,13 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   Session tests cover both existing protocols, denied opens, lost-data
   retransmission, and admission recovery; a separate drain-deadline regression
   keeps a second Path alive across health ticks.
-  A routed flow currently retains the eligible Path IDs captured at its open;
-  a later replacement Path is not automatically added to that existing flow.
-  If all of those IDs fail, the flow can therefore close even while another
-  Session Path exists. Treating all Session Paths as eligible would violate
-  Transit-rule isolation; a safe update requires a negotiated flow-eligibility
-  protocol and independent interoperability tests. A configured
-  `minUsablePaths` is checked against the rule's admissible Paths when opening
-  TCP or UDP, not against unrelated Session Paths, and does not terminate an
-  already admitted flow. Maintenance detects a rule-specific shortfall even
-  when other rules have enough ready Paths.
+  Every new Stream and UDP Association uses the common Session pool in both
+  directions. A Path failure can therefore move an admitted flow to another
+  ready Path without changing its Egress or target socket. The configured
+  `minUsablePaths` is an Egress Session minimum: below it, new admission is
+  denied while existing work remains when another ready Path exists; loss of
+  the last ready Path closes the Session. Planned scale-in counts only usable
+  non-draining Paths after all selected drain candidates.
 - Ingress has ordinary HTTP forwarding and CONNECT, SOCKS4/4a/5 CONNECT,
   SOCKS5 UDP ASSOCIATE, Linux REDIRECT
   and TPROXY adapters, transparent UDP, a direct smoltcp TUN reactor, process
@@ -187,11 +208,11 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   runtime.
 - `IngressDataPlane` compiles/evaluates ordered policy, creates authenticated
   Egress Sessions through Transit adapters, exposes TCP/UDP openers, maintains
-  Path slots, applies selected TrafficPolicy replication/retransmission
-  budgets, exports path-quality/session/individual Stream observations, and
-  publishes DNS protected endpoints. TrafficPolicy class priority/share
-  scheduling is negotiated in both directions with bounded priority, weighted
-  fairness, and class-aware TCP/UDP queues.
+  Egress-owned Path slots, applies one Session TrafficPolicy replication
+  allowance per sending direction, exports path-quality/session/individual
+  Stream observations, and publishes DNS protected endpoints. Internal queue
+  fairness and bounded priority remain, but business traffic-class settings
+  are not part of the authored policy or observation surface.
 - Static policy reload prepares every changed Transit adapter before a
   transactional runtime/control-plane commit. Failed preparation or durable
   control reconciliation retains the previous generation; changed Paths drain

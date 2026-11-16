@@ -16,9 +16,9 @@ use url::Url;
 use crate::{
     AuthenticationMode, Capabilities, DnsBlockedResponse, DnsCacheConfig, DnsLocalConfig,
     DnsPolicyConfig, DnsPolicyId, DnsRoute, EgressConfig, EgressId, EgressRule, EgressSelection,
-    Endpoint, FallbackAction, FlowMatch, FlowProtocol, Generation, GeoIpDatabaseConfig,
-    GeoIpDatabaseId, GeoSiteDatabaseConfig, GeoSiteDatabaseId, ListenerConfig, ListenerId,
-    ListenerKind, PolicyConfig, ProcessMetadataRequest, ProxyRule, ProxySelection,
+    EgressTransitBinding, Endpoint, FallbackAction, FlowMatch, FlowProtocol, Generation,
+    GeoIpDatabaseConfig, GeoIpDatabaseId, GeoSiteDatabaseConfig, GeoSiteDatabaseId, ListenerConfig,
+    ListenerId, ListenerKind, PolicyConfig, ProcessMetadataRequest, ProxyRule, ProxySelection,
     RetransmissionReplication, RuleId, Scheduler, Selector, SubscriptionCache, SubscriptionConfig,
     SubscriptionId, SubscriptionRefresh, SubscriptionSource, SubscriptionSourceType, TrafficPolicy,
     TrafficPolicyId, TransitProxyConfig, TransitProxyId, TransitRule, TransitSource,
@@ -84,6 +84,24 @@ pub struct EgressSpec {
     capabilities: Capabilities,
     #[serde(default)]
     status_requirements: RequirementsSpec,
+    transit: Option<EgressTransitSpec>,
+    traffic_policy_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EgressTransitSpec {
+    #[serde(default)]
+    require: SelectorSpec,
+    #[serde(default)]
+    reject: EgressTransitRejectSpec,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EgressTransitRejectSpec {
+    #[serde(default)]
+    tags: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -293,7 +311,7 @@ pub struct EgressRuleSpec {
     egress_selector: Option<SelectorSpec>,
     mode: Option<String>,
     #[serde(default)]
-    requirements: RequirementsSpec,
+    requirements: Option<RequirementsSpec>,
     #[serde(default)]
     catch_all: bool,
 }
@@ -357,7 +375,7 @@ pub struct TrafficPolicySpec {
     #[serde(default = "default_replication")]
     retransmission_replication: ReplicationSpec,
     #[serde(default)]
-    classes: BTreeMap<String, ClassSpec>,
+    classes: Option<BTreeMap<String, ClassSpec>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -723,17 +741,43 @@ impl KubeConfig {
                         path: value.spec.path,
                     });
                 }
-                KubeResource::Egress(value) => config.egresses.push(EgressConfig {
-                    id: EgressId::in_namespace(&namespace, &value.metadata.name),
-                    endpoint: Endpoint {
-                        host: value.spec.address,
-                        port: value.spec.port,
-                    },
-                    public_key: value.spec.public_key,
-                    labels: value.metadata.labels,
-                    capabilities: value.spec.capabilities,
-                    status_requirements: value.spec.status_requirements.into(),
-                }),
+                KubeResource::Egress(value) => {
+                    let policy_name = value.spec.traffic_policy_ref.ok_or_else(|| {
+                        invalid_spec(
+                            &value.kind,
+                            &value.metadata.name,
+                            "trafficPolicyRef is required",
+                        )
+                    })?;
+                    config.egresses.push(EgressConfig {
+                        id: EgressId::in_namespace(&namespace, &value.metadata.name),
+                        endpoint: Endpoint {
+                            host: value.spec.address,
+                            port: value.spec.port,
+                        },
+                        public_key: value.spec.public_key,
+                        labels: value.metadata.labels,
+                        capabilities: value.spec.capabilities,
+                        status_requirements: value.spec.status_requirements.into(),
+                        transit: {
+                            let transit = value.spec.transit.ok_or_else(|| {
+                                invalid_spec(
+                                    &value.kind,
+                                    &value.metadata.name,
+                                    "transit binding is required",
+                                )
+                            })?;
+                            EgressTransitBinding {
+                                require: transit.require.into(),
+                                reject_tags: transit.reject.tags,
+                            }
+                        },
+                        traffic_policy: Some(TrafficPolicyId::in_namespace(
+                            &namespace,
+                            &policy_name,
+                        )),
+                    });
+                }
                 KubeResource::TransitProxy(value) => {
                     let source = value.spec.source.map(|source| TransitSource {
                         source_type: source.source_type,
@@ -797,14 +841,15 @@ impl KubeConfig {
                                     .into(),
                         }),
                     };
+                    let requirements = value.spec.requirements.unwrap_or_default();
                     egress_rules.push((
                         value.spec.order,
                         EgressRule {
                             id: RuleId::in_namespace(&namespace, &value.metadata.name),
                             matches: qualified_match(value.spec.matches, &namespace),
                             egress,
-                            min_usable_paths: value.spec.requirements.min_usable_paths,
-                            required_capabilities: value.spec.requirements.capabilities,
+                            min_usable_paths: requirements.min_usable_paths,
+                            required_capabilities: requirements.capabilities,
                         },
                     ));
                 }
@@ -902,6 +947,15 @@ impl KubeConfig {
                             reason: "scheduler must be effectiveCapacityWeighted".into(),
                         });
                     }
+                    if value.spec.class_replication_budget_bps.is_some()
+                        || value.spec.classes.is_some()
+                    {
+                        return Err(invalid_spec(
+                            &value.kind,
+                            &value.metadata.name,
+                            "TrafficPolicy class fields are retired",
+                        ));
+                    }
                     config.traffic_policies.push(TrafficPolicy {
                         id: TrafficPolicyId::in_namespace(&namespace, &value.metadata.name),
                         scheduler: Scheduler::EffectiveCapacityWeighted,
@@ -911,20 +965,7 @@ impl KubeConfig {
                             ReplicationSpec::Allowed => RetransmissionReplication::Allowed,
                             ReplicationSpec::Disabled => RetransmissionReplication::Disabled,
                         },
-                        classes: value
-                            .spec
-                            .classes
-                            .into_iter()
-                            .map(|(name, class)| {
-                                (
-                                    name,
-                                    crate::TrafficClass {
-                                        priority: class.priority,
-                                        share: class.share,
-                                    },
-                                )
-                            })
-                            .collect(),
+                        classes: BTreeMap::new(),
                     });
                 }
                 KubeResource::Listener(value) => {
@@ -1351,6 +1392,25 @@ fn validate_resource_set(
                 .map_err(|reason| invalid_spec(&value.kind, &value.metadata.name, reason))?,
             KubeResource::Egress(value) => {
                 validate_egress_spec(value)?;
+                if value
+                    .spec
+                    .traffic_policy_ref
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                {
+                    return Err(invalid_spec(
+                        &value.kind,
+                        &value.metadata.name,
+                        "trafficPolicyRef is required",
+                    ));
+                }
+                if value.spec.transit.is_none() {
+                    return Err(invalid_spec(
+                        &value.kind,
+                        &value.metadata.name,
+                        "transit binding is required",
+                    ));
+                }
             }
             KubeResource::TransitProxy(value) => {
                 validate_transit_proxy_spec(value)?;
@@ -1359,6 +1419,13 @@ fn validate_resource_set(
                 validate_subscription_spec(value)?;
             }
             KubeResource::EgressRule(value) => {
+                if value.spec.requirements.is_some() {
+                    return Err(invalid_spec(
+                        &value.kind,
+                        &value.metadata.name,
+                        "EgressRule requirements are retired; configure the Egress minimum",
+                    ));
+                }
                 validate_flow_match(
                     value.spec.matches.as_ref(),
                     &value.kind,
@@ -1373,25 +1440,11 @@ fn validate_resource_set(
                 )?;
             }
             KubeResource::TransitRule(value) => {
-                validate_flow_match(
-                    value.spec.matches.as_ref(),
+                return Err(invalid_spec(
                     &value.kind,
                     &value.metadata.name,
-                )?;
-                validate_rule_spec(
-                    value.kind.as_str(),
-                    &value.metadata.name,
-                    value.spec.order,
-                    value.spec.matches.as_ref(),
-                    value.spec.catch_all,
-                )?;
-                if value.spec.traffic_policy_ref.as_deref() == Some("") {
-                    return Err(invalid_spec(
-                        &value.kind,
-                        &value.metadata.name,
-                        "trafficPolicyRef cannot be empty",
-                    ));
-                }
+                    "TransitRule resources are retired; configure Transit on the Egress",
+                ));
             }
             KubeResource::ProxyRule(value) => {
                 validate_flow_match(
@@ -1773,10 +1826,12 @@ fn validate_traffic_policy_spec(value: &Resource<TrafficPolicySpec>) -> Result<(
             "replication budgets must not exceed 10^12",
         ));
     }
-    if value.spec.classes.len() > MAX_MAP_ENTRIES
-        || value.spec.classes.values().any(|class| class.share == 0)
-    {
-        return Err(invalid_spec(kind, name, "classes contain an invalid share"));
+    if value.spec.classes.is_some() {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "TrafficPolicy class fields are retired",
+        ));
     }
     Ok(())
 }
@@ -2338,6 +2393,14 @@ items:
       port: 443
       publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
       capabilities: {tcp: true, udp: true}
+      transit: {}
+      trafficPolicyRef: default-policy
+  - apiVersion: pathchord.io/v1
+    kind: TrafficPolicy
+    metadata:
+      name: default-policy
+    spec:
+      scheduler: effectiveCapacityWeighted
   - apiVersion: pathchord.io/v1
     kind: DNSPolicy
     metadata:
@@ -2771,7 +2834,7 @@ spec:
     }
 
     #[test]
-    fn traffic_class_references_select_existing_policy_classes() {
+    fn traffic_class_configuration_is_retired() {
         let input = format!(
             r#"{VALID}
 ---
@@ -2788,20 +2851,18 @@ metadata: {{name: classified}}
 spec: {{order: 99, catchAll: true, egressRef: jp-1, trafficPolicyRef: gaming, trafficClassRef: interactive}}
 "#
         );
-        let parsed = KubeConfig::from_yaml(&input)
-            .unwrap()
-            .into_validated_snapshot(Generation::new(1))
-            .unwrap();
-        assert_eq!(
-            parsed.config().transit_rules[0].traffic_class.as_deref(),
-            Some("interactive")
-        );
-        let invalid = input.replace("trafficClassRef: interactive", "trafficClassRef: absent");
+        let error = KubeConfig::from_yaml(&input).unwrap_err().to_string();
         assert!(
-            KubeConfig::from_yaml(&invalid)
-                .unwrap()
-                .into_validated_snapshot(Generation::new(1))
-                .is_err()
+            error.contains("TrafficPolicy class fields are retired"),
+            "{error}"
+        );
+        let transit = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitRule\nmetadata: {{name: retired}}\nspec: {{order: 99, catchAll: true, egressRef: jp-1}}\n"
+        );
+        let error = KubeConfig::from_yaml(&transit).unwrap_err().to_string();
+        assert!(
+            error.contains("TransitRule resources are retired"),
+            "{error}"
         );
     }
 
@@ -2817,6 +2878,14 @@ spec:
   port: 443
   publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
   capabilities: {tcp: true, udp: true}
+  transit: {}
+  trafficPolicyRef: default-policy
+---
+apiVersion: pathchord.io/v1
+kind: TrafficPolicy
+metadata:
+  name: default-policy
+spec: {}
 ---
 apiVersion: pathchord.io/v1
 kind: DNSPolicy
@@ -2835,7 +2904,7 @@ spec:
   action: reject
 "#;
         let config = KubeConfig::from_yaml(input).expect("multi-document config");
-        assert_eq!(config.resources.len(), 3);
+        assert_eq!(config.resources.len(), 4);
     }
 
     #[test]
@@ -2913,7 +2982,6 @@ spec:
     fn omitted_match_is_a_catch_all_and_empty_match_is_rejected() {
         for (kind, action) in [
             ("EgressRule", "egressRef: jp-1"),
-            ("TransitRule", "egressRef: jp-1"),
             ("ProxyRule", "proxy: direct"),
         ] {
             let input = format!(
@@ -2934,6 +3002,15 @@ spec:
                     .contains("empty match")
             );
         }
+        let retired = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitRule\nmetadata: {{name: retired}}\nspec: {{order: 1, catchAll: true, egressRef: jp-1}}\n"
+        );
+        assert!(
+            KubeConfig::from_yaml(&retired)
+                .unwrap_err()
+                .to_string()
+                .contains("TransitRule resources are retired")
+        );
     }
 
     #[test]
@@ -2957,7 +3034,7 @@ spec:
 apiVersion: pathchord.io/v1
 kind: Egress
 metadata: {{name: edge, namespace: {namespace}, labels: {{region: jp}}}}
-spec: {{address: 127.0.0.1, port: 7443, publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, capabilities: {{tcp: true}}}}
+spec: {{address: 127.0.0.1, port: 7443, publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, capabilities: {{tcp: true}}, transit: {{}}, trafficPolicyRef: traffic}}
 ---
 apiVersion: pathchord.io/v1
 kind: Listener
@@ -2977,7 +3054,7 @@ spec: {{protocol: direct, source: {{type: clash, subscriptionRef: provider}}, cr
 apiVersion: pathchord.io/v1
 kind: TrafficPolicy
 metadata: {{name: traffic, namespace: {namespace}}}
-spec: {{classes: {{interactive: {{priority: 1, share: 2}}}}}}
+spec: {{}}
 ---
 apiVersion: pathchord.io/v1
 kind: EgressRule
@@ -2985,17 +3062,11 @@ metadata: {{name: route, namespace: {namespace}}}
 spec: {{order: {order}, match: {{listenerRefs: [local]}}, egressRef: edge}}
 ---
 apiVersion: pathchord.io/v1
-kind: TransitRule
-metadata: {{name: route, namespace: {namespace}}}
-spec: {{order: {}, egressRef: edge, trafficPolicyRef: traffic, trafficClassRef: interactive}}
----
-apiVersion: pathchord.io/v1
 kind: ProxyRule
 metadata: {{name: route, namespace: {namespace}}}
 spec: {{order: {}, require: {{labels: {{region: jp}}}}}}
 "#,
             order + 1,
-            order + 2
         )
     }
 
@@ -3018,16 +3089,14 @@ spec: {{order: {}, require: {{labels: {{region: jp}}}}}}
         assert_ne!(policy.egresses[0].id, policy.egresses[1].id);
         for namespace in ["alpha", "beta"] {
             let egress = EgressId::in_namespace(namespace, "edge");
-            assert!(policy.egresses.iter().any(|value| value.id == egress));
-            let rule = policy
-                .transit_rules
+            let configured_egress = policy
+                .egresses
                 .iter()
-                .find(|rule| rule.id.namespace() == namespace)
+                .find(|value| value.id == egress)
                 .unwrap();
-            assert_eq!(rule.egress, egress);
             assert_eq!(
-                rule.traffic_policy,
-                TrafficPolicyId::in_namespace(namespace, "traffic")
+                configured_egress.traffic_policy,
+                Some(TrafficPolicyId::in_namespace(namespace, "traffic"))
             );
             let proxy = policy
                 .transit_proxies

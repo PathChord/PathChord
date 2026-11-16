@@ -10,7 +10,7 @@
 
 ### Requirement: Versioned schema conformance
 
-v1 schema SHALL 暴露 Egress aggregate wire capacity 和全局入站目标连接限制，同时将 desired Path 数量、per-Ingress stream 配额和 Path 安全上限排除在 authored Egress policy 之外。
+v1 schema SHALL 暴露 Egress aggregate wire capacity 和全局入站目标连接限制，同时将 desired Path 数量、per-Ingress stream 配额和 Path 安全上限排除在 authored Egress policy 之外。每个 Ingress 侧 Egress 必须声明一个 Transit 绑定和一个用于 Session Path 池的 TrafficPolicy 引用。
 
 #### Scenario: Removed desired-Path fields are authored
 
@@ -42,21 +42,36 @@ Ingress 必须（SHALL）先选择命令行配置，再选择环境配置和账�
 
 ### Requirement: Atomic publication and resilient watching
 
-完整候选必须（SHALL）通过解析、验证、规范化、编译及必要的持久化后，才能发布一个不可变代次。无效候选必须（SHALL）保留上一份有效配置集合；单文件和根目录的原子替换必须（SHALL）保留监听能力，只在启动时加载的字段发生变化时必须（SHALL）报告需要重启。
+完整候选必须（SHALL）通过解析、验证、规范化、编译及必要的持久化后，才能发布一个不可变代次。无效候选必须（SHALL）保留上一份有效配置集合；单文件和根目录的原子替换必须（SHALL）保留监听能力。Egress 绑定、公共准入最小值、引用的策略或已解析策略内容发生变化时，必须报告需要重启并保留当前配置。
 
 #### Scenario: Atomic replacement contains an invalid candidate
 
 - **WHEN** 一个受监听的配置文件被原子替换为无效资源候选
 - **THEN** 上一份有效配置集合继续生效，且继续监听后续有效替换
 
+#### Scenario: A referenced policy changes without changing its name
+
+- **WHEN** 重载改变 Egress 引用的 TrafficPolicy 内容但保留引用名称
+- **THEN** Ingress 报告需要重启，并保留当前配置和 Session 策略快照
+
+#### Scenario: Only Transit membership changes
+
+- **WHEN** 订阅或授权的管理员元数据更新改变了不变 Egress 绑定下的节点
+- **THEN** Ingress 发布有效动态代次并排空被移除的候选，不要求新的 Egress 策略快照
+
 ### Requirement: Deterministic bounded rule compilation
 
-规则必须（SHALL）使用显式且唯一的顺序值，并进行确定、有界且无 I/O 的求值。无效策略和类别引用必须（SHALL）拒绝。TransitRule 未提供所需 TrafficPolicy 且运行时候选超过一个时，必须（SHALL）拒绝该 flow，不得进入 Proxy 规则或 fallback。
+规则必须（SHALL）使用显式且唯一的顺序值，并进行确定、有界且无 I/O 的求值。EgressRule 输出只能选择 Egress 动作并携带诊断规则身份。每个 Egress 必须在完整资源集合验证期间解析一个 TrafficPolicy，不依赖运行时候选数量。已退休的 TransitRule 和流量类别配置必须明确拒绝。
 
 #### Scenario: Multiple Transit relationships lack a policy
 
-- **WHEN** 规则省略 `trafficPolicyRef`，且多条已准入 Transit 关系都可承载该 flow
-- **THEN** 必须拒绝该 flow，不得继续普通 Proxy 规则或全局回退
+- **WHEN** 一个 Egress 有多个可能 Transit 关系却省略 `trafficPolicyRef`
+- **THEN** 必须在发布前拒绝完整候选，而不是等节点加入后才因单路径配置失败
+
+#### Scenario: Only one Transit is currently available
+
+- **WHEN** 一个 Egress 当前只有一条可用 Transit 关系却省略策略引用
+- **THEN** 仍必须拒绝同一验证错误，不创建隐式的单 Transit 策略
 
 ### Requirement: Persistent subscription ownership
 
@@ -196,7 +211,7 @@ items:
 `metadata.annotations` 是可选且有界的字符串映射。`metadata.uid`、`metadata.generation` 和
 `metadata.resourceVersion` 由服务端生成，不能由用户写入。运行时 `status` 只读，并由控制面单独暴露。
 
-支持的 kind 为 `Egress`、`TransitProxy`、`Subscription`、`EgressRule`、`TransitRule`、`ProxyRule`、
+支持的 kind 为 `Egress`、`TransitProxy`、`Subscription`、`EgressRule`、`ProxyRule`、
 `TrafficPolicy`、`Listener`、`DNSPolicy`、`FallbackPolicy`、`GeoSiteDatabase`、`GeoIpDatabase`、
 `EgressService` 和 `NodeProbePolicy`。
 后两者是角色专用的服务资源：`EgressService` 为一个 Egress 进程选择身份、监听器、授权存储和服务限制；
@@ -255,9 +270,13 @@ mutation 写入。导入的 source、observed、quota 和 billing 值均由运�
 | `spec.publicKey` | 是 | 32 字节无填充 base64url Curve25519 公钥 |
 | `spec.capabilities` | 否 | `tcp`/`udp` 布尔映射，默认均为 false |
 | `spec.statusRequirements` | 否 | `minUsablePaths` 和可选能力集合，默认 1 |
+| `spec.transit` | 是 | 同一 namespace 的公共 Transit 绑定，可选 `require` 和 `reject` 选择器 |
+| `spec.trafficPolicyRef` | 是 | 每个使用该 Egress 的 Session 所用的同 namespace TrafficPolicy |
 
 `capabilities.tcp` 或 `capabilities.udp` 至少一个必须为 true。所有 Egress 引用必须解析到 Egress
-对象。Egress 拓扑和本地密钥属于启动配置，不能热重载。
+对象。`transit: {}` 明确允许同 namespace 中其他条件合格的 Transit 节点；`require` 使用 label、tag
+和 capability，`reject.tags` 排除匹配节点。绑定不能包含 flow match、order、第二个 weight、Path 子集
+或 desired Path 数量。Egress 拓扑、绑定和已解析 TrafficPolicy 属于启动配置，不能热重载。
 
 ### EgressService 和 NodeProbePolicy
 
@@ -349,7 +368,7 @@ maxAgeSeconds 默认 86400 且范围 `60..=2592000`。`source.userAgent` 可选�
 相对路径基于选定配置文件的父目录或选定配置目录根目录解析。数据库文件是外部输入，不是资源
 文档，MUST 放在被扫描的配置目录之外，或使用不被扫描的扩展名。
 
-`targetGeoSites` 和 `targetGeoIps` 是 EgressRule、TransitRule 或 ProxyRule 的 `match` 中
+`targetGeoSites` 和 `targetGeoIps` 是 EgressRule 或 ProxyRule 的 `match` 中
 可选的非空序列，每个最多 256 个字符串。Geosite 引用使用 `set` 或 `set@attribute`，可选
 `geosite:` 前缀；geoip 引用使用 `set`，可选 `geoip:` 前缀。对应前缀在规范化时移除；不兼容的
 前缀必须拒绝。集合和属性名称使用非空 ASCII 字母、数字、`.`、`_`、`-` 和 `!`，大小写不敏感。
@@ -367,30 +386,27 @@ namespace 中。归一化后重复的引用无效。同一字段中的值为 OR�
 
 ### 规则和选择器
 
-规则是资源，顺序由 `spec.order` 整数决定；同序号必须拒绝。`EgressRule`、`TransitRule` 和 `ProxyRule`
+规则是资源，顺序由 `spec.order` 整数决定；同序号必须拒绝。`EgressRule` 和 `ProxyRule`
 都可以有可选的 `spec.match`。显式提供 `match: {}` 必须拒绝；只有确实需要显式全匹配规则时才省略 `match`。字段之间为 AND，同一字段
 中的多个值为 OR。支持 `flowTags`、`protocols`、`listenerRefs`、`sourceNetworks`、
 `authenticationIdentities`、`processExecutables`、`targetHosts`、`targetGeoSites`、
 `targetGeoIps` 和 `targetPorts`。
 
 EgressRule 的 spec 在 `egressRef`、`egressSelector` 或 `mode: none` 中选择一个。selector 至少一个条件；
-mode none 是普通 Proxy 模式，不得创建 Session。TransitRule 在选定 Egress 后求值，使用 egressRef、
-require、reject、weight（默认 100）；当多条准入的 Transit 关系可承载同一 flow 时必须提供
-`trafficPolicyRef`。规则省略该引用而其运行时候选超过一个时，必须拒绝该 flow，不得进入 Proxy 规则
-或 fallback。可选 `trafficClassRef` 选择所选 TrafficPolicy 类别映射中的 key；未知 key 必须拒绝。没有准入 Proxy 时继续下一条 EgressRule，
-不得隐式选择任意 Proxy。ProxyRule 的 select 默认 any，也可以使用 `proxy: direct`；proxy 与 select 互斥。
+mode none 是普通 Proxy 模式，不得创建 Session。EgressRule 不接受 requirements、Transit selector、策略覆盖或业务类别字段；选定 Egress 的绑定提供公共 Transit 候选、Path 最小值和 TrafficPolicy。绑定没有准入 Transit 时继续下一条 EgressRule，不得隐式选择任意 Proxy。ProxyRule 的 select 默认 any，也可以使用 `proxy: direct`；proxy 与 select 互斥。
 规则求值必须确定、有界且无 I/O，编译器必须拒绝未知字段、无界表达式和无效引用，编译失败保留上一快照。
 
 ### TrafficPolicy
 
 TrafficPolicy spec 支持 `scheduler`（默认 `effectiveCapacityWeighted`）、`sessionReplicationBudgetBps`
-（默认 0）、可选 `classReplicationBudgetBps`、`retransmissionReplication`（默认 disabled）以及
-`classes`（priority/share 映射）。预算不得超过 `10^12`，priority 为 `0..=255`，share 为 `1..=1_000_000`。
-Session 预算是硬上限且包含控制流量；调度器应用关系权重、billing 倍率、有效容量、拥塞窗口、RTT、抖动和丢包，
+（默认 0）和 `retransmissionReplication`（默认 disabled）。预算不得超过 `10^12`。
+Session 预算在每个发送方向是硬上限且包含控制流量；`disabled` 即使配置正预算也请求零，`allowed`
+请求预算除以 8 后向下取整的 wire bytes/s。零上限禁用可选业务和控制副本，但保留首份、必要控制和普通可靠重传。
+调度器应用关系权重、billing 倍率、有效容量、拥塞窗口、RTT、抖动和丢包，
 不得超过 Path 的流控上报限制。
 
-`TransitRule.spec.trafficClassRef` 可以将准入 flow 分配到所选 `TrafficPolicy.classes` 中的一个 key。
-未知类别引用属于验证错误；缺少引用时使用默认类别。
+`classes`、`classReplicationBudgetBps` 和 `trafficClassRef` 已退休并拒绝，包括空值或零值。策略每个 Session
+只捕获一次；后续 Path attach 不能替换策略或提高协商上限。
 
 ### Listener
 
@@ -456,8 +472,9 @@ Ingress 接受一个资源文件或一棵目录树。配置来源按以下优先
 ### 快照发布和重载
 
 加载器必须先解析、验证、规范化并编译完整对象图，再发布不可变代次。连接在 Egress/Proxy 求值前捕获一个
-代次并使用到完整决策结束。运行时观测不能覆盖期望 spec。静态 Egress 拓扑、本地密钥、监听器绑定和平台
-路由需要重启；订阅、导入 Proxy、管理员 label、DNS 健康和编译后的动态规则可以热重载。替换必须原子化；
+代次并使用到完整决策结束。运行时观测不能覆盖期望 spec。静态 Egress 拓扑、Transit 绑定、公共 Path 要求、
+引用的 TrafficPolicy 内容、本地密钥、监听器绑定和平台路由需要重启；订阅、导入 Proxy、管理员 label、DNS
+健康和编译后的动态规则可以热重载。替换必须原子化；
 解析、验证、编译、持久化或缓存失败时，上一成功代次保持生效并通过类型化 status 暴露错误。
 
 对于声明式 Subscription，管理接口的启用、禁用、删除或显式重新创建在声明未改变时必须跨重载
@@ -466,4 +483,5 @@ Ingress 接受一个资源文件或一棵目录树。配置来源按以下优先
 
 目录中的创建、修改、删除和重命名事件触发完整候选重扫。单文件原子替换和根目录替换后必须
 保留监听能力。所有文件验证通过后才发布一个快照；非法、不完整或重复的候选保留上一份有效
-配置集合。只在启动时加载的字段发生变化时，继续报告需要重启。
+配置集合。只在启动时加载的字段发生变化时，继续报告需要重启。未被任何 Egress 引用的 TrafficPolicy
+变化不触发 Egress 启动边界；等价默认值和文件/映射顺序变化也不触发重启。

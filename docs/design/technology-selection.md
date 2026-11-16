@@ -32,10 +32,11 @@ provide the baseline; Ingress observes upstream and downstream Path capacity,
 congestion, RTT, jitter, loss, and retransmission to adjust instantaneous
 allocation. Egress enforces a global wire hard cap and reports aggregate
 configured/effective capacity and admission state; it does not interpret
-Ingress rules or provide a desired Path count. A mandatory Session replication
-cap is negotiated during attachment, while per-flow/class budgets remain local
-to Ingress and extra copies use only residual capacity after primary traffic,
-ordinary retransmission, and required control traffic.
+Ingress rules or provide a desired Path count. Each Egress binding supplies one
+Session Path pool and TrafficPolicy. A mandatory Session replication cap is
+negotiated during attachment, and each sender shares its outbound allowance
+across all flows and Paths; extra copies use only residual capacity after
+primary traffic, ordinary retransmission, and required control traffic.
 
 The Egress resource surface is intentionally small: authored configuration
 provides only the aggregate wire cap and global inbound target-connection cap.
@@ -125,7 +126,7 @@ The implementation must not reuse WireGuard key material or treat the Transit Pr
 
 ## Rule engine selection criteria
 
-The rule engine must be deterministic, bounded, and unable to perform I/O. It may read a connection context, listener metadata, process metadata, target metadata, static labels, and observed state. It may output selectors, tags, labels, and traffic policy parameters, but never a concrete socket or arbitrary node object.
+The rule engine must be deterministic, bounded, and unable to perform I/O. It may read a connection context, listener metadata, process metadata, target metadata, static labels, and observed state. It may select an Egress or ordinary Proxy action, but never a concrete socket, Transit Path subset, per-rule minimum, business class, or arbitrary node object.
 
 The built-in rule engine uses a small native AST compiler. An alternative WASM
 or eBPF-like backend may implement the same restricted rule interface, but it
@@ -134,7 +135,7 @@ defines the boundary between policy compilation and runtime evaluation.
 
 ## Configuration and hot reload
 
-Human configuration is parsed into typed data, validated, normalized, and compiled into an immutable snapshot. Snapshot replacement is atomic. Static Egress topology and local key material remain startup configuration; Transit Proxy data and compiled dynamic rules may be hot reloaded according to the configuration rules.
+Human configuration is parsed into typed data, validated, normalized, and compiled into an immutable snapshot. Snapshot replacement is atomic. Static Egress topology, Transit bindings, common Path requirements, resolved TrafficPolicies, and local key material remain startup configuration; Transit Proxy membership and compiled dynamic rules may be hot reloaded according to the configuration rules.
 
 SQLite transactions are used for Egress authorization changes. The running Egress process owns the database and publishes the resulting generation to its in-memory authorization snapshot.
 

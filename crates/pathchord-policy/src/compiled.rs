@@ -11,9 +11,9 @@ use crate::geodata::{
     MAX_DATABASE_BYTES,
 };
 use crate::{
-    Capabilities, EgressConfig, EgressId, EgressRule, EgressSelection, FlowMatch, FlowProtocol,
-    Generation, ListenerId, PolicyConfig, PolicyContext, ProxyRule, ProxySelection, RuleId,
-    Selector, TargetEndpoint, TargetHost, TrafficPolicy, TrafficPolicyId, TransitProxyConfig,
+    Capabilities, EgressConfig, EgressId, EgressRule, EgressSelection, EgressTransitBinding,
+    FlowMatch, FlowProtocol, Generation, PolicyConfig, PolicyContext, ProxyRule, ProxySelection,
+    RuleId, Selector, TargetHost, TrafficPolicy, TrafficPolicyId, TransitProxyConfig,
     TransitProxyId, TransitRule, ValidatedPolicySnapshot,
 };
 
@@ -114,9 +114,6 @@ pub struct TransitCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressRouteCandidate {
     pub egress_id: EgressId,
-    pub transit_rule_id: RuleId,
-    pub traffic_policy_id: TrafficPolicyId,
-    pub traffic_class: Option<String>,
     pub transit_proxies: Vec<TransitCandidate>,
 }
 
@@ -124,8 +121,6 @@ pub struct EgressRouteCandidate {
 pub struct EgressRoutePlan {
     pub generation: Generation,
     pub egress_rule_id: RuleId,
-    pub min_usable_paths: u32,
-    pub required_capabilities: BTreeSet<FlowProtocol>,
     pub candidates: Vec<EgressRouteCandidate>,
 }
 
@@ -690,8 +685,6 @@ impl CompiledPolicy {
                 return Evaluation::Route(RoutePlan::Egress(EgressRoutePlan {
                     generation: self.generation,
                     egress_rule_id: compiled.rule.id.clone(),
-                    min_usable_paths: compiled.rule.min_usable_paths,
-                    required_capabilities: compiled.rule.required_capabilities.clone(),
                     candidates,
                 }));
             }
@@ -722,70 +715,6 @@ impl CompiledPolicy {
         }
     }
 
-    /// Return only rule-derived warmup routes. This deliberately uses a
-    /// synthetic empty-tag context, so a Transit that is eligible only for a
-    /// different flow selector is not counted by namespace-wide warmup.
-    pub fn warmup_routes(
-        &self,
-        protocol: FlowProtocol,
-        runtime: &RuntimeCatalog,
-    ) -> Vec<(EgressId, u32, EgressRouteCandidate)> {
-        let mut routes = Vec::new();
-        for compiled in &self.egress_rules {
-            let context = PolicyContext {
-                flow_tags: BTreeSet::new(),
-                listener_id: ListenerId::in_namespace(
-                    compiled.matches.namespace.as_str(),
-                    "__pathchord_warmup",
-                ),
-                source: "0.0.0.0:0".parse().expect("warmup source address"),
-                authentication_identity: None,
-                process: None,
-                protocol,
-                target: TargetEndpoint {
-                    host: TargetHost::Hostname("__pathchord_warmup__".into()),
-                    port: 0,
-                },
-            };
-            if !compiled.matches.matches(&context) {
-                continue;
-            }
-            let egresses: Vec<_> = match &compiled.rule.egress {
-                EgressSelection::Id(id) => self.egresses.get(id).into_iter().collect(),
-                EgressSelection::Selector(selector) => self
-                    .egresses
-                    .values()
-                    .filter(|egress| {
-                        egress.id.namespace() == compiled.matches.namespace
-                            && selector.labels.iter().all(|(key, value)| {
-                                egress.labels.get(key).is_some_and(|actual| actual == value)
-                            })
-                            && selector.tags.is_empty()
-                            && selector.capabilities.iter().all(|capability| {
-                                egress_supports(&egress.capabilities, *capability)
-                            })
-                    })
-                    .collect(),
-                EgressSelection::None => Vec::new(),
-            };
-            for egress in egresses {
-                if !egress_supports(&egress.capabilities, protocol)
-                    || !compiled
-                        .rule
-                        .required_capabilities
-                        .iter()
-                        .all(|capability| egress_supports(&egress.capabilities, *capability))
-                {
-                    continue;
-                }
-                if let Ok(Some(candidate)) = self.transit_candidate(egress, &context, runtime) {
-                    routes.push((egress.id.clone(), compiled.rule.min_usable_paths, candidate));
-                }
-            }
-        }
-        routes
-    }
-
     fn egress_candidates(
         &self,
         rule: &EgressRule,
@@ -812,7 +741,7 @@ impl CompiledPolicy {
             let Some(status) = runtime.egress(&egress.id) else {
                 continue;
             };
-            if !egress_is_usable(rule, egress, status, context.protocol) {
+            if !egress_is_usable(egress, status, context.protocol) {
                 continue;
             }
             if let Some(candidate) = self.transit_candidate(egress, context, runtime)? {
@@ -828,24 +757,34 @@ impl CompiledPolicy {
         context: &PolicyContext,
         runtime: &RuntimeCatalog,
     ) -> Result<Option<EgressRouteCandidate>, RejectReason> {
-        let Some(compiled) = self.transit_rules.iter().find(|compiled| {
+        // New configurations bind Transit selection directly to the Egress.
+        // Keep the legacy branch for programmatic PolicyConfig fixtures while
+        // callers migrate; the YAML adapter rejects TransitRule resources.
+        let legacy = self.transit_rules.iter().find(|compiled| {
             compiled.rule.egress == egress.id && compiled.matches.matches(context)
-        }) else {
-            return Ok(None);
-        };
+        });
+        let binding = &egress.transit;
         let mut transit_proxies: Vec<_> = self
             .transit_proxy_configs(runtime)
             .filter_map(|proxy| {
-                if proxy.id.namespace() != compiled.rule.id.namespace() {
+                if proxy.id.namespace() != egress.id.namespace() {
                     return None;
                 }
                 let status = runtime.transit_proxy(&proxy.id)?;
-                if !transit_is_usable(&compiled.rule, proxy, status, context.protocol) {
+                let eligible = if binding != &EgressTransitBinding::default() {
+                    transit_binding_is_usable(binding, proxy, status)
+                } else if let Some(compiled) = legacy {
+                    transit_is_usable(&compiled.rule, proxy, status, context.protocol)
+                } else {
+                    transit_binding_is_usable(binding, proxy, status)
+                };
+                if !eligible {
                     return None;
                 }
                 Some(TransitCandidate {
                     id: proxy.id.clone(),
-                    relationship_weight: compiled.rule.weight,
+                    relationship_weight: legacy
+                        .map_or(proxy.weight, |compiled| compiled.rule.weight),
                     selection_score: weighted_score(proxy.weight, status.selection_score),
                 })
             })
@@ -853,18 +792,9 @@ impl CompiledPolicy {
         if transit_proxies.is_empty() {
             return Ok(None);
         }
-        if transit_proxies.len() > 1
-            && compiled.rule.traffic_policy.resource_name()
-                == crate::config::IMPLICIT_SINGLE_TRANSIT_POLICY
-        {
-            return Err(RejectReason::MissingTrafficPolicy);
-        }
         transit_proxies.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(Some(EgressRouteCandidate {
             egress_id: egress.id.clone(),
-            transit_rule_id: compiled.rule.id.clone(),
-            traffic_policy_id: compiled.rule.traffic_policy.clone(),
-            traffic_class: compiled.rule.traffic_class.clone(),
             transit_proxies,
         }))
     }
@@ -939,21 +869,18 @@ fn ensure_selector(rule_id: &str, selector: &Selector) -> Result<(), CompileErro
 }
 
 fn egress_is_usable(
-    rule: &EgressRule,
     egress: &EgressConfig,
     status: &EgressRuntimeStatus,
     protocol: FlowProtocol,
 ) -> bool {
-    let min_paths = rule
-        .min_usable_paths
-        .max(egress.status_requirements.min_usable_paths);
+    let min_paths = egress.status_requirements.min_usable_paths;
     status.state.admits_new_work()
         && status.usable_paths >= min_paths
         && egress_supports(&egress.capabilities, protocol)
-        && rule
-            .required_capabilities
+        && egress
+            .status_requirements
+            .capabilities
             .iter()
-            .chain(egress.status_requirements.capabilities.iter())
             .all(|capability| egress_supports(&egress.capabilities, *capability))
 }
 
@@ -982,6 +909,22 @@ fn transit_is_usable(
         && tags_match(&rule.require.tags, &proxy.tags, &status.tags)
         && rule.require.capabilities.is_subset(&status.capabilities)
         && rule
+            .reject_tags
+            .iter()
+            .all(|tag| !proxy.tags.contains(tag) && !status.tags.contains(tag))
+}
+
+fn transit_binding_is_usable(
+    binding: &EgressTransitBinding,
+    proxy: &TransitProxyConfig,
+    status: &TransitProxyRuntimeStatus,
+) -> bool {
+    status.state.admits_new_work()
+        && status.capabilities.contains(&FlowProtocol::Tcp)
+        && labels_match(&binding.require.labels, &proxy.labels, &status.labels)
+        && tags_match(&binding.require.tags, &proxy.tags, &status.tags)
+        && binding.require.capabilities.is_subset(&status.capabilities)
+        && binding
             .reject_tags
             .iter()
             .all(|tag| !proxy.tags.contains(tag) && !status.tags.contains(tag))
@@ -1137,6 +1080,8 @@ mod tests {
                 min_usable_paths: 1,
                 capabilities: BTreeSet::new(),
             },
+            transit: crate::EgressTransitBinding::default(),
+            traffic_policy: None,
         }
     }
 
@@ -1400,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn implicit_transit_policy_allows_one_candidate_but_rejects_dynamic_multipath() {
+    fn egress_binding_allows_dynamic_multipath_without_a_transit_rule() {
         let input = r#"
 apiVersion: pathchord.io/v1
 kind: Egress
@@ -1410,6 +1355,8 @@ spec:
   port: 443
   publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
   capabilities: {tcp: true, udp: true}
+  transit: {}
+  trafficPolicyRef: default
 ---
 apiVersion: pathchord.io/v1
 kind: TransitProxy
@@ -1422,9 +1369,9 @@ metadata: {name: route}
 spec: {order: 10, catchAll: true, egressRef: edge}
 ---
 apiVersion: pathchord.io/v1
-kind: TransitRule
-metadata: {name: paths}
-spec: {order: 20, catchAll: true, egressRef: edge}
+kind: TrafficPolicy
+metadata: {name: default}
+spec: {}
 ---
 apiVersion: pathchord.io/v1
 kind: DNSPolicy
@@ -1453,32 +1400,15 @@ spec: {action: direct}
             Evaluation::Route(RoutePlan::Egress(_))
         ));
         // A subscription refresh may add a second matching relationship after
-        // validation. This must fail closed even when the fallback is direct.
+        // validation. The Egress binding owns the common pool, so it remains
+        // eligible without a flow-specific TransitRule.
         runtime.set_dynamic_transit_proxy(
             proxy("second", &[], &[], 100),
             ready_proxy(&[FlowProtocol::Tcp], 1),
         );
-        assert_eq!(
-            implicit.evaluate(&context(), &runtime),
-            Evaluation::Reject {
-                generation: Generation::new(7),
-                reason: RejectReason::MissingTrafficPolicy,
-            }
-        );
-
-        let explicit_input = input.replace(
-            "spec: {order: 20, catchAll: true, egressRef: edge}",
-            "spec: {order: 20, catchAll: true, egressRef: edge, trafficPolicyRef: default}\n---\napiVersion: pathchord.io/v1\nkind: TrafficPolicy\nmetadata: {name: default}\nspec: {}",
-        );
-        let explicit = crate::KubeConfig::from_yaml(&explicit_input)
-            .unwrap()
-            .into_validated_snapshot(Generation::new(7))
-            .unwrap()
-            .compile()
-            .unwrap();
-        let Evaluation::Route(RoutePlan::Egress(route)) = explicit.evaluate(&context(), &runtime)
+        let Evaluation::Route(RoutePlan::Egress(route)) = implicit.evaluate(&context(), &runtime)
         else {
-            panic!("explicit traffic policy must allow the multipath route");
+            panic!("Egress binding must allow the multipath route");
         };
         assert_eq!(route.candidates[0].transit_proxies.len(), 2);
     }
@@ -1520,46 +1450,8 @@ spec: {action: direct}
         else {
             panic!("expected an Egress route");
         };
-        assert_eq!(route.egress_rule_id.as_str(), "second-rule");
-        assert_eq!(route.candidates[0].egress_id.as_str(), "second");
-    }
-
-    #[test]
-    fn warmup_routes_keep_transit_rule_eligibility() {
-        let mut rule = transit_rule("selected-transit", "edge", Selector::default());
-        rule.require.tags.insert("eligible".into());
-        let policy = compile(PolicyConfig {
-            egresses: vec![egress("edge", &[], true, false)],
-            transit_proxies: vec![
-                proxy("ineligible", &[], &[], 100),
-                proxy("eligible", &[], &["eligible"], 100),
-            ],
-            subscriptions: Vec::new(),
-            egress_rules: vec![egress_rule("edge-rule", "edge", 1)],
-            transit_rules: vec![rule],
-            proxy_rules: Vec::new(),
-            traffic_policies: vec![traffic_policy("default")],
-            listeners: Vec::new(),
-            dns_policy: None,
-            node_probe: None,
-            fallback: Some(FallbackAction::Reject),
-            ..PolicyConfig::default()
-        });
-        let mut runtime = RuntimeCatalog::default();
-        runtime.set_transit_proxy(
-            TransitProxyId::new("ineligible"),
-            ready_proxy(&[FlowProtocol::Tcp], 1),
-        );
-        runtime.set_transit_proxy(
-            TransitProxyId::new("eligible"),
-            ready_proxy(&[FlowProtocol::Tcp], 1),
-        );
-        let routes = policy.warmup_routes(FlowProtocol::Tcp, &runtime);
-        assert_eq!(routes.len(), 1);
-        assert_eq!(
-            routes[0].2.transit_proxies[0].id,
-            TransitProxyId::new("eligible")
-        );
+        assert_eq!(route.egress_rule_id.as_str(), "first-rule");
+        assert_eq!(route.candidates[0].egress_id.as_str(), "first");
     }
 
     #[test]

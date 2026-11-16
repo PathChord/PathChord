@@ -781,7 +781,7 @@ fn validation_diagnostic(error: ValidationError) -> ReloadDiagnostic {
         ),
         ValidationError::UnknownTrafficPolicy { rule_id, .. } => (
             "CONFIG_UNKNOWN_REFERENCE",
-            resource_field("TransitRule", &rule_id, "spec.trafficPolicyRef"),
+            resource_field("Egress", &rule_id, "spec.trafficPolicyRef"),
         ),
         ValidationError::UnknownTrafficClass { rule_id, .. } => (
             "CONFIG_UNKNOWN_REFERENCE",
@@ -965,6 +965,13 @@ items:
       port: 443
       publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
       capabilities: {tcp: true, udp: true}
+      transit: {}
+      trafficPolicyRef: default-policy
+  - apiVersion: pathchord.io/v1
+    kind: TrafficPolicy
+    metadata:
+      name: default-policy
+    spec: {}
   - apiVersion: pathchord.io/v1
     kind: DNSPolicy
     metadata:
@@ -1191,15 +1198,16 @@ items:
     #[test]
     fn unknown_reference_and_runtime_failure_have_stable_redacted_diagnostics() {
         let handle = ConfigReloadHandle::from_yaml(VALID, 1).unwrap();
-        let candidate = format!(
-            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitRule\nmetadata: {{name: path}}\nspec: {{order: 2, catchAll: true, egressRef: jp-1, trafficPolicyRef: absent}}\n"
+        let candidate = VALID.replace(
+            "trafficPolicyRef: default-policy",
+            "trafficPolicyRef: absent",
         );
         handle.reload_text(&candidate);
         let diagnostic = handle.status().diagnostic.unwrap();
         assert_eq!(diagnostic.code, "CONFIG_UNKNOWN_REFERENCE");
         assert_eq!(
             diagnostic.field_path,
-            "$.resources.TransitRule[path].spec.trafficPolicyRef"
+            "$.resources.Egress[jp-1].spec.trafficPolicyRef"
         );
 
         handle.enable_runtime_commit().unwrap();
@@ -1348,7 +1356,11 @@ items:
     #[tokio::test]
     async fn directory_fragments_resolve_cross_file_references_and_global_duplicates() {
         let root = Directory::new();
-        std::fs::write(root.0.join("base.yaml"), VALID).unwrap();
+        let base = VALID.replace(
+            "trafficPolicyRef: default-policy",
+            "trafficPolicyRef: traffic",
+        );
+        std::fs::write(root.0.join("base.yaml"), base).unwrap();
         std::fs::create_dir(root.0.join("routes")).unwrap();
         std::fs::write(
             root.0.join("routes/policy.yml"),
@@ -1357,19 +1369,18 @@ kind: TrafficPolicy
 metadata: {name: traffic}
 spec: {scheduler: effectiveCapacityWeighted}
 ---
-apiVersion: pathchord.io/v1
-kind: TransitRule
-metadata: {name: through-japan}
-spec: {order: 20, catchAll: true, egressRef: jp-1, trafficPolicyRef: traffic}
 "#,
         )
         .unwrap();
         std::fs::write(root.0.join("proxy.JSON"),r#"{"apiVersion":"pathchord.io/v1","kind":"TransitProxy","metadata":{"name":"relay"},"spec":{"protocol":"socks5","address":"127.0.0.1","port":1080}}"#).unwrap();
         let reloader = ConfigHotReloader::bind(root.0.clone(), 1).await.unwrap();
         let snapshot = reloader.handle().snapshot().unwrap();
-        assert_eq!(snapshot.config.transit_rules[0].egress.as_str(), "jp-1");
         assert_eq!(
-            snapshot.config.transit_rules[0].traffic_policy.as_str(),
+            snapshot.config.egresses[0]
+                .traffic_policy
+                .as_ref()
+                .unwrap()
+                .as_str(),
             "traffic"
         );
         assert_eq!(snapshot.config.transit_proxies[0].id.as_str(), "relay");

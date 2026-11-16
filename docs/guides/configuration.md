@@ -46,7 +46,7 @@ The basic direct example has three resources:
 - `DNSPolicy` chooses how DNS queries reach their resolver. It is independent of ordinary connection routing. Change `local.servers` to use your own resolver; the [platform and DNS contract](../../openspec/specs/platform-and-dns/spec.md#dns-configuration) explains the other routes.
 - `FallbackPolicy` decides what happens after no earlier route wins. Use `direct` for an intentional direct fallback or `reject` to refuse unmatched flows.
 
-Add `Subscription` and `ProxyRule` resources for ordinary third-party proxy routing backed by a subscription. Add `Egress`, `EgressRule`, `TransitRule`, and a suitable `TrafficPolicy` for a controlled Egress route. Routing considers effective Egress rules first, then ordinary Proxy rules, then the global fallback. See the [configuration model](../../openspec/specs/configuration/spec.md) for these relationships and the [Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md) for supported node options and subscription formats.
+Add `Subscription` and `ProxyRule` resources for ordinary third-party proxy routing backed by a subscription. Add `Egress`, `EgressRule`, a common `transit` binding, and a suitable `TrafficPolicy` for a controlled Egress route. Routing considers effective Egress rules first, then ordinary Proxy rules, then the global fallback. Every flow selecting one Egress shares that Egress's Session Path pool and TrafficPolicy. See the [configuration model](../../openspec/specs/configuration/spec.md) for these relationships and the [Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md) for supported node options and subscription formats.
 
 Resources refer to one another by `metadata.name` within their namespace. Names and explicit rule order determine the graph; filenames do not provide override layers. Duplicate resource identities or unresolved references reject the candidate configuration. Keep exactly one `DNSPolicy` and one `FallbackPolicy` across the whole graph.
 
@@ -76,7 +76,7 @@ sha256sum -c geoip.dat.sha256sum
 ```
 
 Add the following resources and rules to a complete bundle that already defines
-the Egress `egress-jp-1` and its eligible TransitRule and TrafficPolicy:
+the Egress `egress-jp-1`, its common Transit binding, and its TrafficPolicy:
 
 ```yaml
 apiVersion: pathchord.io/v1
@@ -96,7 +96,6 @@ spec:
   order: 10
   match:
     targetGeoSites: [huggingface]
-  requirements: {minUsablePaths: 3}
   egressRef: egress-jp-1
 ---
 apiVersion: pathchord.io/v1
@@ -231,8 +230,9 @@ An `EgressService` authors only the global resource limits
 `maxWireBandwidthBps` and `maxInboundTargetConnections`. The Egress runtime
 computes its Path safety ceiling and pending reservations from these limits and
 the local profile. Do not add `recommendedPathCount`, `maxConcurrentPaths`, or
-`maxStreamsPerIngress`; Path targets belong to Ingress rules and runtime
-observations. STATUS_REPORT exposes configured/effective/current capacity,
+`maxStreamsPerIngress`; the common Path minimum belongs on the Ingress-side
+Egress `statusRequirements.minUsablePaths`, while the target remains a Session
+runtime decision. STATUS_REPORT exposes configured/effective/current capacity,
 capacity confidence, admission state, and the current replication allowance;
 it does not expose rule or TrafficClass metadata.
 
@@ -247,6 +247,6 @@ symlink sources reject the node instead of downgrading its transport.
 
 The service watches additions, edits, removals, and renames in a selected resource directory and validates the entire candidate before publishing it. Atomic file replacement is supported. If parsing, graph validation, rule compilation, persistence, or cache writing fails, the last successful configuration remains active; inspect structured status for the failure, fix the candidate, and let it reload.
 
-Subscription nodes, compiled dynamic rules, administrator labels/tags, and DNS runtime health can update dynamically. Changes to static Egress topology, local private keys, listener bind settings, or platform routing settings require a service restart. Moving unchanged resources between files does not change their identity or require restart. New flows use a single published generation for their complete route decision; existing resources follow their admission and normal drain/failure rules.
+Subscription nodes, compiled dynamic rules, administrator labels/tags, and DNS runtime health can update dynamically. Changes to static Egress topology, its Transit binding, common Path requirements, resolved TrafficPolicy, local private keys, listener bind settings, or platform routing settings require a service restart. Moving unchanged resources between files does not change their identity or require restart. New flows use a single published generation for their complete route decision; existing resources follow their admission and normal drain/failure rules.
 
 Management changes to a declared subscription remain effective across reload and restart while its declaration is unchanged. Editing or removing the declaration applies the corresponding new desired state. The [reload contract](../../openspec/specs/configuration-schema/spec.md#snapshot-publication-and-reload) provides the exact publication and ownership rules.
