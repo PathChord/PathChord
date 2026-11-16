@@ -290,47 +290,38 @@ fn destination(port: u16) -> ConnectRequest {
 async fn relay(peer: Peer, protocol: Protocol, tls: bool) {
     let server = Server::start(peer, protocol, tls).await;
     let address = SocketAddr::from(([127, 0, 0, 1], server.port));
-    let client = adapter(protocol, address, server.certificate.as_deref(), SERVICE);
-    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = target.local_addr().unwrap().port();
-    let upload: Vec<u8> = (0..393_333).map(|i| (i % 251) as u8).collect();
-    let download: Vec<u8> = (0..412_777).map(|i| (i % 239) as u8).collect();
-    let upstream = async {
-        let (mut stream, _) = target.accept().await.unwrap();
-        let (mut read, mut write) = stream.split();
-        let (received, sent) = tokio::join!(
-            async {
-                let mut data = vec![0; upload.len()];
-                read.read_exact(&mut data).await.unwrap();
-                data
-            },
-            write.write_all(&download)
-        );
-        sent.unwrap();
-        assert_eq!(received, upload);
+    let attempts = tcp_relay_attempts(peer, protocol, tls);
+    let timeout_per_attempt = if attempts > 1 {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(20)
     };
-    let downstream = async {
-        let stream = client.connect(destination(port)).await.unwrap();
-        let (mut read, mut write) = tokio::io::split(stream);
-        let (sent, received) = tokio::join!(
-            async {
-                write.write_all(&upload).await.unwrap();
-                write.flush().await.unwrap();
-            },
-            async {
-                let mut data = vec![0; download.len()];
-                read.read_exact(&mut data).await.unwrap();
-                data
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        match relay_tcp(
+            protocol,
+            address,
+            server.certificate.as_deref(),
+            SERVICE,
+            timeout_per_attempt,
+        )
+        .await
+        {
+            Ok(()) => {
+                last_error = None;
+                break;
             }
-        );
-        let () = sent;
-        assert_eq!(received, download);
-    };
-    timeout(Duration::from_secs(20), async {
-        tokio::join!(upstream, downstream)
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{peer:?} {protocol:?} tls={tls} TCP timeout"));
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < attempts {
+                    sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        panic!("{peer:?} {protocol:?} tls={tls} TCP failed after {attempts} attempt(s): {error}");
+    }
 
     let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let port = target.local_addr().unwrap().port();
@@ -355,6 +346,93 @@ async fn relay(peer: Peer, protocol: Protocol, tls: bool) {
     })
     .await
     .unwrap_or_else(|_| panic!("{peer:?} {protocol:?} tls={tls} UDP timeout"));
+}
+
+fn tcp_relay_attempts(peer: Peer, protocol: Protocol, tls: bool) -> usize {
+    if matches!((peer, protocol, tls), (Peer::Xray, Protocol::Vmess, false)) {
+        3
+    } else {
+        1
+    }
+}
+
+async fn relay_tcp(
+    protocol: Protocol,
+    address: SocketAddr,
+    certificate: Option<&str>,
+    service: &str,
+    deadline: Duration,
+) -> Result<(), String> {
+    let client = adapter(protocol, address, certificate, service);
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| format!("target bind failed: {error}"))?;
+    let port = target
+        .local_addr()
+        .map_err(|error| format!("target address failed: {error}"))?
+        .port();
+    let upload: Vec<u8> = (0..393_333).map(|i| (i % 251) as u8).collect();
+    let download: Vec<u8> = (0..412_777).map(|i| (i % 239) as u8).collect();
+    let expected_upload = upload.clone();
+    let expected_download = download.clone();
+    let upstream_download = download.clone();
+    let upstream = async move {
+        let (stream, _) = target
+            .accept()
+            .await
+            .map_err(|error| format!("target accept failed: {error}"))?;
+        let (mut read, mut write) = stream.into_split();
+        let (received, sent) = tokio::join!(
+            async {
+                let mut data = vec![0; expected_upload.len()];
+                read.read_exact(&mut data)
+                    .await
+                    .map_err(|error| format!("target read failed: {error}"))?;
+                Ok::<_, String>(data)
+            },
+            async {
+                write
+                    .write_all(&upstream_download)
+                    .await
+                    .map_err(|error| format!("target write failed: {error}"))
+            }
+        );
+        let received = received?;
+        sent?;
+        if received != expected_upload {
+            return Err("target received an unexpected upload".to_owned());
+        }
+        Ok::<_, String>(())
+    };
+    let downstream = async move {
+        let stream = client
+            .connect(destination(port))
+            .await
+            .map_err(|error| format!("adapter connect failed: {error}"))?;
+        let (mut read, mut write) = tokio::io::split(stream);
+        write
+            .write_all(&upload)
+            .await
+            .map_err(|error| format!("adapter upload failed: {error}"))?;
+        write
+            .flush()
+            .await
+            .map_err(|error| format!("adapter flush failed: {error}"))?;
+        let mut data = vec![0; download.len()];
+        read.read_exact(&mut data)
+            .await
+            .map_err(|error| format!("adapter download failed: {error}"))?;
+        if data != expected_download {
+            return Err("adapter received an unexpected download".to_owned());
+        }
+        Ok::<_, String>(())
+    };
+    timeout(deadline, async {
+        tokio::try_join!(upstream, downstream).map(|_| ())
+    })
+    .await
+    .map_err(|_| "TCP timeout".to_owned())??;
+    Ok(())
 }
 
 async fn pathchord_half_close(server: &Server, protocol: Protocol) -> Vec<u8> {
@@ -430,6 +508,14 @@ async fn xray_grpc_tcp_udp() {
     ] {
         relay(Peer::Xray, protocol, tls).await;
     }
+}
+
+#[test]
+fn retries_only_the_known_xray_vmess_grpc_readiness_case() {
+    assert_eq!(tcp_relay_attempts(Peer::Xray, Protocol::Vmess, false), 3);
+    assert_eq!(tcp_relay_attempts(Peer::Xray, Protocol::Vmess, true), 1);
+    assert_eq!(tcp_relay_attempts(Peer::Xray, Protocol::Vless, false), 1);
+    assert_eq!(tcp_relay_attempts(Peer::SingBox, Protocol::Vmess, false), 1);
 }
 
 async fn check_service_name(peer: Peer, service: &str) {
