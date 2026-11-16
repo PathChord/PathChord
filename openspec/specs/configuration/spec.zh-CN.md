@@ -121,6 +121,25 @@ Ingress SHALL 按 Session 作用域的 rule、policy 和 class key 使用有界 
 - **WHEN** 新 SessionID 替换失败 Session
 - **THEN** 新 Session 的 demand counter 和 EWMA 从空状态开始，旧值只能作为有界观测保留
 
+### Requirement: Geodata predicates participate in ordered routing
+
+EgressRule、TransitRule 和 ProxyRule 的 flow match SHALL 使用与其余路由决策相同的不可变 geodata 代次，对配置的 geosite 和 geoip 条件求值。这些条件 SHALL 遵循 [geodata 路由契约](../geodata-routing/spec.zh-CN.md)，不改变规则顺序或隐式回退行为。
+
+#### Scenario: Hugging Face redirect uses the same Egress policy
+
+- **WHEN** 显式代理 flow 的目标主机名属于已配置的 `huggingface` geosite 集合，包括 CDN 子域名
+- **THEN** 匹配的 Egress 和 Transit 规则选择其配置路由，无需逐一列出主机名
+
+#### Scenario: GeoIP predicate receives an original destination address
+
+- **WHEN** 以 IP 为目标的 TCP 或 UDP flow 命中具有匹配 geoip 集合的规则
+- **THEN** 规则在选择 Egress、Proxy 或配置的回退前，使用已捕获代次对原始目标 IP 求值
+
+#### Scenario: Geodata fact is unavailable
+
+- **WHEN** 规则需要监听器未提供的主机名或 IP
+- **THEN** 相应 geodata 条件不匹配，Ingress 继续执行配置的有序规则和回退，不得经其他 DNS 路由解析
+
 ## Detailed contract
 
 本文档说明 Kubernetes 风格配置对象和求值顺序。规范性的字段、类型、默认值和验证契约见[版本化配置 schema](../configuration-schema/spec.zh-CN.md)；平台监听器和独立 DNS 见[平台与 DNS 规范](../platform-and-dns/spec.zh-CN.md)。配置使用 `apiVersion: pathchord.io/v1`、`kind`、`metadata` 和 `spec` 对象；多资源通常使用 `kind: List`。下文片段会明确标注是完整对象还是 `spec` 片段。配置适配器必须验证完整对象图，并在发布前将其转换为不可变类型化快照。运行时观测以只读 `status` 视图暴露，不能混入期望的 `spec`。管理操作使用[协议规范](../protocol/spec.zh-CN.md)定义的 JSON 封装；配置 YAML 不作为管理消息或 data Path 的线编码。
@@ -245,7 +264,7 @@ spec:
     minUsablePaths: 1
 ```
 
-首个条件匹配且 Egress 当前可用的规则胜出。Egress 可用性由运行时状态管理器预先计算。
+首个条件匹配且 Egress 当前可用的规则胜出。Egress 可用性由运行时状态管理器预先计算。Geosite 和 geoip 条件使用 flow 的原始主机名或原始目标 IP 以及不可变的 [geodata 路由](../geodata-routing/spec.zh-CN.md)代次；事实缺失时不匹配，也不触发 DNS。
 
 ### Egress 专用 Proxy 规则
 

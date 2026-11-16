@@ -18,7 +18,8 @@ use pathchord_path::{
     EgressPathAdmissionConfig, EgressSessionController, EgressSessionHandle, EgressStatusConfig,
     EgressStatusProvider, EgressStatusSample, EgressStreamFactory, EgressStreamOpenError,
     MultipathPathObservation, PathAdmissionOutcome, PathAuthorization, PathAuthorizer,
-    UdpTargetError, UdpTargetFactory, UdpTargetSocket, WireBudget, WirePriority, accept_path,
+    SessionRuntimeError, UdpTargetError, UdpTargetFactory, UdpTargetSocket, WireBudget,
+    WirePriority, accept_path,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -71,6 +72,7 @@ pub struct EgressNodeSnapshot {
     pub target_open_successes: u64,
     pub target_open_failures: u64,
     pub last_target_open: Option<TargetOpenObservation>,
+    pub last_session_end: Option<&'static str>,
     pub running: bool,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: u32,
@@ -284,6 +286,11 @@ where
                 .lock()
                 .map_err(|_| EgressNodeError::RuntimeStateLock)?
                 .clone(),
+            last_session_end: *self
+                .observations
+                .last_session_end
+                .lock()
+                .map_err(|_| EgressNodeError::RuntimeStateLock)?,
             running: self.running.load(Ordering::Relaxed),
             quota_remaining: self.config.quota_remaining,
             traffic_multiplier_basis_points: self.config.traffic_multiplier_basis_points,
@@ -788,6 +795,7 @@ struct NodeObservations {
     target_open_successes: AtomicU64,
     target_open_failures: AtomicU64,
     last_target_open: Mutex<Option<TargetOpenObservation>>,
+    last_session_end: Mutex<Option<&'static str>>,
 }
 
 impl NodeObservations {
@@ -1233,9 +1241,15 @@ async fn run_path_task<C>(
             }
             match handle.wait().await {
                 Ok(_) => {
+                    if let Ok(mut last) = observations.last_session_end.lock() {
+                        *last = Some("completed");
+                    }
                     let _ = events.send(NodeEvent::Completed);
                 }
-                Err(_) => {
+                Err(error) => {
+                    if let Ok(mut last) = observations.last_session_end.lock() {
+                        *last = Some(session_end_reason(&error));
+                    }
                     let _ = events.send(NodeEvent::Failed);
                 }
             }
@@ -1252,6 +1266,32 @@ async fn run_path_task<C>(
             controller.wait_path_closed(path_id).await;
         }
         ClaimDecision::Reject => {}
+    }
+}
+
+fn session_end_reason(error: &SessionRuntimeError) -> &'static str {
+    match error {
+        SessionRuntimeError::SessionTrustFailure => "session_trust_failure",
+        SessionRuntimeError::EgressHardFailure => "egress_hard_failure",
+        SessionRuntimeError::PathClosed => "path_closed",
+        SessionRuntimeError::UnacknowledgedData { .. } => "unacknowledged_data",
+        SessionRuntimeError::PathWrite { .. } => "path_write",
+        SessionRuntimeError::Io(_) => "io",
+        SessionRuntimeError::Noise(_) => "noise",
+        SessionRuntimeError::Frame(_) => "frame",
+        SessionRuntimeError::Message(_) => "message",
+        SessionRuntimeError::Reliability(_) => "reliability",
+        SessionRuntimeError::InvalidCiphertextLength { .. } => "ciphertext_length",
+        SessionRuntimeError::NoiseStatePoisoned => "noise_state",
+        SessionRuntimeError::FrameSequenceExhausted => "sequence_exhausted",
+        SessionRuntimeError::WrongPathIdentity | SessionRuntimeError::WrongSession => "identity",
+        SessionRuntimeError::UnexpectedFrame(_) => "unexpected_frame",
+        SessionRuntimeError::InvalidRuntimeLimit => "runtime_limit",
+        SessionRuntimeError::WireBudgetExhausted => "wire_budget",
+        SessionRuntimeError::RequestIdRandom => "request_id",
+        SessionRuntimeError::Task(_) => "task",
+        SessionRuntimeError::Multipath(_) => "multipath",
+        SessionRuntimeError::Udp(_) => "udp",
     }
 }
 
@@ -1563,6 +1603,22 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn session_end_observation_reports_bounded_categories() {
+        assert_eq!(
+            session_end_reason(&SessionRuntimeError::SessionTrustFailure),
+            "session_trust_failure"
+        );
+        assert_eq!(
+            session_end_reason(&SessionRuntimeError::PathClosed),
+            "path_closed"
+        );
+        assert_eq!(
+            session_end_reason(&SessionRuntimeError::Task("private-detail".into())),
+            "task"
+        );
+    }
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, copy, duplex, split};
 

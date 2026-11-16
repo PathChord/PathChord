@@ -50,6 +50,96 @@ Add `Subscription` and `ProxyRule` resources for ordinary third-party proxy rout
 
 Resources refer to one another by `metadata.name` within their namespace. Names and explicit rule order determine the graph; filenames do not provide override layers. Duplicate resource identities or unresolved references reject the candidate configuration. Keep exactly one `DNSPolicy` and one `FallbackPolicy` across the whole graph.
 
+## Route with geosite and geoip sets
+
+Geosite and geoip use operator-provided V2Fly databases. Obtain a pinned
+`dlc.dat` release from [domain-list-community](https://github.com/v2fly/domain-list-community/releases)
+and `geoip.dat` from [v2fly/geoip](https://github.com/v2fly/geoip/releases).
+Download each file and the corresponding `*.sha256sum` from the same release,
+then verify it with `sha256sum -c` in the download directory. Place the verified
+`.dat` files where the Ingress service account can read them. Keep a copy of
+the previous verified versions for rollback. PathChord reads local files; it
+does not download or update these databases automatically.
+
+For example, replace the tag placeholders with selected release tags and run
+the following in a private staging directory:
+
+```sh
+site_tag=REPLACE_WITH_DOMAIN_LIST_RELEASE_TAG
+ip_tag=REPLACE_WITH_GEOIP_RELEASE_TAG
+curl -fsSLO "https://github.com/v2fly/domain-list-community/releases/download/${site_tag}/dlc.dat"
+curl -fsSLO "https://github.com/v2fly/domain-list-community/releases/download/${site_tag}/dlc.dat.sha256sum"
+curl -fsSLO "https://github.com/v2fly/geoip/releases/download/${ip_tag}/geoip.dat"
+curl -fsSLO "https://github.com/v2fly/geoip/releases/download/${ip_tag}/geoip.dat.sha256sum"
+sha256sum -c dlc.dat.sha256sum
+sha256sum -c geoip.dat.sha256sum
+```
+
+Add the following resources and rules to a complete bundle that already defines
+the Egress `egress-jp-1` and its eligible TransitRule and TrafficPolicy:
+
+```yaml
+apiVersion: pathchord.io/v1
+kind: GeoSiteDatabase
+metadata: {name: sites}
+spec: {path: /var/lib/pathchord/geodata/dlc.dat}
+---
+apiVersion: pathchord.io/v1
+kind: GeoIpDatabase
+metadata: {name: addresses}
+spec: {path: /var/lib/pathchord/geodata/geoip.dat}
+---
+apiVersion: pathchord.io/v1
+kind: EgressRule
+metadata: {name: huggingface-egress}
+spec:
+  order: 10
+  match:
+    targetGeoSites: [huggingface]
+  requirements: {minUsablePaths: 3}
+  egressRef: egress-jp-1
+---
+apiVersion: pathchord.io/v1
+kind: EgressRule
+metadata: {name: geoip-example}
+spec:
+  order: 20
+  match:
+    targetGeoIps: [cn]
+  egressRef: egress-jp-1
+```
+
+The first rule covers names in the upstream `huggingface` set, including
+subdomains of `hf.co` such as `us.aws.cdn.hf.co`. The second rule is an example
+for an IP-targeted flow; choose the set and Egress that fit your policy. Each
+database belongs to the same namespace as the rules that use it. Geosite can
+also select an attribute with `set@attribute`, for example `google@ads` when
+that attribute exists in the verified database. See the
+[geodata contract](../../openspec/specs/geodata-routing/spec.md) for matching
+types and the [configuration schema](../../openspec/specs/configuration-schema/spec.md#geodata-databases)
+for limits and field rules.
+
+The explicit forms `geosite:huggingface` and `geoip:cn` are also accepted in
+their respective fields; they refer to the same sets as the short names above.
+
+Geosite uses the original hostname supplied by the listener. GeoIP uses the
+original destination IP, such as the address of a transparent flow. A request
+that supplies only a hostname does not acquire a GeoIP match through a DNS
+lookup; a flow that supplies only an IP does not acquire a geosite match.
+Values within one match field are alternatives, while different populated match
+fields are combined. Use separate ordered rules when either a hostname set or
+an IP set should select the route. `targetHosts` retains exact-match behavior.
+
+Keep database files outside a scanned configuration directory or use an
+unscanned extension such as `.dat`. Resolve relative database paths against the
+selected configuration file's parent or selected configuration directory.
+For an update, download and verify the new release separately, then atomically
+replace the configured file. Ingress validates the full candidate before
+publishing rules and data together. If validation fails, inspect reload status;
+the previous generation remains active. To roll back, atomically restore the
+previous verified file and the matching configuration, then verify reload
+status and the selected route.
+
 ## Keep credentials separate
 
 Store private identities, node/listener credential JSON, subscription caches, and the service data directory outside the resource tree. The directory loader also reads JSON, so placing a private JSON document among configuration resources can make the bundle invalid. Use opaque `credentialsRef` values to refer to the local credential store. Keep passwords and subscription tokens out of committed examples; treat provider URLs that contain credentials as private configuration.

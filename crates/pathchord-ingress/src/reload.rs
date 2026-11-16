@@ -80,6 +80,8 @@ pub enum ReloadError {
     Notify,
     #[error("initial configuration is invalid")]
     InvalidInitialConfiguration,
+    #[error("initial geodata configuration is invalid: {field_path}")]
+    InvalidInitialGeodata { field_path: String },
     #[error("control-plane reload transaction was rejected")]
     ControlCommit,
     #[error("configuration reload state lock is unavailable")]
@@ -89,10 +91,12 @@ pub enum ReloadError {
 #[derive(Clone)]
 pub struct ConfigReloadHandle {
     state: Arc<RwLock<ReloadData>>,
+    reload_gate: Arc<std::sync::Mutex<()>>,
 }
 
 struct ReloadData {
     active: ReloadSnapshot,
+    source_dir: Option<PathBuf>,
     status: ReloadStatus,
     runtime_managed: bool,
     next_generation: u64,
@@ -117,11 +121,28 @@ impl ConfigReloadHandle {
         inputs: impl IntoIterator<Item = &'a str>,
         generation: u64,
     ) -> Result<Self, ReloadError> {
-        let active = compile_candidate_documents(inputs, generation)
-            .map_err(|_| ReloadError::InvalidInitialConfiguration)?;
+        Self::from_documents_with_source(inputs, generation, None)
+    }
+
+    fn from_documents_with_source<'a>(
+        inputs: impl IntoIterator<Item = &'a str>,
+        generation: u64,
+        source_dir: Option<PathBuf>,
+    ) -> Result<Self, ReloadError> {
+        let active = compile_candidate_documents(inputs, generation, source_dir.as_deref())
+            .map_err(|diagnostic| {
+                if diagnostic.code == "CONFIG_GEODATA_INVALID" {
+                    ReloadError::InvalidInitialGeodata {
+                        field_path: diagnostic.field_path,
+                    }
+                } else {
+                    ReloadError::InvalidInitialConfiguration
+                }
+            })?;
         Ok(Self {
             state: Arc::new(RwLock::new(ReloadData {
                 active,
+                source_dir,
                 status: ReloadStatus {
                     state: ReloadState::Applied,
                     active_generation: generation,
@@ -133,6 +154,7 @@ impl ConfigReloadHandle {
                 next_generation: generation,
                 pending: None,
             })),
+            reload_gate: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -230,34 +252,54 @@ impl ConfigReloadHandle {
     }
 
     pub fn reload_documents<'a>(&self, inputs: impl IntoIterator<Item = &'a str>) -> ReloadOutcome {
+        // Serialize candidate preparation without blocking readers of the
+        // active snapshot. This also prevents an older compile finishing
+        // after a newer reload and replacing it.
+        let Ok(_reload) = self.reload_gate.lock() else {
+            return ReloadOutcome::Rejected {
+                active_generation: 0,
+            };
+        };
+        let (generation, source_dir) = {
+            let Ok(mut state) = self.state.write() else {
+                return ReloadOutcome::Rejected {
+                    active_generation: 0,
+                };
+            };
+            let active_generation = state.active.generation;
+            let previous_generation = if state.runtime_managed {
+                state.next_generation
+            } else {
+                active_generation
+            };
+            let Some(generation) = previous_generation.checked_add(1) else {
+                state.pending = None;
+                state.status = ReloadStatus {
+                    state: ReloadState::Rejected,
+                    active_generation,
+                    observed_at_ms: now_ms(),
+                    reason: Some("configuration generation is exhausted".to_owned()),
+                    diagnostic: Some(reload_diagnostic(
+                        "CONFIG_GENERATION_EXHAUSTED",
+                        "$".to_owned(),
+                        "configuration generation is exhausted",
+                    )),
+                };
+                return ReloadOutcome::Rejected { active_generation };
+            };
+            state.next_generation = generation;
+            (generation, state.source_dir.clone())
+        };
+        // Dataset loading and compilation can be substantial. Keep the
+        // published snapshot readable while a candidate is prepared.
+        let result = compile_candidate_documents(inputs, generation, source_dir.as_deref());
         let Ok(mut state) = self.state.write() else {
             return ReloadOutcome::Rejected {
                 active_generation: 0,
             };
         };
         let active_generation = state.active.generation;
-        let previous_generation = if state.runtime_managed {
-            state.next_generation
-        } else {
-            active_generation
-        };
-        let Some(generation) = previous_generation.checked_add(1) else {
-            state.pending = None;
-            state.status = ReloadStatus {
-                state: ReloadState::Rejected,
-                active_generation,
-                observed_at_ms: now_ms(),
-                reason: Some("configuration generation is exhausted".to_owned()),
-                diagnostic: Some(reload_diagnostic(
-                    "CONFIG_GENERATION_EXHAUSTED",
-                    "$".to_owned(),
-                    "configuration generation is exhausted",
-                )),
-            };
-            return ReloadOutcome::Rejected { active_generation };
-        };
-        state.next_generation = generation;
-        let candidate = match compile_candidate_documents(inputs, generation) {
+        let candidate = match result {
             Ok(candidate) => candidate,
             Err(diagnostic) => {
                 state.pending = None;
@@ -271,7 +313,10 @@ impl ConfigReloadHandle {
                 return ReloadOutcome::Rejected { active_generation };
             }
         };
-        if candidate.config == state.active.config {
+        if candidate.config == state.active.config
+            && candidate.compiled.geodata_fingerprint()
+                == state.active.compiled.geodata_fingerprint()
+        {
             state.pending = None;
             state.status = ReloadStatus {
                 state: ReloadState::Applied,
@@ -298,6 +343,8 @@ impl ConfigReloadHandle {
         if state.runtime_managed {
             if let Some(pending) = &state.pending
                 && candidate.config == pending.config
+                && candidate.compiled.geodata_fingerprint()
+                    == pending.compiled.geodata_fingerprint()
             {
                 return ReloadOutcome::Pending {
                     generation: pending.generation,
@@ -336,6 +383,8 @@ impl ConfigReloadHandle {
 pub struct ConfigHotReloader {
     source: ConfigurationSource,
     directories: BTreeSet<PathBuf>,
+    geodata_paths: BTreeSet<PathBuf>,
+    geodata_watch_dirs: BTreeSet<PathBuf>,
     handle: ConfigReloadHandle,
     events: mpsc::Receiver<Result<Event, notify::Error>>,
     watcher: RecommendedWatcher,
@@ -374,13 +423,46 @@ impl ConfigHotReloader {
                 .map_err(|_| ReloadError::Notify)?;
         }
         let loaded = source.load().await?;
-        let handle = ConfigReloadHandle::from_documents(
+        // Establish external parent watches before reading dataset bytes.
+        // File replacements occurring while initial compilation runs are then
+        // queued and re-evaluated when the watcher task starts.
+        let initial_candidate =
+            KubeConfig::from_documents(loaded.documents.iter().map(String::as_str))
+                .and_then(|kube| kube.into_validated_snapshot(Generation::new(generation)))
+                .map_err(|_| ReloadError::InvalidInitialConfiguration)?;
+        let geodata_paths = CompiledPolicy::referenced_geodata_paths(
+            initial_candidate.config(),
+            Some(source.base_directory()),
+        )
+        .map_err(|_| ReloadError::InvalidInitialConfiguration)?;
+        let config_parent = source
+            .path()
+            .parent()
+            .ok_or(ReloadError::UnsupportedSource)?;
+        let geodata_watch_dirs: BTreeSet<_> = geodata_paths
+            .iter()
+            .filter_map(|path| path.parent())
+            .filter(|parent| {
+                *parent != config_parent
+                    && !(source.is_directory() && parent.starts_with(source.path()))
+            })
+            .map(std::path::Path::to_path_buf)
+            .collect();
+        for directory in &geodata_watch_dirs {
+            watcher
+                .watch(directory, RecursiveMode::NonRecursive)
+                .map_err(|_| ReloadError::Notify)?;
+        }
+        let handle = ConfigReloadHandle::from_documents_with_source(
             loaded.documents.iter().map(String::as_str),
             generation,
+            Some(source.base_directory().to_owned()),
         )?;
         Ok(Self {
             source,
             directories: loaded.directories,
+            geodata_paths,
+            geodata_watch_dirs,
             handle,
             events,
             watcher,
@@ -450,7 +532,42 @@ impl ConfigHotReloader {
                     match loaded {
                         Ok(loaded) => {
                             self.directories = loaded.directories;
-                            self.handle.reload_documents(loaded.documents.iter().map(String::as_str));
+                            // Watch both the active files and a syntactically
+                            // valid new candidate before compiling it, so an
+                            // atomic replacement or recovery from a bad file
+                            // cannot be missed between reading and watching.
+                            let mut paths = CompiledPolicy::referenced_geodata_paths(
+                                &self.handle.snapshot()?.config,
+                                Some(self.source.base_directory()),
+                            ).unwrap_or_else(|_| self.geodata_paths.clone());
+                            if let Ok(candidate) = KubeConfig::from_documents(loaded.documents.iter().map(String::as_str))
+                                .and_then(|kube| kube.into_validated_snapshot(Generation::new(1)))
+                                && let Ok(candidate_paths) = CompiledPolicy::referenced_geodata_paths(
+                                    candidate.config(),
+                                    Some(self.source.base_directory()),
+                                )
+                            {
+                                paths.extend(candidate_paths);
+                            }
+                            if self.update_geodata_watches(paths).is_err() {
+                                self.handle.replace_status(ReloadStatus {
+                                    state: ReloadState::Rejected,
+                                    active_generation: self.handle.status().active_generation,
+                                    observed_at_ms: now_ms(),
+                                    reason: Some("geodata watcher could not be established".to_owned()),
+                                    diagnostic: Some(reload_diagnostic(
+                                        "CONFIG_WATCH_FAILED", "$.GeoDataDatabase.spec.path".to_owned(), "geodata watcher could not be established",
+                                    )),
+                                });
+                                continue;
+                            }
+                            let handle = self.handle.clone();
+                            let documents = loaded.documents;
+                            tokio::task::spawn_blocking(move || {
+                                handle.reload_documents(documents.iter().map(String::as_str))
+                            })
+                            .await
+                            .map_err(|_| ReloadError::Lock)?;
                         }
                         Err(_) => {
                             self.handle.replace_status(ReloadStatus {
@@ -486,6 +603,43 @@ impl ConfigHotReloader {
         Ok(())
     }
 
+    fn update_geodata_watches(&mut self, paths: BTreeSet<PathBuf>) -> Result<(), ReloadError> {
+        let config_parent = self
+            .source
+            .path()
+            .parent()
+            .ok_or(ReloadError::UnsupportedSource)?;
+        let desired: BTreeSet<_> = paths
+            .iter()
+            .filter_map(|path| path.parent())
+            .filter(|parent| {
+                *parent != config_parent
+                    && !(self.source.is_directory() && parent.starts_with(self.source.path()))
+            })
+            .map(std::path::Path::to_path_buf)
+            .collect();
+        let mut added: Vec<PathBuf> = Vec::new();
+        for path in desired.difference(&self.geodata_watch_dirs) {
+            if self
+                .watcher
+                .watch(path, RecursiveMode::NonRecursive)
+                .is_err()
+            {
+                for path in added {
+                    let _ = self.watcher.unwatch(&path);
+                }
+                return Err(ReloadError::Notify);
+            }
+            added.push(path.clone());
+        }
+        for path in self.geodata_watch_dirs.difference(&desired) {
+            let _ = self.watcher.unwatch(path);
+        }
+        self.geodata_watch_dirs = desired;
+        self.geodata_paths = paths;
+        Ok(())
+    }
+
     fn reload_event(&self, event: &Event) -> bool {
         if !matches!(
             event.kind,
@@ -497,6 +651,9 @@ impl ConfigHotReloader {
             return true;
         }
         event.paths.iter().any(|path| {
+            if self.geodata_paths.contains(path) {
+                return true;
+            }
             if path == self.source.path() {
                 return true;
             }
@@ -515,13 +672,16 @@ impl ConfigHotReloader {
 fn compile_candidate_documents<'a>(
     inputs: impl IntoIterator<Item = &'a str>,
     generation: u64,
+    source_dir: Option<&std::path::Path>,
 ) -> Result<ReloadSnapshot, ReloadDiagnostic> {
     let kube = KubeConfig::from_documents(inputs).map_err(config_diagnostic)?;
     let validated = kube
         .into_validated_snapshot(Generation::new(generation))
         .map_err(config_diagnostic)?;
     let config = Arc::new(validated.config().clone());
-    let compiled = Arc::new(validated.compile().map_err(compile_diagnostic)?);
+    let compiled = Arc::new(
+        CompiledPolicy::compile_with_source(&validated, source_dir).map_err(compile_diagnostic)?,
+    );
     Ok(ReloadSnapshot {
         generation,
         config,
@@ -641,16 +801,36 @@ fn validation_diagnostic(error: ValidationError) -> ReloadDiagnostic {
             "CONFIG_INVALID_FIELD",
             resource_field("DNSPolicy", &policy_id, "spec"),
         ),
+        ValidationError::InvalidGeoData { owner, .. } => (
+            "CONFIG_INVALID_GEODATA",
+            resource_field("Resource", &owner, "spec"),
+        ),
     };
     reload_diagnostic(code, field_path, "configuration validation failed")
 }
 
 fn compile_diagnostic(error: CompileError) -> ReloadDiagnostic {
+    if let CompileError::InvalidGeodata {
+        database,
+        set,
+        reason,
+    } = &error
+    {
+        let mut field = resource_field("GeoDataDatabase", database, "spec.path");
+        if let Some(set) = set {
+            // Set names have already passed schema validation and are
+            // bounded. Do not expose the database path or pattern contents.
+            field.push_str(" set=");
+            field.push_str(set);
+        }
+        return reload_diagnostic("CONFIG_GEODATA_INVALID", field, reason);
+    }
     let (rule_id, field) = match error {
         CompileError::InvalidSourceNetwork { rule_id, .. } => {
             (rule_id, "spec.match.sourceNetworks")
         }
         CompileError::EmptySelector { rule_id } => (rule_id, "spec.selector"),
+        CompileError::InvalidGeodata { .. } => unreachable!("handled above"),
     };
     reload_diagnostic(
         "CONFIG_COMPILE_ERROR",
@@ -672,6 +852,7 @@ fn resource_field(kind: &str, name: &str, field: &'static str) -> String {
         "DNSPolicy" => "DNSPolicy",
         "FallbackPolicy" => "FallbackPolicy",
         "EgressService" => "EgressService",
+        "GeoDataDatabase" => "GeoDataDatabase",
         "NodeProbePolicy" => "NodeProbePolicy",
         "Rule" | "rule" => "Rule",
         "metadata" => "Resource",
@@ -1280,6 +1461,90 @@ spec: {order: 20, catchAll: true, egressRef: jp-1, trafficPolicyRef: traffic}
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(handle.snapshot().unwrap().generation, 3);
         assert_eq!(handle.status().state, ReloadState::Applied);
+        stop(shutdown, task).await;
+    }
+
+    #[tokio::test]
+    async fn geodata_file_replacement_publishes_atomically_and_retains_last_good_data() {
+        fn field(tag: u8, bytes: &[u8]) -> Vec<u8> {
+            assert!(bytes.len() < 128);
+            let mut out = vec![tag, bytes.len() as u8];
+            out.extend_from_slice(bytes);
+            out
+        }
+        fn database(root_domain: &str) -> Vec<u8> {
+            let mut rule = vec![8, 2];
+            rule.extend(field(18, root_domain.as_bytes()));
+            let mut set = field(10, b"service");
+            set.extend(field(18, &rule));
+            field(10, &set)
+        }
+        fn context(host: &str) -> pathchord_policy::PolicyContext {
+            pathchord_policy::PolicyContext {
+                flow_tags: BTreeSet::new(),
+                listener_id: pathchord_policy::ListenerId::new("test"),
+                source: "127.0.0.1:12345".parse().unwrap(),
+                authentication_identity: None,
+                process: None,
+                protocol: pathchord_policy::FlowProtocol::Tcp,
+                target: pathchord_policy::TargetEndpoint {
+                    host: pathchord_policy::TargetHost::Hostname(host.into()),
+                    port: 443,
+                },
+            }
+        }
+        fn matched(snapshot: &ReloadSnapshot, host: &str) -> bool {
+            matches!(
+                snapshot
+                    .compiled
+                    .evaluate(&context(host), &Default::default()),
+                pathchord_policy::Evaluation::Direct { .. }
+            )
+        }
+        let root = Directory::new();
+        let configs = root.0.join("config");
+        let data = root.0.join("data");
+        std::fs::create_dir_all(&configs).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let config = format!(
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: GeoSiteDatabase\nmetadata: {{name: sites}}\nspec: {{path: ../data/sites.dat}}\n---\napiVersion: pathchord.io/v1\nkind: ProxyRule\nmetadata: {{name: geo}}\nspec: {{order: 10, match: {{targetGeoSites: [service]}}, proxy: direct}}\n"
+        );
+        std::fs::write(configs.join("bundle.yaml"), &config).unwrap();
+        let db = data.join("sites.dat");
+        assert!(matches!(
+            ConfigHotReloader::bind(&configs, 1).await,
+            Err(ReloadError::InvalidInitialGeodata { .. })
+        ));
+        std::fs::write(&db, database("first.test")).unwrap();
+        let reloader = ConfigHotReloader::bind(&configs, 1).await.unwrap();
+        let handle = reloader.handle();
+        let old = handle.snapshot().unwrap();
+        assert!(matched(&old, "cdn.first.test"));
+        assert!(!matched(&old, "second.test"));
+        let (shutdown, task) = start(reloader);
+        let replacement = data.join("next.tmp");
+        std::fs::write(&replacement, database("second.test")).unwrap();
+        std::fs::rename(&replacement, &db).unwrap();
+        wait_until(&handle, 2, ReloadState::Applied).await;
+        let new = handle.snapshot().unwrap();
+        assert!(matched(&new, "second.test"));
+        assert!(!matched(&new, "first.test"));
+        assert!(
+            matched(&old, "first.test"),
+            "captured generation remains immutable"
+        );
+        std::fs::write(&replacement, b"\xff").unwrap();
+        std::fs::rename(&replacement, &db).unwrap();
+        wait_until(&handle, 2, ReloadState::Rejected).await;
+        assert!(matched(&handle.snapshot().unwrap(), "second.test"));
+        assert_eq!(
+            handle.status().diagnostic.unwrap().code,
+            "CONFIG_GEODATA_INVALID"
+        );
+        std::fs::write(&replacement, database("third.test")).unwrap();
+        std::fs::rename(&replacement, &db).unwrap();
+        wait_until(&handle, 3, ReloadState::Applied).await;
+        assert!(matched(&handle.snapshot().unwrap(), "third.test"));
         stop(shutdown, task).await;
     }
 

@@ -16,7 +16,8 @@ use url::Url;
 use crate::{
     AuthenticationMode, Capabilities, DnsBlockedResponse, DnsCacheConfig, DnsLocalConfig,
     DnsPolicyConfig, DnsPolicyId, DnsRoute, EgressConfig, EgressId, EgressRule, EgressSelection,
-    Endpoint, FallbackAction, FlowMatch, FlowProtocol, Generation, ListenerConfig, ListenerId,
+    Endpoint, FallbackAction, FlowMatch, FlowProtocol, Generation, GeoIpDatabaseConfig,
+    GeoIpDatabaseId, GeoSiteDatabaseConfig, GeoSiteDatabaseId, ListenerConfig, ListenerId,
     ListenerKind, PolicyConfig, ProcessMetadataRequest, ProxyRule, ProxySelection,
     RetransmissionReplication, RuleId, Scheduler, Selector, SubscriptionCache, SubscriptionConfig,
     SubscriptionId, SubscriptionRefresh, SubscriptionSource, SubscriptionSourceType, TrafficPolicy,
@@ -178,8 +179,19 @@ pub struct FlowMatchSpec {
     process_executables: BTreeSet<String>,
     #[serde(default)]
     target_hosts: BTreeSet<String>,
+    #[serde(default, deserialize_with = "deserialize_geodata_list")]
+    target_geo_sites: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_geodata_list")]
+    target_geo_ips: Option<Vec<String>>,
     #[serde(default)]
     target_ports: BTreeSet<u16>,
+}
+
+fn deserialize_geodata_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer).map(Some)
 }
 
 impl From<FlowMatchSpec> for FlowMatch {
@@ -192,6 +204,18 @@ impl From<FlowMatchSpec> for FlowMatch {
             authentication_identities: value.authentication_identities,
             process_executables: value.process_executables,
             target_hosts: value.target_hosts,
+            target_geo_sites: value
+                .target_geo_sites
+                .unwrap_or_default()
+                .into_iter()
+                .map(|value| crate::normalize_geodata_reference(&value, true).unwrap_or(value))
+                .collect(),
+            target_geo_ips: value
+                .target_geo_ips
+                .unwrap_or_default()
+                .into_iter()
+                .map(|value| crate::normalize_geodata_reference(&value, false).unwrap_or(value))
+                .collect(),
             target_ports: value.target_ports,
         }
     }
@@ -491,6 +515,12 @@ pub struct SubscriptionSpec {
     cache: Option<CacheSpec>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GeoDataDatabaseSpec {
+    path: String,
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -502,6 +532,8 @@ pub enum KubeResource {
     Egress(Resource<EgressSpec>),
     TransitProxy(Resource<TransitProxySpec>),
     Subscription(Resource<SubscriptionSpec>),
+    GeoSiteDatabase(Resource<GeoDataDatabaseSpec>),
+    GeoIpDatabase(Resource<GeoDataDatabaseSpec>),
     EgressRule(Resource<EgressRuleSpec>),
     TransitRule(Resource<TransitRuleSpec>),
     ProxyRule(Resource<ProxyRuleSpec>),
@@ -525,6 +557,9 @@ impl KubeResource {
                 (&value.metadata.namespace, &value.kind, &value.metadata.name)
             }
             Self::Subscription(value) => {
+                (&value.metadata.namespace, &value.kind, &value.metadata.name)
+            }
+            Self::GeoSiteDatabase(value) | Self::GeoIpDatabase(value) => {
                 (&value.metadata.namespace, &value.kind, &value.metadata.name)
             }
             Self::EgressRule(value) => {
@@ -556,6 +591,7 @@ impl KubeResource {
             Self::Egress(value) => &value.metadata,
             Self::TransitProxy(value) => &value.metadata,
             Self::Subscription(value) => &value.metadata,
+            Self::GeoSiteDatabase(value) | Self::GeoIpDatabase(value) => &value.metadata,
             Self::EgressRule(value) => &value.metadata,
             Self::TransitRule(value) => &value.metadata,
             Self::ProxyRule(value) => &value.metadata,
@@ -675,6 +711,18 @@ impl KubeConfig {
         for resource in self.resources {
             let namespace = resource.metadata().namespace.clone();
             match resource {
+                KubeResource::GeoSiteDatabase(value) => {
+                    config.geo_site_databases.push(GeoSiteDatabaseConfig {
+                        id: GeoSiteDatabaseId::in_namespace(&namespace, &value.metadata.name),
+                        path: value.spec.path,
+                    });
+                }
+                KubeResource::GeoIpDatabase(value) => {
+                    config.geo_ip_databases.push(GeoIpDatabaseConfig {
+                        id: GeoIpDatabaseId::in_namespace(&namespace, &value.metadata.name),
+                        path: value.spec.path,
+                    });
+                }
                 KubeResource::Egress(value) => config.egresses.push(EgressConfig {
                     id: EgressId::in_namespace(&namespace, &value.metadata.name),
                     endpoint: Endpoint {
@@ -1176,6 +1224,8 @@ fn parse_resource(value: Value) -> Result<KubeResource, ConfigError> {
         "Egress" => parse!(EgressSpec, Egress),
         "TransitProxy" => parse!(TransitProxySpec, TransitProxy),
         "Subscription" => parse!(SubscriptionSpec, Subscription),
+        "GeoSiteDatabase" => parse!(GeoDataDatabaseSpec, GeoSiteDatabase),
+        "GeoIpDatabase" => parse!(GeoDataDatabaseSpec, GeoIpDatabase),
         "EgressRule" => parse!(EgressRuleSpec, EgressRule),
         "TransitRule" => parse!(TransitRuleSpec, TransitRule),
         "ProxyRule" => parse!(ProxyRuleSpec, ProxyRule),
@@ -1211,6 +1261,34 @@ fn validate_resource_set(
         ));
     }
     let mut rule_orders = HashSet::new();
+    let mut geo_site_namespaces = HashSet::new();
+    let mut geo_ip_namespaces = HashSet::new();
+    for resource in resources {
+        let (database, namespaces, kind) = match resource {
+            KubeResource::GeoSiteDatabase(value) => {
+                (value, &mut geo_site_namespaces, "GeoSiteDatabase")
+            }
+            KubeResource::GeoIpDatabase(value) => (value, &mut geo_ip_namespaces, "GeoIpDatabase"),
+            _ => continue,
+        };
+        if database.spec.path.trim().is_empty()
+            || database.spec.path.len() > 4096
+            || contains_control(&database.spec.path)
+        {
+            return Err(invalid_spec(
+                kind,
+                &database.metadata.name,
+                "path is empty or invalid",
+            ));
+        }
+        if !namespaces.insert(database.metadata.namespace.as_str()) {
+            return Err(invalid_spec(
+                kind,
+                &database.metadata.name,
+                "at most one database of this kind is permitted per namespace",
+            ));
+        }
+    }
     if resources
         .iter()
         .filter(|resource| matches!(resource, KubeResource::NodeProbePolicy(_)))
@@ -1230,6 +1308,24 @@ fn validate_resource_set(
             _ => None,
         };
         if let Some(matches) = matches {
+            if matches.target_geo_sites.is_some()
+                && !geo_site_namespaces.contains(resource.metadata().namespace.as_str())
+            {
+                return Err(invalid_spec(
+                    resource.key().1,
+                    resource.key().2,
+                    "targetGeoSites requires a GeoSiteDatabase in this namespace",
+                ));
+            }
+            if matches.target_geo_ips.is_some()
+                && !geo_ip_namespaces.contains(resource.metadata().namespace.as_str())
+            {
+                return Err(invalid_spec(
+                    resource.key().1,
+                    resource.key().2,
+                    "targetGeoIps requires a GeoIpDatabase in this namespace",
+                ));
+            }
             for listener in &matches.listener_refs {
                 if !resource_keys.contains(&(
                     resource.metadata().namespace.as_str(),
@@ -1904,6 +2000,31 @@ fn validate_flow_match(
     let Some(matches) = matches else {
         return Ok(());
     };
+    for (field, values, geosite) in [
+        ("targetGeoSites", &matches.target_geo_sites, true),
+        ("targetGeoIps", &matches.target_geo_ips, false),
+    ] {
+        let Some(values) = values else { continue };
+        if values.is_empty() || values.len() > 256 {
+            return Err(invalid_spec(
+                kind,
+                name,
+                format!("{field} must have between 1 and 256 references"),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for value in values {
+            let normalized = crate::normalize_geodata_reference(value, geosite)
+                .map_err(|reason| invalid_spec(kind, name, format!("{field}: {reason}")))?;
+            if !seen.insert(normalized) {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    format!("{field} contains duplicate references"),
+                ));
+            }
+        }
+    }
     if matches.source_networks.len() > 10_000 {
         return Err(invalid_spec(
             kind,
@@ -2278,6 +2399,114 @@ items:
                 group: true,
             }
         );
+    }
+
+    #[test]
+    fn geodata_resources_and_rule_references_are_namespace_scoped_and_normalized() {
+        let extra = r#"
+---
+apiVersion: pathchord.io/v1
+kind: GeoSiteDatabase
+metadata: {name: domains, namespace: tenant}
+spec: {path: ../geodata/dlc.dat}
+---
+apiVersion: pathchord.io/v1
+kind: GeoIpDatabase
+metadata: {name: addresses, namespace: tenant}
+spec: {path: ../geodata/geoip.dat}
+---
+apiVersion: pathchord.io/v1
+kind: ProxyRule
+metadata: {name: geodata-route, namespace: tenant}
+spec:
+  order: 10
+  match:
+    targetGeoSites: ["GeoSite:HuggingFace@Ads"]
+    targetGeoIps: ["GeoIP:CN"]
+  select: any
+"#;
+        let policy = KubeConfig::from_yaml(&format!("{VALID}{extra}"))
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(policy.geo_site_databases[0].id.namespace(), "tenant");
+        assert_eq!(policy.geo_site_databases[0].path, "../geodata/dlc.dat");
+        assert_eq!(policy.geo_ip_databases[0].id.namespace(), "tenant");
+        assert_eq!(
+            policy.proxy_rules[0].matches.target_geo_sites,
+            BTreeSet::from(["huggingface@ads".to_owned()])
+        );
+        assert_eq!(
+            policy.proxy_rules[0].matches.target_geo_ips,
+            BTreeSet::from(["cn".to_owned()])
+        );
+    }
+
+    #[test]
+    fn invalid_geodata_configuration_is_rejected_before_normalization() {
+        let databases = r#"
+---
+apiVersion: pathchord.io/v1
+kind: GeoSiteDatabase
+metadata: {name: domains, namespace: tenant}
+spec: {path: ../geodata/dlc.dat}
+---
+apiVersion: pathchord.io/v1
+kind: GeoIpDatabase
+metadata: {name: addresses, namespace: tenant}
+spec: {path: ../geodata/geoip.dat}
+"#;
+        let proxy = |matching: &str| {
+            format!(
+                r#"
+---
+apiVersion: pathchord.io/v1
+kind: ProxyRule
+metadata: {{name: geo, namespace: tenant}}
+spec: {{order: 11, match: {{{matching}}}, select: any}}
+"#
+            )
+        };
+        for matching in [
+            "targetGeoSites: []",
+            "targetGeoIps: []",
+            "targetGeoSites: null, targetHosts: [example.test]",
+            "targetGeoSites: ['site@']",
+            "targetGeoSites: ['site@one@two']",
+            "targetGeoIps: ['cn@x']",
+            "targetGeoSites: ['Geosite:HF', 'hf']",
+            "targetGeoIps: ['CN', 'geoip:cn']",
+        ] {
+            let input = format!("{VALID}{databases}{}", proxy(matching));
+            assert!(KubeConfig::from_yaml(&input).is_err(), "{matching}");
+        }
+        let names = (0..=256)
+            .map(|index| format!("site-{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let input = format!(
+            "{VALID}{databases}{}",
+            proxy(&format!("targetGeoSites: [{names}]"))
+        );
+        assert!(KubeConfig::from_yaml(&input).is_err());
+        let missing = format!("{VALID}{}", proxy("targetGeoSites: [huggingface]"));
+        assert!(KubeConfig::from_yaml(&missing).is_err());
+        let wrong_namespace = databases.replace("namespace: tenant", "namespace: other");
+        let cross = format!("{VALID}{wrong_namespace}{}", proxy("targetGeoSites: [hf]"));
+        assert!(KubeConfig::from_yaml(&cross).is_err());
+        let duplicate = r#"
+---
+apiVersion: pathchord.io/v1
+kind: GeoSiteDatabase
+metadata: {name: another, namespace: tenant}
+spec: {path: ../geodata/another.dat}
+"#;
+        let error = KubeConfig::from_yaml(&format!("{VALID}{databases}{duplicate}"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at most one database"));
+        let bad_path = databases.replace("../geodata/dlc.dat", "''");
+        assert!(KubeConfig::from_yaml(&format!("{VALID}{bad_path}")).is_err());
     }
 
     #[test]

@@ -679,7 +679,8 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         })?;
     let reload_handle = reloader.handle();
     reload_handle.enable_runtime_commit()?;
-    let policy_config = (*reload_handle.snapshot()?.config).clone();
+    let initial_snapshot = reload_handle.snapshot()?;
+    let policy_config = (*initial_snapshot.config).clone();
     let policy =
         pathchord_policy::ValidatedPolicySnapshot::new(Generation::new(1), policy_config.clone())
             .map_err(pathchord_policy::ConfigError::from)?;
@@ -689,11 +690,10 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         None => return Err(CliError::MissingIdentity),
     };
     let platform = SystemProxyPlatform::current();
-    let data_plane = Arc::new(IngressDataPlane::new(IngressDataPlaneConfig::new(
-        args.ingress_id,
-        identity,
-        policy,
-    ))?);
+    let data_plane = Arc::new(IngressDataPlane::new_with_compiled(
+        IngressDataPlaneConfig::new(args.ingress_id, identity, policy),
+        (*initial_snapshot.compiled).clone(),
+    )?);
     data_plane
         .configure_node_probe(node_probe_config(policy_config.node_probe.as_ref()))
         .await?;
@@ -1236,6 +1236,7 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
                     "active_sessions": snapshot.active_sessions,
                     "active_streams": snapshot.active_streams,
                     "active_target_connections": snapshot.active_target_connections,
+                    "last_session_end": snapshot.last_session_end,
                     "target_open": {
                         "attempts": snapshot.target_open_attempts,
                         "successes": snapshot.target_open_successes,
@@ -1815,7 +1816,11 @@ async fn apply_reloaded_policies(
                 ).map_err(pathchord_policy::ConfigError::from)?;
                 let prepared = match cancellable_ingress_work(
                     shutdown.clone(),
-                    data_plane.prepare_static_snapshot(&validated, adapter_registry.as_ref()),
+                    data_plane.prepare_static_snapshot_with_compiled(
+                        &validated,
+                        (*snapshot.compiled).clone(),
+                        adapter_registry.as_ref(),
+                    ),
                 ).await {
                     Some(Ok(prepared)) => prepared,
                     Some(Err(error)) => {

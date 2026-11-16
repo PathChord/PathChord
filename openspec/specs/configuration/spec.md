@@ -121,6 +121,25 @@ Ingress SHALL aggregate demand by Session-scoped rule, policy, and class keys us
 - **WHEN** a new SessionID replaces a failed Session
 - **THEN** its demand counters and EWMA start empty while prior values remain only in bounded observations
 
+### Requirement: Geodata predicates participate in ordered routing
+
+EgressRule, TransitRule, and ProxyRule flow matches SHALL evaluate configured geosite and geoip predicates using the same immutable geodata generation as the rest of the routing decision. The predicates SHALL follow the [geodata routing contract](../geodata-routing/spec.md) without changing rule order or implicit fallback behavior.
+
+#### Scenario: Hugging Face redirect uses the same Egress policy
+
+- **WHEN** an explicit proxy flow targets a hostname in a configured `huggingface` geosite set, including a CDN subdomain
+- **THEN** the matching Egress and Transit rules select their configured route without requiring every hostname to be enumerated
+
+#### Scenario: GeoIP predicate receives an original destination address
+
+- **WHEN** an IP-targeted TCP or UDP flow reaches a rule with a matching geoip set
+- **THEN** the rule evaluates the original destination IP under its captured generation before selecting an Egress, Proxy, or configured fallback
+
+#### Scenario: Geodata fact is unavailable
+
+- **WHEN** a rule needs a hostname or IP that the listener did not provide
+- **THEN** the corresponding geodata predicate does not match and Ingress proceeds through the configured ordered rules and fallback without resolving through another DNS route
+
 ## Detailed contract
 
 This document explains the Kubernetes-style configuration objects and evaluation order. The
@@ -261,7 +280,7 @@ spec:
     minUsablePaths: 1
 ```
 
-The first rule whose conditions match and whose Egress is currently usable wins. Egress usability is precomputed by the runtime state manager.
+The first rule whose conditions match and whose Egress is currently usable wins. Egress usability is precomputed by the runtime state manager. Geosite and geoip predicates use the flow's original hostname or original destination IP and the immutable [geodata routing](../geodata-routing/spec.md) generation; missing facts do not match or trigger DNS.
 
 ### Egress-specific Proxy rules
 

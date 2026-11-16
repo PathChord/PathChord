@@ -50,6 +50,82 @@ pathchord ingress
 
 资源通过所属 namespace 内的 `metadata.name` 相互引用。名称和显式规则顺序决定资源图；文件名不提供覆写层。重复资源身份或无法解析的引用会使候选配置被拒绝。完整资源图中保留恰好一个 `DNSPolicy` 和一个 `FallbackPolicy`。
 
+## 使用 geosite 和 geoip 集合路由
+
+Geosite 和 geoip 使用由运维人员提供的 V2Fly 数据库。从固定版本的
+[domain-list-community 发布页](https://github.com/v2fly/domain-list-community/releases)获取
+`dlc.dat`，并从 [v2fly/geoip 发布页](https://github.com/v2fly/geoip/releases)获取
+`geoip.dat`。从同一发布版本下载各自的 `*.sha256sum`，在下载目录中用
+`sha256sum -c` 校验。将校验成功的 `.dat` 文件放到 Ingress 服务账号可读取的位置，
+并保留上一版已校验文件以便回滚。PathChord 读取本地文件，不会自动下载或更新这些数据库。
+
+例如，将以下版本标签占位符替换为所选发布版本，并在私有暂存目录中执行：
+
+```sh
+site_tag=REPLACE_WITH_DOMAIN_LIST_RELEASE_TAG
+ip_tag=REPLACE_WITH_GEOIP_RELEASE_TAG
+curl -fsSLO "https://github.com/v2fly/domain-list-community/releases/download/${site_tag}/dlc.dat"
+curl -fsSLO "https://github.com/v2fly/domain-list-community/releases/download/${site_tag}/dlc.dat.sha256sum"
+curl -fsSLO "https://github.com/v2fly/geoip/releases/download/${ip_tag}/geoip.dat"
+curl -fsSLO "https://github.com/v2fly/geoip/releases/download/${ip_tag}/geoip.dat.sha256sum"
+sha256sum -c dlc.dat.sha256sum
+sha256sum -c geoip.dat.sha256sum
+```
+
+在完整配置中加入以下资源和规则；该配置还应已定义 Egress `egress-jp-1` 及其合规的
+TransitRule 和 TrafficPolicy：
+
+```yaml
+apiVersion: pathchord.io/v1
+kind: GeoSiteDatabase
+metadata: {name: sites}
+spec: {path: /var/lib/pathchord/geodata/dlc.dat}
+---
+apiVersion: pathchord.io/v1
+kind: GeoIpDatabase
+metadata: {name: addresses}
+spec: {path: /var/lib/pathchord/geodata/geoip.dat}
+---
+apiVersion: pathchord.io/v1
+kind: EgressRule
+metadata: {name: huggingface-egress}
+spec:
+  order: 10
+  match:
+    targetGeoSites: [huggingface]
+  requirements: {minUsablePaths: 3}
+  egressRef: egress-jp-1
+---
+apiVersion: pathchord.io/v1
+kind: EgressRule
+metadata: {name: geoip-example}
+spec:
+  order: 20
+  match:
+    targetGeoIps: [cn]
+  egressRef: egress-jp-1
+```
+
+第一条规则覆盖上游 `huggingface` 集合中的域名，包括 `hf.co` 的子域名
+`us.aws.cdn.hf.co`。第二条规则演示以 IP 为目标的 flow；请按自己的策略选择集合和
+Egress。数据库与使用它的规则属于同一 namespace。Geosite 也可以使用 `set@attribute`
+选择属性，例如已校验数据库中存在该属性时可使用 `google@ads`。匹配类型见
+[geodata 契约](../../openspec/specs/geodata-routing/spec.zh-CN.md)，限制和字段规则见
+[配置 schema](../../openspec/specs/configuration-schema/spec.zh-CN.md#geodata-数据库)。
+
+相应字段也接受显式形式 `geosite:huggingface` 和 `geoip:cn`；它们分别引用与上述短名称
+相同的集合。
+
+Geosite 使用监听器提供的原始主机名。GeoIP 使用原始目标 IP，例如透明 flow 的目标地址。
+只提供主机名的请求不会通过 DNS 查询获得 GeoIP 匹配；只提供 IP 的 flow 不会获得 geosite
+匹配。同一 match 字段内的值互为备选，不同的非空 match 字段组合求值。如果主机名集合或
+IP 集合任一匹配即可选路，应使用多条有序规则。`targetHosts` 保持精确匹配语义。
+
+数据库文件应放在扫描的配置目录之外，或使用 `.dat` 等不被扫描的扩展名。相对数据库路径
+从选定配置文件的父目录或选定配置目录解析。更新时，先单独下载并校验新版本，再原子替换
+配置的文件。Ingress 验证完整候选后，将规则与数据一起发布。如果验证失败，检查重载状态；
+上一代配置保持生效。回滚时，原子恢复上一份已校验文件及相应配置，再检查重载状态和实际路由。
+
 ## 单独存放凭据
 
 将私有身份、节点/监听器凭据 JSON、订阅缓存和服务数据目录放在资源树外。目录加载器也会读取 JSON，因此将私有 JSON 文档混入配置资源可能使整个配置集合无效。使用不透明的 `credentialsRef` 引用本地凭据存储。不要把密码和订阅 token 写入已提交的示例；含凭据的 provider URL 应按私有配置处理。

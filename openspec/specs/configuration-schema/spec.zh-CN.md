@@ -117,6 +117,43 @@ Subscription 来源 SHALL 接受可选 `userAgent` 字段。其值 SHALL 是非�
 - **WHEN** Subscription 声明的 User-Agent 包含换行符
 - **THEN** 配置验证拒绝候选配置集合
 
+### Requirement: Geodata resources and references
+
+配置 schema SHALL 支持 namespace 范围的 geosite 和 geoip 数据库资源，以及 flow match 中类型化的命名集合引用。验证 SHALL 对照完整资源图解析所有引用，并在发布前拒绝无效或歧义数据。
+
+#### Scenario: Reference an absent database
+
+- **WHEN** 规则引用其 namespace 中不存在的 geodata 资源或命名集合
+- **THEN** 候选配置被拒绝，诊断标识字段和资源，不发布部分规则
+
+#### Scenario: Existing exact host matches remain valid
+
+- **WHEN** 现有配置只使用 `targetHosts`
+- **THEN** 它保留原有的精确主机名或 IP 字面量匹配语义，无需 geodata 资源
+
+### Requirement: Geodata updates publish atomically
+
+加载器 SHALL 作为完整候选的一部分读取和验证每个被引用的数据库，并将 geodata 与规则发布为同一不可变代次。替换配置的数据库文件 SHALL 触发有界重载；候选失败时 SHALL 保留上一代有效配置。
+
+#### Scenario: Replace a referenced database
+
+- **WHEN** 运维人员以有效内容原子替换被引用的 geodata 文件
+- **THEN** Ingress 验证完整候选，并将变更后的数据和规则一起发布为新代次
+
+#### Scenario: Start with missing geodata
+
+- **WHEN** 初始配置引用缺失或不可读的 geodata 数据库
+- **THEN** 启动报告类型化配置失败，不静默禁用条件
+
+### Requirement: Detailed geodata contract
+
+Geodata 配置 SHALL 遵循完整的[详细契约](#geodata-数据库)。
+
+#### Scenario: Apply the detailed contract
+
+- **WHEN** 处理 geodata 配置或匹配
+- **THEN** 执行详细契约中的 schema、限制和失败语义
+
 ## Detailed contract
 
 本文档是人工编写 YAML 配置的规范性版本化 schema。[配置规范](../configuration/spec.zh-CN.md)
@@ -160,7 +197,8 @@ items:
 `metadata.resourceVersion` 由服务端生成，不能由用户写入。运行时 `status` 只读，并由控制面单独暴露。
 
 支持的 kind 为 `Egress`、`TransitProxy`、`Subscription`、`EgressRule`、`TransitRule`、`ProxyRule`、
-`TrafficPolicy`、`Listener`、`DNSPolicy`、`FallbackPolicy`、`EgressService` 和 `NodeProbePolicy`。
+`TrafficPolicy`、`Listener`、`DNSPolicy`、`FallbackPolicy`、`GeoSiteDatabase`、`GeoIpDatabase`、
+`EgressService` 和 `NodeProbePolicy`。
 后两者是角色专用的服务资源：`EgressService` 为一个 Egress 进程选择身份、监听器、授权存储和服务限制；
 `NodeProbePolicy` 配置可选的有界 Transit 节点探测。Ingress 消费 `NodeProbePolicy`，Egress 消费
 `EgressService`；两者都可以存在于同一已验证资源包中。
@@ -303,12 +341,37 @@ maxAgeSeconds 默认 86400 且范围 `60..=2592000`。`source.userAgent` 可选�
 保留上一成功快照，记录类型化错误并使用有界指数退避。删除或禁用订阅会阻止后续刷新，仅由该来源导入
 的节点进入排空并排除新选择。成功刷新发布一个动态代次，失败不发布代次。
 
+### Geodata 数据库
+
+`kind: GeoSiteDatabase` 或 `kind: GeoIpDatabase` 资源包含共同的 `apiVersion`、
+`metadata.name`、可选 namespace，以及指向本地 V2Fly protobuf 文件的 `spec.path` 字符串。
+每个 namespace 的每种 kind MUST 至多有一个资源。文件是只读输入；匹配时不下载或修改文件。
+相对路径基于选定配置文件的父目录或选定配置目录根目录解析。数据库文件是外部输入，不是资源
+文档，MUST 放在被扫描的配置目录之外，或使用不被扫描的扩展名。
+
+`targetGeoSites` 和 `targetGeoIps` 是 EgressRule、TransitRule 或 ProxyRule 的 `match` 中
+可选的非空序列，每个最多 256 个字符串。Geosite 引用使用 `set` 或 `set@attribute`，可选
+`geosite:` 前缀；geoip 引用使用 `set`，可选 `geoip:` 前缀。对应前缀在规范化时移除；不兼容的
+前缀必须拒绝。集合和属性名称使用非空 ASCII 字母、数字、`.`、`_`、`-` 和 `!`，大小写不敏感。
+被引用的对应数据库资源 MUST 存在于规则的
+namespace 中。归一化后重复的引用无效。同一字段中的值为 OR；非空匹配字段之间为 AND，
+包括 `targetHosts`、`targetGeoSites` 和 `targetGeoIps`。原始目标事实不可用时，相应条件
+为 false。同一规则同时配置 geosite 和 geoip 时要求两个事实都存在；两者任选其一时使用
+独立有序规则。
+
+外部数据库路径与内容参与候选验证、重载观测、代次标识和有界诊断。被引用文件发生变化，
+包括原子替换时，会触发完整资源图验证。发布前须解码、验证并建立数据索引；flow 不得看到
+旧规则与新数据的混合。启动时没有有效候选则启动失败；后续失败保留上一代有效配置。更新和
+数据文件读取限制遵循 [geodata 路由契约](../geodata-routing/spec.zh-CN.md)。没有 geodata
+引用的配置无需数据库文件。
+
 ### 规则和选择器
 
 规则是资源，顺序由 `spec.order` 整数决定；同序号必须拒绝。`EgressRule`、`TransitRule` 和 `ProxyRule`
 都可以有可选的 `spec.match`。显式提供 `match: {}` 必须拒绝；只有确实需要显式全匹配规则时才省略 `match`。字段之间为 AND，同一字段
 中的多个值为 OR。支持 `flowTags`、`protocols`、`listenerRefs`、`sourceNetworks`、
-`authenticationIdentities`、`processExecutables`、`targetHosts` 和 `targetPorts`。
+`authenticationIdentities`、`processExecutables`、`targetHosts`、`targetGeoSites`、
+`targetGeoIps` 和 `targetPorts`。
 
 EgressRule 的 spec 在 `egressRef`、`egressSelector` 或 `mode: none` 中选择一个。selector 至少一个条件；
 mode none 是普通 Proxy 模式，不得创建 Session。TransitRule 在选定 Egress 后求值，使用 egressRef、

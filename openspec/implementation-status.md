@@ -10,6 +10,22 @@ this snapshot records evidence rather than a second implementation plan.
 
 ## Current focus
 
+The [geosite and geoip routing change](changes/support-geosite-geoip-routing/)
+adds local V2Fly geodata databases, named-set rule matching and atomic dataset
+reload. Deterministic tests cover domain types, attributes, IPv4/IPv6, invalid
+inputs and retained generations. Official domain-list-community release
+`20261116002619` and v2fly/geoip release `202611080027` were verified against
+their published checksums; each set compiled independently. On the authorized
+`egress-jp-1` test host, a local Ingress routed the Hugging Face origin and CDN
+through `geosite:huggingface` and downloaded a 1 MiB range with HTTP 206; a
+separate `geoip:au` IP request reached Egress and returned HTTP 301. Both used
+the two subscription sources, at least three Paths at admission, and a local
+HTTP proxy. An earlier run with an older diagnostic Egress stopped after a
+partial range and did not expose the Session termination reason; the repeat
+with the updated Egress completed while Paths were replaced. See the change's
+research record for dataset hashes. These bounded tests are not prolonged
+throughput or native-platform evidence.
+
 The unreleased v1 session/resource contract is now implemented through the
 wire, lifecycle, scheduling, Egress-resource, TLS, and local-control slices.
 The implementation uses the finalized v1 registry without PathRebind or
@@ -134,6 +150,16 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   Session tests cover both existing protocols, denied opens, lost-data
   retransmission, and admission recovery; a separate drain-deadline regression
   keeps a second Path alive across health ticks.
+  A routed flow currently retains the eligible Path IDs captured at its open;
+  a later replacement Path is not automatically added to that existing flow.
+  If all of those IDs fail, the flow can therefore close even while another
+  Session Path exists. Treating all Session Paths as eligible would violate
+  Transit-rule isolation; a safe update requires a negotiated flow-eligibility
+  protocol and independent interoperability tests. A configured
+  `minUsablePaths` is checked against the rule's admissible Paths when opening
+  TCP or UDP, not against unrelated Session Paths, and does not terminate an
+  already admitted flow. Maintenance detects a rule-specific shortfall even
+  when other rules have enough ready Paths.
 - Ingress has ordinary HTTP forwarding and CONNECT, SOCKS4/4a/5 CONNECT,
   SOCKS5 UDP ASSOCIATE, Linux REDIRECT
   and TPROXY adapters, transparent UDP, a direct smoltcp TUN reactor, process

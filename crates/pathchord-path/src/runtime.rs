@@ -2047,9 +2047,13 @@ where
                 let require_fresh_status = multipath_config
                     .as_ref()
                     .is_some_and(|config| config.require_fresh_status_report);
-                if !self
+                let minimum = multipath_config
+                    .as_ref()
+                    .map_or(1, |config| config.minimum_usable_paths.max(1));
+                if self
                     .multipath
-                    .has_admissible_path(eligible_paths.as_ref(), require_fresh_status)
+                    .admissible_path_count(eligible_paths.as_ref(), require_fresh_status)
+                    < minimum
                 {
                     let _ = reply.send(Err(OpenUdpError::ResourceLimit));
                     return Ok(false);
@@ -2298,9 +2302,13 @@ where
                 let require_fresh_status = multipath_config
                     .as_ref()
                     .is_some_and(|config| config.require_fresh_status_report);
-                if !self
+                let minimum = multipath_config
+                    .as_ref()
+                    .map_or(1, |config| config.minimum_usable_paths.max(1));
+                if self
                     .multipath
-                    .has_admissible_path(eligible_paths.as_ref(), require_fresh_status)
+                    .admissible_path_count(eligible_paths.as_ref(), require_fresh_status)
+                    < minimum
                 {
                     let _ = reply.send(Err(OpenStreamError::ResourceLimit));
                     return Ok(false);
@@ -7276,6 +7284,78 @@ mod tests {
         ingress.shutdown().await.unwrap();
         egress.wait().await.unwrap();
         factory.join().await;
+    }
+
+    #[tokio::test]
+    async fn rule_minimum_counts_only_eligible_paths_for_tcp_and_udp() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ingress_key, egress_key) = keys();
+            let (i1, e1) = admitted_pair_for(&ingress_key, &egress_key, 401).await;
+            let (i2, e2) = admitted_pair_for(&ingress_key, &egress_key, 402).await;
+            let factory = EchoFactory::default();
+            let egress =
+                EgressSessionHandle::start_with_udp(e1, factory.clone(), EchoUdpFactory).unwrap();
+            let ingress = IngressSessionHandle::start(i1).unwrap();
+            egress
+                .controller()
+                .add_path(e2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            ingress
+                .add_path(i2, MultipathPathObservation::default())
+                .await
+                .unwrap();
+            let policy = MultipathConfig {
+                minimum_usable_paths: 2,
+                ..Default::default()
+            };
+            let only_one = BTreeMap::from([(PathId::new(401), 100)]);
+            assert!(matches!(
+                ingress
+                    .open_tcp_routed_with_config(
+                        target("minimum.test"),
+                        only_one.clone(),
+                        policy.clone()
+                    )
+                    .await,
+                Err(OpenStreamError::ResourceLimit)
+            ));
+            assert!(matches!(
+                ingress
+                    .open_udp_routed_with_config(
+                        target("minimum-udp.test"),
+                        only_one,
+                        policy.clone()
+                    )
+                    .await,
+                Err(OpenUdpError::ResourceLimit)
+            ));
+            assert!(!ingress.snapshot().closed);
+            let both = BTreeMap::from([(PathId::new(401), 100), (PathId::new(402), 100)]);
+            let mut stream = ingress
+                .open_tcp_routed_with_config(target("minimum.test"), both.clone(), policy.clone())
+                .await
+                .unwrap();
+            let mut udp = ingress
+                .open_udp_routed_with_config(target("minimum-udp.test"), both, policy)
+                .await
+                .unwrap();
+            ingress.close_path(PathId::new(401)).await.unwrap();
+            stream.write_all(b"still-running").await.unwrap();
+            let mut reply = [0; 13];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"still-running");
+            udp.send(b"still-running".to_vec()).await.unwrap();
+            assert_eq!(udp.receive().await.unwrap(), b"still-running");
+            udp.close().await.unwrap();
+            stream.shutdown().await.unwrap();
+            stream.read_to_end(&mut Vec::new()).await.unwrap();
+            ingress.shutdown().await.unwrap();
+            egress.wait().await.unwrap();
+            factory.join().await;
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
