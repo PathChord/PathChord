@@ -24,6 +24,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
+struct StalledTransit {
+    metadata: pathchord_transit::TransitMetadata,
+}
+
+#[async_trait::async_trait]
+impl pathchord_transit::TransitAdapter for StalledTransit {
+    fn metadata(&self) -> &pathchord_transit::TransitMetadata {
+        &self.metadata
+    }
+
+    async fn connect(
+        &self,
+        _: pathchord_transit::ConnectRequest,
+    ) -> Result<pathchord_transit::BoxedTransitConnection, pathchord_transit::TransitError> {
+        std::future::pending().await
+    }
+}
+
 #[tokio::test]
 async fn http_connect_crosses_transit_noise_session_and_egress() {
     http_connect_through_egress("default", "127.0.0.1:0").await;
@@ -171,7 +189,8 @@ async fn retiring_a_replaced_transit_path_prevents_new_streams_from_using_it() {
             pathchord_ingress::DynamicTransitRegistration::Registered
         );
         plane.warmup().await;
-        assert_eq!(plane.snapshot().await.ready_paths, 1);
+        plane.warmup().await;
+        assert_eq!(plane.snapshot().await.ready_paths, 2);
         let old_path = plane.session_snapshots().await[0]
             .path_transit
             .keys()
@@ -352,7 +371,24 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
             .await
     });
 
-    let policy = policy(namespace, egress_address, egress_key.public());
+    let base_policy = policy(namespace, egress_address, egress_key.public());
+    let stalled_id = TransitProxyId::in_namespace(namespace, "aaa-stalled");
+    let mut config = base_policy.config().clone();
+    config.transit_proxies.push(TransitProxyConfig {
+        id: stalled_id.clone(),
+        source: None,
+        protocol: "http".into(),
+        endpoint: Endpoint {
+            host: "127.0.0.1".into(),
+            port: 1,
+        },
+        credentials_ref: None,
+        labels: BTreeMap::new(),
+        tags: BTreeSet::new(),
+        weight: 100,
+        options: Default::default(),
+    });
+    let policy = ValidatedPolicySnapshot::new(Generation::new(1), config).unwrap();
     let data_plane = Arc::new(
         IngressDataPlane::new(IngressDataPlaneConfig::new(
             "ingress-a",
@@ -362,7 +398,29 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
         .expect("Ingress data plane"),
     );
     data_plane.warmup().await;
-    assert_eq!(data_plane.snapshot().await.ready_paths, 1);
+    data_plane.warmup().await;
+    assert_eq!(data_plane.snapshot().await.ready_paths, 2);
+    data_plane
+        .register_transit_adapter(
+            stalled_id,
+            Arc::new(StalledTransit {
+                metadata: pathchord_transit::TransitMetadata {
+                    adapter_id: "aaa-stalled".into(),
+                    kind: pathchord_transit::AdapterKind::ExternalProxy {
+                        protocol: "http".into(),
+                    },
+                    labels: BTreeMap::new(),
+                },
+            }),
+            pathchord_policy::TransitProxyRuntimeStatus {
+                state: pathchord_policy::RuntimeNodeState::Ready,
+                capabilities: BTreeSet::from([FlowProtocol::Tcp]),
+                selection_score: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     let target = TcpListener::bind("127.0.0.1:0").await.expect("echo target");
     let target_address = target.local_addr().expect("target address");
@@ -419,10 +477,14 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
         .await
         .expect("CONNECT request");
     let mut response = Vec::new();
-    while !response.ends_with(b"\r\n\r\n") {
-        assert!(response.len() < 4096, "bounded HTTP response");
-        response.push(client.read_u8().await.expect("CONNECT response"));
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !response.ends_with(b"\r\n\r\n") {
+            assert!(response.len() < 4096, "bounded HTTP response");
+            response.push(client.read_u8().await.expect("CONNECT response"));
+        }
+    })
+    .await
+    .expect("an unused stalled Transit must not block an existing Path");
     assert!(response.starts_with(b"HTTP/1.1 200"));
 
     let payload = b"real-pathchord-data-plane";

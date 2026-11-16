@@ -508,6 +508,27 @@ impl MultipathSession {
         })
     }
 
+    /// Release a terminal Path's bounded Session slot once the actor has
+    /// transferred or discarded its retained business ranges. Keeping failed
+    /// Path IDs in `paths` forever prevents replacement after enough churn.
+    pub(crate) fn forget_terminal_path(&mut self, path_id: PathId) -> Result<(), MultipathError> {
+        match self.lifecycle.path_state(path_id) {
+            Some(PathState::Failed | PathState::Closed) => {}
+            Some(from) => {
+                return Err(MultipathError::Lifecycle(
+                    StateTransitionError::InvalidPath {
+                        from,
+                        to: PathState::Closed,
+                    },
+                ));
+            }
+            None => return Err(MultipathError::UnknownPath(path_id)),
+        }
+        self.lifecycle.unregister_path(path_id)?;
+        self.paths.remove(&path_id);
+        Ok(())
+    }
+
     fn transition_path_terminal(
         &mut self,
         path_id: PathId,
@@ -1663,6 +1684,38 @@ mod tests {
         assert!(!session.fail_path(PathId::new(1)).unwrap().session_closed);
         assert!(session.fail_path(PathId::new(2)).unwrap().session_closed);
         assert_eq!(session.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn failed_path_slots_are_reusable_after_repeated_replacements() {
+        let mut session = MultipathSession::new(
+            SessionId::new(1),
+            MultipathConfig {
+                max_paths: 2,
+                ..MultipathConfig::default()
+            },
+        )
+        .unwrap();
+        session
+            .add_path(PathId::new(1), observation(1_000, 10, 0))
+            .unwrap();
+        for id in 2..12 {
+            session
+                .add_path(PathId::new(id), observation(1_000, 10, 0))
+                .unwrap();
+            assert!(
+                !session
+                    .mark_path_failed(PathId::new(id))
+                    .unwrap()
+                    .session_closed
+            );
+            session.forget_terminal_path(PathId::new(id)).unwrap();
+            assert_eq!(session.ready_path_count(), 1);
+        }
+        session
+            .add_path(PathId::new(12), observation(1_000, 10, 0))
+            .unwrap();
+        assert_eq!(session.ready_path_count(), 2);
     }
 
     #[test]
