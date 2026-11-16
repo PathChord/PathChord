@@ -175,7 +175,7 @@ pub struct Capabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressConfig {
     pub id: EgressId,
-    pub endpoint: Endpoint,
+    pub endpoints: Vec<Endpoint>,
     pub public_key: String,
     pub labels: BTreeMap<String, String>,
     pub capabilities: Capabilities,
@@ -791,7 +791,15 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
     }
 
     for egress in &config.egresses {
-        validate_port("egress", egress.id.as_str(), egress.endpoint.port)?;
+        if egress.endpoints.is_empty() {
+            return Err(ValidationError::InvalidPort {
+                kind: "egress",
+                id: egress.id.as_str().to_owned(),
+            });
+        }
+        for endpoint in &egress.endpoints {
+            validate_port("egress", egress.id.as_str(), endpoint.port)?;
+        }
     }
     for proxy in &config.transit_proxies {
         proxy
@@ -1209,10 +1217,10 @@ mod tests {
         PolicyConfig {
             egresses: vec![EgressConfig {
                 id: EgressId::new("jp-1"),
-                endpoint: Endpoint {
+                endpoints: vec![Endpoint {
                     host: "egress.example.net".into(),
                     port: 443,
-                },
+                }],
                 public_key: "test-key".into(),
                 labels: BTreeMap::new(),
                 capabilities: Capabilities {
@@ -1295,7 +1303,7 @@ mod tests {
         ));
 
         let mut invalid_port = base_config();
-        invalid_port.egresses[0].endpoint.port = 0;
+        invalid_port.egresses[0].endpoints[0].port = 0;
         assert!(matches!(
             ValidatedPolicySnapshot::new(Generation::new(1), invalid_port),
             Err(ValidationError::InvalidPort { kind: "egress", .. })

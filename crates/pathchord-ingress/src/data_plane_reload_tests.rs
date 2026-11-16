@@ -67,10 +67,10 @@ fn egress_policy(generation: u64, budget_bps: u64) -> ValidatedPolicySnapshot {
         PolicyConfig {
             egresses: vec![EgressConfig {
                 id: EgressId::new("edge"),
-                endpoint: Endpoint {
+                endpoints: vec![Endpoint {
                     host: "127.0.0.1".into(),
                     port: 7443,
-                },
+                }],
                 public_key: "test-key".into(),
                 labels: BTreeMap::new(),
                 capabilities: Capabilities {
@@ -110,6 +110,23 @@ async fn referenced_egress_policy_changes_require_restart() {
     let current = egress_policy(1, 8_000);
     let next = egress_policy(2, 16_000);
     let plane = plane(current.clone());
+    let registry = registry(&[]);
+    assert!(matches!(
+        plane.prepare_static_snapshot(&next, &registry).await,
+        Err(DataPlaneError::StaticReloadRequiresRestart)
+    ));
+}
+
+#[tokio::test]
+async fn egress_endpoint_topology_changes_require_restart() {
+    let current = egress_policy(1, 8_000);
+    let mut next_config = current.config().clone();
+    next_config.egresses[0].endpoints.push(Endpoint {
+        host: "2001:db8::10".into(),
+        port: 8443,
+    });
+    let next = ValidatedPolicySnapshot::new(Generation::new(2), next_config).unwrap();
+    let plane = plane(current);
     let registry = registry(&[]);
     assert!(matches!(
         plane.prepare_static_snapshot(&next, &registry).await,

@@ -180,6 +180,61 @@ EgressRule 和 ProxyRule 的 flow match SHALL 使用与其余路由决策相同�
 - **WHEN** 规则需要监听器未提供的主机名或 IP
 - **THEN** 相应 geodata 条件不匹配，Ingress 继续执行配置的有序规则和回退，不得经其他 DNS 路由解析
 
+### Requirement: Egress Paths select endpoint candidates independently
+
+对于一个配置的 Egress，Ingress SHALL 维护一个 Session Path 池，并在每条 Path 建立时选择一个规范化
+endpoint。选择必须是确定且有界的，不得为每个 endpoint 创建独立 Session、策略或 Egress identity。
+
+#### Scenario: One Session uses IPv4 and IPv6 endpoints
+
+- **WHEN** Egress 拥有不同地址族的 ready endpoint，且 Session 需要多条 Path
+- **THEN** 不同 Path 可以通过不同候选连接，同时仍属于同一个认证 Session Path 池
+
+#### Scenario: Endpoint candidate order is reused
+
+- **WHEN** Path 建立从有序 endpoint 列表开始
+- **THEN** cursor 和有界回绕保留配置顺序，不会无限重试单个候选
+
+### Requirement: Endpoint failure uses bounded pre-admission failover
+
+Path 达到认证 ready 前，Ingress SHALL 在 Path 连接截止时间和有限尝试次数内尝试合规 Egress endpoint。
+所有候选失败时，Path 尝试 SHALL 返回类型化连接失败，不得选择 Direct、无关 Egress 或普通 Proxy 路由。
+
+#### Scenario: The preferred endpoint is unavailable
+
+- **WHEN** 第一个 endpoint 在 Noise 准入完成前失败且仍有其他候选
+- **THEN** Ingress 在同一个有界 Path 建立操作中尝试下一个候选
+
+#### Scenario: All endpoint candidates fail
+
+- **WHEN** 所有候选在 Path 准入前失败
+- **THEN** Egress Path 尝试返回规范化 Egress/Transit 连接错误，不创建目标 Stream 或 UDP Association
+
+### Requirement: Established Paths retain endpoint ownership
+
+Path 达到 ready 后 SHALL 保留其 endpoint 候选，直到 Path 排空或失败。endpoint 故障只影响使用该候选的
+Path，不得通过静默更换对端 socket 迁移已建立 Path。
+
+#### Scenario: One endpoint fails while another Path is ready
+
+- **WHEN** 使用一个 endpoint 的 Path 传输失败，而使用另一个 endpoint 的非排空 ready Path 仍存在
+- **THEN** Session 按现有最小值保持可用，只有失败 Path 进入恢复或替换
+
+### Requirement: Hostname candidates preserve family and port semantics
+
+Egress endpoint 主机名 SHALL 由所选 Transit Adapter 按配置端口解析；同一主机名的 IPv4/IPv6 结果只是
+该端口的候选。不同端口必须使用不同 endpoint 表达，不能从 DNS 地址记录推断端口。
+
+#### Scenario: One hostname returns A and AAAA records
+
+- **WHEN** 一个主机名候选在 7443 端口返回 IPv4 和 IPv6 地址
+- **THEN** 适配器可以在有界尝试中选择任一地址族，Egress identity 保持不变
+
+#### Scenario: IPv4 and IPv6 use different ports
+
+- **WHEN** IPv4 使用 7443 端口而 IPv6 使用 8443 端口
+- **THEN** Ingress 将它们视为两个显式候选，Path 可以独立选择任一候选
+
 ## Detailed contract
 
 本文档说明 Kubernetes 风格配置对象和求值顺序。规范性的字段、类型、默认值和验证契约见[版本化配置 schema](../configuration-schema/spec.zh-CN.md)；平台监听器和独立 DNS 见[平台与 DNS 规范](../platform-and-dns/spec.zh-CN.md)。配置使用 `apiVersion: pathchord.io/v1`、`kind`、`metadata` 和 `spec` 对象；多资源通常使用 `kind: List`。下文片段会明确标注是完整对象还是 `spec` 片段。配置适配器必须验证完整对象图，并在发布前将其转换为不可变类型化快照。运行时观测以只读 `status` 视图暴露，不能混入期望的 `spec`。管理操作使用[协议规范](../protocol/spec.zh-CN.md)定义的 JSON 封装；配置 YAML 不作为管理消息或 data Path 的线编码。
@@ -203,8 +258,13 @@ items:
       labels:
         region: jp
     spec:
-      address: egress.example.net
-      port: 443
+      endpoints:
+        - address: egress-v4.example.net
+          port: 7443
+        - address: egress-v6.example.net
+          port: 8443
+        - address: egress.example.net
+          port: 443
       publicKey: <curve25519-public-key>
       capabilities:
         tcp: true
@@ -247,8 +307,13 @@ metadata:
     region: jp
     role: egress
 spec:
-  address: egress.example.net
-  port: 443
+  endpoints:
+    - address: egress-v4.example.net
+      port: 7443
+    - address: egress-v6.example.net
+      port: 8443
+    - address: egress.example.net
+      port: 443
   publicKey: <curve25519-public-key>
   capabilities:
     tcp: true

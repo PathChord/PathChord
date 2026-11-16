@@ -28,6 +28,11 @@ Transit A  Transit B  Transit C
 
 首先选择 Egress，随后由该 Egress 的 Ingress 侧 Transit 绑定提供公共候选集和 Session Path 池。一个流绝不会跨越多个 Egress 节点，路由规则也不选择 Transit 或 Path 子集。
 
+一个 Egress identity 可以暴露多个公共 Path listener bind。所有 bind 共享授权库和运行时资源上限。
+Ingress 侧 Egress 资源保存有序 endpoint 候选列表，每条 Path 可以使用不同候选，同时继续共享同一
+Session 和 TrafficPolicy。一个 endpoint 故障时，只移除或替换使用该 endpoint 的 Path；只要仍有健康
+endpoint 支持的 ready Path，就保留关系可用。
+
 ## 3. 路由模式
 
 - `egress: <id-or-selector>`：Ingress 通过一个或多个 Transit Path 到达选定的 Egress。默认使用多路径聚合。

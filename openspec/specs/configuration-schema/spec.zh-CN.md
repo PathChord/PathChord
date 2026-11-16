@@ -42,7 +42,7 @@ Ingress 必须（SHALL）先选择命令行配置，再选择环境配置和账�
 
 ### Requirement: Atomic publication and resilient watching
 
-完整候选必须（SHALL）通过解析、验证、规范化、编译及必要的持久化后，才能发布一个不可变代次。无效候选必须（SHALL）保留上一份有效配置集合；单文件和根目录的原子替换必须（SHALL）保留监听能力。Egress 绑定、公共准入最小值、引用的策略或已解析策略内容发生变化时，必须报告需要重启并保留当前配置。
+完整候选必须（SHALL）通过解析、验证、规范化、编译及必要的持久化后，才能发布一个不可变代次。无效候选必须（SHALL）保留上一份有效配置集合；单文件和根目录的原子替换必须（SHALL）保留监听能力。Egress endpoint 集合、EgressService bind 集合、公共准入最小值、引用的策略或已解析策略内容发生变化时，必须报告需要重启并保留当前配置。
 
 #### Scenario: Atomic replacement contains an invalid candidate
 
@@ -58,6 +58,21 @@ Ingress 必须（SHALL）先选择命令行配置，再选择环境配置和账�
 
 - **WHEN** 订阅或授权的管理员元数据更新改变了不变 Egress 绑定下的节点
 - **THEN** Ingress 发布有效动态代次并排空被移除的候选，不要求新的 Egress 策略快照
+
+#### Scenario: Egress endpoint topology changes
+
+- **WHEN** 候选配置新增、移除、重排或修改 Egress endpoint 或 EgressService bind
+- **THEN** 完整候选仍需验证，活动运行时保持不变，重载结果报告需要重启
+
+#### Scenario: Normalization preserves an Egress policy
+
+- **WHEN** 重载只改变文件或 mapping 顺序，或写入等价的显式默认值
+- **THEN** 规范化后的 Egress policy fingerprint 不变，不要求重启
+
+#### Scenario: Only an unreferenced policy changes
+
+- **WHEN** 重载改变了没有任何配置 Egress 引用的 TrafficPolicy
+- **THEN** 该变化单独不触发 Egress 启动边界，也不改变存活 Session 的策略
 
 ### Requirement: Deterministic bounded rule compilation
 
@@ -104,6 +119,92 @@ EgressService SHALL 定义全局入站目标连接上限和配置的 aggregate w
 
 - **WHEN** 活跃目标连接加 pending reservation 达到全局上限
 - **THEN** 新目标打开返回 `RESOURCE_LIMIT`，现有目标连接保持活动
+
+### Requirement: Egress service supports one identity across multiple binds
+
+一个 EgressService SHALL 接受有界且非空的公共 Path listener bind 列表。同一服务的所有 bind SHALL
+共享 Egress ID、私有 identity、授权库和全局资源限制。
+
+#### Scenario: Multiple address families use one Egress identity
+
+- **WHEN** EgressService 声明了有效的 IPv4 和 IPv6 bind，包括不同端口
+- **THEN** 一个 Egress runtime 暴露全部 listener，并使用同一 Egress identity 和授权代次认证 Path
+
+#### Scenario: Duplicate listener binds are declared
+
+- **WHEN** EgressService 规范化后声明了重复的地址和端口
+- **THEN** 验证以字段诊断拒绝候选
+
+#### Scenario: One listener cannot be bound
+
+- **WHEN** 启动或重启时任一 bind 无法打开
+- **THEN** 服务不得发布不完整 listener 集合，并报告类型化启动失败
+
+### Requirement: Egress service bind forms normalize deterministically
+
+EgressService schema SHALL 接受现有单数 `bind` 作为一个 listener 的简写，也接受多个 listener 的 `binds` 列表。
+同时提供两种形式 SHALL 被拒绝；规范化结果保留声明顺序且不得含重复 SocketAddr。
+
+#### Scenario: Existing singular bind is loaded
+
+- **WHEN** EgressService 只提供 `bind`
+- **THEN** 验证生成等价的单项 bind 列表
+
+#### Scenario: Singular and plural binds conflict
+
+- **WHEN** EgressService 同时提供 `bind` 和 `binds`
+- **THEN** 验证拒绝资源，不按优先级选择一种形式
+
+### Requirement: Ingress Egress supports bounded endpoint candidates
+
+Ingress 侧 Egress SHALL 包含有界、非空、有序的 endpoint 列表。每个 endpoint SHALL 包含有效主机名或 IP
+字面量及 `1..=65535` 端口；候选可以使用不同地址族、主机名和端口。
+
+#### Scenario: IPv4, IPv6, and named endpoints are configured
+
+- **WHEN** 一个 Egress 声明 IPv4、IPv6 和带独立端口的域名候选
+- **THEN** 规范化策略在同一资源身份和公钥下保留全部候选
+
+#### Scenario: An endpoint has an invalid host or port
+
+- **WHEN** endpoint 主机为空/无效，或端口为零/越界
+- **THEN** 完整配置验证拒绝 Egress 并保留上一份已发布快照
+
+#### Scenario: Endpoint candidates are duplicated
+
+- **WHEN** 两个候选规范化为相同主机和端口
+- **THEN** 验证以重复 endpoint 诊断拒绝 Egress
+
+### Requirement: Ingress Egress endpoint forms normalize without changing identity
+
+Egress schema SHALL 接受现有 `address` 和 `port` 组合作为单 endpoint 简写，也接受 `endpoints` 列表。
+同时提供两种形式 SHALL 被拒绝；endpoint 规范化不得改变 Egress 资源名、Egress ID 或公钥绑定。
+
+#### Scenario: Existing address and port are loaded
+
+- **WHEN** Egress 只提供 `address` 和 `port`
+- **THEN** 验证生成等价单项 endpoint 列表并保留原路由身份
+
+#### Scenario: Singular and plural endpoint forms conflict
+
+- **WHEN** Egress 同时提供 `address`/`port` 和 `endpoints`
+- **THEN** 验证拒绝资源，不静默合并或选择一种形式
+
+### Requirement: Endpoint collections have bounded canonical values
+
+规范化的 `binds` 和 `endpoints` SHALL 各包含 1..=32 项，保留声明顺序、拒绝重复值，且不得从 endpoint
+派生新身份。bind 使用 SocketAddr 的 IPv6 方括号；Egress endpoint 主机保存无 URI 方括号的 IPv6 字面量。
+endpoint 拓扑属于启动配置。
+
+#### Scenario: Endpoint collection exceeds its bound
+
+- **WHEN** `binds` 或 `endpoints` 超过 32 项
+- **THEN** 完整配置验证以有界数量诊断拒绝候选
+
+#### Scenario: Endpoint order changes
+
+- **WHEN** endpoint 列表成员不变但顺序发生变化
+- **THEN** 规范化拓扑发生变化，重载结果报告需要重启
 
 ### Requirement: Truststore sources are explicit and bounded
 
@@ -265,8 +366,9 @@ mutation 写入。导入的 source、observed、quota 和 billing 值均由运�
 | 字段 | 必填 | 类型和语义 |
 |---|---|---|
 | `metadata.name` | 是 | namespace 内唯一的资源名 |
-| `spec.address` | 是 | 主机名或 IP 字面量 |
-| `spec.port` | 是 | 端口 |
+| `spec.address` | 条件 | 旧的主机名或 IP 字面量；没有 `endpoints` 时必须与 `port` 一起提供 |
+| `spec.port` | 条件 | 旧的 endpoint 端口；没有 `endpoints` 时必须与 `address` 一起提供 |
+| `spec.endpoints` | 条件 | 1..=32 个有序 `{address, port}` 候选；与 `address`/`port` 互斥 |
 | `spec.publicKey` | 是 | 32 字节无填充 base64url Curve25519 公钥 |
 | `spec.capabilities` | 否 | `tcp`/`udp` 布尔映射，默认均为 false |
 | `spec.statusRequirements` | 否 | `minUsablePaths` 和可选能力集合，默认 1 |
@@ -280,10 +382,11 @@ mutation 写入。导入的 source、observed、quota 和 billing 值均由运�
 
 ### EgressService 和 NodeProbePolicy
 
-`EgressService.spec` 接受 `bind`、`egressId`、`identity`、`authorizationDb`、
+`EgressService.spec` 接受 `bind` 或 `binds`、`egressId`、`identity`、`authorizationDb`、
 `controlSocket`、`maxWireBandwidthBps`、`maxInboundTargetConnections`、
 `quotaRemaining`、`trafficMultiplierBasisPoints`、
-`remoteDnsOnly`、`webBind`、`webTokenFile`、`webOrigins` 和 `webProtectedTransport`。
+`remoteDnsOnly`、`webBind`、`webTokenFile`、`webOrigins` 和 `webProtectedTransport`。`bind` 是单项简写，
+`binds` 是 1..=32 个唯一 SocketAddr 的有序列表，两种形式互斥。
 desired Path 数量、per-Ingress stream 配额和 Path 安全上限由运行时拥有，不得在资源中配置。
 资源中的相对路径相对于所选配置来源解析。一个 Egress 进程最多选择一个此类资源。
 应用命令行覆写后必须提供 `identity` 和 Egress ID；缺少 `egressId` 时使用资源名。

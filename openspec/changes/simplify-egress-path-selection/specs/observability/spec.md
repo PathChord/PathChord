@@ -75,6 +75,11 @@ Egress status reports SHALL describe global Egress resource facts and SHALL NOT 
 - **WHEN** an Egress serves multiple Ingress Sessions
 - **THEN** its status reports aggregate wire rate, capacity, active target connections, service state, and global admission state without exposing per-rule information
 
+#### Scenario: Egress has multiple listener endpoints
+
+- **WHEN** an Egress serves Paths through multiple configured listeners
+- **THEN** capacity, target-connection counts, authorization effects, and admission state are reported once for the Egress and are not multiplied or partitioned by listener
+
 ### Requirement: Directional Path observations remain Ingress-owned
 
 Ingress SHALL publish bounded upstream and downstream Path observations and use them for Session-scoped scheduling and autoscaling under the Egress binding. Egress status SHALL NOT duplicate those Path-local observations as a second authoritative source. Rule identity or business class SHALL NOT partition the common Path target.

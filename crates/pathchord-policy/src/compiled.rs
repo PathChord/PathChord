@@ -1066,10 +1066,10 @@ mod tests {
     fn egress(id: &str, labels: &[(&str, &str)], tcp: bool, udp: bool) -> EgressConfig {
         EgressConfig {
             id: EgressId::new(id),
-            endpoint: Endpoint {
+            endpoints: vec![Endpoint {
                 host: format!("{id}.example.test"),
                 port: 443,
-            },
+            }],
             public_key: "test-key".into(),
             labels: labels
                 .iter()

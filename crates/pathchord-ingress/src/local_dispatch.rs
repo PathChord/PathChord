@@ -1330,6 +1330,7 @@ impl LocalControlDispatcher {
                 "reordering_events",
                 "control_pending",
                 "control_retransmissions",
+                "endpoint_index",
             ],
         ) {
             Ok(query) => query,
@@ -1353,6 +1354,7 @@ impl LocalControlDispatcher {
                     "session_id": path.session_id.to_string(),
                     "egress_id": path.egress_id.as_ref().or_else(|| snapshot.sessions.get(&path.session_id).map(|session| &session.egress_id)),
                     "transit_proxy_id": path.transit_proxy_id,
+                    "endpoint_index": path.endpoint_index,
                     "generation": snapshot.generation,
                     "state": format!("{:?}", path.state).to_ascii_lowercase(),
                     "ready_since_ms": path.ready_since_ms,
@@ -1938,6 +1940,15 @@ fn session_value(
         "replication_cap_bps": session.replication_cap_bps,
         "replication_upstream_used_bps": session.replication_upstream_used_bps,
         "replication_downstream_used_bps": session.replication_downstream_used_bps,
+        "endpoint_count": session.endpoint_count,
+        "endpoint_states": session.endpoint_states.iter().map(|state| json!({
+            "state": state.state,
+            "attempts": state.attempts,
+            "failures": state.failures,
+        })).collect::<Vec<_>>(),
+        "path_endpoints": session.path_endpoints.iter().map(|(path_id, endpoint_index)| {
+            json!({"path_id": path_id.to_string(), "endpoint_index": endpoint_index})
+        }).collect::<Vec<_>>(),
         "active_streams": session.active_streams,
         "active_udp_associations": session.active_udp_associations,
         "pending_session_controls": session.pending_session_controls,
@@ -2789,11 +2800,19 @@ mod tests {
                     replication_cap_bps: None,
                     replication_upstream_used_bps: None,
                     replication_downstream_used_bps: None,
+                    endpoint_count: 2,
+                    endpoint_states: vec![crate::EndpointStateObservation {
+                        state: "failed".into(),
+                        attempts: 2,
+                        failures: 1,
+                    }],
+                    path_endpoints: std::collections::BTreeMap::from([(path_id, 1)]),
                 }],
                 [crate::PathObservation {
                     path_id,
                     session_id,
                     egress_id: Some("egress-a".into()),
+                    endpoint_index: Some(1),
                     transit_proxy_id: Some("transit-a".into()),
                     state: pathchord_core::PathState::Active,
                     ready_since_ms: None,
@@ -2815,6 +2834,7 @@ mod tests {
         let paths = dispatcher.dispatch(request("metrics.paths", &["metrics:read"], json!({})));
         let path = &paths.result.expect("path metrics")["items"][0];
         assert_eq!(path["rtt_ms"], 12);
+        assert_eq!(path["endpoint_index"], 1);
         assert_eq!(path["loss_ppm"], 4_000);
         assert_eq!(path["reordering_events"], 6);
         assert!(path["exclusion_reason"].is_null());
@@ -3202,6 +3222,9 @@ mod tests {
                     replication_cap_bps: None,
                     replication_upstream_used_bps: None,
                     replication_downstream_used_bps: None,
+                    endpoint_count: 0,
+                    endpoint_states: Vec::new(),
+                    path_endpoints: std::collections::BTreeMap::new(),
                 }],
                 [],
             )

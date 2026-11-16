@@ -114,6 +114,11 @@ The complete candidate SHALL pass parsing, validation, normalization, compilatio
 - **WHEN** a subscription or authorized administrator-metadata update changes nodes under an unchanged Egress binding
 - **THEN** Ingress publishes the valid dynamic generation and drains removed candidates without requiring a new Egress policy snapshot
 
+#### Scenario: Egress endpoint topology changes
+
+- **WHEN** a candidate adds, removes, reorders, or changes an Egress endpoint or EgressService bind
+- **THEN** the candidate is validated as a complete snapshot, the active runtime remains unchanged, and the reload result reports restart required
+
 #### Scenario: Normalization preserves an Egress policy
 
 - **WHEN** a reload changes only file or mapping order or writes equivalent explicit defaults

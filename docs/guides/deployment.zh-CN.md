@@ -112,6 +112,11 @@ pathchord-egressd --egress-id exit --identity egress.key.json \
   --bind 127.0.0.1:9443 --control-socket /tmp/pathchord-egress.sock
 ```
 
+一个 Egress 进程拥有多个公共 Path listener 时，可以重复使用 `--bind`。相同的列表也可以在
+`EgressService` 中写成 `spec.binds`。Ingress 使用一份 Egress 资源及有序的 `spec.endpoints` 列表，
+表达不同的 IPv4、IPv6、域名或端口候选；所有项都使用相同、已经核验的 Egress ID 和公钥。单个
+`--bind` 以及旧的 `address`/`port` 形式仍可用于单 endpoint 部署。
+
 在 Egress 机器上显式登记 Ingress 公钥。把 `INGRESS_PUBLIC_KEY` 替换为 Ingress 身份生成命令
 打印的公钥。代次 0 适用于新授权数据库；后续变更必须使用其观测到的代次：
 
@@ -122,8 +127,9 @@ pathchordctl --socket /tmp/pathchord-egress.sock enroll add \
 ```
 
 在 `examples/ingress-egress.yaml` 中，把 `REPLACE_WITH_EGRESS_PUBLIC_KEY` 替换为 Egress 公钥。
-示例使用回环 Egress 地址；跨机器部署必须设置可达的 Egress bind/address，并保留相同的、
-已经显式核验的公钥和规范 Egress ID。在另一个独立终端中启动 Ingress：
+示例包含回环、IPv6 和域名 endpoint 候选；本地部署时只保留可达的候选，或替换为 Egress 实际
+暴露的公共端点。跨机器部署必须设置可达的 Egress binds/endpoints，并保留相同的、已经显式核验的
+公钥和规范 Egress ID。在另一个独立终端中启动 Ingress：
 
 ```sh
 pathchord-ingressd --socket /tmp/pathchord-ingress.sock \

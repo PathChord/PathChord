@@ -19,7 +19,7 @@
 
 ### Requirement: Draining and terminal Session cleanup
 
-排空中的 Path 和 Session SHALL 拒绝新业务工作，并按其截止时间保留已有工作。最后一条 ready Path 丢失、端点重启、Egress 硬故障或授权失败时 SHALL 关闭受影响的 Session 资源并废弃旧 SessionID。
+排空中的 Path 和 Session SHALL 拒绝新业务工作，并按其截止时间保留已有工作。最后一条 ready Path 丢失、整个 Egress runtime 重启或硬故障、授权失败时 SHALL 关闭受影响的 Session 资源并废弃旧 SessionID。单个配置 Egress endpoint 故障或排空时，只影响使用该 endpoint 的 Path，只要仍有其他 endpoint 支持的 ready Path 就保持关系可用。
 
 #### Scenario: Only draining Paths remain
 
@@ -30,6 +30,16 @@
 
 - **WHEN** Session 失去最后一条 ready Path
 - **THEN** 关闭业务资源、废弃 SessionID，后续任何 Session 都使用新 SessionID
+
+#### Scenario: One configured endpoint fails
+
+- **WHEN** 一个 listener 或传输 endpoint 故障，但另一个 endpoint 支持的 Path 仍为 `ACTIVE` 或 `DEGRADED`
+- **THEN** 只有使用故障 endpoint 的 Path 进入失败或替换，Session 保持存活，健康 Path 上的已有业务继续保留
+
+#### Scenario: The whole Egress runtime restarts
+
+- **WHEN** 所有配置的 Egress listener 及共享 runtime 重启或失去授权状态
+- **THEN** 受影响 Session 按现有端点重启规则关闭，恢复时创建新的 SessionID
 
 ### Requirement: Stream and association resource ownership
 
@@ -126,6 +136,20 @@ Ingress Session owner SHALL 为一个 Egress 关系维护一个认证的公共 P
 
 - **WHEN** 公共池最后一条 ready Path 失败
 - **THEN** 关闭所有相关业务资源，废弃的 SessionID 不得复用
+
+### Requirement: Endpoint failure preserves shared lifecycle ownership
+
+endpoint 级 Path 故障 SHALL 由现有 Session/Path lifecycle owner 处理。endpoint 选择、listener accept loop 和 endpoint 健康观测 SHALL 通过 owner 请求转换，不得直接修改 Session 或 Path 状态。替代 Path SHALL 使用新的 PathID，整个 Egress runtime 重启仍属于 Session 重启。
+
+#### Scenario: A failed endpoint is replaced
+
+- **WHEN** 有界恢复通过另一个配置 endpoint 建立替代 Path
+- **THEN** lifecycle owner 按当前 Session 状态记录新 Path，不复用已废弃的 PathID
+
+#### Scenario: All endpoint-backed Paths are draining
+
+- **WHEN** 每一条 ready Path 都关联到正在排空或已失败的 endpoint
+- **THEN** Session 拒绝新业务准入并遵循正常排空或最后 ready Path 转换，不把仅配置存在的 endpoint 当作 ready
 
 ### Requirement: Directional Path capacity drives scaling
 

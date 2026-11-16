@@ -1,12 +1,24 @@
 # PathChord implementation status
 
-Status snapshot: 2026-11-16.
+Status snapshot: 2026-11-17.
 
 This document records the current implementation and validation state. Final
 architecture remains under `docs/design/`; behavioral contracts live under
 `openspec/specs/`. User configuration and operation guides live under
 `docs/guides/`. Pending actions are tracked in the [active changes](changes/);
 this snapshot records evidence rather than a second implementation plan.
+
+The multi-endpoint Egress change is implemented in the local runtime. Egress
+Service accepts ordered `binds` with the singular `bind` shorthand, and the
+Ingress Egress resource accepts ordered `endpoints` with the legacy
+`address`/`port` shorthand. One Egress identity, authorization store, Session
+pool, wire budget, and target-connection limit are shared across listeners;
+each Path selects and retains its endpoint with bounded pre-admission failover.
+Local control observations expose bounded listener and endpoint ordinals while
+the authenticated `STATUS_REPORT` remains aggregate and unchanged. Linux
+loopback evidence covers IPv4, IPv6, hostname candidates, different ports,
+HTTP CONNECT, and UDP; Windows and FreeBSD native host execution remain
+unverified.
 
 ## Current focus
 

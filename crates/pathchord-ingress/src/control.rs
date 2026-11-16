@@ -468,6 +468,16 @@ pub struct SessionObservation {
     pub replication_cap_bps: Option<u64>,
     pub replication_upstream_used_bps: Option<u64>,
     pub replication_downstream_used_bps: Option<u64>,
+    pub endpoint_count: usize,
+    pub endpoint_states: Vec<EndpointStateObservation>,
+    pub path_endpoints: BTreeMap<PathId, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointStateObservation {
+    pub state: String,
+    pub attempts: u64,
+    pub failures: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,6 +503,7 @@ pub struct PathObservation {
     pub path_id: PathId,
     pub session_id: SessionId,
     pub egress_id: Option<String>,
+    pub endpoint_index: Option<usize>,
     pub transit_proxy_id: Option<String>,
     pub state: PathState,
     pub ready_since_ms: Option<u64>,
@@ -3328,11 +3339,15 @@ mod tests {
                     replication_cap_bps: None,
                     replication_upstream_used_bps: None,
                     replication_downstream_used_bps: None,
+                    endpoint_count: 0,
+                    endpoint_states: Vec::new(),
+                    path_endpoints: BTreeMap::new(),
                 }],
                 [PathObservation {
                     path_id,
                     session_id,
                     egress_id: Some("egress-a".into()),
+                    endpoint_index: None,
                     transit_proxy_id: Some("transit-a".into()),
                     state: PathState::Degraded,
                     ready_since_ms: None,

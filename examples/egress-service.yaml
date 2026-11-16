@@ -3,7 +3,9 @@ kind: EgressService
 metadata:
   name: exit
 spec:
-  bind: 0.0.0.0:7443
+  binds:
+    - 0.0.0.0:7443
+    - "[::]:8443"
   egressId: exit
   identity: ../secrets/egress.key.json
   authorizationDb: ../data/authorizations.db

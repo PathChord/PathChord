@@ -31,6 +31,7 @@ const MAX_MAP_ENTRIES: usize = 256;
 const MAX_MAP_KEY_BYTES: usize = 64;
 const MAX_MAP_VALUE_BYTES: usize = 256;
 const MAX_WEIGHT: u32 = 1_000_000;
+const MAX_EGRESS_ENDPOINTS: usize = 32;
 /// Internal marker for a rule without an explicit trafficPolicyRef. Its name
 /// cannot be authored as a Kubernetes-style resource name.
 pub(crate) const IMPLICIT_SINGLE_TRANSIT_POLICY: &str = "__pathchord_implicit_single_transit";
@@ -77,8 +78,10 @@ struct ResourceList {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressSpec {
-    address: String,
-    port: u16,
+    address: Option<String>,
+    port: Option<u16>,
+    #[serde(default)]
+    endpoints: Option<Vec<EgressEndpointSpec>>,
     public_key: String,
     #[serde(default)]
     capabilities: Capabilities,
@@ -86,6 +89,13 @@ pub struct EgressSpec {
     status_requirements: RequirementsSpec,
     transit: Option<EgressTransitSpec>,
     traffic_policy_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EgressEndpointSpec {
+    address: String,
+    port: u16,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -762,19 +772,23 @@ impl KubeConfig {
                     });
                 }
                 KubeResource::Egress(value) => {
-                    let policy_name = value.spec.traffic_policy_ref.ok_or_else(|| {
-                        invalid_spec(
-                            &value.kind,
-                            &value.metadata.name,
-                            "trafficPolicyRef is required",
-                        )
-                    })?;
+                    let policy_name = value
+                        .spec
+                        .traffic_policy_ref
+                        .as_ref()
+                        .ok_or_else(|| {
+                            invalid_spec(
+                                &value.kind,
+                                &value.metadata.name,
+                                "trafficPolicyRef is required",
+                            )
+                        })?
+                        .clone();
+                    let endpoints =
+                        normalize_egress_endpoints(&value.spec, &value.kind, &value.metadata.name)?;
                     config.egresses.push(EgressConfig {
                         id: EgressId::in_namespace(&namespace, &value.metadata.name),
-                        endpoint: Endpoint {
-                            host: value.spec.address,
-                            port: value.spec.port,
-                        },
+                        endpoints,
                         public_key: value.spec.public_key,
                         labels: value.metadata.labels,
                         capabilities: value.spec.capabilities,
@@ -1665,8 +1679,7 @@ fn validate_public_key(key: &str) -> Result<(), String> {
 fn validate_egress_spec(value: &Resource<EgressSpec>) -> Result<(), ConfigError> {
     let kind = value.kind.as_str();
     let name = value.metadata.name.as_str();
-    validate_host("address", &value.spec.address)
-        .map_err(|reason| invalid_spec(kind, name, reason))?;
+    normalize_egress_endpoints(&value.spec, kind, name)?;
     validate_public_key(&value.spec.public_key)
         .map_err(|reason| invalid_spec(kind, name, reason))?;
     if !value.spec.capabilities.tcp && !value.spec.capabilities.udp {
@@ -1677,6 +1690,80 @@ fn validate_egress_spec(value: &Resource<EgressSpec>) -> Result<(), ConfigError>
         ));
     }
     Ok(())
+}
+
+fn normalize_egress_endpoints(
+    spec: &EgressSpec,
+    kind: &str,
+    name: &str,
+) -> Result<Vec<Endpoint>, ConfigError> {
+    let legacy_present = spec.address.is_some() || spec.port.is_some();
+    if legacy_present && spec.endpoints.is_some() {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "address/port and endpoints are mutually exclusive",
+        ));
+    }
+
+    let raw = if let Some(endpoints) = &spec.endpoints {
+        if endpoints.is_empty() || endpoints.len() > MAX_EGRESS_ENDPOINTS {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "endpoints must contain between 1 and 32 entries",
+            ));
+        }
+        endpoints
+            .iter()
+            .map(|endpoint| (&endpoint.address, endpoint.port))
+            .collect::<Vec<_>>()
+    } else {
+        match (&spec.address, spec.port) {
+            (Some(address), Some(port)) => vec![(address, port)],
+            (None, None) => {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "address/port or endpoints is required",
+                ));
+            }
+            _ => {
+                return Err(invalid_spec(
+                    kind,
+                    name,
+                    "address and port must be supplied together",
+                ));
+            }
+        }
+    };
+
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(raw.len());
+    for (address, port) in raw {
+        validate_host("address", address).map_err(|reason| invalid_spec(kind, name, reason))?;
+        if port == 0 {
+            return Err(invalid_spec(kind, name, "endpoint port must be non-zero"));
+        }
+        let host = normalize_endpoint_host(address);
+        if !seen.insert((host.clone(), port)) {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "endpoints contain a duplicate address and port",
+            ));
+        }
+        normalized.push(Endpoint { host, port });
+    }
+    Ok(normalized)
+}
+
+fn normalize_endpoint_host(host: &str) -> String {
+    if let Ok(address) = host.parse::<IpAddr>() {
+        address.to_string()
+    } else {
+        host.trim_end_matches('.').to_ascii_lowercase()
+    }
 }
 
 fn validate_transit_proxy_spec(value: &Resource<TransitProxySpec>) -> Result<(), ConfigError> {
@@ -2457,6 +2544,8 @@ items:
         let config = KubeConfig::from_yaml(VALID).expect("valid config");
         let policy = config.into_policy_config().expect("policy conversion");
         assert_eq!(policy.egresses[0].id.as_str(), "jp-1");
+        assert_eq!(policy.egresses[0].endpoints.len(), 1);
+        assert_eq!(policy.egresses[0].endpoints[0].port, 443);
         assert_eq!(policy.fallback, Some(FallbackAction::Reject));
         assert_eq!(policy.listeners[0].id.as_str(), "local-http");
         assert_eq!(policy.listeners[0].bind.as_ref().expect("bind").port, 8080);
@@ -2482,6 +2571,85 @@ items:
                 group: true,
             }
         );
+    }
+
+    #[test]
+    fn normalizes_multiple_egress_endpoints_and_preserves_order() {
+        let input = VALID.replace(
+            "      address: egress.example.net\n      port: 443",
+            "      endpoints:\n        - address: Egress-V4.Example.net.\n          port: 7443\n        - address: 2001:0db8::10\n          port: 8443\n        - address: egress.example.net\n          port: 443",
+        );
+        let policy = KubeConfig::from_yaml(&input)
+            .expect("multiple endpoints parse")
+            .into_policy_config()
+            .expect("multiple endpoints convert");
+        assert_eq!(
+            policy.egresses[0].endpoints,
+            vec![
+                Endpoint {
+                    host: "egress-v4.example.net".into(),
+                    port: 7443,
+                },
+                Endpoint {
+                    host: "2001:db8::10".into(),
+                    port: 8443,
+                },
+                Endpoint {
+                    host: "egress.example.net".into(),
+                    port: 443,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_invalid_egress_endpoint_forms() {
+        let cases = [
+            (
+                "      address: egress.example.net\n      port: 443\n      endpoints: [{address: other.example.net, port: 443}]",
+                "mutually exclusive",
+            ),
+            ("      address: egress.example.net", "supplied together"),
+            (
+                "      endpoints: [{address: egress.example.net, port: 443}, {address: EGRESS.EXAMPLE.NET., port: 443}]",
+                "duplicate",
+            ),
+            (
+                "      endpoints: [{address: '[2001:db8::10]', port: 443}]",
+                "valid DNS hostname",
+            ),
+            (
+                "      endpoints: [{address: egress.example.net, port: 0}]",
+                "non-zero",
+            ),
+        ];
+        for (replacement, expected) in cases {
+            let input = VALID.replace(
+                "      address: egress.example.net\n      port: 443",
+                replacement,
+            );
+            let error = KubeConfig::from_yaml(&input).expect_err("invalid endpoint form");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_more_than_32_egress_endpoints() {
+        let endpoints = (0..33)
+            .map(|index| {
+                format!(
+                    "        - address: egress-{index}.example.net\n          port: {}",
+                    7000 + index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input = VALID.replace(
+            "      address: egress.example.net\n      port: 443",
+            &format!("      endpoints:\n{endpoints}"),
+        );
+        let error = KubeConfig::from_yaml(&input).expect_err("endpoint bound");
+        assert!(error.to_string().contains("between 1 and 32"), "{error}");
     }
 
     #[test]

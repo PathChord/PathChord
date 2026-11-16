@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -118,6 +119,8 @@ pub struct DataPlaneSessionSnapshot {
     pub egress_id: String,
     pub session: SessionSnapshot,
     pub path_transit: BTreeMap<PathId, String>,
+    pub path_endpoint: BTreeMap<PathId, usize>,
+    pub endpoint_states: Vec<EgressEndpointRuntimeSnapshot>,
     pub minimum_usable_paths: usize,
     pub eligible_transit_count: usize,
     pub traffic_policy_id: Option<String>,
@@ -187,6 +190,9 @@ struct SessionSlot {
     target_path_count: Mutex<usize>,
     replication_budget_bytes: Mutex<Option<u64>>,
     session_policy: Mutex<Option<MultipathConfig>>,
+    endpoint_cursor: AtomicUsize,
+    endpoint_states: Mutex<Vec<EgressEndpointRuntimeSnapshot>>,
+    path_endpoints: Mutex<BTreeMap<PathId, usize>>,
     warmup_cursor: std::sync::atomic::AtomicUsize,
     trust_failures: Mutex<TrustFailureState>,
     maintenance_sample: Mutex<(Instant, u64)>,
@@ -197,6 +203,7 @@ struct SessionSlot {
 impl SessionSlot {
     fn new(egress: EgressConfig) -> Self {
         let min_paths = (egress.status_requirements.min_usable_paths as usize).max(1);
+        let endpoint_count = egress.endpoints.len();
         let now = Instant::now();
         Self {
             egress,
@@ -216,6 +223,16 @@ impl SessionSlot {
             target_path_count: Mutex::new(reserved_path_target(min_paths, 8_usize.max(min_paths))),
             replication_budget_bytes: Mutex::new(None),
             session_policy: Mutex::new(None),
+            endpoint_cursor: AtomicUsize::new(0),
+            endpoint_states: Mutex::new(
+                (0..endpoint_count)
+                    .map(|_| EgressEndpointRuntimeSnapshot {
+                        state: "configured",
+                        ..EgressEndpointRuntimeSnapshot::default()
+                    })
+                    .collect(),
+            ),
+            path_endpoints: Mutex::new(BTreeMap::new()),
             warmup_cursor: std::sync::atomic::AtomicUsize::new(0),
             trust_failures: Mutex::new(TrustFailureState::default()),
             maintenance_sample: Mutex::new((now, 0)),
@@ -225,6 +242,52 @@ impl SessionSlot {
             maintenance_epoch: now,
         }
     }
+
+    fn endpoint_candidates(&self) -> Vec<(usize, pathchord_policy::Endpoint)> {
+        let count = self.egress.endpoints.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        let start = self.endpoint_cursor.fetch_add(1, Ordering::Relaxed) % count;
+        (0..count)
+            .map(|offset| {
+                let index = (start + offset) % count;
+                (index, self.egress.endpoints[index].clone())
+            })
+            .collect()
+    }
+
+    fn record_endpoint_attempt(&self, endpoint_index: usize, success: bool) {
+        if let Ok(mut states) = self.endpoint_states.try_lock()
+            && let Some(state) = states.get_mut(endpoint_index)
+        {
+            state.attempts = state.attempts.saturating_add(1);
+            if success {
+                state.state = "available";
+            } else {
+                state.failures = state.failures.saturating_add(1);
+                state.state = "failed";
+            }
+        }
+    }
+
+    async fn record_path_endpoint(&self, path_id: PathId, endpoint_index: usize) {
+        self.path_endpoints
+            .lock()
+            .await
+            .insert(path_id, endpoint_index);
+    }
+
+    async fn endpoint_states_snapshot(&self) -> Vec<EgressEndpointRuntimeSnapshot> {
+        self.endpoint_states.lock().await.clone()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressEndpointRuntimeSnapshot {
+    pub state: &'static str,
+    pub attempts: u64,
+    pub failures: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1192,6 +1255,10 @@ impl IngressDataPlane {
                     removed_paths.insert(path_id);
                 }
             }
+            slot.path_endpoints
+                .lock()
+                .await
+                .retain(|path_id, _| !removed_paths.contains(path_id));
             if let Some(session) = session {
                 let ready = session.snapshot().ready_path_ids;
                 if !removed_paths.is_empty() && ready.iter().all(|id| removed_paths.contains(id)) {
@@ -1461,6 +1528,7 @@ impl IngressDataPlane {
                         transit_paths.remove(&transit_id);
                     }
                 }
+                slot.path_endpoints.lock().await.remove(&path_id);
             }
             // A transport failure removes the Path from the Session actor
             // immediately, while the Ingress ownership index is intentionally
@@ -1491,6 +1559,10 @@ impl IngressDataPlane {
                 !path_ids.is_empty()
             });
             drop(transit_paths);
+            slot.path_endpoints
+                .lock()
+                .await
+                .retain(|path_id, _| known_paths.contains(path_id));
             let snapshot = session.snapshot();
             input.ready_paths = snapshot.ready_paths;
             let max_paths = slot.autoscaler.lock().await.config().max_paths;
@@ -2080,6 +2152,8 @@ impl IngressDataPlane {
                                 .map(move |path| (*path, transit.as_str().to_owned()))
                         })
                         .collect(),
+                    path_endpoint: slot.path_endpoints.lock().await.clone(),
+                    endpoint_states: slot.endpoint_states_snapshot().await,
                 });
             }
         }
@@ -2313,6 +2387,16 @@ impl IngressDataPlane {
                 });
                 !path_ids.is_empty()
             });
+            let known_paths: BTreeSet<_> = session_snapshot
+                .ready_path_ids
+                .iter()
+                .copied()
+                .chain(draining.keys().copied())
+                .collect();
+            slot.path_endpoints
+                .lock()
+                .await
+                .retain(|path_id, _| known_paths.contains(path_id));
             let ready_path = transit_paths.get(transit_id).and_then(|path_ids| {
                 path_ids
                     .iter()
@@ -2368,6 +2452,7 @@ impl IngressDataPlane {
         slot.session.lock().await.take();
         slot.transit_paths.lock().await.clear();
         slot.draining_paths.lock().await.clear();
+        slot.path_endpoints.lock().await.clear();
         *slot.target_path_count.lock().await = reserved_path_target(
             (slot.egress.status_requirements.min_usable_paths as usize).max(1),
             slot.autoscaler.lock().await.config().max_paths,
@@ -2447,17 +2532,6 @@ impl IngressDataPlane {
             .cloned()
             .ok_or_else(|| DataPlaneError::TransitUnavailable(transit_id.as_str().to_owned()))?;
         let deadline = Instant::now() + dial_timeout;
-        let io = timeout(
-            dial_timeout,
-            adapter.connect(ConnectRequest {
-                destination: TransitEndpoint {
-                    host: slot.egress.endpoint.host.clone(),
-                    port: slot.egress.endpoint.port,
-                },
-            }),
-        )
-        .await
-        .map_err(|_| TransitError::Connection("Egress Path connection timed out".into()))??;
         let responder_key = decode_key(&slot.egress.public_key)?;
         let replication_budget_bytes_per_second = self.session_replication_budget_bytes(slot).await;
         let mut prologue = WIRE_PROFILE_V1_PROLOGUE_PREFIX.to_vec();
@@ -2481,16 +2555,76 @@ impl IngressDataPlane {
             replication_budget_bytes_per_second,
             local_limits: ProtocolLimits::default(),
         };
-        let outcome = timeout(
-            deadline.saturating_duration_since(Instant::now()),
-            dial_path(io, self.identity.private(), &responder_key, &admission),
-        )
-        .await
-        .map_err(|_| TransitError::Connection("Egress Path admission timed out".into()))??;
-        match outcome {
-            PathAdmissionOutcome::Ready(path) => Ok(path),
-            PathAdmissionOutcome::Rejected { .. } => Err(DataPlaneError::AdmissionRejected),
+        let mut last_error = None;
+        for (endpoint_index, endpoint) in slot.endpoint_candidates() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let io = match timeout(
+                remaining,
+                adapter.connect(ConnectRequest {
+                    destination: TransitEndpoint {
+                        host: endpoint.host.clone(),
+                        port: endpoint.port,
+                    },
+                }),
+            )
+            .await
+            {
+                Ok(Ok(io)) => io,
+                Ok(Err(error)) => {
+                    slot.record_endpoint_attempt(endpoint_index, false);
+                    last_error = Some(DataPlaneError::Transit(error));
+                    continue;
+                }
+                Err(_) => {
+                    slot.record_endpoint_attempt(endpoint_index, false);
+                    last_error = Some(DataPlaneError::Transit(TransitError::Connection(
+                        "Egress Path connection timed out".into(),
+                    )));
+                    continue;
+                }
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let outcome = match timeout(
+                remaining,
+                dial_path(io, self.identity.private(), &responder_key, &admission),
+            )
+            .await
+            {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => {
+                    slot.record_endpoint_attempt(endpoint_index, false);
+                    last_error = Some(DataPlaneError::Admission(error));
+                    continue;
+                }
+                Err(_) => {
+                    slot.record_endpoint_attempt(endpoint_index, false);
+                    last_error = Some(DataPlaneError::Transit(TransitError::Connection(
+                        "Egress Path admission timed out".into(),
+                    )));
+                    continue;
+                }
+            };
+            match outcome {
+                PathAdmissionOutcome::Ready(path) => {
+                    slot.record_endpoint_attempt(endpoint_index, true);
+                    slot.record_path_endpoint(path_id, endpoint_index).await;
+                    return Ok(path);
+                }
+                PathAdmissionOutcome::Rejected { .. } => {
+                    slot.record_endpoint_attempt(endpoint_index, false);
+                    last_error = Some(DataPlaneError::AdmissionRejected);
+                }
+            }
         }
+        Err(last_error.unwrap_or_else(|| {
+            DataPlaneError::TransitUnavailable(slot.egress.id.as_str().to_owned())
+        }))
     }
 
     async fn refresh_runtime(&self) {
@@ -2996,10 +3130,10 @@ mod tests {
     async fn one_transit_relationship_tracks_independent_path_instances() {
         let slot = SessionSlot::new(EgressConfig {
             id: EgressId::new("edge"),
-            endpoint: pathchord_policy::Endpoint {
+            endpoints: vec![pathchord_policy::Endpoint {
                 host: "127.0.0.1".into(),
                 port: 7443,
-            },
+            }],
             public_key: "key".into(),
             labels: BTreeMap::new(),
             capabilities: pathchord_policy::Capabilities {
@@ -3010,6 +3144,12 @@ mod tests {
             transit: pathchord_policy::EgressTransitBinding::default(),
             traffic_policy: None,
         });
+        assert!(
+            slot.endpoint_states_snapshot()
+                .await
+                .iter()
+                .all(|state| state.state == "configured")
+        );
         let relationship = TransitProxyId::new("transit");
         let first = PathId::new(1);
         let second = PathId::new(2);
@@ -3027,6 +3167,61 @@ mod tests {
             .expect("relationship")
             .remove(&first);
         assert_eq!(paths[&relationship], BTreeSet::from([second]));
+    }
+
+    #[tokio::test]
+    async fn session_slot_rotates_endpoint_candidates_and_tracks_path_endpoint() {
+        let slot = SessionSlot::new(EgressConfig {
+            id: EgressId::new("edge"),
+            endpoints: vec![
+                pathchord_policy::Endpoint {
+                    host: "egress-v4.example.test".into(),
+                    port: 7443,
+                },
+                pathchord_policy::Endpoint {
+                    host: "2001:db8::10".into(),
+                    port: 8443,
+                },
+            ],
+            public_key: "key".into(),
+            labels: BTreeMap::new(),
+            capabilities: pathchord_policy::Capabilities {
+                tcp: true,
+                udp: true,
+            },
+            status_requirements: pathchord_policy::EgressStatusRequirements::default(),
+            transit: pathchord_policy::EgressTransitBinding::default(),
+            traffic_policy: None,
+        });
+        assert!(
+            slot.endpoint_states_snapshot()
+                .await
+                .iter()
+                .all(|state| state.state == "configured")
+        );
+        assert_eq!(
+            slot.endpoint_candidates()
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            slot.endpoint_candidates()
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        slot.record_endpoint_attempt(0, false);
+        slot.record_endpoint_attempt(1, true);
+        slot.record_path_endpoint(PathId::new(7), 1).await;
+        assert_eq!(
+            slot.path_endpoints.lock().await.get(&PathId::new(7)),
+            Some(&1)
+        );
+        assert_eq!(slot.endpoint_states_snapshot().await[0].state, "failed");
+        assert_eq!(slot.endpoint_states_snapshot().await[1].state, "available");
     }
 
     #[test]
@@ -3094,10 +3289,10 @@ mod tests {
         for namespace in ["alpha", "beta"] {
             config.egresses.push(EgressConfig {
                 id: EgressId::in_namespace(namespace, "edge"),
-                endpoint: pathchord_policy::Endpoint {
+                endpoints: vec![pathchord_policy::Endpoint {
                     host: "127.0.0.1".into(),
                     port: 9,
-                },
+                }],
                 public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .encode(identity.public()),
                 labels: BTreeMap::from([("region".into(), "jp".into())]),

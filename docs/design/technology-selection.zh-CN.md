@@ -29,6 +29,8 @@
 
 调度器使用有效容量加权。配置的关系权重提供基线；Ingress 分别观测上行和下行 Path 的容量、拥塞、RTT、抖动、丢包和重传，以调整即时分配。Egress 执行全局 wire 硬上限，并报告聚合的配置/有效容量和准入状态；它不解释 Ingress 规则，也不提供期望 Path 数。每个 Egress 绑定提供一个 Session Path 池和 TrafficPolicy。Session 建立时必须协商复制硬上限；每个发送方在所有 flow 和 Path 之间共享 outbound allowance，额外副本只能使用主流量、普通重传和必要控制流量之后的剩余容量。
 
+一个 Egress runtime 可以在同一 identity 和授权库下拥有多个公共 listener socket。Ingress 保存有序 endpoint 候选列表，并为每条 Path 选择一个候选；Session、策略、wire budget 和目标连接上限仍然共享。endpoint 候选属于本地传输元数据，不进入 Noise prologue 或 wire status 布局。
+
 Egress 资源面保持刻意简单：authored 配置只提供 aggregate wire 上限和全局入站目标连接上限。Path 安全上限与 reservation 由运行时计算。Egress wire budget 使用有界 token 窗口，并优先保障主流量、重传和控制流量；可选复制只能使用剩余容量。
 
 ## 架构边界
