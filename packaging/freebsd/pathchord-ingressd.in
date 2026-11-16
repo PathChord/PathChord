@@ -1,0 +1,32 @@
+#!/bin/sh
+
+# PROVIDE: pathchord-ingressd
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="pathchord_ingressd"
+rcvar=pathchord_ingressd_enable
+load_rc_config "$name"
+
+: "${pathchord_ingressd_enable:=NO}"
+: "${pathchord_ingressd_user:=pathchord}"
+: "${pathchord_ingressd_config_dir:=/usr/local/etc/pathchord/ingress}"
+: "${pathchord_ingressd_data_dir:=/var/db/pathchord-ingress}"
+: "${pathchord_ingressd_credentials_dir:=${pathchord_ingressd_config_dir}/secrets}"
+
+command="/usr/sbin/daemon"
+procname="/usr/local/bin/pathchord-ingressd"
+pidfile="/var/run/${name}.pid"
+command_args="-f -p ${pidfile} -u ${pathchord_ingressd_user} -- ${procname} --socket /var/run/pathchord/ingress.sock --config-dir ${pathchord_ingressd_config_dir} --data-dir ${pathchord_ingressd_data_dir} --credentials-dir ${pathchord_ingressd_credentials_dir}"
+
+start_precmd="pathchord_ingressd_precmd"
+pathchord_ingressd_precmd()
+{
+	install -d -o "${pathchord_ingressd_user}" -g "${pathchord_ingressd_user}" -m 0750 "${pathchord_ingressd_data_dir}"
+	install -d -o root -g "${pathchord_ingressd_user}" -m 0750 "${pathchord_ingressd_credentials_dir}"
+	install -d -o "${pathchord_user}" -g "${pathchord_user}" -m 0750 /var/run/pathchord
+}
+
+run_rc_command "$1"

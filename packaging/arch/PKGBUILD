@@ -32,10 +32,10 @@ package() {
         "$pkgdir/usr/share/man/man1/pathchord.1"
     install -Dm0644 packaging/common/default-config.yaml \
         "$pkgdir/etc/pathchord/ingress/ingress.yaml"
-    install -Dm0644 packaging/arch/pathchord-ingress.service \
-        "$pkgdir/usr/lib/systemd/system/pathchord-ingress.service"
-    install -Dm0644 packaging/arch/pathchord-egress.service \
-        "$pkgdir/usr/lib/systemd/system/pathchord-egress.service"
+    install -Dm0644 packaging/arch/pathchord-ingressd.service \
+        "$pkgdir/usr/lib/systemd/system/pathchord-ingressd.service"
+    install -Dm0644 packaging/arch/pathchord-egressd.service \
+        "$pkgdir/usr/lib/systemd/system/pathchord-egressd.service"
     install -Dm0644 packaging/arch/pathchord.sysusers \
         "$pkgdir/usr/lib/sysusers.d/pathchord.conf"
     install -Dm0644 packaging/arch/pathchord.tmpfiles \

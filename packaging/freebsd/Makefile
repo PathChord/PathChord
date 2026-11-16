@@ -34,10 +34,10 @@ post-install:
 		${STAGEDIR}${PREFIX}/etc/pathchord/ingress/ingress.yaml
 	${INSTALL_DATA} ${WRKSRC}/packaging/common/pathchord.1 \
 		${STAGEDIR}${PREFIX}/share/man/man1/pathchord.1
-	${INSTALL_SCRIPT} ${WRKSRC}/packaging/freebsd/pathchord.in \
-		${STAGEDIR}${PREFIX}/etc/rc.d/pathchord
-	${INSTALL_SCRIPT} ${WRKSRC}/packaging/freebsd/pathchord-egress.in \
-		${STAGEDIR}${PREFIX}/etc/rc.d/pathchord-egress
+	${INSTALL_SCRIPT} ${WRKSRC}/packaging/freebsd/pathchord-ingressd.in \
+		${STAGEDIR}${PREFIX}/etc/rc.d/pathchord-ingressd
+	${INSTALL_SCRIPT} ${WRKSRC}/packaging/freebsd/pathchord-egressd.in \
+		${STAGEDIR}${PREFIX}/etc/rc.d/pathchord-egressd
 	${SED} 's,%%PREFIX%%,${PREFIX},g' \
 		${WRKSRC}/packaging/freebsd/pkg-message > \
 		${STAGEDIR}${PREFIX}/share/pathchord/pkg-message

@@ -66,10 +66,10 @@ install -m0644 "$root_dir/packaging/common/pathchord.1" \
 gzip -n -9 "$stage/usr/share/man/man1/pathchord.1"
 install -m0644 "$root_dir/packaging/common/default-config.yaml" \
 	"$stage/etc/pathchord/ingress/ingress.yaml"
-install -m0644 "$root_dir/packaging/debian/pathchord-ingress.service" \
-	"$stage/usr/lib/systemd/system/pathchord-ingress.service"
-install -m0644 "$root_dir/packaging/debian/pathchord-egress.service" \
-	"$stage/usr/lib/systemd/system/pathchord-egress.service"
+install -m0644 "$root_dir/packaging/debian/pathchord-ingressd.service" \
+	"$stage/usr/lib/systemd/system/pathchord-ingressd.service"
+install -m0644 "$root_dir/packaging/debian/pathchord-egressd.service" \
+	"$stage/usr/lib/systemd/system/pathchord-egressd.service"
 
 cat >"$stage/DEBIAN/control" <<EOF
 Package: pathchord
@@ -121,7 +121,7 @@ cat >"$stage/DEBIAN/prerm" <<'EOF'
 set -eu
 
 if [ "${1:-}" = remove ] && command -v deb-systemd-invoke >/dev/null 2>&1; then
-	deb-systemd-invoke stop pathchord-ingress.service pathchord-egress.service || true
+	deb-systemd-invoke stop pathchord-ingressd.service pathchord-egressd.service || true
 fi
 exit 0
 EOF

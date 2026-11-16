@@ -1,6 +1,6 @@
 #!/sbin/openrc-run
 
-name="pathchord"
+name="pathchord-ingressd"
 description="PathChord Ingress proxy runtime"
 command="/usr/bin/pathchord-ingressd"
 command_args="--socket /run/pathchord/ingress.sock --config-dir /etc/pathchord/ingress --data-dir /var/lib/pathchord-ingress --credentials-dir /etc/pathchord/ingress/secrets"

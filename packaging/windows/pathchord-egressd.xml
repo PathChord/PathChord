@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- WinSW service definition. Keep this file beside the matching WinSW
-     executable (pathchord-egress-service.exe) before installing it. -->
+     executable (pathchord-egressd-service.exe) before installing it. -->
 <service>
-  <id>PathChordEgress</id>
-  <name>PathChord Egress</name>
+  <id>PathChordEgressd</id>
+  <name>PathChord Egressd</name>
   <description>PathChord authenticated Egress Path listener.</description>
   <startmode>Manual</startmode>
   <executable>%ProgramFiles%\PathChord\pathchord-egressd.exe</executable>

@@ -80,8 +80,8 @@ Section "PathChord runtime" SecRuntime
   CreateDirectory "$COMMONAPPDATA\PathChord\logs"
 
   SetOutPath "$INSTDIR\services"
-  File "pathchord-ingress.xml"
-  File "pathchord-egress.xml"
+  File "pathchord-ingressd.xml"
+  File "pathchord-egressd.xml"
   File "install-service.ps1"
   File "README.md"
 
@@ -98,12 +98,12 @@ SectionEnd
 
 Section "Uninstall"
   ; If WinSW wrappers were installed, let them stop and unregister cleanly.
-  IfFileExists "$INSTDIR\pathchord-ingress-service.exe" 0 +3
-    ExecWait '"$INSTDIR\pathchord-ingress-service.exe" stop'
-    ExecWait '"$INSTDIR\pathchord-ingress-service.exe" uninstall'
-  IfFileExists "$INSTDIR\pathchord-egress-service.exe" 0 +3
-    ExecWait '"$INSTDIR\pathchord-egress-service.exe" stop'
-    ExecWait '"$INSTDIR\pathchord-egress-service.exe" uninstall'
+  IfFileExists "$INSTDIR\pathchord-ingressd-service.exe" 0 +3
+    ExecWait '"$INSTDIR\pathchord-ingressd-service.exe" stop'
+    ExecWait '"$INSTDIR\pathchord-ingressd-service.exe" uninstall'
+  IfFileExists "$INSTDIR\pathchord-egressd-service.exe" 0 +3
+    ExecWait '"$INSTDIR\pathchord-egressd-service.exe" stop'
+    ExecWait '"$INSTDIR\pathchord-egressd-service.exe" uninstall'
 
   Delete "$INSTDIR\pathchord-ingressd.exe"
   Delete "$INSTDIR\pathchord-egressd.exe"
@@ -112,12 +112,12 @@ Section "Uninstall"
   Delete "$INSTDIR\default-config.yaml"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\uninstall.exe"
-  Delete "$INSTDIR\pathchord-ingress-service.exe"
-  Delete "$INSTDIR\pathchord-egress-service.exe"
-  Delete "$INSTDIR\pathchord-ingress-service.xml"
-  Delete "$INSTDIR\pathchord-egress-service.xml"
-  Delete "$INSTDIR\pathchord-ingress.xml"
-  Delete "$INSTDIR\pathchord-egress.xml"
+  Delete "$INSTDIR\pathchord-ingressd-service.exe"
+  Delete "$INSTDIR\pathchord-egressd-service.exe"
+  Delete "$INSTDIR\pathchord-ingressd-service.xml"
+  Delete "$INSTDIR\pathchord-egressd-service.xml"
+  Delete "$INSTDIR\pathchord-ingressd.xml"
+  Delete "$INSTDIR\pathchord-egressd.xml"
   RMDir /r "$INSTDIR\services"
   RMDir "$INSTDIR"
   DeleteRegKey HKLM "${UNINSTALL_KEY}"

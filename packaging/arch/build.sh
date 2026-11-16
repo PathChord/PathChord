@@ -57,8 +57,8 @@ cp "$ctl_binary" "$work/src/pathchordctl"
 cp "$root_dir/packaging/common/pathchord.1" "$work/src/common/pathchord.1"
 cp "$root_dir/packaging/common/default-config.yaml" "$work/src/common/default-config.yaml"
 cp "$root_dir/LICENSE" "$work/src/common/LICENSE"
-cp "$root_dir/packaging/arch/pathchord-ingress.service" "$work/src/common/pathchord-ingress.service"
-cp "$root_dir/packaging/arch/pathchord-egress.service" "$work/src/common/pathchord-egress.service"
+cp "$root_dir/packaging/arch/pathchord-ingressd.service" "$work/src/common/pathchord-ingressd.service"
+cp "$root_dir/packaging/arch/pathchord-egressd.service" "$work/src/common/pathchord-egressd.service"
 cp "$root_dir/packaging/arch/pathchord.sysusers" "$work/src/common/pathchord.sysusers"
 cp "$root_dir/packaging/arch/pathchord.tmpfiles" "$work/src/common/pathchord.tmpfiles"
 
@@ -87,10 +87,10 @@ package() {
         "$pkgdir/usr/share/man/man1/pathchord.1"
     install -Dm0644 "$srcdir/common/default-config.yaml" \
         "$pkgdir/etc/pathchord/ingress/ingress.yaml"
-    install -Dm0644 "$srcdir/common/pathchord-ingress.service" \
-        "$pkgdir/usr/lib/systemd/system/pathchord-ingress.service"
-    install -Dm0644 "$srcdir/common/pathchord-egress.service" \
-        "$pkgdir/usr/lib/systemd/system/pathchord-egress.service"
+    install -Dm0644 "$srcdir/common/pathchord-ingressd.service" \
+		"$pkgdir/usr/lib/systemd/system/pathchord-ingressd.service"
+    install -Dm0644 "$srcdir/common/pathchord-egressd.service" \
+		"$pkgdir/usr/lib/systemd/system/pathchord-egressd.service"
     install -Dm0644 "$srcdir/common/pathchord.sysusers" \
         "$pkgdir/usr/lib/sysusers.d/pathchord.conf"
     install -Dm0644 "$srcdir/common/pathchord.tmpfiles" \

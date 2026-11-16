@@ -35,8 +35,8 @@ package() {
 	gzip -n -9 "$pkgdir/usr/share/man/man1/pathchord.1"
 	install -Dm0644 packaging/common/default-config.yaml \
 		"$pkgdir/etc/pathchord/ingress/ingress.yaml"
-	install -Dm0755 packaging/alpine/pathchord.initd \
-		"$pkgdir/etc/init.d/pathchord"
-	install -Dm0755 packaging/alpine/pathchord-egress.initd \
-		"$pkgdir/etc/init.d/pathchord-egress"
+	install -Dm0755 packaging/alpine/pathchord-ingressd.initd \
+		"$pkgdir/etc/init.d/pathchord-ingressd"
+	install -Dm0755 packaging/alpine/pathchord-egressd.initd \
+		"$pkgdir/etc/init.d/pathchord-egressd"
 }
