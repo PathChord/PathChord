@@ -17,6 +17,50 @@ Transit adapters and subscription processing SHALL conform to the complete detai
 - **WHEN** a `socks4` or `socks4a` outbound node is imported
 - **THEN** it remains unavailable with a typed diagnostic even though local listeners support those protocols.
 
+### Requirement: Bounded smux sessions
+
+smux sessions SHALL enforce the detailed per-session and per-stream resource
+bounds, isolate receive-overloaded streams, and preserve the documented FIN and
+carrier lifetime semantics.
+
+#### Scenario: A smux stream exceeds its receive budget
+
+- **WHEN** a smux stream exceeds its receive budget or is selected for isolation under the shared receive budget
+- **THEN** that stream reports a resource error and schedules FIN, while the session continues processing other streams
+
+#### Scenario: The last smux stream is released
+
+- **WHEN** the last stream handle in a smux session is released while carrier I/O is pending
+- **THEN** pending I/O shares one ten-second drain deadline; opening a new stream cancels that deadline
+
+#### Scenario: A target responds after smux FIN
+
+- **WHEN** a target sends a response after receiving smux FIN for a request
+- **THEN** the client does not promise TCP half-close behavior or that the later response will arrive
+
+### Requirement: Hysteria2 negotiated congestion control
+
+Hysteria2 SHALL send the configured receive-rate hint and select its upload
+congestion control after authentication according to the peer's response and
+the configured upload rate, as specified in the detailed contract. A zero
+effective target or an `auto` response SHALL use BBR; a positive effective
+target SHALL use Brutal pacing and loss compensation.
+
+#### Scenario: The peer requests automatic congestion control
+
+- **WHEN** the authenticated Hysteria2 peer responds with `Hysteria-CC-RX: auto`
+- **THEN** the client uses BBR even when a nonzero `up_mbps` is configured
+
+#### Scenario: The peer supplies a numeric receive rate
+
+- **WHEN** the peer responds with a numeric receive rate and the client has a nonzero `up_mbps`
+- **THEN** the client uses the configured upload rate for a zero response or the smaller nonzero rate for a positive response
+
+#### Scenario: No upload rate is configured
+
+- **WHEN** `up_mbps` is absent or zero and the peer responds with a numeric receive rate
+- **THEN** the client uses BBR, including when the peer's numeric rate is positive
+
 ### Requirement: Validate native parameters without downgrade
 
 A native TLS-capable adapter SHALL load system roots by default, apply the configured ordered truststore source list, and fail preparation when any source cannot be read or parsed. TLS verification SHALL remain enabled unless an explicit insecure option is selected, and validation failure SHALL NOT fall back to plaintext or another protocol.
@@ -33,7 +77,7 @@ A native TLS-capable adapter SHALL load system roots by default, apply the confi
 
 ### Requirement: Bounded imports and source-bound caches
 
-Subscription processing SHALL normalize only supported node definitions, preserve valid siblings alongside individual diagnostics, retain the previous successful snapshot for malformed documents, and enforce the detailed node and byte limits. Private caches SHALL retain options and diagnostics and SHALL be bound to source type, URL, and credential reference; unverified caches SHALL NOT publish, and replaced-source nodes SHALL drain rather than accept new flows.
+Subscription processing SHALL normalize only supported node definitions, preserve valid siblings alongside individual diagnostics, retain the previous successful snapshot for malformed documents, and enforce the detailed node and byte limits. Private caches SHALL retain options and diagnostics and SHALL be bound to source type, URL, credential reference and effective User-Agent; unverified caches SHALL NOT publish, and replaced-source nodes SHALL drain rather than accept new flows.
 
 #### Scenario: One imported node is invalid
 
@@ -42,8 +86,20 @@ Subscription processing SHALL normalize only supported node definitions, preserv
 
 #### Scenario: Subscription source changes
 
-- **WHEN** the subscription's source type, URL, or credential reference changes
+- **WHEN** the subscription's source type, URL, credential reference or effective User-Agent changes
 - **THEN** nodes belonging to the previous source enter draining and cannot be selected for new flows.
+
+### Requirement: Node probe revocation follows source visibility
+
+When Ingress applies a subscription disable, deletion, or source replacement,
+it SHALL cancel queued and in-flight probes for affected nodes and SHALL NOT
+publish observations from a revoked admission. Unrelated node probes SHALL
+continue independently.
+
+#### Scenario: Subscription changes while a probe is queued
+
+- **WHEN** Ingress disables, deletes, or replaces the source of a queued or in-flight node probe
+- **THEN** that probe is cancelled, stale results are not published, and unrelated probes can continue
 
 ### Requirement: Bounded provider expansion and credential origins
 
@@ -90,6 +146,15 @@ An adapter SHALL skip certificate verification only when its TLS options explici
 - **WHEN** a node uses a custom truststore and the peer certificate is not anchored by it
 - **THEN** the TLS connection fails with a typed adapter error and does not retry as plaintext or insecure TLS
 
+### Requirement: Subscription User-Agent identifies source content
+
+Subscription HTTP requests SHALL use the configured per-source User-Agent, or `clash.meta` when it is absent. Root and nested provider requests SHALL carry the same value. Changing the effective User-Agent SHALL invalidate source-bound caches and stale refresh candidates without weakening credential origin or fetch-budget boundaries.
+
+#### Scenario: A subscription changes its User-Agent
+
+- **WHEN** a subscription's effective User-Agent changes
+- **THEN** old-source nodes drain and cached or in-flight content obtained using the previous value cannot publish as the new source
+
 ## Detailed contract
 
 This document defines node connection semantics, subscription normalization,
@@ -104,17 +169,18 @@ NOT be interpreted as support for the same outbound node protocol.
 | --- | --- | --- |
 | `direct` | TCP and UDP | Extended dialer options |
 | `http`, `https` | HTTP/1 CONNECT, Basic authentication, validated extra headers; HTTPS uses TLS | Supported extended node options |
-| `socks5` | CONNECT, username/password, UDP ASSOCIATE; optional TLS for TCP | Supported extended node options |
-| `ss` | TCP/UDP with AEAD and SS2022 ciphers; legacy stream ciphers are rejected | Native AEAD/SS2022 options; `obfs-local`, `v2ray-plugin`, and other plugin parameters produce unavailable diagnostics |
+| `socks5` | CONNECT, username/password, UDP ASSOCIATE or UDP-over-TCP v1/v2; optional TLS | Supported extended node options |
+| `ss` | TCP/UDP with AEAD, SS2022, selected legacy stream ciphers, explicit `none`/`plain`, UDP-over-TCP v1/v2, and native simple-obfs or v2ray-plugin WebSocket for TCP | Unsupported ciphers, plugins and plugin parameters produce unavailable diagnostics |
 | `socks4`, `socks4a` | No native outbound adapter | CONNECT |
-| `vless` | TCP, TLS, WebSocket, and WSS byte transports with typed TLS/transport validation | Extended transport and flow options |
-| `vmess` | TCP, TLS, WebSocket/WSS, AES-128-GCM or ChaCha20-Poly1305 body records, single-target UDP, `alter_id: 0` | mux, legacy non-AEAD security, and other unsupported extended options |
-| `trojan` | TLS-wrapped TCP, WebSocket, and WSS byte transports | Extended transport options |
+| `vless` | TCP, TLS, WebSocket/WSS, HTTP, HTTPUpgrade, gRPC, QUIC and Meek byte transports with typed TLS/transport validation | Extended transport and flow options |
+| `vmess` | TCP, TLS, WebSocket/WSS, HTTP, HTTPUpgrade, gRPC, QUIC, Meek, AES-128-GCM, ChaCha20-Poly1305 or AES-128-CFB body records, explicit `none`/`zero` plaintext bodies, single-target UDP, bounded legacy or AEAD `alter_id` headers | Supported multiplex and extended options are validated as described below |
+| `trojan` | TLS-wrapped TCP, WebSocket/WSS, HTTP, HTTPUpgrade, gRPC and QUIC byte transports, plus supported Trojan-Go share links with original/TCP and WebSocket, gRPC and HTTPUpgrade aliases | Trojan-Go original/TCP with SS encryption is unavailable because the reference server's request sniffing is not reliable for short encrypted streams; unsupported Trojan-Go options produce typed diagnostics |
 | `anytls` | TLS stream, authentication, settings, SYN/SYNACK, PUSH/FIN, heartbeat frames, and bounded UDP-over-TCP datagrams | Multiplexed session options outside the native frame contract |
-| `hysteria2` | Native QUIC/TLS + HTTP/3 authentication, TCP/UDP relay, Salamander or un-obfuscated transport, and bounded server-port hopping | Bandwidth limit fields, Gecko-specific obfuscation, and other unsupported extended options |
-| `tuic` | Native QUIC/TLS-exporter TCP CONNECT, UDP DATAGRAM relay, heartbeat, and optional replay-sensitive 0-RTT | Unsupported congestion controllers, UDP-over-stream, and other extended options |
-| `vless` + `tls.reality` | Native VLESS over REALITY TLS with X25519 ClientHello proof and certificate proof validation | Vision flow and unsupported outer transports |
-| `xtls`, `hysteria`, `ssh`, `shadowtls` | No native adapter | Typed unavailable diagnostic |
+| `hysteria2` | Native QUIC/TLS + HTTP/3 authentication, TCP/UDP relay to IPv4 or IPv6 targets, bounded UDP fragmentation and reassembly, Salamander, Gecko or un-obfuscated transport, bounded server-port hopping, and negotiated BBR/Brutal rates | TLS fingerprints and other unsupported extended options |
+| `tuic` | Native QUIC/TLS-exporter TCP CONNECT, native DATAGRAM, QUIC-stream UDP relay or UDP-over-stream, cubic/NewReno/BBR congestion control and heartbeat | TLS fingerprints, 0-RTT and other unsupported extended options |
+| `vless` + `tls.reality` | Native VLESS over REALITY TLS with X25519 ClientHello proof, certificate proof validation and dae Chrome 133, iOS 14, Safari 16, Edge 85, QQ 11.1 and Firefox 120 fingerprint profiles | Other fingerprints, certificate pins, custom trust roots and unsupported outer transports produce typed unavailable diagnostics |
+| `xtls` | Alias for VLESS with an explicit registered XTLS Vision flow; normalized to `vless` before adapter selection | Missing or unsupported XTLS flow produces a typed diagnostic |
+| `hysteria`, `ssh`, `shadowtls` | No native adapter | Typed unavailable diagnostic |
 | `wireguard` | No native adapter | Complete userspace WireGuard endpoint document |
 | `snell` | No native adapter | Typed unavailable diagnostic |
 | `ssr` and unregistered protocols | Unavailable | Explicitly unavailable |
@@ -125,10 +191,110 @@ unimplemented protocols MUST produce typed, redacted diagnostics. A failed TLS
 or transport configuration MUST NOT fall back to plaintext or direct.
 
 Native VLESS and Trojan adapters reject unsupported flow, multiplex, packet,
-and transport options before opening a socket. Native VMess accepts only
-AEAD body ciphers and `alter_id: 0`; mux remains unavailable. REALITY requires
-the native ClientHello proof callback and does not enable Vision flow by itself.
-A protocol row in this table never makes an unsupported parameter set selectable.
+and transport options before opening a socket. Native VMess accepts positive
+`alter_id` legacy HMAC-MD5/AES-128-CFB headers as well as AEAD headers,
+AEAD body ciphers, AES-128-CFB with continuous stream state and per-record
+FNV-1a checksums, or explicitly configured `none`/`zero` plaintext bodies;
+`alter_id` is bounded to `0..=65535`. Native h2mux, yamux and smux are available as described below. Its AEAD response header uses
+AES-128-GCM independently of the selected body cipher. A VLESS node
+with either `xtls-rprx-vision` or `xtls-rprx-vision-udp443` uses Vision over
+direct TLS 1.3 or REALITY. Without multiplex, Vision datagrams use XUDP; with
+supported multiplex they use its UDP framing. Only the latter flow allows UDP
+to port 443; both send `xtls-rprx-vision` on the wire. XUDP datagrams are
+bounded to 8192 bytes. An unavailable fingerprint is not approximated by a
+different ClientHello. A protocol row in this table never makes an unsupported
+parameter set selectable.
+The first Vision request and first outbound frame share a padded outer TLS
+record when data arrives promptly. An idle connection emits a padded empty
+frame after a bounded delay; a complete CONTINUE frame followed by EOF is a
+valid stream end.
+
+VMess `globalPadding` and `authenticatedLength` are accepted only with an
+AEAD body cipher. The authenticated-length wire format derives both directional
+length keys and nonce sequences from the request key and IV; peers therefore
+reuse a key/nonce across directions. Each direction MUST stop before its own
+record counter wraps.
+VMess supports `packetEncoding: xudp` and `packetaddr`; packetaddr requires an
+IP destination. Returned packet addresses are checked against the bound
+destination, with a resolved IP accepted for an XUDP hostname target only
+when its port matches.
+VLESS also supports `packetaddr` for IP destinations over plain TCP, TLS or
+REALITY without Vision. `packetaddr` with either Vision flow is rejected during
+adapter preparation. Explicit packet encoding is also incompatible with
+multiplex; supported multiplex uses its own datagram framing.
+
+For REALITY, `fingerprint: chrome` selects the dae 2.1.2 Chrome 133 profile.
+It initially attempts the classic X25519 form, remembers a successful form,
+and retries the other form only after a complete TLS handshake authenticates a trusted decoy certificate. It
+never sends VLESS data to the decoy. TLS 1.2, HelloRetryRequest, resumption,
+real ECH and a server ALPS response are unavailable in this profile.
+`fingerprint: ios`, `safari`, `edge` and `qq` select dae's iOS 14, Safari 16,
+Edge 85 and QQ 11.1 profiles respectively, using their original X25519 key
+share. `fingerprint: firefox` selects dae's Firefox 120 profile with separate
+X25519 and P-256 key shares. The peer's `record_size_limit` constrains outgoing
+TLS records independently of the client's advertised receive limit, without
+increasing a stricter local limit. A QQ server ALPS response is rejected
+explicitly. Ordinary TLS also supports these profiles with the configured
+certificate checks. `fingerprint: android` selects dae/uTLS Android 11 OkHttp
+for ordinary TLS 1.2 without ALPN; REALITY, Vision and transports requiring
+ALPN are unavailable with this profile. The 360 profile is unavailable because
+its advertised cipher suites have no supported implementation in this TLS
+backend; it MUST NOT be substituted with another profile.
+
+Gecko accepts `gecko_min_packet_size` and `gecko_max_packet_size` as integer
+on-wire padding targets. Each omitted or zero value independently defaults to
+512 or 1200 bytes, respectively; the resulting range MUST satisfy
+`1 <= min <= max <= 2048`. These fields require Gecko. The targets apply to
+fragmented long-header packets including the Salamander salt; short-header
+packets are not padded, and a fragment already larger than the maximum is
+sent without extra padding. sing-box's nested `obfs.min_packet_size` and
+`obfs.max_packet_size` normalize to these fields.
+
+Hysteria2 `up_mbps` and `down_mbps` are optional nonnegative integer Mbps values;
+invalid values and values whose conversion to bytes per second overflows are
+rejected at preparation. Each Mbps is 125,000 bytes per second. Omitted values
+are zero. `down_mbps` is sent as the client's receive-rate hint in the request
+`Hysteria-CC-RX`; zero means unknown, and the server may ignore the hint.
+
+The client uses BBR for the QUIC handshake. After authentication, a response
+`Hysteria-CC-RX: auto` keeps BBR regardless of `up_mbps`. For a numeric
+response, zero selects the configured `up_mbps`; a positive response selects
+the smaller of that value and the configured `up_mbps`. A zero resulting target
+keeps BBR, including when `up_mbps` is absent or zero and the server returns a
+positive numeric value. A positive target selects Brutal for that connection.
+
+Brutal uses the recent acknowledged-packet ratio over five second-indexed
+slots. Fewer than 50 acknowledged and lost packets yield a ratio of one;
+otherwise the ratio is clamped to at least 0.8. Its pacing rate is the target
+divided by that ratio and its congestion window is twice the product of that
+rate and the smoothed RTT. Before an RTT sample the window is 10,240 bytes;
+afterwards it is at least one byte. The pacer's token-bucket capacity is the
+larger of ten maximum-sized datagrams and four milliseconds of pacing budget.
+Loss compensation can therefore raise the normal paced QUIC rate to 1.25 times
+the target. PTO loss probes and ACK-only packets can bypass pacing; MTU and
+path-validation probes may also be sent outside it. These exceptions, bursts,
+retransmissions, and UDP/IP or obfuscation overhead mean the target is not a
+strict physical bandwidth cap or a throughput guarantee.
+
+Shadowsocks supports SIP004 `aes-192-gcm` for TCP and UDP. The accepted legacy
+stream methods are AES-128/192/256 CTR, CFB and OFB, Camellia-128/192/256 CFB,
+RC4, RC4-MD5, ChaCha20-IETF and `xchacha20`. Legacy stream methods do not
+authenticate their payloads. `none` and `plain` explicitly select the
+unencrypted Shadowsocks wire mode; they do not use a password. A nonempty
+password with either method is rejected rather than discarded. Other
+unsupported stream methods are unavailable.
+
+For `aes-192-gcm` and `xchacha20`, each adapter instance retains a bounded
+window of 4096 recently used outbound and inbound salts or IVs across TCP and
+UDP, rejecting repeats still in that window. This window is not persistent;
+in particular, it does not provide payload authentication for `xchacha20`.
+
+The native Shadowsocks `v2ray-plugin` adapter supports SIP003 and Clash
+WebSocket options, optional TLS, Host, path, validated headers, configured
+certificate and pin checks, and the default single-stream mux or explicit
+`mux=0`. UDP uses the Shadowsocks datagram transport unless UDP-over-TCP
+is explicitly selected, in which case it traverses the configured TCP plugin.
+Unsupported mux counts, transport modes and unconsumed options are rejected.
 
 ### Typed connection options
 
@@ -138,10 +304,12 @@ are retained as unavailable-node diagnostics rather than silently ignored.
 
 | Field | Default and meaning |
 | --- | --- |
-| `tls` | absent; TLS object with `enabled`, `serverName`, `insecure`, ordered `truststore`, `alpn`, `certificate`, `clientCertificate`, `clientKeyField`, `fingerprint`, `reality` |
+| `tls` | absent; TLS object with `enabled`, `serverName`, `insecure`, ordered `truststore`, `alpn`, `certificate`, `certificateSha256`, `clientCertificate`, `clientKeyField`, `fingerprint`, `reality` |
 | `transport` | absent; object with `type`, `path`, `host`, `headers`, `serviceName`, `maxEarlyData`, `earlyDataHeaderName` |
 | `headers` | `{}`; non-secret HTTP CONNECT headers |
 | `udp` | absent; use adapter capability; `false` disables ordinary UDP forwarding |
+| `udpOverTcp` | absent; SOCKS5 or Shadowsocks UDP-over-TCP version `1` or `2`; incompatible with `udp: false` |
+| `vmess` | absent; `globalPadding` and `authenticatedLength` booleans, both default `false` |
 | `multiplex` | absent; object with `enabled`, `protocol`, `maxConnections`, `minStreams`, `maxStreams`, `padding` |
 | `tcpFastOpen` | absent; optional boolean |
 | `bindInterface` | absent; optional local interface name |
@@ -161,20 +329,82 @@ of the connection address. Native HTTPS CONNECT permits HTTP/1.1 ALPN.
 Certificate values are inline PEM; client private keys are resolved only from
 the opaque credential document field named by `clientKeyField`. TLS settings
 with disabled TLS are invalid unless the object is entirely default-valued.
-Reality uses `publicKey` and `shortId`; fingerprint/Reality options require the
-native Reality adapter. `insecure` is an explicit certificate-verification option,
+`certificateSha256` is the hexadecimal SHA-256 of a DER certificate; a leaf
+match authenticates the leaf, and a matched intermediate anchors normal chain,
+name and time validation. The pin remains mandatory when `insecure: true`.
+Reality uses `publicKey` and `shortId`; a fingerprint requires an adapter
+that implements the requested ClientHello profile. `insecure` is an explicit certificate-verification option,
 never a fallback after validation failure.
 
-Transport `type` is `tcp`, `ws`, `grpc`, `http`, `httpupgrade`, `quic`, or
-`xhttp`; accepting the type in the model does not imply native support. Plain
-TCP cannot carry HTTP transport parameters. WebSocket Host
+Transport `type` is `tcp`, `ws`, `grpc`, `http`, `httpupgrade`, `quic`, `meek`,
+or `xhttp`; accepting the type in the model does not imply native support. Plain
+TCP cannot carry HTTP transport parameters. The `http` transport supports a
+path, at most one Host and validated headers for VLESS, VMess and Trojan. It
+uses HTTP/1.1 PUT without TLS and HTTP/2 PUT with TLS and `h2` ALPN; the peer
+response must have status 200. The default path is `/`; without a configured
+Host, plaintext uses the endpoint host and TLS uses `www.example.com`.
+Conflicting Host values, multiple hosts, service-name or early-data options,
+and framing-controlled headers are rejected. Trojan still requires TLS.
+The V2Ray `quic` transport requires TLS for VLESS, VMess and Trojan; it uses
+`h3` ALPN when no ALPN is configured and preserves explicit ALPN values. It
+rejects REALITY, Vision, ClientHello fingerprints and other unconsumed
+transport parameters rather than silently changing them.
+Meek is available for VLESS and VMess over HTTPS. Its full URL, including any
+query, is stored in private `meek_url` credentials; public path, Host and
+header transport options are rejected. Meek's local write shutdown does not
+signal an end-of-stream to the remote endpoint.
+HTTPUpgrade supports its path, Host and validated headers over TCP or TLS.
+WebSocket early data sends up to
+`maxEarlyData` bytes from the first write as unpadded Base64URL in the path or
+the specified `earlyDataHeaderName`, with remaining bytes sent in binary frames.
+Path early data with an unrelated query is unavailable. WebSocket Host
 overrides map to the transport's `Host` header. Conflicting aliases or Host
-values are rejected. Multiplex booleans default to `false`; its protocol is
-`smux`, `yamux`, or `h2mux`. Unsupported combinations fail validation.
+values are rejected. Multiplex booleans default to `false`. Native `h2mux`,
+`yamux`, and `smux` support SS, VLESS, VMess and Trojan with optional sing-mux padding;
+omitted protocol selects `h2mux`. `maxConnections` is at most 256, `minStreams` requires
+`maxConnections`, and `maxStreams` is exclusive with both; stream limits are
+at most 4096 for h2mux and 256 for yamux or smux. With neither connection nor stream
+limits configured, an idle connection may be reused while an active one causes
+a new connection. Combinations of multiplex with explicit packet encoding or
+UDP-over-TCP are unavailable rather than silently ignored.
+
+Each smux session supports at most 256 logical streams, including streams
+being closed, and separately bounds queued receive payload and transmit wire
+frames to 4 MiB each. It also bounds reception to 256 KiB per stream and 1024
+queued frames per session, and transmission to 512 queued frames per session.
+Receive payload remains charged until its complete frame allocation is
+released; these queue budgets are not a bound on total process memory. If a
+stream exceeds its receive limit, or shared receive pressure selects it for
+isolation, the session discards its buffered data, returns a resource error to
+that stream and schedules FIN. It continues consuming and discarding later data for
+that stream so other streams can progress.
+
+The adapter cannot observe every byte of progress inside a buffered carrier.
+Pending carrier I/O with an active stream therefore has no smux-driver
+no-progress deadline; the caller or a higher-level timeout must cancel stalled
+work. After the last stream handle is released, pending I/O shares one absolute ten-second drain
+deadline across the session's reader and writer. A new stream cancels that
+deadline; expiration terminates the session. An otherwise idle pooled session
+can remain available until normal pool reclamation. smux v1 FIN follows the
+reference peer's full-close semantics: after a peer FIN, reads drain already
+buffered data and further writes fail. A local FIN does not guarantee that a
+response produced after the target sees EOF can be delivered; smux MUST NOT be
+advertised as supporting full TCP half-close compatibility.
+
+With multiplex padding enabled, the physical connection starts with sing-mux
+version `1`, protocol `0` for smux, `1` for yamux or `2` for h2mux, padding flag `1`, a
+big-endian `u16` padding length, and that many padding bytes. The first 16
+records in each direction carry a big-endian `u16` content length, a
+big-endian `u16` padding length, the content, and the padding. Subsequent
+bytes in that direction are unframed by this padding layer. The client chooses
+256–767 padding bytes per emitted padded record; truncated records are errors.
+If a multiplexed UDP association closes before the peer supplies its success
+status, close reports an unconfirmed response rather than success. A datagram
+may already have reached the destination; the adapter MUST NOT replay it.
 
 Native adapter credential fields are protocol-specific. HTTP/SOCKS use
-`username` and `password`; SS uses `cipher` and `password`. The native adapter
-rejects SS plugin fields and reports diagnostics. Extra credential
+`username` and `password`; SS uses `cipher`, `password` and supported plugin
+fields. Unsupported plugin fields produce diagnostics. Extra credential
 keys MUST NOT be silently discarded. Sensitive headers, private keys, passwords, UUIDs, and complete
 imported documents remain private credential data, never administrator labels
 or public node diagnostics.
@@ -185,11 +415,13 @@ performs final protocol validation.
 
 | Protocol | Private credential fields |
 | --- | --- |
-| `vless`, `xtls` | `uuid`, `flow` |
-| `vmess` | `uuid`, `security` or equivalent `cipher`, `alter_id` |
-| `trojan`, `anytls` | `password` |
+| `http`, `https` | `username`, `password`, optional private `http_path` |
+| `socks5` | `username`, `password` |
+| `vless`, `xtls` | `uuid`, `flow`, `meek_url` when using Meek |
+| `vmess` | `uuid`, `security` or equivalent `cipher`, `alter_id`, `meek_url` when using Meek |
+| `trojan`, `anytls` | `password`; Trojan-Go SS encryption additionally uses private `trojan_go_ss_method` and `trojan_go_ss_password` fields |
 | `hysteria` | `auth` or `password`, `up_mbps`, `down_mbps`, `obfs`, `server_ports`, `hop_interval` |
-| `hysteria2` | `password`, `obfs`, `obfs_password`, `server_ports`, `hop_interval` |
+| `hysteria2` | `password` or equivalent `auth`, `obfs`, `obfs_password`, `gecko_min_packet_size`, `gecko_max_packet_size`, `server_ports`, `hop_interval`, `up_mbps`, `down_mbps` |
 | `tuic` | `uuid`, `password`, `congestion_control`, `udp_relay_mode`, `heartbeat`, `zero_rtt_handshake`, `udp_over_stream` |
 | `ssh` | `username`, `password`, `private_key`, `private_key_passphrase`, `host_key` |
 | `shadowtls` | `password`, `version` |
@@ -199,12 +431,16 @@ performs final protocol validation.
 Conflicting aliases are invalid. Further protocol fields remain unavailable
 until the corresponding native adapter supports them.
 
-The credential field `sing_box_outbound` is retained as an imported opaque
-document for diagnostics, but it has no native adapter and is not executable
-by PathChord. Imported documents cannot become an implicit process launch or
-direct fallback. SS plugin fields are retained for diagnostics and rejected by
-the native adapter; PathChord does not execute plugin processes or provide an
-implicit wrapper.
+Representable sing-box proxy nodes are normalized to native options and
+credentials. A node with unrepresentable fields retains its complete private
+`sing_box_outbound` document and remains unavailable with a diagnostic;
+selector, URL-test, direct and block entries are not imported as proxy nodes.
+Imported documents cannot become an implicit process launch or direct fallback.
+The SS adapter implements simple-obfs `obfs`, `obfs-local` and `simple-obfs`
+HTTP/TLS modes and v2ray-plugin WebSocket modes natively; UDP uses ordinary
+Shadowsocks datagrams unless UDP-over-TCP is explicitly enabled. Other plugins
+and unsupported options remain unavailable.
+PathChord does not execute plugin processes.
 
 ### Subscription document families
 
@@ -214,7 +450,7 @@ implicit wrapper.
 | `clash` | Clash/Mihomo `proxies` and HTTP `proxy-providers` |
 | `sip008` | SS JSON array or versioned object containing `servers` |
 | `uri` | Plain or Base64-encoded share-link lists; percent-encoded URI fields; VMess JSON and legacy/SIP002 SS forms |
-| `sing_box` | Imported sing-box node documents retained as unavailable diagnostics |
+| `sing_box` | Native-supported sing-box node definitions; unsupported documents remain private unavailable diagnostics |
 | `surge`, `quantumult`, `loon` | Supported node-list and proxy-section forms |
 | `static` | Administrator-authored nodes; no remote subscription refresh |
 
@@ -223,6 +459,17 @@ to `uri`; `sing-box` and `singbox` to `sing_box`; `quantumult_x` and
 `quantumult-x` to `quantumult`. Import normalizes node definitions, not another
 tool's routing rules, groups, scripts, or complete application configuration.
 Recognizing a share-link format MUST NOT imply its node protocol is usable.
+Clash VLESS with omitted or empty `packet-encoding` and sing-box VLESS with
+omitted `packet_encoding` default to XUDP unless multiplex is enabled, in which
+case its UDP framing is used. An explicit empty sing-box value requests ordinary
+VLESS UDP when neither Vision nor multiplex is enabled; multiplex instead uses
+its own framing. Vision with an explicit empty value remains unavailable. For
+an authored native VLESS node without multiplex, omitted `packetEncoding`
+selects ordinary VLESS UDP without Vision and XUDP with Vision. V2Ray URI
+`pinSHA256` maps to `certificateSha256`, `mport` maps to the Hysteria2 port
+range, and equal `sni`/`servername` aliases are accepted. Conflicting aliases
+are invalid. The default REALITY `spx=/` does not alter the proxy handshake;
+custom spider paths remain unavailable rather than being ignored.
 
 Malformed documents retain the previous successful snapshot. A malformed,
 unsupported, or unavailable individual node MUST NOT discard valid sibling
@@ -232,11 +479,15 @@ values MUST NOT appear in diagnostics. Private caches preserve options and
 diagnostics; reload MUST NOT turn an invalid or unsupported cached node into
 a usable node. Node count is bounded by 10,000 and document bytes by 4 MiB.
 
-Cached nodes MUST be bound to the subscription's source type, URL, and
-credential reference; a cache whose source cannot be verified MUST NOT be
+Cached nodes MUST be bound to the subscription's source type, URL,
+credential reference, and effective User-Agent; a cache whose source cannot be verified MUST NOT be
 published. When any of these source fields changes, nodes from the previous
 source enter draining and MUST NOT be selected for new flows. Source URLs and
 credential values MUST NOT be exposed through the cache's source identifier.
+The root request and all referenced HTTP providers use the same effective
+User-Agent, defaulting to `clash.meta` when none is configured. A cache from a
+previous version that did not bind a User-Agent cannot establish that source
+identity and MUST NOT publish.
 
 ### HTTP provider expansion
 
@@ -275,8 +526,15 @@ economics; they do not override authorization, health, or explicit policy.
 Ordinary direct, SOCKS5, and SS routes can use native UDP forwarding, including
 SS2022 datagram session state. SOCKS5 relay replies are validated and its TCP
 control connection remains owned until association close. Disabling node UDP
-prevents new ordinary UDP associations. A TLS SOCKS node cannot silently send
-plaintext UDP; an unsupported `udp: true` combination is rejected.
+prevents new ordinary UDP associations. SOCKS and Shadowsocks UDP-over-TCP
+carry datagrams inside the configured proxy TCP stream, including TLS or a
+TCP plugin when configured.
+A TLS SOCKS node cannot silently send plaintext UDP; an unsupported `udp: true`
+combination is rejected.
+TUIC `udp_over_stream` uses UoT v2 over its authenticated QUIC stream and
+cannot be combined with an explicit `udp_relay_mode`. Its peer may impose a
+smaller packet limit than the protocol's 65,535-byte maximum; packets MUST NOT
+be silently truncated.
 
 UDP through a PathChord Egress remains Session datagrams carried inside its
 selected byte-stream Transit Paths. That capability is independent of whether

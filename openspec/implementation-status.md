@@ -1,6 +1,6 @@
 # PathChord implementation status
 
-Status snapshot: 2026-11-15.
+Status snapshot: 2026-11-16.
 
 This document records the current implementation and validation state. Final
 architecture remains under `docs/design/`; behavioral contracts live under
@@ -44,19 +44,21 @@ recovery retries bounded resource snapshots when their observation generations
 do not match; the resource queries are still not one cross-resource atomic
 transaction.
 
-Final v1 contract validation in this checkout:
+Earlier local validation of the v1 contract, before the current uncommitted
+proxy-compatibility work:
 
 - `cargo fmt --all -- --check` passed.
-- Locked workspace Clippy with `-D warnings` passed; Cargo still reports the
-  pre-existing unused `netsock` manifest dependency as a warning.
+- Locked workspace Clippy with `-D warnings` passed; on Linux Cargo reports
+  `netsock` as unused even though the Windows and FreeBSD metadata providers
+  use it under platform-specific compilation.
 - `cargo test --locked --workspace --all-targets` passed. The seven external
   core/peer interoperability tests remain explicitly ignored unless their
   external binaries are supplied.
 - `openspec validate --all --strict --no-interactive`, `git diff --check`, and
   the repository heading/bilingual documentation audit passed.
-- Native Windows/FreeBSD execution, privileged Linux interception, external
-  peer runs, cross-machine behavior, and prolonged soak remain unverified on
-  this host; the local loopback tests must not be read as those evidence.
+- Native Windows/FreeBSD execution, privileged Linux interception, and
+  prolonged soak remain unverified; external-peer and cross-machine evidence
+  is limited to the separately identified runs below.
 
 Active work prioritizes HTTP forwarding/CONNECT, SOCKS4/4a/5 CONNECT, SOCKS5
 UDP ASSOCIATE, and same-port Mixed listeners on Linux, Windows, and FreeBSD.
@@ -125,6 +127,13 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   I/O errors retain `TARGET_FAILURE`, received drain deadlines close expired
   Paths, and Stream open RequestIDs use operating-system random 128-bit values
   while semantic retransmissions retain the original identifier.
+  Existing TCP and UDP traffic, retransmissions, and required controls can use
+  live Paths even when status is stale or denies new admission; new opens still
+  require an admissible Path. Strict initial admission waits at most three
+  seconds for the first status, then rejects if it is unavailable. Local Noise
+  Session tests cover both existing protocols, denied opens, lost-data
+  retransmission, and admission recovery; a separate drain-deadline regression
+  keeps a second Path alive across health ticks.
 - Ingress has ordinary HTTP forwarding and CONNECT, SOCKS4/4a/5 CONNECT,
   SOCKS5 UDP ASSOCIATE, Linux REDIRECT
   and TPROXY adapters, transparent UDP, a direct smoltcp TUN reactor, process
@@ -164,12 +173,22 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 - Explicit NodeProbePolicy configuration performs bounded TCP connect probes
   only to its configured target. Observations expose adapter readiness, state,
   latency, jitter, loss, and typed failures without fabricating throughput or
-  capacity. Probing is disabled by default.
+  capacity. Source disablement, deletion or replacement cancels its queued or
+  active probes; admission is rechecked before dialing and publishing results.
+  Local regressions cover queued and active cancellation while other sources
+  and static nodes continue. Probing is disabled by default.
 - Egress has a real TCP Path listener, authorization-backed admission, target
   Stream/UDP forwarding, multiple Path attachment, global status inputs,
   authorization reconciliation, cleanup barriers, and bounded supervision.
   `EgressService.spec.remoteDnsOnly` selects Egress system resolution for
   supplied hostnames without trusting accompanying Ingress address candidates.
+  Wire-rate samples use at least one-second windows and become zero after an
+  empty window. Expired capacity remains stale and blocks new admission while
+  Streams or target connections are active. Once both are idle, the expired
+  estimate is discarded and capacity returns to unknown, allowing a new Path
+  to start collecting evidence. A deterministic local regression ages a real
+  Egress's sample after a Noise Session and echo, then verifies a second Session
+  and echo; separate tests cover active-work staleness and idle rate decay.
 - Ingress and Egress consume the same file/directory resource bundle. Egress
   selects one EgressService resource, resolves relative paths from its source,
   and applies command-line, environment, then account-default precedence while
@@ -179,22 +198,89 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   `CompiledPolicy` evaluates Egress, Transit, ordinary Proxy, and fallback
   routes without I/O.
 - Transit adapters include direct TCP, HTTP CONNECT, HTTPS CONNECT over
-  rustls, SOCKS5, and Shadowsocks, with direct/SOCKS5/SS UDP and SS2022.
+  rustls, SOCKS5, and Shadowsocks, with direct/SOCKS5/SS UDP, SS2022 and
+  selected legacy stream methods. Explicit `none`/`plain` modes are available;
+  other unsupported methods and plugins remain unavailable.
   Typed TLS settings include SNI, ALPN, custom CA, explicit insecure, and
   client-certificate/key references. HTTP custom headers are validated. Unknown
   credentials/options are rejected instead of ignored; TLS options cannot
   silently become plaintext. Credential files retain bounded, private,
   symlink/TOCTOU-checked, redacted handling.
-- Native Rust VLESS and Trojan adapters support TCP, TLS, WebSocket, and WSS
+- SOCKS5 supports UDP-over-TCP v1/v2, including through its configured TLS
+  stream. HTTP CONNECT consumes its optional request path from private
+  credentials and validates Host overrides. VMess supports AEAD global padding
+  and authenticated length. VLESS/VMess Meek uses a private HTTPS URL; Meek
+  local write shutdown does not signal an end-of-stream to its remote peer.
+- Native `h2mux`, `yamux` and `smux` wrap SS, VLESS, VMess and Trojan with bounded
+  connection pooling, optional sing-mux padding and TCP/UDP streams. Multiplex
+  carries its own UDP frames; explicit packet-encoding or UDP-over-TCP
+  combinations remain unavailable. A smux session supports at most 256 streams,
+  separate 4 MiB receive and transmit queue budgets, a 256 KiB per-stream
+  receive budget, and bounded frame counts. Receive pressure isolates the
+  selected stream with an error and FIN so other streams can progress.
+  Stalled buffered carrier I/O on active streams needs cancellation by the
+  caller or a higher-level timeout. Pending I/O after the final stream release
+  shares a ten-second drain deadline.
+  smux FIN follows the peer's full-close behavior and does not guarantee a
+  delayed response after local write shutdown.
+- Shadowsocks also supports UDP-over-TCP v1/v2, including over its configured
+  TCP plugin. An independent sing-box server verified AES-128-GCM and
+  AES-192-GCM with IPv4/IPv6 and repeated 4096-byte UDP payloads; subscription
+  normalization preserves sing-box and Clash version defaults separately.
+- Shadowsocks supports SIP004 `aes-192-gcm` and legacy `xchacha20` over TCP
+  and UDP, including native simple-obfs HTTP/TLS for their TCP connections;
+  UDP uses Shadowsocks datagrams without the TCP plugin unless UDP-over-TCP is
+  configured. These two methods use
+  a per-adapter window of 4096 recent outgoing and incoming salts or IVs to
+  reject repeats while retained. Legacy stream encryption, including
+  `xchacha20`, does not authenticate payloads.
+- Shadowsocks supports native `v2ray-plugin` WebSocket with optional TLS,
+  default single-stream mux or `mux=0`. UDP uses native Shadowsocks unless
+  UDP-over-TCP is configured through the plugin.
+  Other plugin transports and mux counts remain unavailable.
+- Native Rust VLESS and Trojan adapters support TCP, TLS, WebSocket, WSS,
+  HTTP/HTTP2, gRPC, HTTPUpgrade and QUIC
   combinations with real protocol-peer TCP and UDP interoperability
-  coverage. VLESS + REALITY uses the local rustls ClientHello callback, X25519
-  proof, and certificate proof verifier. Native VMess supports TCP, TLS,
-  WebSocket/WSS, AES-128-GCM or ChaCha20-Poly1305 body records, single-target
-  UDP, and `alter_id: 0`; plain TCP and TLS/WebSocket AES paths have real peer
+  coverage. Trojan-Go share links cover original/TCP, WebSocket, gRPC and
+  HTTPUpgrade aliases; its WebSocket Shadowsocks layer covers AES-128-GCM,
+  AES-256-GCM and ChaCha20-IETF-Poly1305. Original/TCP plus that layer remains
+  unavailable because short-stream HTTP sniffing in the reference server is
+  unreliable. VLESS + REALITY uses the local rustls ClientHello callback, X25519
+  proof and certificate proof verifier. Both registered Vision flow names use
+  bounded framing and independent DIRECT transitions in both directions. Vision
+  uses XUDP without multiplex and the selected multiplex UDP framing otherwise.
+  Clash and sing-box VLESS imports with omitted packet encoding default to XUDP
+  unless multiplex is enabled; authored VLESS without Vision or multiplex
+  defaults to ordinary VLESS UDP. Vision rejects packetaddr, and explicit packet
+  encoding is incompatible with multiplex.
+  REALITY supports dae/uTLS Chrome 133, iOS 14, Safari 16, Edge 85, QQ 11.1 and Firefox 120 fingerprints;
+  Chrome can switch between classic and hybrid key shares after a verified
+  decoy. Ordinary TLS also supports Android 11 OkHttp for TLS 1.2 without ALPN;
+  its REALITY, Vision and ALPN-dependent transport combinations are rejected.
+  The 360 profile and other unimplemented fingerprints remain unavailable.
+  Native VMess supports TCP, TLS,
+  WebSocket/WSS, HTTP/HTTP2, gRPC, HTTPUpgrade and QUIC,
+  AES-128-GCM, ChaCha20-Poly1305 or AES-128-CFB body records,
+  explicit `none`/`zero` plaintext bodies, single-target UDP with XUDP or
+  packetaddr encodings, and positive legacy `alter_id` values up to 65,535;
+  plain TCP and TLS/WebSocket AES paths have real peer
   fixtures. Native Hysteria2 covers QUIC/TLS, HTTP/3 authentication, TCP/UDP
-  relay, Salamander, and bounded server-port rotation with a real peer fixture.
-  Native TUIC covers QUIC/TLS-exporter TCP CONNECT, UDP DATAGRAM relay,
-  heartbeat, and optional 0-RTT setup with a real TCP/UDP peer fixture.
+  relay to IPv4 and IPv6 targets, bounded UDP fragmentation and reassembly,
+  Salamander, Gecko with configurable padding sizes, bounded server-port rotation and a
+  `down_mbps` server hint, and negotiated BBR or Brutal upload congestion
+  control. The server may ignore the download hint. A server response of
+  `auto` selects BBR regardless of `up_mbps`; numeric zero selects the local
+  upload rate, while a positive response selects the smaller of the server
+  value and the local rate. An absent or zero `up_mbps` retains BBR. Brutal
+  compensates for loss; PTO probes and ACK-only packets may bypass pacing, so
+  the target is not a strict physical bandwidth cap. The
+  [Brutal pacing investigation](changes/support-sing-box-dae-transit-protocols/research/2026-11-16-hysteria2-brutal-pacing.md)
+  records the narrowly patched Quinn hooks, validation and limits.
+  Native TUIC covers QUIC/TLS-exporter TCP CONNECT, UDP DATAGRAM and
+  QUIC-stream relay or UDP-over-stream, cubic/NewReno/BBR congestion control and heartbeat with a
+  real TCP/UDP peer fixture. Hysteria2 and TUIC reject TLS fingerprints
+  until QUIC-specific profiles are implemented. TUIC 0-RTT remains unavailable until exporter
+  authentication and rejected early-data recovery are implemented safely.
 - AnyTLS has a native TLS/session adapter with bounded frame/authentication
   codec, settings, SYN/SYNACK, PUSH/FIN, heartbeat handling, bounded
   UDP-over-TCP framing, and a sing-box TCP/UDP protocol-peer interoperability
@@ -203,20 +289,44 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   for the ClientHello proof callback and X25519 secret seam. The VLESS +
   REALITY adapter is registered; construction/proof tests and a local decoy
   sing-box Reality/VLESS peer fixture pass.
-- Imported complete sing-box documents are retained as opaque unavailable-node
-  diagnostics. PathChord does not start or embed a compatibility process.
+- Supported sing-box proxy definitions normalize to native adapters. Documents
+  with unsupported fields remain private unavailable-node diagnostics, and
+  policy selectors are not imported as nodes. PathChord does not start or
+  embed a compatibility process.
 - Subscription refresh supports automatic detection, Clash/Mihomo, SIP008
   arrays and object wrappers, URI/Base64 lists, sing-box document syntax, and
-  supported Surge/Quantumult X/Loon node lines. Complete imported external
+  supported Surge/Quantumult X/Loon node lines. Unrepresentable external
   documents remain unavailable diagnostics. HTTP provider references
   are bounded by depth/count/aggregate bytes and propagate bearer credentials
   only to the same origin. Individual invalid nodes retain sanitized
   diagnostics; malformed documents and failed providers retain applicable
   last-good data. Cache, draining, controls, and reload preserve diagnostics.
+  A per-subscription User-Agent is configurable through YAML and control API,
+  defaults to `clash.meta`, and is shared with referenced HTTP providers.
+  Effective UA participates in the private cache and refresh source identity;
+  caches predating UA binding are rejected, while old declaration ownership
+  decisions remain compatible. Concurrent local HTTP and restart tests cover
+  these boundaries.
   Root fetches, provider expansion, and retries share one 4 MiB body budget;
   interrupted and cancelled downloads retain their consumed allowance.
   Conflicting credential aliases produce unavailable-node diagnostics.
   Native Hysteria2 and TUIC honor explicit UDP enablement and disablement.
+  Imported and restored nodes remain pending until the configured registry
+  builds and prepares their exact adapter within a timeout. The resulting
+  admission is bound to the source, complete configuration, private
+  credentials, and snapshot generation; its capabilities reflect the adapter
+  and explicit UDP settings. Cache loads do not inherit old admissions, and
+  source disablement or replacement revokes even cloned admissions. Queued and
+  in-flight node probes are cancelled when source visibility is withdrawn;
+  stale results cannot publish and unrelated probes continue. Registration
+  conflicts and preparation failures produce sanitized diagnostics. When a
+  refresh replaces credentials, old Paths stop accepting new streams while
+  established streams can drain for up to five seconds. Local tests exercise
+  cache revalidation with a changed backend, overlapping refreshes, credential
+  replacement, timeout and cancellation, registration conflicts, and source
+  fencing. Local HTTP CONNECT and Noise/Egress exchanges cover failed-refresh
+  recovery and replacement Path retirement. Preparation validates the adapter
+  locally; it does not establish that a provider node is reachable.
 - Subscription usage is collected from `Subscription-Userinfo`; an explicit
   `PathChord-Traffic-Multiplier` extension supplies billing metadata. Cache,
   node queries, the console, and Path economics consume the metadata. Unknown
@@ -323,7 +433,7 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   rather than a single atomic cross-resource transaction.
 - Native Windows/FreeBSD runtime matrices, provider soak tests, external
   monitoring deployment, and a broad real-provider protocol/parameter matrix
-  remain validation work. SSR and other unregistered protocols stay explicitly
+  remain validation work. SSR, SOCKS4/4a outbound and other unregistered protocols stay explicitly
   unavailable. Cross-machine Reality and long-running protocol soak evidence
   remain validation work.
 - The authenticated Prometheus endpoint now exports aggregate Egress configured,
@@ -354,6 +464,13 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   protocol-specific interoperability fixtures.
 
 ## Validation evidence
+
+The current Linux workspace run passed 1,064 tests with 118 external or
+environment-specific tests ignored; `cargo fmt --check`, strict workspace
+Clippy, the standalone Netlink patch test, cargo-deny advisories and strict
+OpenSpec validation also passed. Windows GNU all-target cross-checking passed;
+this is not a native Windows run. Explicit independent-peer results are
+recorded separately below.
 
 The [specification-alignment repair](changes/fix-spec-alignment-findings/) adds
 regressions for connection churn beyond 16,384 completions, shared admission
@@ -414,10 +531,224 @@ reference-peer tests ignored. With
 `PATHCHORD_TEST_SING_BOX` pointing to the external sing-box 1.14.4 binary,
 `scripts/test-with-sing-box.sh` ran all seven ignored protocol tests
 successfully: VLESS/Trojan, VMess TCP/TLS/WebSocket/UDP, AnyTLS TCP/UDP,
-Hysteria2 TCP, TUIC TCP, and Reality/VLESS. The binary is a test-only peer and
+Hysteria2 TCP, TUIC TCP, and Reality/VLESS. The Reality/VLESS fixture now uses
+the `xtls-rprx-vision` flow and passes. The binary is a test-only peer and
 is not part of the PathChord runtime or dependency graph. Each fixture starts
 sing-box with an inbound server and exercises the PathChord native Transit
 adapter as the client; the compatibility direction is intentional.
+The worktree's Xray 26.11.9 Vision fixture passed twelve cases, including both
+flow names, large bidirectional TCP, multiple XUDP datagrams, the UDP/443
+switch and real inner TLS with DIRECT in both directions. A fragmented TLS 1.3
+case checks the client DIRECT command at the peer, and a TLS 1.2 case verifies
+that the client retains the outer TLS transport.
+Xray Vision interoperability also verifies the initial VLESS request and
+outbound TLS ClientHello share a padded outer TLS record. A server-first idle
+case verifies the bounded empty-padding frame, including when the caller does
+not poll the returned connection.
+REALITY Chrome 133 was compared with dae's uTLS 1.8.2 ClientHello and tested
+locally against Xray 26.11.9 and sing-box 1.14.4, including both key shares,
+concurrency, trusted-decoy retry boundaries and Brotli decompression. One
+Xray decoy retry timed out in a combined run; eight single and five combined
+subsequent runs passed, and the original timeout remains unexplained.
+The iOS 14, Safari 16, Edge 85 and QQ 11.1 ClientHellos were compared with
+dae/uTLS and exercised against a local sing-box REALITY server. Their classic
+X25519 shares cannot authenticate to Xray 26.11.9, which requires a hybrid
+share; the Xray fixture confirms the adapter stops at the trusted decoy and
+sends it no VLESS data. QQ and Chrome explicitly reject their respective ALPS
+responses, as verified by a synthetic OpenSSL peer. Ordinary TLS supports
+P-256/P-384 HelloRetryRequest; REALITY rejects that retry explicitly.
+Firefox 120 was compared with dae/uTLS, tested against sing-box REALITY and
+ordinary TLS peers, and exercised both independent key shares. OpenSSL tested
+directional record-size limits and invalid extension handling. Xray's hybrid
+share requirement and sing-box's P-256 REALITY decoy path reject safely without
+forwarding VLESS data. Some sing-box REALITY handshakes timed out. A captured
+failure and a controlled test established one cause: sing-box 1.14.4 waits
+when the decoy's third TLS record is exactly 512 bytes. With the same
+certificate and key, a valid 513-byte record completes the handshake and Vision
+round trip. The ordinary fixture uses a longer test certificate, and a separate
+boundary regression preserves this peer limitation. Whether a given real
+server's decoy produces the affected record layout is not established; see the
+[decoy record investigation](changes/support-sing-box-dae-transit-protocols/research/reality-decoy-record-boundary.md).
+Android 11's TLS 1.2 ClientHello was compared with dae/uTLS and exercised
+against sing-box and Xray over VLESS TCP/UDP. TLS 1.3-only peers and selections
+of advertised but unsupported legacy ciphers fail explicitly.
+The sing-box Hysteria2 fixture exchanged fragmented 4096-byte UDP datagrams in
+both directions and exercised TCP and UDP IPv6 targets.
+Custom Gecko packet sizes from 700 through 1452 bytes passed against a local
+sing-box 1.14.4 server. A 2048-byte setting passed TCP and UDP with an
+independent sing-quic Gecko relay in front of a plain Hysteria2 server. The
+sing-box 1.14.4 client and server both timed out when configured for fixed
+2048-byte Gecko packets; its QUIC receive buffer is 1452 bytes, so this peer
+combination cannot establish a successful 2048-byte interoperability claim.
+An independent sing-box 1.14.4 matrix exercised Hysteria2 numeric and `auto`
+upload negotiation, TCP and UDP with Salamander and Gecko, and UDP across two
+port-hopping relays with BBR and Brutal. With a local relay adding 10 ms in
+each direction, a 512 KiB upload at a negotiated 1 Mbps took 4.22 seconds
+without injected loss and 4.29 seconds with controlled loss and reordering;
+the latter observed 40 QUIC losses and delivered the full payload. At roughly
+0.4 ms RTT, the corresponding loopback transfer took about 9.4 seconds, showing
+that the window and ACK timing can limit throughput at very short RTTs. These
+are local measurements, not WAN or deployed performance evidence. A separate
+copy of the patched Quinn crate passed 305 upstream library tests and two
+additional delayed ACK/loss switch tests; the sing-box TUIC fixture also
+passed with cubic, NewReno and BBR. See the
+[Brutal pacing investigation](changes/support-sing-box-dae-transit-protocols/research/2026-11-16-hysteria2-brutal-pacing.md)
+for the setup and its limits. A controller switch without a later application
+write and live QUIC path migration/reset have not been independently verified.
+The sing-box HTTP transport fixture covers VLESS and VMess over HTTP/1.1 and
+TLS/HTTP2, and Trojan over TLS/HTTP2, with large TCP and repeated UDP payloads.
+It also rejects incorrect paths and Host values; separate local peer tests
+verify request headers, coalesced bytes and HTTP/2 rejection.
+The sing-box V2Ray QUIC fixture covers VLESS, VMess and Trojan TCP/UDP,
+half-close, custom ALPN and TLS rejection cases. Local QUIC tests also cover
+connection reuse, cancellation, IPv6, address fallback and reconnection.
+SOCKS5 UDP-over-TCP v1/v2 completed authenticated TCP and UDP against sing-box,
+including IPv6, TLS and certificate rejection. Standard HTTP CONNECT passed
+sing-box; the optional path and Host override passed an independent Go peer,
+while sing-box's inbound cannot route its own path-form CONNECT. VMess AEAD
+padding and authenticated-length combinations passed TCP/UDP against
+sing-box. V2Fly Meek passed VLESS/VMess TCP/UDP over HTTP/1.1 and HTTP/2.
+VMess XUDP and packetaddr passed sing-box TCP and IPv4/IPv6 UDP tests across
+the supported body security modes and AEAD framing options. XUDP also retained
+remote DNS for hostname targets; packetaddr rejects hostname targets.
+VLESS packetaddr also passed sing-box TCP and IPv4/IPv6 UDP over plain, TLS
+and non-Vision REALITY. Xray 26.11.9 did not respond to its packetaddr UDP
+requests; Vision with packetaddr is rejected during preparation.
+h2mux and yamux passed independent sing-box SS, VLESS, VMess and Trojan TCP/UDP
+tests, including both Vision flow variants, connection reuse, isolated stream
+errors, UDP close and existing-stream draining after subscription revocation.
+Four additional sing-box cases exercised required multiplex padding for both
+protocols across those nodes and reuse; local tests cover padding
+fragmentation, cancellation, truncated frames, bounded records and independent
+read/write wakeups. Vision tests separately cover request, DIRECT and raw
+transport wakeups, cancellation and errors after a frame is accepted.
+Six additional smux cases passed against sing-box 1.14.4, covering SS, VLESS,
+VMess and Trojan TCP/UDP, both Vision flow variants, padding, connection reuse,
+and an existing stream after subscription revocation. The FIN case confirmed
+that a target's response after receiving EOF was not delivered, so the result
+does not establish TCP half-close compatibility. Local smux tests cover receive
+budget isolation and partial-allocation accounting, cancellation, stalled and
+slow buffered I/O, and the shared deadline after the last stream is released.
+The local Ingress fetched the supplied provider using `clash.meta` and imported
+32 VLESS nodes with no configuration diagnostics. Eight different servers were
+then checked anonymously: seven returned a trusted decoy certificate without
+a matching REALITY proof and one failed TLS; the same eight nodes produced no
+HTTP response through Xray. A locally built Ingress established one direct
+IPv6 Path to the existing `egress-jp-1` and received HTTP 200 through it. With
+the same temporary enrollment and subscription nodes as Transit, all 32 nodes
+imported but no Path became ready within 50 seconds. The temporary authorization
+was removed; the existing authorization and Egress identity remain intact.
+This does not establish a working provider-to-Egress Path or identify why those
+nodes did not authenticate.
+On 2026-11-16, a newly built local Ingress reached the existing Egress TCP
+listener over IPv6 but did not establish a Path. A direct admission probe sent
+the first Noise handshake and received a reset before any response. SSH local
+forwarding was disabled on the VPS, so attempts to compare isolated Egress
+processes through an SSH tunnel were inconclusive. The Egress public identity
+file matched its private key; temporary authorizations and isolated servers
+were removed. The cause is not established. A separate current-code local IPv6
+Egress fixture completed the Noise Session and TCP echo. After the local idle
+capacity fix, a locally built and signed Alpine APK was installed in an
+isolated root on the VPS. Its packaged Egress was then started with the
+existing identity and configuration: a local Ingress established a direct
+IPv6 Noise Path and reached the VPS loopback SSH service. A second admission
+also succeeded after more than ten seconds of idle time. The tested packaged
+binary was promoted to the existing Egress executable path, and the temporary
+root, test keys, package and authorizations were removed. An Egress-specific
+OpenRC service was then started and enabled in the default runlevel; a further
+direct IPv6 Path and SSH target exchange succeeded under that service. The
+pre-existing unrelated OpenRC definition remains stopped. Subsequent attempts
+through the configured public IPv4 `49742 -> 7443` mapping did not increase
+the Egress listener's accepted-connection count; a VPS-local IPv4 connection
+to port 7443 did. This is a mapping/network observation, not a protocol
+interoperability result.
+The current locally built Ingress also reached the VPS loopback SSH service
+through a local independent sing-box Shadowsocks Transit and an IPv6 Noise
+Path to the deployed Egress. The temporary enrollment was removed and the
+existing authorization records were preserved. This exercises the Transit
+and Egress chain without relying on provider node availability. Both the local
+Linux development build and the locally cross-built x86_64 musl release build
+passed this chain. A new temporary-key APK containing that musl build was
+signature-verified and installed in a local Alpine 3.24 container, including
+the service account, default configuration, both OpenRC scripts and manpage;
+packaged Ingress and Egress also passed OpenRC start, control status and stop
+after waiting for their sockets. This new package was not installed on the
+VPS; the previous packaged Egress binary remains deployed there.
+The final local validation APK is
+`dist/alpine-final-validation-20261116/pathchord-0.1.0-r0.apk` with SHA-256
+`e50ead1acd5eec89252186fc9a0c1092cee83452ad789b7387cb03b9339c9be7`; its
+temporary signing key is not a release signing identity.
+Both providers were also fetched through `clash.meta`, `sing-box`, and `v2rayN`
+User-Agents. Each response imported the expected 32 or 65 proxy nodes without
+configuration diagnostics; this is import evidence and does not prove network
+connectivity. A first per-node local ordinary-proxy run, before the subsequent
+ECH GREASE fix, obtained HTTPS 2xx through 54 of 97 Clash nodes using PathChord
+and 39 using Mihomo; successful sets differed. After ECH GREASE and SCT
+handling were corrected, a repeat against the same target returned HTTPS 2xx
+through 76/97 nodes (15/32 from the first provider and 61/65 from the second).
+Mihomo returned 2xx through 39/97 in that run; results differ by node and do
+not establish that the remaining servers are all available. The four second
+provider failures were three Shadowsocks nodes and one Hysteria2 node.
+An additional no-Egress UDP run used SOCKS5 UDP ASSOCIATE and non-DNS STUN
+transaction validation: PathChord received matching responses from 49 of 94
+UDP-enabled nodes and Mihomo from 31; three Shadowsocks nodes had UDP
+disabled and were skipped. Timeouts do not establish whether a node, target,
+network route or client is responsible, so unresolved nodes remain under
+investigation rather than being counted as protocol successes.
+The x86_64 musl release binary and a locally signed Alpine APK were built on the
+development host. Alpine 3.24.4 containers verified signature, install,
+service-account creation, OpenRC start/stop and control sockets. The final APK
+was also signature-verified and installed into a temporary isolated Alpine root
+on `egress-jp-1`; its separate loopback Egress started and answered status.
+The isolated root and uploaded package were removed, and the existing Egress
+continued to run. This is package-host smoke evidence, not an upgrade/rollback
+test or a successful provider-to-Egress Path. The temporary signing key is not
+a release signing identity.
+An independent local Shadowsocks-compatible server verified 15 legacy stream
+methods with large TCP transfers and UDP; sing-box 1.14.4 verified `none`,
+`plain`, three classic AEAD and three SS2022 methods. These are test-only
+servers, and the unsupported legacy cipher and plugin matrix remains open.
+An additional sing-box 1.14.4 matrix verified TCP and repeated UDP for `none`,
+AES-128/192/256-GCM, ChaCha20-IETF-Poly1305, XChaCha20-IETF-Poly1305 and all
+three supported SS2022 methods. A separate Mihomo 1.19.34 fixture verified
+`xchacha20` TCP and UDP. The two newly added methods also completed TCP
+exchanges through upstream simple-obfs 0.0.5 HTTP and TLS servers to their
+respective independent Shadowsocks servers; UDP bypasses the TCP plugin.
+The AES-192-GCM peer rejected a wrong password for both TCP and UDP. Local
+fault tests exercised authentication failure, reflection and replay rejection,
+fragmentation, cancelled short writes and TCP half-close. In a separate
+upstream `obfs-local` plus `obfs-server` 0.0.5 test, the backend observed EOF
+but its subsequent response did not return; the PathChord stream and adapter
+half-close tests use peers that preserve the opposite direction.
+The original v2ray-plugin server at commit `7d70ea7` passed eight SIP003 and
+Clash WebSocket/TLS/mux combinations with large TCP and repeated UDP traffic,
+plus credential, certificate and request rejection tests. Its reference
+client/server combination does not return responses after TCP half-close; with
+mux enabled the backend did not observe EOF in that test.
+The worktree HTTPUpgrade fixture passed sing-box 1.14.4 VLESS and VMess over
+plaintext and TLS and Trojan over TLS, including bidirectional large TCP and
+UDP traffic and rejected Host/path cases.
+WebSocket early data passes a sing-box 1.14.4 matrix for VLESS/VMess over
+WS/WSS and Trojan over WSS, using path and header forms, large TCP writes and
+UDP. The sing-box Trojan inbound rejects early-data limits below its 56-byte
+password digest read; that peer-specific limitation remains visible.
+VMess with AES-128-GCM, ChaCha20-Poly1305, AES-128-CFB, `none`, and `zero`
+bodies passed 50 KB TCP and repeated UDP echo up to 4096 bytes against
+sing-box 1.14.4; AES-128-CFB also passed TCP and UDP over WSS. VMess AEAD
+response headers use AES-128-GCM regardless of the body method. UDP receive
+preserves partially read response headers and frames across cancellation;
+CFB matches the NIST CFB128 vector and rejects a corrupt record checksum.
+Positive legacy VMess `alter_id` values 1 and 4 passed sing-box 1.14.4 and
+V2Fly 5.53.0 TCP/UDP peers across the supported body modes. Response
+authentication, continuous legacy CFB state and malformed-response errors have
+deterministic regressions. A V2Fly 2048-byte UDP response remains peer-limited
+in the recorded fixture, while 1024-byte bidirectional traffic passed.
+The TUIC fixture also verifies both UDP relay modes with cubic, NewReno and
+BBR against sing-box 1.14.4, including 4096-byte UDP packets fragmented and
+reassembled in native DATAGRAM mode. Its distinct `udp_over_stream` extension
+also passed TCP and IPv4/IPv6 UDP against sing-box, which accepts up to 16,384
+bytes in this mode and closes the stream on a 16,385-byte packet. A controlled
+QUIC peer verified the protocol's full 65,535-byte limit without truncation.
 The external-core fixture covers native Shadowsocks, VMess, VLESS, and Trojan
 server compatibility with Mihomo 1.19.34, Xray 26.11.9, and V2Fly 5.53.0.
 Mihomo additionally covers AnyTLS, Hysteria2, and TUIC server compatibility;

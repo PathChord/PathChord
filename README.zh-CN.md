@@ -14,10 +14,14 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 节点导入支持自动识别、Clash/Mihomo provider、SIP008、URI/Base64 列表、sing-box JSON，以及
 所支持的 Surge/Quantumult X/Loon 节点行。原生传输支持类型化 TLS 设置、VLESS/Trojan 的
-TCP/TLS/WebSocket 传输、VLESS + REALITY、带 AEAD 正文记录和单目标 UDP 的 VMess TCP/TLS/
-WebSocket、AnyTLS TCP 与 UDP-over-TCP、带 Salamander 和端口跳转的原生 Hysteria2 TCP/UDP，
-以及带 heartbeat 和可选 0-RTT 的 TUIC TCP/UDP。direct/SOCKS5/Shadowsocks UDP（包括 SS2022）
-仍可用。未支持的协议和参数保持为明确诊断。精确的兼容边界见
+TCP/TLS/WebSocket/HTTPUpgrade 传输、VLESS + REALITY 和 XTLS Vision flow、带 AEAD 或 AES-128-CFB 正文记录和单目标 UDP 的 VMess TCP/TLS/
+WebSocket/HTTPUpgrade、AnyTLS TCP 与 UDP-over-TCP、带 Salamander 和端口跳转的原生 Hysteria2 TCP/UDP，
+以及带 heartbeat 的 TUIC TCP/UDP。原生 h2mux、yamux 和 smux 支持满足条件的 Shadowsocks、VLESS、
+VMess 和 Trojan 节点。smux FIN 遵循对端的整流关闭语义，不具备 TCP 半关闭兼容性。
+direct/SOCKS5/Shadowsocks UDP（包括 SS2022）
+仍可用。REALITY 适配器支持 dae Chrome 133、iOS 14、Safari 16、Edge 85、QQ 11.1 和 Firefox 120 指纹；
+其他不支持的参数会产生单独诊断。
+精确的兼容边界见
 [Transit Proxy 与订阅契约](openspec/specs/transit-proxies/spec.zh-CN.md)，可运行配置见
 [部署指南](docs/guides/deployment.zh-CN.md)。
 
@@ -72,6 +76,7 @@ WebSocket、AnyTLS TCP 与 UDP-over-TCP、带 Salamander 和端口跳转的原�
 | --- | --- |
 | [原生平台](openspec/changes/validate-native-platforms/tasks.md) | Windows/FreeBSD 监听器与本地控制，以及 Linux 透明代理/TUN/eBPF 的特权验证。 |
 | [提供商与运行时可靠性](openspec/changes/validate-provider-and-runtime-reliability/tasks.md) | 真实提供商导出、独立协议 peer、跨机器流量、故障与重启长时间测试。 |
+| [已有代理协议兼容性](openspec/changes/support-sing-box-dae-transit-protocols/tasks.md) | 补齐 sing-box 和 dae 使用的已有原生协议及连接选项。 |
 | [调度与可观测性](openspec/changes/complete-scheduling-and-observability/tasks.md) | 策略/类别预算、Egress 协调、类型化观测和实际监控部署。 |
 | [原生软件包](openspec/changes/validate-native-packages/tasks.md) | Debian、Alpine、Arch Linux、FreeBSD 和 NSIS 打包主机验收。 |
 

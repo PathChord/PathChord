@@ -142,6 +142,7 @@ async fn setup() -> (
                 enabled: true,
                 url: "https://example.test/sub".into(),
                 credentials_ref: None,
+                user_agent: None,
                 refresh: SubscriptionRefreshSpec::default(),
                 cache: None,
             }],
@@ -202,6 +203,101 @@ async fn successful_disable_or_delete_fences_new_flows_even_after_stale_publicat
         assert!(plane.open_tcp(&context()).await.is_err());
         assert!(plane.open_udp(&context()).await.is_err());
     }
+}
+
+#[tokio::test]
+async fn subscription_disable_revokes_cloned_verified_snapshots_and_stale_registration() {
+    struct FixtureFetcher;
+    #[async_trait::async_trait]
+    impl pathchord_transit::SubscriptionFetcher for FixtureFetcher {
+        async fn fetch(
+            &self,
+            _: pathchord_transit::SubscriptionFetchRequest,
+        ) -> Result<Vec<u8>, pathchord_transit::SubscriptionError> {
+            Ok(b"proxies: [{name: node, type: http, server: proxy.test, port: 8080}]".to_vec())
+        }
+    }
+    let (plane, mut dispatcher, _) = setup().await;
+    let config = pathchord_policy::SubscriptionConfig {
+        id: pathchord_policy::SubscriptionId::new("provider"),
+        enabled: true,
+        source: pathchord_policy::SubscriptionSource {
+            source_type: pathchord_policy::SubscriptionSourceType::Clash,
+            url: "https://example.test/sub".into(),
+            credentials_ref: None,
+            user_agent: None,
+        },
+        refresh: Default::default(),
+        cache: None,
+    };
+    let mut manager = pathchord_transit::SubscriptionManager::new(
+        Arc::new(FixtureFetcher),
+        std::env::temp_dir(),
+        BTreeSet::from(["http".into()]),
+    );
+    assert!(matches!(
+        manager.refresh(&config).await,
+        pathchord_transit::RefreshOutcome::Published { .. }
+    ));
+    let registry = AdapterRegistry::for_configs(
+        Arc::new(pathchord_transit::NoTransitCredentials),
+        Duration::from_secs(1),
+        manager.snapshot().nodes.values().map(|node| &node.config),
+    )
+    .unwrap();
+    let prepared = manager.snapshot().prepare_adapters(&registry).await;
+    manager.commit_prepared_adapters(prepared).unwrap();
+    let old = manager.snapshot().clone();
+    let node = old.selectable_nodes().next().unwrap();
+    let id = node.config.id.clone();
+    let admission = old.validated_admission(&id).unwrap();
+    let adapter = admission.adapter();
+    assert_eq!(
+        plane
+            .register_verified_dynamic_transit_adapter(
+                node.config.clone(),
+                admission.clone(),
+                ready(),
+            )
+            .await,
+        DynamicTransitRegistration::Registered
+    );
+    assert!(Arc::ptr_eq(
+        &adapter,
+        &plane.transit_adapters.read().await[&id]
+    ));
+    let mut changed = node.config.clone();
+    changed.endpoint.port = 9999;
+    assert_eq!(
+        plane
+            .register_verified_dynamic_transit_adapter(changed, admission.clone(), ready())
+            .await,
+        DynamicTransitRegistration::StaleAdmission
+    );
+
+    let generation = dispatcher.service().snapshot().generation;
+    assert!(
+        dispatch(
+            &mut dispatcher,
+            request("subscriptions.disable", "disable-proof", generation)
+        )
+        .await
+        .ok
+    );
+    assert_eq!(old.selectable_nodes().count(), 0);
+    assert!(old.validated_adapter(&id).is_none());
+    assert!(plane.open_tcp(&context()).await.is_err());
+    plane.allow_subscription_after_refresh("provider").await;
+    assert_eq!(
+        plane
+            .register_verified_dynamic_transit_adapter(node.config.clone(), admission, ready(),)
+            .await,
+        DynamicTransitRegistration::StaleAdmission
+    );
+    plane
+        .publish_dynamic_transit_status(node.config.clone(), ready())
+        .await;
+    assert!(plane.open_tcp(&context()).await.is_err());
 }
 
 #[tokio::test]

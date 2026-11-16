@@ -8,8 +8,9 @@ publish.workspace = true
 
 [dependencies]
 atomic-write-file.workspace = true
-aes-gcm = "0.10.3"
-aes = "0.8.4"
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+aes = { version = "0.8.4", features = ["zeroize"] }
+chacha20 = { version = "0.9.1", features = ["zeroize"] }
 chacha20poly1305 = "0.10.1"
 async-trait.workspace = true
 base64.workspace = true
@@ -19,9 +20,14 @@ blake2 = "0.10.6"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
+h2 = "=0.4.19"
 http = "1"
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http2"] }
+hyper-util.workspace = true
 trojan-proto = "=0.18.0"
 sha2 = "0.10.9"
+sha3 = "0.10.9"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 hmac = "0.12.1"
 crc32fast = "1.5.5"
@@ -34,16 +40,19 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 shadowsocks.workspace = true
-rustls = "0.23.46"
+sha1 = "0.10.6"
+rustls = { version = "0.23.46", features = ["brotli", "zlib"] }
 rustls-native-certs = "0.8.5"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
 tokio-rustls = "0.26.6"
+tokio-util = { version = "0.7.20", features = ["compat"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 zeroize.workspace = true
 url.workspace = true
 uuid = "1.29.2"
 x509-parser = "0.18.1"
+yamux = "=0.14.1"
 
 [dev-dependencies]
 rcgen = "0.14.10"

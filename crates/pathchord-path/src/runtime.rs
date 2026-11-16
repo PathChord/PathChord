@@ -85,6 +85,12 @@ pub enum OpenUdpError {
     Rejected { error: ErrorClass, reason: Vec<u8> },
 }
 
+#[derive(Clone, Copy)]
+enum InitialStatusError {
+    SessionClosed,
+    Timeout,
+}
+
 pub struct IngressUdpHandle {
     association_id: u64,
     commands: mpsc::Sender<IngressCommand>,
@@ -552,6 +558,14 @@ impl IngressSessionHandle {
         eligible_paths: BTreeMap<PathId, u32>,
         multipath_config: MultipathConfig,
     ) -> Result<BoxedSessionStream, OpenStreamError> {
+        if multipath_config.require_fresh_status_report {
+            self.wait_for_initial_egress_status()
+                .await
+                .map_err(|error| match error {
+                    InitialStatusError::SessionClosed => OpenStreamError::SessionClosed,
+                    InitialStatusError::Timeout => OpenStreamError::ResourceLimit,
+                })?;
+        }
         let (client, actor_io) = duplex(self.stream_capacity);
         let (reply, result) = oneshot::channel();
         self.commands
@@ -610,6 +624,14 @@ impl IngressSessionHandle {
         eligible_paths: BTreeMap<PathId, u32>,
         multipath_config: MultipathConfig,
     ) -> Result<IngressUdpHandle, OpenUdpError> {
+        if multipath_config.require_fresh_status_report {
+            self.wait_for_initial_egress_status()
+                .await
+                .map_err(|error| match error {
+                    InitialStatusError::SessionClosed => OpenUdpError::SessionClosed,
+                    InitialStatusError::Timeout => OpenUdpError::ResourceLimit,
+                })?;
+        }
         let (datagrams_tx, datagrams) = mpsc::channel(STREAM_COMMAND_QUEUE_CAPACITY);
         let (reply, result) = oneshot::channel();
         self.commands
@@ -629,6 +651,30 @@ impl IngressSessionHandle {
             datagrams,
             closed: false,
         })
+    }
+
+    async fn wait_for_initial_egress_status(&self) -> Result<(), InitialStatusError> {
+        let mut snapshots = self.snapshots.clone();
+        tokio::time::timeout(PATH_DEGRADED_AFTER, async {
+            loop {
+                let (closed, has_status) = {
+                    let snapshot = snapshots.borrow_and_update();
+                    (snapshot.closed, snapshot.egress_status.is_some())
+                };
+                if closed {
+                    return Err(InitialStatusError::SessionClosed);
+                }
+                if has_status {
+                    return Ok(());
+                }
+                snapshots
+                    .changed()
+                    .await
+                    .map_err(|_| InitialStatusError::SessionClosed)?;
+            }
+        })
+        .await
+        .unwrap_or(Err(InitialStatusError::Timeout))
     }
 
     pub async fn add_path<S>(
@@ -1927,6 +1973,16 @@ where
                     }));
                     return Ok(false);
                 }
+                let require_fresh_status = multipath_config
+                    .as_ref()
+                    .is_some_and(|config| config.require_fresh_status_report);
+                if !self
+                    .multipath
+                    .has_admissible_path(eligible_paths.as_ref(), require_fresh_status)
+                {
+                    let _ = reply.send(Err(OpenUdpError::ResourceLimit));
+                    return Ok(false);
+                }
                 let traffic_class = multipath_config
                     .as_ref()
                     .and_then(|config| config.traffic_class.clone());
@@ -2154,6 +2210,16 @@ where
                         error: ErrorClass::EgressFailure,
                         reason: b"TCP capability was not negotiated".to_vec(),
                     }));
+                    return Ok(false);
+                }
+                let require_fresh_status = multipath_config
+                    .as_ref()
+                    .is_some_and(|config| config.require_fresh_status_report);
+                if !self
+                    .multipath
+                    .has_admissible_path(eligible_paths.as_ref(), require_fresh_status)
+                {
+                    let _ = reply.send(Err(OpenStreamError::ResourceLimit));
                     return Ok(false);
                 }
                 let traffic_class = multipath_config
@@ -2833,6 +2899,9 @@ where
         }
 
         for path_id in degraded {
+            if self.multipath.is_draining(path_id) {
+                continue;
+            }
             self.multipath.degrade_path(path_id)?;
             if let Some(health) = self.path_health.get_mut(&path_id) {
                 health.exclusion_reason = Some(
@@ -2845,6 +2914,9 @@ where
             }
         }
         for path_id in active {
+            if self.multipath.is_draining(path_id) {
+                continue;
+            }
             self.multipath.activate_path(path_id)?;
             if self.multipath.ready_path_ids().contains(&path_id)
                 && let Some(health) = self.path_health.get_mut(&path_id)
@@ -3750,12 +3822,12 @@ where
         let path_id = match eligible.as_ref() {
             Some(eligible) => {
                 self.multipath
-                    .schedule_eligible(self.outbound_direction(), length, eligible)?
+                    .schedule_existing_eligible(self.outbound_direction(), length, eligible)?
                     .path_id
             }
             None => {
                 self.multipath
-                    .schedule(self.outbound_direction(), length)?
+                    .schedule_existing(self.outbound_direction(), length)?
                     .path_id
             }
         };
@@ -3970,7 +4042,7 @@ where
     }
 
     async fn cancel_unroutable_flows(&mut self) -> Result<(), SessionRuntimeError> {
-        let ready: BTreeSet<_> = self.multipath.ready_path_ids().into_iter().collect();
+        let ready: BTreeSet<_> = self.multipath.existing_path_ids().into_iter().collect();
         if ready.is_empty() {
             return Ok(());
         }
@@ -4680,7 +4752,7 @@ where
         if let Some(eligible) = eligible {
             let path_id = self
                 .multipath
-                .schedule_eligible(self.outbound_direction(), 0, &eligible)?
+                .schedule_existing_eligible(self.outbound_direction(), 0, &eligible)?
                 .path_id;
             self.send_message_on(path_id, message).await
         } else {
@@ -4734,7 +4806,7 @@ where
             };
             let path_id = self
                 .multipath
-                .schedule_eligible(self.outbound_direction(), bytes, &eligible)?
+                .schedule_existing_eligible(self.outbound_direction(), bytes, &eligible)?
                 .path_id;
             self.send_message_on(path_id, message).await
         } else {
@@ -4756,7 +4828,7 @@ where
             ActorRole::Ingress => ScheduleDirection::Upstream,
             ActorRole::Egress { .. } => ScheduleDirection::Downstream,
         };
-        let path_id = self.multipath.schedule(direction, bytes)?.path_id;
+        let path_id = self.multipath.schedule_existing(direction, bytes)?.path_id;
         self.send_message_on(path_id, message).await
     }
 
@@ -4826,7 +4898,7 @@ where
     ) -> Result<(), SessionRuntimeError> {
         let paths: Vec<_> = self
             .multipath
-            .ready_path_ids()
+            .existing_path_ids()
             .into_iter()
             .filter(|path| eligible.is_none_or(|eligible| eligible.contains_key(path)))
             .collect();
@@ -6524,6 +6596,23 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SwitchableStatus(AtomicBool);
+
+    impl EgressStatusProvider for SwitchableStatus {
+        fn sample(&self) -> EgressStatusSample {
+            let mut sample = StaticEgressStatusProvider(EgressStatusConfig::default()).sample();
+            if !self.0.load(Ordering::Acquire) {
+                sample.service_state = EgressServiceState::Degraded;
+                sample.admission_allowed = false;
+                sample.admission_reason = AdmissionReason::ResourceLimit;
+                sample.effective_capacity_bps = 0;
+                sample.capacity_state = CapacityState::Stale;
+            }
+            sample
+        }
+    }
+
     struct RejectFactory;
 
     #[async_trait]
@@ -6564,6 +6653,228 @@ mod tests {
         let egress_snapshot = egress.await.expect("Egress task").expect("Egress runtime");
         assert!(egress_snapshot.closed);
         assert_eq!(egress_snapshot.bytes_received, payload.len() as u64);
+        factory.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn existing_stream_keeps_transferring_when_egress_denies_new_admission() {
+        let (ingress_path, egress_path) = admitted_pair().await;
+        let factory = EchoFactory::default();
+        let status = Arc::new(SwitchableStatus(AtomicBool::new(true)));
+        let egress = EgressSessionHandle::start_inner(
+            egress_path,
+            factory.clone(),
+            Some(Arc::new(EchoUdpFactory)),
+            EgressStatusConfig::default(),
+            Some(status.clone()),
+            None,
+        )
+        .unwrap();
+        let ingress = IngressSessionHandle::start(ingress_path).unwrap();
+        let mut stream = ingress.open_tcp(target("existing.test")).await.unwrap();
+        stream.write_all(b"before").await.unwrap();
+        let mut before = [0; 6];
+        stream.read_exact(&mut before).await.unwrap();
+        assert_eq!(&before, b"before");
+        let mut udp = ingress.open_udp(target("existing-udp.test")).await.unwrap();
+        udp.send(b"before-udp".to_vec()).await.unwrap();
+        assert_eq!(udp.receive().await.unwrap(), b"before-udp");
+
+        status.0.store(false, Ordering::Release);
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            if ingress
+                .snapshot()
+                .egress_status
+                .is_some_and(|value| !value.report.admission_allowed)
+            {
+                break;
+            }
+        }
+        assert!(
+            ingress
+                .snapshot()
+                .egress_status
+                .is_some_and(|value| !value.report.admission_allowed),
+            "Ingress must observe the denial before testing the existing Stream"
+        );
+        assert!(!ingress.snapshot().closed);
+        assert!(!factory.tasks.lock().unwrap()[0].is_finished());
+        stream.write_all(b"after").await.unwrap();
+        let mut after = [0; 5];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut after))
+            .await
+            .expect("existing Stream must continue")
+            .expect("existing Stream must remain open");
+        assert_eq!(&after, b"after");
+        udp.send(b"after-udp".to_vec()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), udp.receive())
+                .await
+                .expect("existing UDP Association must continue")
+                .unwrap(),
+            b"after-udp"
+        );
+        udp.close().await.unwrap();
+
+        assert!(matches!(
+            ingress.open_tcp(target("new-tcp.test")).await,
+            Err(OpenStreamError::ResourceLimit)
+        ));
+        assert!(matches!(
+            ingress.open_udp(target("new-udp.test")).await,
+            Err(OpenUdpError::ResourceLimit)
+        ));
+        assert_eq!(factory.tasks.lock().unwrap().len(), 1);
+        assert!(!ingress.snapshot().closed);
+
+        status.0.store(true, Ordering::Release);
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            if ingress
+                .snapshot()
+                .egress_status
+                .is_some_and(|value| value.report.admission_allowed)
+            {
+                break;
+            }
+        }
+        assert!(
+            ingress
+                .snapshot()
+                .egress_status
+                .is_some_and(|value| value.report.admission_allowed)
+        );
+        let mut recovered = ingress.open_tcp(target("recovered.test")).await.unwrap();
+        recovered.write_all(b"recovered").await.unwrap();
+        let mut recovered_echo = [0; 9];
+        recovered.read_exact(&mut recovered_echo).await.unwrap();
+        assert_eq!(&recovered_echo, b"recovered");
+        recovered.shutdown().await.unwrap();
+        recovered.read_to_end(&mut Vec::new()).await.unwrap();
+
+        stream.shutdown().await.unwrap();
+        stream.read_to_end(&mut Vec::new()).await.unwrap();
+        ingress.shutdown().await.unwrap();
+        egress.wait().await.unwrap();
+        factory.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn existing_stream_retransmits_lost_data_while_admission_is_denied() {
+        let (ingress_key, egress_key) = keys();
+        let drop_next = Arc::new(AtomicBool::new(false));
+        let (ingress_path, egress_path) = admitted_pair_for_with_dropped_ingress_write(
+            &ingress_key,
+            &egress_key,
+            0x5678,
+            Arc::clone(&drop_next),
+        )
+        .await;
+        let factory = EchoFactory::default();
+        let status = Arc::new(SwitchableStatus(AtomicBool::new(true)));
+        let egress = EgressSessionHandle::start_inner(
+            egress_path,
+            factory.clone(),
+            None,
+            EgressStatusConfig::default(),
+            Some(status.clone()),
+            None,
+        )
+        .unwrap();
+        let ingress = IngressSessionHandle::start(ingress_path).unwrap();
+        let mut stream = ingress.open_tcp(target("loss.test")).await.unwrap();
+        status.0.store(false, Ordering::Release);
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            if ingress
+                .snapshot()
+                .egress_status
+                .is_some_and(|value| !value.report.admission_allowed)
+            {
+                break;
+            }
+        }
+        assert!(
+            ingress
+                .snapshot()
+                .egress_status
+                .is_some_and(|value| !value.report.admission_allowed)
+        );
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        drop_next.store(true, Ordering::Release);
+        stream.write_all(b"lost-and-retried").await.unwrap();
+        let mut reply = [0; 16];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut reply))
+            .await
+            .expect("lost data should be retransmitted")
+            .unwrap();
+        assert!(!drop_next.load(Ordering::Acquire));
+        assert_eq!(&reply, b"lost-and-retried");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            ingress
+                .snapshot()
+                .streams
+                .values()
+                .any(|value| value.retransmissions > 0)
+        );
+
+        stream.shutdown().await.unwrap();
+        stream.read_to_end(&mut Vec::new()).await.unwrap();
+        ingress.shutdown().await.unwrap();
+        egress.wait().await.unwrap();
+        factory.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn strict_admission_waits_for_a_fresh_status_without_closing_the_session() {
+        let (ingress_path, egress_path) = admitted_pair().await;
+        let factory = EchoFactory::default();
+        let ingress = IngressSessionHandle::start(ingress_path).unwrap();
+        assert!(ingress.snapshot().egress_status.is_none());
+        let policy = MultipathConfig {
+            require_fresh_status_report: true,
+            ..Default::default()
+        };
+        let paths = BTreeMap::from([(PathId::new(0x5678), 1)]);
+        assert!(matches!(
+            ingress
+                .open_tcp_routed_with_config(target("strict.test"), paths.clone(), policy.clone())
+                .await,
+            Err(OpenStreamError::ResourceLimit)
+        ));
+        assert!(!ingress.snapshot().closed);
+        assert!(ingress.snapshot().egress_status.is_none());
+        let egress = EgressSessionHandle::start(egress_path, factory.clone()).unwrap();
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            ingress.open_tcp_routed_with_config(target("strict.test"), paths, policy),
+        )
+        .await
+        .expect("the first status should unblock admission")
+        .unwrap();
+        stream.write_all(b"fresh").await.unwrap();
+        let mut reply = [0; 5];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"fresh");
+        stream.shutdown().await.unwrap();
+        stream.read_to_end(&mut Vec::new()).await.unwrap();
+        ingress.shutdown().await.unwrap();
+        egress.wait().await.unwrap();
         factory.join().await;
     }
 

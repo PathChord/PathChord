@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     display_name TEXT NOT NULL,
     source_url TEXT NOT NULL,
     credentials_ref TEXT,
+    user_agent TEXT,
     refresh_interval_seconds INTEGER NOT NULL CHECK (refresh_interval_seconds BETWEEN 60 AND 604800),
     refresh_timeout_seconds INTEGER NOT NULL CHECK (refresh_timeout_seconds BETWEEN 1 AND 300),
     refresh_max_attempts INTEGER NOT NULL CHECK (refresh_max_attempts BETWEEN 1 AND 10),
@@ -98,7 +99,7 @@ CREATE TABLE IF NOT EXISTS control_audit (
 );
 "#;
 
-const SUBSCRIPTION_SCHEMA_MIGRATIONS: [(&str, &str); 8] = [
+const SUBSCRIPTION_SCHEMA_MIGRATIONS: [(&str, &str); 9] = [
     (
         "source_url",
         "ALTER TABLE subscriptions ADD COLUMN source_url TEXT NOT NULL DEFAULT 'https://legacy.invalid/subscription'",
@@ -106,6 +107,10 @@ const SUBSCRIPTION_SCHEMA_MIGRATIONS: [(&str, &str); 8] = [
     (
         "credentials_ref",
         "ALTER TABLE subscriptions ADD COLUMN credentials_ref TEXT",
+    ),
+    (
+        "user_agent",
+        "ALTER TABLE subscriptions ADD COLUMN user_agent TEXT",
     ),
     (
         "refresh_interval_seconds",
@@ -479,7 +484,7 @@ impl IngressControlStore {
 
         let mut subscriptions = BTreeMap::new();
         let mut statement = connection.prepare(
-            "SELECT subscription_id, source_type, display_name, source_url, credentials_ref, refresh_interval_seconds, refresh_timeout_seconds, refresh_max_attempts, refresh_backoff_seconds, cache_path, cache_max_age_seconds, enabled, revision, refresh_state, last_error, cache_metadata_json, last_refresh_at_ms FROM subscriptions ORDER BY subscription_id LIMIT ?1",
+            "SELECT subscription_id, source_type, display_name, source_url, credentials_ref, refresh_interval_seconds, refresh_timeout_seconds, refresh_max_attempts, refresh_backoff_seconds, cache_path, cache_max_age_seconds, enabled, revision, refresh_state, last_error, cache_metadata_json, last_refresh_at_ms, user_agent FROM subscriptions ORDER BY subscription_id LIMIT ?1",
         )?;
         let rows = statement.query_map(
             [i64::try_from(MAX_SUBSCRIPTION_COUNT + 1).unwrap()],
@@ -502,6 +507,7 @@ impl IngressControlStore {
                     row.get::<_, Option<String>>(14)?,
                     row.get::<_, String>(15)?,
                     row.get::<_, Option<i64>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
                 ))
             },
         )?;
@@ -524,6 +530,7 @@ impl IngressControlStore {
                 error,
                 cache_metadata_json,
                 last,
+                user_agent,
             ) = row?;
             if subscriptions.len() >= MAX_SUBSCRIPTION_COUNT {
                 return Err(IngressControlStoreError::InvalidState);
@@ -553,6 +560,7 @@ impl IngressControlStore {
                 enabled: enabled != 0,
                 url: source_url,
                 credentials_ref,
+                user_agent,
                 refresh: crate::SubscriptionRefreshSpec {
                     interval_seconds: to_u64(refresh_interval_seconds)?,
                     timeout_seconds: to_u64(refresh_timeout_seconds)?,
@@ -788,7 +796,7 @@ impl IngressControlStore {
                 .validate()
                 .map_err(|_| IngressControlStoreError::InvalidState)?;
             transaction.execute(
-                "INSERT INTO subscriptions(subscription_id, source_type, display_name, source_url, credentials_ref, refresh_interval_seconds, refresh_timeout_seconds, refresh_max_attempts, refresh_backoff_seconds, cache_path, cache_max_age_seconds, enabled, revision, refresh_state, last_error, cache_metadata_json, last_refresh_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                "INSERT INTO subscriptions(subscription_id, source_type, display_name, source_url, credentials_ref, refresh_interval_seconds, refresh_timeout_seconds, refresh_max_attempts, refresh_backoff_seconds, cache_path, cache_max_age_seconds, enabled, revision, refresh_state, last_error, cache_metadata_json, last_refresh_at_ms, user_agent) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 params![
                     id.as_str(),
                     state.spec.source_type,
@@ -812,6 +820,7 @@ impl IngressControlStore {
                     state.last_error,
                     serde_json::to_string(&state.cache_metadata)?,
                     state.last_refresh_at_ms.map(to_i64).transpose()?,
+                    state.spec.user_agent,
                 ],
             )?;
         }
@@ -1027,6 +1036,7 @@ mod tests {
             enabled: true,
             url: "https://provider.example/subscription".to_owned(),
             credentials_ref: Some("provider-a-token".to_owned()),
+            user_agent: None,
             refresh: crate::SubscriptionRefreshSpec {
                 interval_seconds: 900,
                 timeout_seconds: 15,
@@ -1158,6 +1168,114 @@ mod tests {
         drop(connection);
         drop(service);
         drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn old_subscription_schema_preserves_tombstones_and_persists_custom_user_agent() {
+        let path = database_path();
+        let deleted = subscription();
+        let legacy_debug = format!(
+            "SubscriptionSpec {{ id: {:?}, source_type: {:?}, display_name: {:?}, enabled: {:?}, url: {:?}, credentials_ref: {:?}, refresh: {:?}, cache: {:?} }}",
+            deleted.id,
+            deleted.source_type,
+            deleted.display_name,
+            deleted.enabled,
+            deleted.url,
+            deleted.credentials_ref,
+            deleted.refresh,
+            deleted.cache,
+        );
+        assert_eq!(format!("{deleted:?}"), legacy_debug);
+        let mut active = subscription();
+        active.id = SubscriptionId::new("active-provider").unwrap();
+        {
+            let store = Arc::new(IngressControlStore::open(&path).unwrap());
+            let mut service = IngressControlService::open(store).unwrap();
+            service
+                .reconcile_declarative_resources(1, [], [deleted.clone(), active.clone()])
+                .unwrap();
+            service
+                .delete_subscription(
+                    "admin",
+                    RequestId::new(1),
+                    service.snapshot().generation,
+                    &deleted.id,
+                )
+                .unwrap();
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch("ALTER TABLE subscriptions DROP COLUMN user_agent")
+                .unwrap();
+            let fingerprint: String = connection
+                .query_row(
+                    "SELECT fingerprint FROM declarative_subscriptions WHERE subscription_id = ?1",
+                    [deleted.id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let legacy = serde_json::json!([
+                "subscription-declaration-v1",
+                deleted.id.as_str(),
+                deleted.source_type,
+                deleted.display_name,
+                deleted.enabled,
+                deleted.url,
+                deleted.credentials_ref,
+                deleted.refresh.interval_seconds,
+                deleted.refresh.timeout_seconds,
+                deleted.refresh.max_attempts,
+                deleted.refresh.backoff_seconds,
+                deleted
+                    .cache
+                    .as_ref()
+                    .map(|cache| (&cache.path, cache.max_age_seconds)),
+            ]);
+            assert_eq!(
+                fingerprint,
+                crate::control::fingerprint_digest(&legacy.to_string())
+            );
+        }
+        {
+            let store = Arc::new(IngressControlStore::open(&path).unwrap());
+            let mut service = IngressControlService::open(store).unwrap();
+            service
+                .reconcile_declarative_resources(1, [], [deleted.clone(), active.clone()])
+                .unwrap();
+            assert!(!service.snapshot().subscriptions.contains_key(&deleted.id));
+            assert_eq!(
+                service.snapshot().subscriptions[&active.id].spec.user_agent,
+                None
+            );
+            let mut changed = deleted.clone();
+            changed.user_agent = Some("CustomClient/1.0".into());
+            service
+                .reconcile_declarative_resources(3, [], [changed.clone(), active.clone()])
+                .unwrap();
+            assert_eq!(
+                service.snapshot().subscriptions[&deleted.id]
+                    .spec
+                    .user_agent,
+                changed.user_agent
+            );
+        }
+        {
+            let store = Arc::new(IngressControlStore::open(&path).unwrap());
+            let service = IngressControlService::open(store).unwrap();
+            assert_eq!(
+                service.snapshot().subscriptions[&deleted.id]
+                    .spec
+                    .user_agent
+                    .as_deref(),
+                Some("CustomClient/1.0")
+            );
+            assert_eq!(
+                service.snapshot().subscriptions[&active.id].spec.user_agent,
+                None
+            );
+        }
         std::fs::remove_file(path).unwrap();
     }
 

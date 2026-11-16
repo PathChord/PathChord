@@ -128,6 +128,8 @@ pub struct ProxyRoutePlan {
     pub proxy_rule_id: RuleId,
     pub transit_proxy_id: TransitProxyId,
     pub selection_score: u64,
+    /// All eligible nodes, in the same preference order as the first choice.
+    pub candidates: Vec<TransitProxyId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,12 +573,16 @@ impl CompiledPolicy {
                 .cmp(left_score)
                 .then_with(|| left_proxy.id.cmp(&right_proxy.id))
         });
-        let (proxy, selection_score) = candidates.into_iter().next()?;
+        let (proxy, selection_score) = candidates.first()?;
         Some(ProxyRoutePlan {
             generation: self.generation,
             proxy_rule_id: rule.id.clone(),
             transit_proxy_id: proxy.id.clone(),
-            selection_score,
+            selection_score: *selection_score,
+            candidates: candidates
+                .into_iter()
+                .map(|(proxy, _)| proxy.id.clone())
+                .collect(),
         })
     }
 
@@ -1245,11 +1251,16 @@ spec: {action: direct}
 
     #[test]
     fn ordinary_proxy_uses_score_then_canonical_id() {
+        let mut foreign = proxy("outside", &[("region", "jp")], &["allowed"], 1000);
+        foreign.id = TransitProxyId::in_namespace("foreign", "outside");
         let policy = compile(PolicyConfig {
             transit_proxies: vec![
-                proxy("b", &[("region", "jp")], &[], 100),
-                proxy("a", &[("region", "jp")], &[], 100),
-                proxy("excluded", &[("region", "us")], &[], 1000),
+                proxy("b", &[("region", "jp")], &["allowed"], 100),
+                proxy("a", &[("region", "jp")], &["allowed"], 100),
+                proxy("c", &[("region", "jp")], &["allowed"], 50),
+                proxy("wrong-region", &[("region", "us")], &["allowed"], 1000),
+                proxy("wrong-tag", &[("region", "jp")], &[], 1000),
+                foreign,
             ],
             proxy_rules: vec![ProxyRule {
                 id: RuleId::new("jp-proxy"),
@@ -1258,18 +1269,25 @@ spec: {action: direct}
                     labels: BTreeMap::from([("region".into(), "jp".into())]),
                     ..Selector::default()
                 },
-                select: ProxySelection::Any,
+                select: ProxySelection::Selector(Selector {
+                    tags: BTreeSet::from(["allowed".into()]),
+                    ..Selector::default()
+                }),
             }],
             fallback: Some(FallbackAction::Reject),
             ..PolicyConfig::default()
         });
         let mut runtime = RuntimeCatalog::default();
-        for id in ["a", "b", "excluded"] {
+        for id in ["a", "b", "c", "wrong-region", "wrong-tag"] {
             runtime.set_transit_proxy(
                 TransitProxyId::new(id),
                 ready_proxy(&[FlowProtocol::Tcp], 5),
             );
         }
+        runtime.set_transit_proxy(
+            TransitProxyId::in_namespace("foreign", "outside"),
+            ready_proxy(&[FlowProtocol::Tcp], 5),
+        );
 
         let Evaluation::Route(RoutePlan::Proxy(route)) = policy.evaluate(&context(), &runtime)
         else {
@@ -1277,6 +1295,14 @@ spec: {action: direct}
         };
         assert_eq!(route.transit_proxy_id.as_str(), "a");
         assert_eq!(route.selection_score, 500);
+        assert_eq!(
+            route.candidates,
+            vec![
+                TransitProxyId::new("a"),
+                TransitProxyId::new("b"),
+                TransitProxyId::new("c")
+            ]
+        );
     }
 
     #[test]

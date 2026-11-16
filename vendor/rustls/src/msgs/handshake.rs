@@ -16,7 +16,7 @@ use crate::enums::{
     CertificateCompressionAlgorithm, CertificateType, CipherSuite, EchClientHelloType,
     HandshakeType, ProtocolVersion, SignatureScheme,
 };
-use crate::error::InvalidMessage;
+use crate::error::{InvalidMessage, PeerMisbehaved};
 #[cfg(feature = "tls12")]
 use crate::ffdhe_groups::FfdheGroup;
 use crate::log::warn;
@@ -978,10 +978,19 @@ extension_struct! {
 
         /// Extensions that must appear contiguously.
         pub(crate) contiguous_extensions: Vec<ExtensionType>,
+
+        /// Frozen, pre-encoded REALITY fingerprint extensions, if selected.
+        pub(crate) reality_extensions: Option<Vec<Vec<u8>>>,
     }
 }
 
 impl ClientExtensions<'_> {
+    pub(crate) fn encode_for_reality(&self, extension: ExtensionType) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        self.encode_one(extension, &mut bytes);
+        bytes
+    }
+
     pub(crate) fn into_owned(self) -> ClientExtensions<'static> {
         let Self {
             server_name,
@@ -1010,6 +1019,7 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            reality_extensions,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -1038,10 +1048,17 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            reality_extensions,
         }
     }
 
     pub(crate) fn used_extensions_in_encoding_order(&self) -> Vec<ExtensionType> {
+        if let Some(extensions) = &self.reality_extensions {
+            return extensions
+                .iter()
+                .map(|ext| ExtensionType::from(u16::from_be_bytes([ext[0], ext[1]])))
+                .collect();
+        }
         let mut exts = self.order_insensitive_extensions_in_random_order();
         exts.extend(&self.contiguous_extensions);
 
@@ -1097,6 +1114,13 @@ impl ClientExtensions<'_> {
 
 impl<'a> Codec<'a> for ClientExtensions<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
+        if let Some(extensions) = &self.reality_extensions {
+            let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+            for extension in extensions {
+                body.buf.extend_from_slice(extension);
+            }
+            return;
+        }
         let order = self.used_extensions_in_encoding_order();
 
         if order.is_empty() {
@@ -1246,6 +1270,10 @@ extension_struct! {
         /// Encrypted inner client hello response (draft-ietf-tls-esni)
         ExtensionType::EncryptedClientHello =>
             pub(crate) encrypted_client_hello_ack: Option<ServerEncryptedClientHello>,
+
+        /// Peer receive limit for protected records (RFC 8449).
+        ExtensionType::RecordSizeLimit =>
+            pub(crate) record_size_limit: Option<u16>,
     } + {
         pub(crate) unknown_extensions: BTreeSet<u16>,
     }
@@ -1271,6 +1299,7 @@ impl ServerExtensions<'_> {
             early_data_ack,
             ticket_request,
             encrypted_client_hello_ack,
+            record_size_limit,
             unknown_extensions,
         } = self;
         ServerExtensions {
@@ -1291,6 +1320,7 @@ impl ServerExtensions<'_> {
             early_data_ack,
             ticket_request,
             encrypted_client_hello_ack,
+            record_size_limit,
             unknown_extensions,
         }
     }
@@ -1725,10 +1755,32 @@ impl TlsListElement for CertificateDer<'_> {
 /// that is directly controllable by the peer.
 pub(crate) const CERTIFICATE_MAX_SIZE_LIMIT: usize = 0x1_0000;
 
+/// RFC 6962's list of opaque, length-prefixed serialized SCTs.  PathChord's
+/// browser fingerprints request the extension but do not verify CT logs.
+#[derive(Clone, Debug)]
+pub(crate) struct SignedCertificateTimestampList(PayloadU16<NonEmpty>);
+
+impl Codec<'_> for SignedCertificateTimestampList {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.0.encode(bytes);
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let list = PayloadU16::<NonEmpty>::read(r)?;
+        let mut entries = Reader::init(&list.0);
+        while entries.any_left() {
+            let _ = PayloadU16::<NonEmpty>::read(&mut entries)?;
+        }
+        Ok(Self(list))
+    }
+}
+
 extension_struct! {
     pub(crate) struct CertificateExtensions<'a> {
         ExtensionType::StatusRequest =>
             pub(crate) status: Option<CertificateStatus<'a>>,
+        ExtensionType::SCT =>
+            pub(crate) sct: Option<SignedCertificateTimestampList>,
     }
 }
 
@@ -1736,6 +1788,7 @@ impl CertificateExtensions<'_> {
     fn into_owned(self) -> CertificateExtensions<'static> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
+            sct: self.sct,
         }
     }
 }
@@ -1829,6 +1882,24 @@ impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
 }
 
 impl<'a> CertificatePayloadTls13<'a> {
+    pub(crate) fn validate_sct_extensions(
+        &self,
+        offered: bool,
+        raw_public_key: bool,
+    ) -> Result<(), PeerMisbehaved> {
+        if self.entries.iter().any(|entry| entry.extensions.sct.is_some()) {
+            if !offered {
+                return Err(PeerMisbehaved::UnsolicitedSctList);
+            }
+            if raw_public_key
+                || self.entries.iter().skip(1).any(|entry| entry.extensions.sct.is_some())
+            {
+                return Err(PeerMisbehaved::UnsolicitedCertExtension);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         certs: impl Iterator<Item = &'a CertificateDer<'a>>,
         ocsp_response: Option<&'a [u8]>,

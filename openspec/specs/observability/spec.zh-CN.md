@@ -30,6 +30,13 @@
 
 快照 SHALL 区分新鲜测量、过期观测和不可用生产者。停止更新或过期的生产者 SHALL NOT 呈现为当前测得的零值。控制平面健康、运行时快照新鲜度和数据 Path 连通性 SHALL 保持为独立值；过期 Egress 报告 SHALL 阻止新准入，除非策略明确允许降级运行。
 
+快照和经过认证的状态报告 SHALL 区分配置容量、有效容量、当前 wire 速率、容量可信度、服务状态和新准入状态。心跳仍健康时，过期 Egress 报告 SHALL 阻止新准入，同时保留已有工作。
+
+#### Scenario: Status is stale but the Path is alive
+
+- **WHEN** 心跳仍新鲜，但最新 Egress 状态超过本地新鲜度限制
+- **THEN** 观测标记为 stale，拒绝新的业务准入，已有工作不能仅因报告过期而变成硬失败
+
 #### Scenario: Egress report exceeds its freshness threshold
 
 - **WHEN** 最新的经过认证 Egress 报告超过配置的新鲜度阈值

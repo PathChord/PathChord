@@ -86,7 +86,7 @@ pub use credentials::{
 };
 pub use data_plane::{
     DEFAULT_PATH_CONNECT_TIMEOUT, DataPlaneError, DataPlaneSessionSnapshot, DataPlaneSnapshot,
-    IngressDataPlane, IngressDataPlaneConfig, StaticReloadOutcome,
+    DynamicTransitRegistration, IngressDataPlane, IngressDataPlaneConfig, StaticReloadOutcome,
 };
 pub use dns::{
     DnsAdapterError, DnsAdapters, DnsError, DnsRouteAdapter, DnsRouteRequest, DnsRouteSelection,

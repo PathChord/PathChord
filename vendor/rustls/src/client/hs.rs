@@ -9,16 +9,14 @@ use pki_types::ServerName;
 #[cfg(feature = "tls12")]
 use super::tls12;
 use super::{ResolvesClientCert, Tls12Resumption};
-use crate::SupportedCipherSuite;
 #[cfg(feature = "logging")]
 use crate::bs_debug;
 use crate::check::inappropriate_handshake_message;
 use crate::client::client_conn::ClientConnectionData;
 use crate::client::common::ClientHelloDetails;
 use crate::client::ech::EchState;
-use crate::client::{ClientConfig, EchMode, EchStatus, tls13};
+use crate::client::{tls13, ClientConfig, EchMode, EchStatus};
 use crate::common_state::{CommonState, HandshakeKind, KxState, State};
-use crate::msgs::codec::Codec;
 use crate::conn::ConnectionRandoms;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
 use crate::enums::{
@@ -28,6 +26,7 @@ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
 use crate::msgs::base::Payload;
+use crate::msgs::codec::Codec;
 use crate::msgs::enums::{Compression, ExtensionType};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
@@ -41,6 +40,7 @@ use crate::msgs::persist;
 use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerCertVerifier;
+use crate::SupportedCipherSuite;
 
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
@@ -76,6 +76,10 @@ pub(super) struct ClientHelloInput {
     pub(super) session_id: SessionId,
     pub(super) server_name: ServerName<'static>,
     pub(super) prev_ech_ext: Option<EncryptedClientHello>,
+    // A profile's first ClientHello must remain stable across a retry: its
+    // randomized GREASE values, extensions and order are part of the wire
+    // image. Only the requested key share and cookie may change.
+    profile_first_hello: Option<ClientHelloPayload>,
 }
 
 impl ClientHelloInput {
@@ -114,6 +118,9 @@ impl ClientHelloInput {
         let session_id = match session_id {
             Some(session_id) => session_id,
             None if cx.common.is_quic() => SessionId::empty(),
+            None if config.client_hello_profile == Some(super::ClientHelloProfile::Android11) => {
+                SessionId::random(config.provider.secure_random)?
+            }
             None if !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) => {
                 SessionId::empty()
             }
@@ -121,10 +128,7 @@ impl ClientHelloInput {
         };
 
         let hello = ClientHelloDetails::new(
-            extra_exts
-                .protocols
-                .clone()
-                .unwrap_or_default(),
+            extra_exts.protocols.clone().unwrap_or_default(),
             crate::rand::random_u16(config.provider.secure_random)?,
         );
 
@@ -136,6 +140,7 @@ impl ClientHelloInput {
             session_id,
             server_name,
             prev_ech_ext: None,
+            profile_first_hello: None,
             config,
         })
     }
@@ -146,11 +151,7 @@ impl ClientHelloInput {
         cx: &mut ClientContext<'_>,
     ) -> NextStateOrError<'static> {
         let mut transcript_buffer = HandshakeHashBuffer::new();
-        if self
-            .config
-            .client_auth_cert_resolver
-            .has_certs()
-        {
+        if self.config.client_auth_cert_resolver.has_certs() {
             transcript_buffer.set_client_auth_enabled();
         }
 
@@ -200,15 +201,36 @@ fn emit_client_hello_for_retry(
     mut ech_state: Option<EchState>,
 ) -> NextStateOrError<'static> {
     let config = &input.config;
+    let profile = config.client_hello_profile;
+    if profile == Some(super::ClientHelloProfile::Android11)
+        && (cx.common.is_quic()
+            || config.reality_callback.is_some()
+            || config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol)
+            || !config.alpn_protocols.is_empty())
+    {
+        return Err(Error::General(
+            "Android 11 ClientHello requires TLS 1.2 without ALPN or REALITY".into(),
+        ));
+    }
+    if profile.is_some() && (input.resuming.is_some() || config.ech_mode.is_some()) {
+        return Err(Error::General(
+            "ClientHello profile does not support resumption or real ECH".into(),
+        ));
+    }
     // Defense in depth: the ECH state should be None if ECH is disabled based on config
     // builder semantics.
     let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
 
-    let supported_versions = SupportedProtocolVersions {
+    let mut supported_versions = SupportedProtocolVersions {
         tls12: config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
             && !forbids_tls12,
         tls13: config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol),
     };
+    if config.client_hello_profile.is_some_and(|profile| profile != super::ClientHelloProfile::Android11) {
+        // Fingerprint presets advertise TLS 1.3 and always carry a key share,
+        // even when the local caller only permits TLS 1.2 negotiation.
+        supported_versions.tls13 = true;
+    }
 
     // should be unreachable thanks to config builder
     assert!(supported_versions.any(|_| true));
@@ -225,11 +247,7 @@ fn emit_client_hello_for_retry(
                 .collect(),
         ),
         supported_versions: Some(supported_versions),
-        signature_schemes: Some(
-            config
-                .verifier
-                .supported_verify_schemes(),
-        ),
+        signature_schemes: Some(config.verifier.supported_verify_schemes()),
         extended_master_secret_request: Some(()),
         certificate_status_request: Some(CertificateStatusRequest::build_ocsp()),
         protocols: extra_exts.protocols.clone(),
@@ -296,17 +314,14 @@ fn emit_client_hello_for_retry(
             .unwrap_or_default()
         {
             // Only for the initial client hello, or a HRR that does not specify a kx group,
-            // see if we can send a second KeyShare for "free".  We only do this if the same
-            // algorithm is also supported separately by our provider for this version
-            // (`find_kx_group` looks that up).
+            // offer the exchange's alternate key share if its algorithm is also enabled
+            // separately by the provider for this version (`find_kx_group` checks this).
             if let Some((component_group, component_share)) =
-                key_share
-                    .hybrid_component()
-                    .filter(|(group, _)| {
-                        config
-                            .find_kx_group(*group, ProtocolVersion::TLSv1_3)
-                            .is_some()
-                    })
+                key_share.alternate_key_share().filter(|(group, _)| {
+                    config
+                        .find_kx_group(*group, ProtocolVersion::TLSv1_3)
+                        .is_some()
+                })
             {
                 shares.push(KeyShareEntry::new(component_group, component_share));
             }
@@ -349,17 +364,43 @@ fn emit_client_hello_for_retry(
             false
         };
 
-    if config
-        .client_auth_cert_resolver
-        .only_raw_public_keys()
-    {
+    if let Some(profile) = profile {
+        let compression = match profile {
+            super::ClientHelloProfile::Chrome133 | super::ClientHelloProfile::Chrome133Classic | super::ClientHelloProfile::Edge85 | super::ClientHelloProfile::Qq111 => {
+                Some(crate::CertificateCompressionAlgorithm::Brotli)
+            }
+            super::ClientHelloProfile::Safari16 => {
+                Some(crate::CertificateCompressionAlgorithm::Zlib)
+            }
+            super::ClientHelloProfile::Ios14 | super::ClientHelloProfile::Firefox120 | super::ClientHelloProfile::Android11 => None,
+        };
+        if let Some(compression) = compression {
+            if !config
+                .cert_decompressors
+                .iter()
+                .any(|decompressor| decompressor.algorithm() == compression)
+            {
+                return Err(Error::General(
+                    "ClientHello profile requires certificate decompression".into(),
+                ));
+            }
+            exts.certificate_compression_algorithms = Some(vec![compression]);
+            input.hello.offered_cert_compression = true;
+        } else {
+            exts.certificate_compression_algorithms = None;
+            input.hello.offered_cert_compression = false;
+        }
+        if profile != super::ClientHelloProfile::Android11 && exts.protocols.as_ref().is_none_or(Vec::is_empty) {
+            exts.protocols = Some(vec![b"h2".to_vec().into(), b"http/1.1".to_vec().into()]);
+        }
+        input.hello.alpn_protocols = exts.protocols.clone().unwrap_or_default();
+    }
+
+    if config.client_auth_cert_resolver.only_raw_public_keys() {
         exts.client_certificate_types = Some(vec![CertificateType::RawPublicKey]);
     }
 
-    if config
-        .verifier
-        .requires_raw_public_keys()
-    {
+    if config.verifier.requires_raw_public_keys() {
         exts.server_certificate_types = Some(vec![CertificateType::RawPublicKey]);
     }
 
@@ -403,17 +444,14 @@ fn emit_client_hello_for_retry(
         extensions: exts,
     };
 
-    let ech_grease_ext = config
-        .ech_mode
-        .as_ref()
-        .and_then(|mode| match mode {
-            EchMode::Grease(cfg) => Some(cfg.grease_ext(
-                config.provider.secure_random,
-                input.server_name.clone(),
-                &chp_payload,
-            )),
-            _ => None,
-        });
+    let ech_grease_ext = config.ech_mode.as_ref().and_then(|mode| match mode {
+        EchMode::Grease(cfg) => Some(cfg.grease_ext(
+            config.provider.secure_random,
+            input.server_name.clone(),
+            &chp_payload,
+        )),
+        _ => None,
+    });
 
     match (cx.data.ech_status, &mut ech_state) {
         // If we haven't offered ECH, or have offered ECH but got a non-rejecting HRR, then
@@ -423,9 +461,7 @@ fn emit_client_hello_for_retry(
             chp_payload = ech_state.ech_hello(chp_payload, retryreq, &tls13_session)?;
             cx.data.ech_status = EchStatus::Offered;
             // Store the ECH extension in case we need to carry it forward in a subsequent hello.
-            input.prev_ech_ext = chp_payload
-                .encrypted_client_hello
-                .clone();
+            input.prev_ech_ext = chp_payload.encrypted_client_hello.clone();
         }
         // If we haven't offered ECH, and have no ECH state, then consider whether to use GREASE
         // ECH.
@@ -443,9 +479,121 @@ fn emit_client_hello_for_retry(
         _ => {}
     }
 
-    // Note what extensions we sent.
-    input.hello.sent_extensions = chp_payload.collect_used();
+    if let Some(profile) = profile {
+        if let Some(hrr) = retryreq {
+            let mut first = input.profile_first_hello.take().ok_or_else(|| {
+                Error::General("ClientHello profile retry state is unavailable".into())
+            })?;
+            let extensions = first
+                .extensions
+                .reality_extensions
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::General("ClientHello profile extensions are unavailable".into())
+                })?;
+            if hrr.key_share.is_some() {
+                let replacement = chp_payload
+                    .extensions
+                    .encode_for_reality(ExtensionType::KeyShare);
+                let original = extensions
+                    .iter_mut()
+                    .find(|extension| {
+                        extension.starts_with(&u16::from(ExtensionType::KeyShare).to_be_bytes())
+                    })
+                    .ok_or_else(|| {
+                        Error::General("ClientHello profile key share is unavailable".into())
+                    })?;
+                if replacement.is_empty() {
+                    return Err(Error::General(
+                        "ClientHello retry key share is unavailable".into(),
+                    ));
+                }
+                *original = replacement;
+                first.extensions.key_shares = chp_payload.extensions.key_shares.clone();
+            }
+            if hrr.cookie.is_some() {
+                let cookie = chp_payload
+                    .extensions
+                    .encode_for_reality(ExtensionType::Cookie);
+                if cookie.is_empty() {
+                    return Err(Error::General(
+                        "ClientHello retry cookie is unavailable".into(),
+                    ));
+                }
+                // Insert before trailing padding when present. No profile
+                // offers PSK, whose extension must otherwise remain last.
+                let insertion = extensions
+                    .iter()
+                    .position(|extension| {
+                        extension.starts_with(&u16::from(ExtensionType::Padding).to_be_bytes())
+                    })
+                    .unwrap_or(extensions.len());
+                extensions.insert(insertion, cookie);
+                first.extensions.cookie = chp_payload.extensions.cookie.clone();
+            }
+            chp_payload = first;
+        } else {
+            match profile {
+                super::ClientHelloProfile::Chrome133
+                | super::ClientHelloProfile::Chrome133Classic => {
+                    let ech_key = config
+                        .find_kx_group(crate::NamedGroup::X25519, ProtocolVersion::TLSv1_3)
+                        .ok_or_else(|| Error::General("Chrome profile requires X25519".into()))?
+                        .start()?;
+                    super::reality_chrome::apply(
+                        &mut chp_payload,
+                        config.provider.secure_random,
+                        ech_key.pub_key(),
+                        profile == super::ClientHelloProfile::Chrome133,
+                    )?;
+                }
+                super::ClientHelloProfile::Ios14 | super::ClientHelloProfile::Safari16 => {
+                    super::reality_apple::apply(
+                        &mut chp_payload,
+                        config.provider.secure_random,
+                        profile == super::ClientHelloProfile::Safari16,
+                    )?;
+                }
+                super::ClientHelloProfile::Edge85 | super::ClientHelloProfile::Qq111 => {
+                    super::reality_edge::apply(&mut chp_payload, config.provider.secure_random, profile == super::ClientHelloProfile::Qq111)?;
+                }
+                super::ClientHelloProfile::Firefox120 => {
+                    let ech_key = config
+                        .find_kx_group(crate::NamedGroup::X25519, ProtocolVersion::TLSv1_3)
+                        .ok_or_else(|| Error::General("Firefox profile requires X25519".into()))?
+                        .start()?;
+                    super::reality_firefox::apply(&mut chp_payload, config.provider.secure_random, ech_key.pub_key())?;
+                }
+                super::ClientHelloProfile::Android11 => {
+                    super::reality_android::apply(&mut chp_payload)?;
+                }
+            }
+            input.profile_first_hello = Some(chp_payload.clone());
+        }
+    }
+
+    // Note exactly what extensions and cipher suites were sent.
+    input.hello.sent_extensions = chp_payload.extensions.used_extensions_in_encoding_order();
     input.hello.offered_cipher_suites = chp_payload.cipher_suites.clone();
+    cx.data.offered_profile_sct = profile.is_some()
+        && input
+            .hello
+            .sent_extensions
+            .contains(&ExtensionType::SCT);
+
+    // Fingerprint profiles encode their GREASE ECH extension directly in the
+    // frozen ClientHello rather than through `ech_mode`. Track that offer so a
+    // server's ECH retry configs are handled as a GREASE response, while
+    // retaining normal certificate and handshake verification.
+    if profile.is_some()
+        && cx.data.ech_status == EchStatus::NotOffered
+        && input
+            .hello
+            .sent_extensions
+            .contains(&ExtensionType::EncryptedClientHello)
+    {
+        cx.data.ech_status = EchStatus::Grease;
+    }
 
     let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload));
 
@@ -463,6 +611,7 @@ fn emit_client_hello_for_retry(
                     &mut hello.session_id.data,
                     &raw_hello,
                 )?;
+                input.session_id = hello.session_id;
             }
         }
     }
@@ -675,9 +824,7 @@ pub(super) fn process_server_cert_type_extension(
 ) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
     process_cert_type_extension(
         common,
-        config
-            .verifier
-            .requires_raw_public_keys(),
+        config.verifier.requires_raw_public_keys(),
         server_cert_extension.copied(),
         ExtensionType::ServerCertificateType,
     )
@@ -690,9 +837,7 @@ pub(super) fn process_client_cert_type_extension(
 ) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
     process_cert_type_extension(
         common,
-        config
-            .client_auth_cert_resolver
-            .only_raw_public_keys(),
+        config.client_auth_cert_resolver.only_raw_public_keys(),
         client_cert_extension.copied(),
         ExtensionType::ClientCertificateType,
     )
@@ -722,6 +867,10 @@ impl State<ClientConnectionData> for ExpectServerHello {
         } else {
             server_hello.legacy_version
         };
+
+        if config.reality_callback.is_some() && server_version != TLSv1_3 {
+            return Err(Error::General("REALITY requires TLS 1.3".into()));
+        }
 
         let version = match server_version {
             TLSv1_3 if tls13_supported => TLSv1_3,
@@ -777,15 +926,18 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         cx.common.negotiated_version = Some(version);
 
+        if version == TLSv1_2 {
+            if let Some(limit) = server_hello.record_size_limit {
+                apply_record_size_limit(cx.common, limit, version, self.input.config.max_fragment_size)?;
+            }
+        }
+
         // Extract ALPN protocol
         if !cx.common.is_tls13() {
             process_alpn_protocol(
                 cx.common,
                 &self.input.hello.alpn_protocols,
-                server_hello
-                    .selected_protocol
-                    .as_ref()
-                    .map(|s| s.as_ref()),
+                server_hello.selected_protocol.as_ref().map(|s| s.as_ref()),
                 self.input.config.check_selected_alpn,
             )?;
         }
@@ -799,6 +951,16 @@ impl State<ClientConnectionData> for ExpectServerHello {
                     PeerMisbehaved::ServerHelloMustOfferUncompressedEcPoints,
                 ));
             }
+        }
+
+        if config.client_hello_profile == Some(super::ClientHelloProfile::Android11)
+            && self.input.hello.offered_cipher_suites.contains(&server_hello.cipher_suite)
+            && config.find_cipher_suite(server_hello.cipher_suite, cx.common.protocol).is_none()
+        {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::HandshakeFailure,
+                Error::General("Android TLS peer selected an unsupported cipher".into()),
+            ));
         }
 
         let Some(Some(suite)) = self
@@ -840,9 +1002,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
         }
 
         // Start our handshake hash, and input the server-hello.
-        let mut transcript = self
-            .transcript_buffer
-            .start_hash(suite.hash_provider());
+        let mut transcript = self.transcript_buffer.start_hash(suite.hash_provider());
         transcript.add_message(&m);
 
         let randoms = ConnectionRandoms::new(self.input.random, server_hello.random);
@@ -879,6 +1039,26 @@ impl State<ClientConnectionData> for ExpectServerHello {
     }
 }
 
+pub(super) fn apply_record_size_limit(
+    common: &mut CommonState,
+    limit: u16,
+    version: ProtocolVersion,
+    configured_max: Option<usize>,
+) -> Result<(), Error> {
+    let maximum = if version == ProtocolVersion::TLSv1_3 { 16_385 } else { 16_384 };
+    if !(64..=maximum).contains(&limit) {
+        return Err(common.send_fatal_alert(
+            AlertDescription::IllegalParameter,
+            PeerMisbehaved::InvalidRecordSizeLimit,
+        ));
+    }
+    // Rustls's fragmenter counts the five-byte TLS header; RFC 8449 counts
+    // TLSInnerPlaintext for TLS 1.3, including the inner content-type byte.
+    let plaintext = usize::from(limit) - usize::from(version == ProtocolVersion::TLSv1_3);
+    let maximum_fragment = plaintext + crate::msgs::fragmenter::PACKET_OVERHEAD;
+    common.set_max_fragment_size(Some(configured_max.unwrap_or(maximum_fragment).min(maximum_fragment)))
+}
+
 impl ExpectServerHelloOrHelloRetryRequest {
     fn into_expect_server_hello(self) -> NextState<'static> {
         Box::new(self.next)
@@ -896,6 +1076,13 @@ impl ExpectServerHelloOrHelloRetryRequest {
         )?;
         trace!("Got HRR {hrr:?}");
 
+        if self.next.input.config.reality_callback.is_some() {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::HandshakeFailure,
+                Error::General("REALITY does not support TLS HelloRetryRequest".into()),
+            ));
+        }
+
         cx.common.check_aligned_handshake()?;
 
         // We always send a key share when TLS 1.3 is enabled.
@@ -905,9 +1092,16 @@ impl ExpectServerHelloOrHelloRetryRequest {
         // retry of a group we already sent.
         let config = &self.next.input.config;
 
+        if !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::ProtocolVersion,
+                PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig,
+            ));
+        }
+
         if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
             let offered_hybrid = offered_key_share
-                .hybrid_component()
+                .alternate_key_share()
                 .and_then(|(group_name, _)| {
                     config.find_kx_group(group_name, ProtocolVersion::TLSv1_3)
                 })
@@ -1021,10 +1215,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
         }
 
         // This is the draft19 change where the transcript became a tree
-        let transcript = self
-            .next
-            .transcript_buffer
-            .start_hash(cs.hash_provider());
+        let transcript = self.next.transcript_buffer.start_hash(cs.hash_provider());
         let mut transcript_buffer = transcript.into_hrr_buffer();
         transcript_buffer.add_message(&m);
 
@@ -1080,9 +1271,7 @@ impl State<ClientConnectionData> for ExpectServerHelloOrHelloRetryRequest {
             MessagePayload::Handshake {
                 parsed: HandshakeMessagePayload(HandshakePayload::ServerHello(..)),
                 ..
-            } => self
-                .into_expect_server_hello()
-                .handle(cx, m),
+            } => self.into_expect_server_hello().handle(cx, m),
             MessagePayload::Handshake {
                 parsed: HandshakeMessagePayload(HandshakePayload::HelloRetryRequest(..)),
                 ..
@@ -1173,9 +1362,7 @@ impl ClientSessionValue {
 
         if let Some(resuming) = &found {
             if cx.common.is_quic() {
-                cx.common.quic.params = resuming
-                    .tls13()
-                    .map(|v| v.quic_params());
+                cx.common.quic.params = resuming.tls13().map(|v| v.quic_params());
             }
         }
 

@@ -214,7 +214,7 @@ pub struct SubscriptionCacheSpec {
 /// Public control-plane alias matching the policy model's terminology.
 pub type SubscriptionCache = SubscriptionCacheSpec;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SubscriptionSpec {
     pub id: SubscriptionId,
     pub source_type: String,
@@ -224,6 +224,28 @@ pub struct SubscriptionSpec {
     pub credentials_ref: Option<String>,
     pub refresh: SubscriptionRefreshSpec,
     pub cache: Option<SubscriptionCacheSpec>,
+    pub user_agent: Option<String>,
+}
+
+// Preserve the legacy debug representation when no User-Agent is configured:
+// older durable idempotency records digest this representation.
+impl fmt::Debug for SubscriptionSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("SubscriptionSpec");
+        debug
+            .field("id", &self.id)
+            .field("source_type", &self.source_type)
+            .field("display_name", &self.display_name)
+            .field("enabled", &self.enabled)
+            .field("url", &self.url)
+            .field("credentials_ref", &self.credentials_ref)
+            .field("refresh", &self.refresh)
+            .field("cache", &self.cache);
+        if let Some(user_agent) = &self.user_agent {
+            debug.field("user_agent", user_agent);
+        }
+        debug.finish()
+    }
 }
 
 impl SubscriptionSpec {
@@ -261,6 +283,15 @@ impl SubscriptionSpec {
                 field: "source.credentials_ref",
             });
         }
+        if self
+            .user_agent
+            .as_deref()
+            .is_some_and(|value| !pathchord_policy::valid_subscription_user_agent(value))
+        {
+            return Err(ControlError::InvalidSubscription {
+                field: "source.user_agent",
+            });
+        }
         if !(60..=604_800).contains(&self.refresh.interval_seconds)
             || !(1..=300).contains(&self.refresh.timeout_seconds)
             || !(1..=10).contains(&self.refresh.max_attempts)
@@ -293,6 +324,7 @@ impl SubscriptionSpec {
                 source_type,
                 url: self.url.clone(),
                 credentials_ref: self.credentials_ref.clone(),
+                user_agent: self.user_agent.clone(),
             },
             refresh: PolicySubscriptionRefresh {
                 interval_seconds: self.refresh.interval_seconds,
@@ -1517,7 +1549,16 @@ impl IngressControlService {
                     let was_enabled = existing.spec.enabled;
                     let source_changed = existing.spec.source_type != spec.source_type
                         || existing.spec.url != spec.url
-                        || existing.spec.credentials_ref != spec.credentials_ref;
+                        || existing.spec.credentials_ref != spec.credentials_ref
+                        || existing
+                            .spec
+                            .user_agent
+                            .as_deref()
+                            .unwrap_or(pathchord_policy::DEFAULT_SUBSCRIPTION_USER_AGENT)
+                            != spec
+                                .user_agent
+                                .as_deref()
+                                .unwrap_or(pathchord_policy::DEFAULT_SUBSCRIPTION_USER_AGENT);
                     existing.spec = spec;
                     existing.refresh_state = SubscriptionRefreshState::Idle;
                     existing.last_error = None;
@@ -2196,11 +2237,11 @@ impl IngressControlService {
     }
 
     pub fn add_node(&mut self, node_id: NodeId) -> Result<(), ControlError> {
-        if self.snapshot.nodes.len() >= MAX_NODE_COUNT {
-            return Err(ControlError::ResourceLimit { resource: "nodes" });
-        }
         if self.snapshot.nodes.contains_key(&node_id) {
             return Ok(());
+        }
+        if self.snapshot.nodes.len() >= MAX_NODE_COUNT {
+            return Err(ControlError::ResourceLimit { resource: "nodes" });
         }
         let checkpoint = self.durable_checkpoint();
         let resource_id = node_id.0.clone();
@@ -2892,7 +2933,7 @@ pub(crate) fn fingerprint_digest(fingerprint: &str) -> String {
 fn subscription_declaration_fingerprint(spec: &SubscriptionSpec) -> String {
     // A fixed JSON array is unambiguous and stable across map ordering and
     // debug-format changes; only its digest is written to the database.
-    let value = json!([
+    let mut value = json!([
         "subscription-declaration-v1",
         spec.id.as_str(),
         spec.source_type,
@@ -2908,6 +2949,12 @@ fn subscription_declaration_fingerprint(spec: &SubscriptionSpec) -> String {
             .as_ref()
             .map(|cache| (&cache.path, cache.max_age_seconds)),
     ]);
+    if let Some(user_agent) = &spec.user_agent {
+        value
+            .as_array_mut()
+            .expect("fingerprint array")
+            .extend([json!("user-agent"), json!(user_agent)]);
+    }
     fingerprint_digest(&value.to_string())
 }
 
@@ -2973,6 +3020,7 @@ mod tests {
                         enabled,
                         url: "https://example.invalid/subscription".into(),
                         credentials_ref: None,
+                        user_agent: None,
                         refresh: SubscriptionRefreshSpec::default(),
                         cache: None,
                     },
@@ -3008,6 +3056,7 @@ mod tests {
                     enabled: true,
                     url: "https://example.invalid/subscription".into(),
                     credentials_ref: None,
+                    user_agent: None,
                     refresh: SubscriptionRefreshSpec::default(),
                     cache: None,
                 },
@@ -3116,6 +3165,7 @@ mod tests {
                     enabled: true,
                     url: "https://provider.example/subscription".into(),
                     credentials_ref: Some("provider-a-token".into()),
+                    user_agent: None,
                     refresh: SubscriptionRefreshSpec::default(),
                     cache: Some(SubscriptionCacheSpec {
                         path: "provider-a.snapshot".into(),
@@ -3145,6 +3195,7 @@ mod tests {
             enabled: true,
             url: "https://provider.example/subscription".into(),
             credentials_ref: Some("provider-a-token".into()),
+            user_agent: None,
             refresh: SubscriptionRefreshSpec {
                 interval_seconds: 900,
                 timeout_seconds: 15,
@@ -3216,6 +3267,23 @@ mod tests {
         assert_eq!(snapshot.connections.len(), 1);
         assert_eq!(service.events_since(None).len(), 3);
         assert_eq!(service.events_since(Some(1)).len(), 2);
+    }
+
+    #[test]
+    fn registering_an_existing_node_is_idempotent_at_capacity() {
+        let mut service = IngressControlService::new();
+        let nodes = (0..MAX_NODE_COUNT)
+            .map(|index| NodeId::new(format!("node-{index}")).unwrap())
+            .collect::<Vec<_>>();
+        service
+            .reconcile_declarative_resources(1, nodes.clone(), [])
+            .unwrap();
+        service.add_node(nodes[0].clone()).unwrap();
+        assert!(matches!(
+            service.add_node(NodeId::new("overflow").unwrap()),
+            Err(ControlError::ResourceLimit { resource: "nodes" })
+        ));
+        assert_eq!(service.snapshot().nodes.len(), MAX_NODE_COUNT);
     }
 
     #[test]

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pathchord_policy::TransitProxyId;
-use pathchord_transit::{ConnectRequest, Endpoint, TransitAdapter};
+use pathchord_transit::{AdmissionRevocation, ConnectRequest, Endpoint, TransitAdapter};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 
@@ -103,6 +104,14 @@ pub(crate) struct ProbeStore {
     pub config: Option<TransitProbeConfig>,
     pub cursor: usize,
     samples: BTreeMap<TransitProxyId, Samples>,
+    active: BTreeMap<TransitProxyId, watch::Sender<bool>>,
+}
+
+pub(crate) struct ProbeCandidate {
+    pub id: TransitProxyId,
+    pub adapter: Arc<dyn TransitAdapter>,
+    pub admission: Option<AdmissionRevocation>,
+    pub cancelled: watch::Receiver<bool>,
 }
 
 #[derive(Default)]
@@ -118,6 +127,7 @@ impl ProbeStore {
     pub fn configure(&mut self, config: Option<TransitProbeConfig>) {
         if self.config != config {
             self.samples.clear();
+            self.active.clear();
             self.cursor = 0;
         }
         self.config = config;
@@ -125,6 +135,23 @@ impl ProbeStore {
 
     pub fn forget(&mut self, id: &TransitProxyId) {
         self.samples.remove(id);
+        self.cancel(id);
+    }
+
+    pub fn arm(&mut self, id: &TransitProxyId) -> watch::Receiver<bool> {
+        let (sender, receiver) = watch::channel(false);
+        self.active.insert(id.clone(), sender);
+        receiver
+    }
+
+    pub fn cancel(&mut self, id: &TransitProxyId) {
+        if let Some(sender) = self.active.remove(id) {
+            sender.send_replace(true);
+        }
+    }
+
+    pub fn finish_batch(&mut self) {
+        self.active.clear();
     }
 
     pub fn record(
@@ -208,45 +235,61 @@ impl ProbeStore {
 
 pub(crate) async fn probe_batch(
     config: TransitProbeConfig,
-    adapters: Vec<(TransitProxyId, Arc<dyn TransitAdapter>)>,
+    adapters: Vec<ProbeCandidate>,
 ) -> Vec<(TransitProxyId, Result<u64, TransitProbeFailure>)> {
     let mut pending = adapters.into_iter();
     let mut tasks = JoinSet::new();
     let mut result = Vec::new();
     loop {
         while tasks.len() < config.max_concurrency {
-            let Some((id, adapter)) = pending.next() else {
+            let Some(ProbeCandidate {
+                id,
+                adapter,
+                admission,
+                mut cancelled,
+            }) = pending.next()
+            else {
                 break;
             };
             let target = config.target.clone();
             let duration = config.timeout;
             tasks.spawn(async move {
+                if *cancelled.borrow() || admission.as_ref().is_some_and(|token| !token.is_valid())
+                {
+                    return None;
+                }
                 let start = Instant::now();
                 let outcome = if !adapter.supports_tcp() {
                     Err(TransitProbeFailure::TcpUnavailable)
                 } else {
-                    match timeout(
-                        duration,
-                        adapter.connect(ConnectRequest {
+                    tokio::select! {
+                        biased;
+                        _ = cancelled.changed() => return None,
+                        result = timeout(duration, adapter.connect(ConnectRequest {
                             destination: target,
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(Ok(connection)) => {
-                            drop(connection);
-                            Ok(start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                        })) => {
+                            match result {
+                                Ok(Ok(connection)) => {
+                                    drop(connection);
+                                    Ok(start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+                                }
+                                Ok(Err(_)) => Err(TransitProbeFailure::Connection),
+                                Err(_) => Err(TransitProbeFailure::Timeout),
+                            }
                         }
-                        Ok(Err(_)) => Err(TransitProbeFailure::Connection),
-                        Err(_) => Err(TransitProbeFailure::Timeout),
                     }
                 };
-                (id, outcome)
+                if *cancelled.borrow() || admission.as_ref().is_some_and(|token| !token.is_valid())
+                {
+                    None
+                } else {
+                    Some((id, outcome))
+                }
             });
         }
         match tasks.join_next().await {
-            Some(Ok(value)) => result.push(value),
-            Some(Err(_)) => {}
+            Some(Ok(Some(value))) => result.push(value),
+            Some(Ok(None) | Err(_)) => {}
             None => break,
         }
     }

@@ -108,6 +108,15 @@ The schema SHALL distinguish the configured aggregate wire hard cap from runtime
 - **WHEN** Egress starts without enough fresh measurements
 - **THEN** the configured cap remains the hard upper bound, while effective capacity is exposed as provisional or unknown rather than authored as a measured value
 
+### Requirement: Subscription User-Agent is bounded
+
+A Subscription source SHALL accept an optional `userAgent` field. Its value SHALL be a nonblank printable ASCII HTTP header value of at most 1024 bytes. An omitted field SHALL use the default specified by the Transit contract.
+
+#### Scenario: User-Agent contains a line break
+
+- **WHEN** a Subscription declares a User-Agent containing a line break
+- **THEN** configuration validation rejects the candidate bundle
+
 ## Detailed contract
 
 This document is the normative versioned schema for the human-authored YAML
@@ -285,7 +294,7 @@ Each `kind: TransitProxy` object has:
 | `tags` | no | sequence of IDs; default `[]` |
 | `weight` | no | integer weight; default `100` |
 | `credentialsRef` | no | opaque local secret reference; never a secret value |
-| `options` | no | typed TLS, transport, header, UDP, multiplex, and dialer options; default `{}` |
+| `options` | no | typed TLS, transport, header, UDP, SOCKS5/SS `udpOverTcp`, VMess framing, multiplex, and dialer options; default `{}` |
 
 `source.type` is one of the [subscription document types](../transit-proxies/spec.md#subscription-document-families),
 including `static`, `auto`, `clash`, `sip008`, `uri`, `sing_box`, `surge`,
@@ -319,6 +328,7 @@ spec:
     type: clash
     url: https://example.invalid/subscription
     credentialsRef: provider-a-token
+    userAgent: clash.meta
   refresh:
     intervalSeconds: 3600
     timeoutSeconds: 30
@@ -333,7 +343,9 @@ spec:
 `60..=604800`; `timeoutSeconds` defaults to `30` and is in `1..=300`;
 `maxAttempts` defaults to `3` and is in `1..=10`; `backoffSeconds` defaults to
 `5` and is in `1..=3600`; `maxAgeSeconds` defaults to `86400` and is in
-`60..=2592000`. URLs MUST NOT contain credentials. `cache.path` is relative to
+`60..=2592000`. `source.userAgent` is optional, defaults to `clash.meta`, and
+must be a nonblank printable ASCII value of at most 1024 bytes. URLs MUST NOT
+contain credentials. `cache.path` is relative to
 the service data directory unless an administrator explicitly supplies an
 absolute path. The cache is written atomically with restrictive permissions.
 
@@ -411,12 +423,14 @@ Each `kind: TrafficPolicy` object has the following `spec` fields:
 
 Budgets are non-negative integers no greater than `10^12`. A class `priority`
 is `0..=255` and a `share` is `1..=1_000_000`. The Session budget is the hard
-upper bound; control traffic is accounted against it. The scheduler applies
-relationship weight first and then effective capacity, congestion window, RTT,
-jitter, and loss. A policy cannot grant a Path more than its advertised flow
-`TransitRule.spec.trafficClassRef` optionally assigns admitted flows to one key in the selected `TrafficPolicy.classes` map. Unknown class references are validation errors. A missing reference uses the default class.
+upper bound; control traffic is accounted against it. The scheduler considers
+relationship weight, the optional billing multiplier, effective capacity,
+congestion window, RTT, jitter, and loss. A policy cannot grant a Path more than
+its advertised flow control limit.
 
-control limit.
+`TransitRule.spec.trafficClassRef` optionally assigns admitted flows to one key
+in the selected `TrafficPolicy.classes` map. Unknown class references are
+validation errors. A missing reference uses the default class.
 
 ### Listener
 

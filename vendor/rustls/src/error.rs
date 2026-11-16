@@ -263,6 +263,7 @@ pub enum PeerMisbehaved {
     IncorrectBinder,
     InvalidCertCompression,
     InvalidMaxEarlyDataSize,
+    InvalidRecordSizeLimit,
     InvalidKeyShare,
     KeyEpochWithPendingFragment,
     KeyUpdateReceivedInQuicConnection,

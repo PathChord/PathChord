@@ -575,6 +575,26 @@ pub trait ActiveKeyExchange: Send + Sync {
         unreachable!("only called if `hybrid_component()` implemented")
     }
 
+    /// An additional key share to offer alongside this exchange.
+    ///
+    /// Unlike [`Self::hybrid_component`], this share may use independent key
+    /// material. By default it retains rustls's existing hybrid optimization.
+    /// The additional group must also be enabled by the crypto provider.
+    fn alternate_key_share(&self) -> Option<(NamedGroup, &[u8])> {
+        self.hybrid_component()
+    }
+
+    /// Complete an exchange with the additional key share.
+    ///
+    /// Called only when [`Self::alternate_key_share`] returned the selected
+    /// group. By default this preserves the hybrid-component behavior.
+    fn complete_alternate_key_share(
+        self: Box<Self>,
+        peer_pub_key: &[u8],
+    ) -> Result<SharedSecret, Error> {
+        self.complete_hybrid_component(peer_pub_key)
+    }
+
     /// Return the public key being used.
     ///
     /// For ECDHE, the encoding required is defined in

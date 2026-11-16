@@ -116,6 +116,7 @@ struct SubscriptionSourceSpec {
     source_type: String,
     url: String,
     credentials_ref: Option<String>,
+    user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -980,6 +981,7 @@ impl KubeConfig {
                             source_type,
                             url: source.url,
                             credentials_ref: source.credentials_ref,
+                            user_agent: source.user_agent,
                         },
                         refresh,
                         cache,
@@ -1625,6 +1627,13 @@ fn validate_subscription_spec(value: &Resource<SubscriptionSpec>) -> Result<(), 
             name,
             "source.url must not contain credentials",
         ));
+    }
+    if source
+        .user_agent
+        .as_deref()
+        .is_some_and(|value| !crate::valid_subscription_user_agent(value))
+    {
+        return Err(invalid_spec(kind, name, "source.userAgent is invalid"));
     }
     if let Some(refresh) = &value.spec.refresh
         && (!(60..=604_800).contains(&refresh.interval_seconds)
@@ -2436,6 +2445,7 @@ spec:
     type: clash
     url: https://example.invalid/subscription
     credentialsRef: provider-a-token
+    userAgent: CustomClient/1.0
   cache:
     path: provider-a.snapshot
 "#
@@ -2455,11 +2465,28 @@ spec:
             subscription.source.credentials_ref.as_deref(),
             Some("provider-a-token")
         );
+        assert_eq!(
+            subscription.source.user_agent.as_deref(),
+            Some("CustomClient/1.0")
+        );
         assert_eq!(subscription.refresh, SubscriptionRefresh::default());
         assert_eq!(
             subscription.cache.as_ref().expect("cache").max_age_seconds,
             86_400
         );
+    }
+
+    #[test]
+    fn subscription_user_agent_must_be_a_safe_http_header_value() {
+        for value in ["''", "'   '", r#""bad\nheader""#, "'猫'"] {
+            let input = format!(
+                "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: Subscription\nmetadata: {{name: provider}}\nspec:\n  source:\n    type: clash\n    url: https://example.invalid/sub\n    userAgent: {value}\n"
+            );
+            assert!(
+                KubeConfig::from_yaml(&input).is_err(),
+                "accepted invalid User-Agent: {value}"
+            );
+        }
     }
 
     #[test]

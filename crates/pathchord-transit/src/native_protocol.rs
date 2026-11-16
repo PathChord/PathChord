@@ -17,6 +17,9 @@ use crate::{
     TransitAdapter, TransitCredential, TransitDatagram, TransitError, TransitMetadata,
 };
 
+#[path = "trojan_go_encryption.rs"]
+mod trojan_go_encryption;
+
 #[derive(Clone, Copy)]
 enum Protocol {
     Vless,
@@ -24,7 +27,7 @@ enum Protocol {
 }
 
 enum Authentication {
-    Vless(Zeroizing<[u8; 16]>),
+    Vless(Zeroizing<[u8; 16]>, Option<crate::vision::VisionFlow>),
     Trojan(Zeroizing<String>),
 }
 
@@ -32,7 +35,9 @@ pub(crate) struct NativeProtocolAdapter {
     metadata: TransitMetadata,
     authentication: Authentication,
     transport: crate::native_transport::NativeTransport,
+    trojan_go_encryption: Option<trojan_go_encryption::Encryption>,
     udp: bool,
+    packet_encoding: VlessPacketEncoding,
     timeout: Duration,
 }
 
@@ -53,9 +58,18 @@ impl NativeProtocolAdapter {
     ) -> Result<Self, TransitError> {
         let mut allowed = match config.protocol.as_str() {
             "vless" => vec!["uuid", "flow"],
-            "trojan" => vec!["password"],
+            "trojan" => vec!["password", "trojan_go_ss_method", "trojan_go_ss_password"],
             _ => return Err(unsupported("protocol has no matching native adapter")),
         };
+        if config.protocol == "vless"
+            && config
+                .options
+                .transport
+                .as_ref()
+                .is_some_and(|transport| transport.kind == "meek")
+        {
+            allowed.push("meek_url");
+        }
         allowed.extend(
             config
                 .options
@@ -66,21 +80,15 @@ impl NativeProtocolAdapter {
         crate::adapter_registry::validate_credentials(Some(credential), &allowed)?;
         let authentication = match config.protocol.as_str() {
             "vless" => {
-                if credential
-                    .field("flow")
-                    .is_some_and(|flow| !flow.is_empty())
-                {
-                    return Err(unsupported(
-                        "VLESS flow requires a validated Vision backend",
-                    ));
-                }
+                let flow = crate::vision::VisionFlow::parse(credential.field("flow"))
+                    .map_err(unsupported)?;
                 let uuid = uuid::Uuid::parse_str(
                     credential
                         .field("uuid")
                         .ok_or_else(|| unsupported("VLESS UUID is missing"))?,
                 )
                 .map_err(|_| unsupported("VLESS UUID is invalid"))?;
-                Authentication::Vless(Zeroizing::new(*uuid.as_bytes()))
+                Authentication::Vless(Zeroizing::new(*uuid.as_bytes()), flow)
             }
             _ => {
                 let password = credential
@@ -90,8 +98,27 @@ impl NativeProtocolAdapter {
                 Authentication::Trojan(Zeroizing::new(password.to_owned()))
             }
         };
-        let transport =
-            crate::native_transport::NativeTransport::new(config, credential, tls, duration)?;
+        let trojan_go_encryption = if matches!(&authentication, Authentication::Trojan(_)) {
+            trojan_go_encryption::Encryption::from_credential(credential)?
+        } else {
+            None
+        };
+        let (transport_config, packet_encoding, vision) = match &authentication {
+            Authentication::Vless(_, flow) => {
+                let (config, xudp) = vless_transport_config(config, *flow)?;
+                (config, xudp, flow.is_some())
+            }
+            Authentication::Trojan(_) => (config.clone(), VlessPacketEncoding::Plain, false),
+        };
+        let mut transport = crate::native_transport::NativeTransport::new(
+            &transport_config,
+            credential,
+            tls,
+            duration,
+        )?;
+        if vision {
+            transport = transport.require_tls13();
+        }
         Ok(Self {
             metadata: TransitMetadata {
                 adapter_id: config.id.as_str().to_owned(),
@@ -102,7 +129,9 @@ impl NativeProtocolAdapter {
             },
             authentication,
             transport,
+            trojan_go_encryption,
             udp: config.options.udp != Some(false),
+            packet_encoding,
             timeout: duration,
         })
     }
@@ -112,11 +141,28 @@ impl NativeProtocolAdapter {
         destination: &Endpoint,
         udp: bool,
     ) -> Result<BoxedTransitConnection, TransitError> {
-        crate::validate_destination(destination)?;
+        if !(udp && self.packet_encoding == VlessPacketEncoding::PacketAddr) {
+            crate::validate_destination(destination)?;
+        }
         timeout(self.timeout, async {
-            let mut stream = self.transport.connect().await?;
+            let vision = matches!(&self.authentication, Authentication::Vless(_, Some(_)));
+            let (mut stream, direct) = if vision {
+                let (stream, direct) = self.transport.connect_vision().await?;
+                (stream, Some(direct))
+            } else {
+                (self.transport.connect().await?, None)
+            };
+            if let Some(encryption) = &self.trojan_go_encryption {
+                stream = encryption.wrap(stream);
+            }
             let header = Zeroizing::new(match &self.authentication {
-                Authentication::Vless(uuid) => vless_request(uuid, destination, udp)?,
+                Authentication::Vless(uuid, flow) => vless_request_with_flow(
+                    uuid,
+                    destination,
+                    udp,
+                    udp && self.packet_encoding == VlessPacketEncoding::Xudp,
+                    flow.map(|_| crate::vision::FLOW_VISION),
+                )?,
                 Authentication::Trojan(password) => {
                     use sha2::Digest;
                     let digest = Zeroizing::new(sha2::Sha224::digest(password.as_bytes()).to_vec());
@@ -143,6 +189,18 @@ impl NativeProtocolAdapter {
                     output
                 }
             });
+            if let Authentication::Vless(uuid, Some(_)) = &self.authentication {
+                let response = Box::new(VlessResponseIo::new(stream));
+                return Ok(Box::new(
+                    crate::vision::VisionStream::new(
+                        response,
+                        crate::vision::VisionContext::new(uuid),
+                    )
+                    .with_request_header(header)
+                    .with_direct_signal(direct.expect("Vision connection has a direct signal"))
+                    .drive_request(),
+                ) as BoxedTransitConnection);
+            }
             stream
                 .write_all(&header)
                 .await
@@ -151,13 +209,8 @@ impl NativeProtocolAdapter {
                 .flush()
                 .await
                 .map_err(|_| protocol("native protocol request flush failed"))?;
-            if matches!(self.authentication, Authentication::Vless(_)) {
-                stream = Box::new(VlessResponseIo {
-                    inner: stream,
-                    header: [0; 2],
-                    filled: 0,
-                    addon_remaining: None,
-                });
+            if matches!(&self.authentication, Authentication::Vless(_, _)) {
+                stream = Box::new(VlessResponseIo::new(stream));
             }
             Ok(stream)
         })
@@ -187,27 +240,127 @@ impl TransitAdapter for NativeProtocolAdapter {
         if !self.udp {
             return Err(unsupported("node UDP is disabled"));
         }
-        let stream = self.open(&request.destination, true).await?;
-        Ok(Box::new(NativeDatagram {
-            stream,
-            destination: request.destination,
-            protocol: match self.authentication {
-                Authentication::Vless(_) => Protocol::Vless,
-                Authentication::Trojan(_) => Protocol::Trojan,
-            },
-        }))
+        if let Authentication::Vless(_, Some(flow)) = &self.authentication
+            && request.destination.port == 443
+            && !flow.allow_udp_443
+        {
+            return Err(unsupported("VLESS Vision rejects UDP to port 443"));
+        }
+        crate::validate_destination(&request.destination)?;
+        let target = if self.packet_encoding == VlessPacketEncoding::PacketAddr {
+            if request.destination.host.parse::<IpAddr>().is_err() {
+                return Err(unsupported("VLESS packetaddr requires an IP destination"));
+            }
+            packetaddr_magic_destination()
+        } else {
+            request.destination.clone()
+        };
+        let stream = self.open(&target, true).await?;
+        match self.packet_encoding {
+            VlessPacketEncoding::Xudp => crate::xudp::xudp_datagram(stream, request.destination),
+            VlessPacketEncoding::PacketAddr => {
+                let inner = vless_datagram(stream, target);
+                Ok(Box::new(crate::vmess::PacketAddrDatagram::new(
+                    inner,
+                    request.destination,
+                    usize::from(u16::MAX),
+                )?))
+            }
+            VlessPacketEncoding::Plain => Ok(Box::new(NativeDatagram::new(
+                stream,
+                request.destination,
+                match self.authentication {
+                    Authentication::Vless(_, _) => Protocol::Vless,
+                    Authentication::Trojan(_) => Protocol::Trojan,
+                },
+            ))),
+        }
     }
 }
 
-pub(crate) fn vless_request(
+/// Remove only packet settings consumed by the VLESS adapter before the
+/// shared byte-transport validation runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VlessPacketEncoding {
+    Plain,
+    Xudp,
+    PacketAddr,
+}
+
+pub(crate) fn packetaddr_magic_destination() -> Endpoint {
+    Endpoint {
+        host: "sp.packet-addr.v2fly.arpa".into(),
+        port: 0,
+    }
+}
+
+pub(crate) fn vless_transport_config(
+    config: &pathchord_policy::TransitProxyConfig,
+    vision: Option<crate::vision::VisionFlow>,
+) -> Result<(pathchord_policy::TransitProxyConfig, VlessPacketEncoding), TransitError> {
+    config.options.validate().map_err(unsupported)?;
+    if vision.is_some() {
+        if !config.options.tls.as_ref().is_some_and(|tls| tls.enabled) {
+            return Err(unsupported("VLESS Vision requires enabled TLS"));
+        }
+        if config
+            .options
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.kind != "tcp")
+        {
+            return Err(unsupported("VLESS Vision requires direct TLS transport"));
+        }
+    }
+    let encoding = match config.options.packet_encoding.as_deref() {
+        Some("xudp") => VlessPacketEncoding::Xudp,
+        Some("packetaddr") if vision.is_none() => VlessPacketEncoding::PacketAddr,
+        Some("packetaddr") => {
+            return Err(unsupported(
+                "VLESS Vision requires XUDP and cannot use packetaddr",
+            ));
+        }
+        Some(_) => return Err(unsupported("VLESS packet encoding is unsupported")),
+        None if vision.is_some() => VlessPacketEncoding::Xudp,
+        None => VlessPacketEncoding::Plain,
+    };
+    let mut transport_config = config.clone();
+    transport_config.options.packet_encoding = None;
+    Ok((transport_config, encoding))
+}
+
+pub(crate) fn vless_request_with_flow(
     uuid: &[u8; 16],
     destination: &Endpoint,
     udp: bool,
+    xudp: bool,
+    flow: Option<&str>,
 ) -> Result<Vec<u8>, TransitError> {
     let mut request = vec![0];
     request.extend_from_slice(uuid);
-    request.push(0);
-    request.push(if udp { 2 } else { 1 });
+    let addons = flow.map_or_else(Vec::new, |flow| {
+        let bytes = flow.as_bytes();
+        let mut addons = Vec::with_capacity(bytes.len() + 2);
+        addons.push((1 << 3) | 2);
+        addons.push(bytes.len() as u8);
+        addons.extend_from_slice(bytes);
+        addons
+    });
+    if addons.len() > u8::MAX as usize {
+        return Err(unsupported("VLESS flow addon is too long"));
+    }
+    request.push(addons.len() as u8);
+    request.extend_from_slice(&addons);
+    request.push(if xudp {
+        3
+    } else if udp {
+        2
+    } else {
+        1
+    });
+    if xudp {
+        return Ok(request);
+    }
     request.extend_from_slice(&destination.port.to_be_bytes());
     match destination.host.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => {
@@ -335,16 +488,25 @@ pub(crate) struct NativeDatagram {
     stream: BoxedTransitConnection,
     destination: Endpoint,
     protocol: Protocol,
+    received: Vec<u8>,
+    write_interrupted: bool,
+}
+impl NativeDatagram {
+    fn new(stream: BoxedTransitConnection, destination: Endpoint, protocol: Protocol) -> Self {
+        Self {
+            stream,
+            destination,
+            protocol,
+            received: Vec::new(),
+            write_interrupted: false,
+        }
+    }
 }
 pub(crate) fn vless_datagram(
     stream: BoxedTransitConnection,
     destination: Endpoint,
 ) -> BoxedTransitDatagram {
-    Box::new(NativeDatagram {
-        stream,
-        destination,
-        protocol: Protocol::Vless,
-    })
+    Box::new(NativeDatagram::new(stream, destination, Protocol::Vless))
 }
 impl std::fmt::Debug for NativeDatagram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -354,6 +516,9 @@ impl std::fmt::Debug for NativeDatagram {
 #[async_trait]
 impl TransitDatagram for NativeDatagram {
     async fn send(&mut self, payload: &[u8]) -> Result<(), TransitError> {
+        if self.write_interrupted {
+            return Err(protocol("native UDP write was interrupted"));
+        }
         let length = u16::try_from(payload.len())
             .map_err(|_| unsupported("UDP packet exceeds the native protocol limit"))?;
         let mut packet = Vec::new();
@@ -365,6 +530,7 @@ impl TransitDatagram for NativeDatagram {
             packet.extend_from_slice(b"\r\n");
         }
         packet.extend_from_slice(payload);
+        self.write_interrupted = true;
         self.stream
             .write_all(&packet)
             .await
@@ -372,9 +538,34 @@ impl TransitDatagram for NativeDatagram {
         self.stream
             .flush()
             .await
-            .map_err(|_| protocol("native UDP packet flush failed"))
+            .map_err(|_| protocol("native UDP packet flush failed"))?;
+        self.write_interrupted = false;
+        Ok(())
     }
     async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
+        if matches!(self.protocol, Protocol::Vless) {
+            loop {
+                if self.received.len() >= 2 {
+                    let length =
+                        usize::from(u16::from_be_bytes([self.received[0], self.received[1]]));
+                    if self.received.len() >= length + 2 {
+                        let payload = self.received[2..length + 2].to_vec();
+                        self.received.drain(..length + 2);
+                        return Ok(payload);
+                    }
+                }
+                let mut chunk = [0; 8192];
+                let size = self
+                    .stream
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|_| protocol("native UDP packet read failed"))?;
+                if size == 0 {
+                    return Err(protocol("native UDP packet is truncated"));
+                }
+                self.received.extend_from_slice(&chunk[..size]);
+            }
+        }
         if matches!(self.protocol, Protocol::Trojan) {
             let source = read_trojan_address(&mut self.stream).await?;
             if source.port != self.destination.port
@@ -522,13 +713,15 @@ mod tests {
     #[test]
     fn vless_request_encodes_remote_domains_and_ipv6_without_local_resolution() {
         let uuid = [7; 16];
-        let request = vless_request(
+        let request = vless_request_with_flow(
             &uuid,
             &Endpoint {
                 host: "remote.test".into(),
                 port: 443,
             },
             false,
+            false,
+            None,
         )
         .unwrap();
         assert_eq!(&request[..18], &[vec![0], uuid.to_vec(), vec![0]].concat());
@@ -536,17 +729,189 @@ mod tests {
             &request[18..],
             &[vec![1, 1, 187, 2, 11], b"remote.test".to_vec()].concat()
         );
-        let request = vless_request(
+        let request = vless_request_with_flow(
             &uuid,
             &Endpoint {
                 host: "::1".into(),
                 port: 53,
             },
             true,
+            false,
+            None,
         )
         .unwrap();
         assert_eq!(&request[18..22], &[2, 0, 53, 3]);
         assert_eq!(&request[22..], &std::net::Ipv6Addr::LOCALHOST.octets());
+    }
+
+    #[tokio::test]
+    async fn vless_datagram_retains_partial_reads_and_fails_closed_after_cancelled_write() {
+        use std::{
+            future::Future,
+            pin::pin,
+            task::{Context, Poll, Waker},
+        };
+        let destination = Endpoint {
+            host: "192.0.2.1".into(),
+            port: 53,
+        };
+        let (stream, mut peer) = tokio::io::duplex(64);
+        let mut datagram = vless_datagram(Box::new(stream), destination.clone());
+        peer.write_all(&[0]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), datagram.receive())
+                .await
+                .is_err()
+        );
+        peer.write_all(&[3, b'a']).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), datagram.receive())
+                .await
+                .is_err()
+        );
+        peer.write_all(&[b'b', b'c', 0, 2, b'd', b'e'])
+            .await
+            .unwrap();
+        assert_eq!(datagram.receive().await.unwrap(), b"abc");
+        assert_eq!(datagram.receive().await.unwrap(), b"de");
+
+        let (stream, _peer) = tokio::io::duplex(1);
+        let mut datagram = vless_datagram(Box::new(stream), destination);
+        {
+            let mut send = pin!(datagram.send(b"partial"));
+            assert!(matches!(
+                send.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
+        }
+        assert!(
+            matches!(datagram.send(b"retry").await, Err(TransitError::Protocol(reason)) if reason.contains("interrupted"))
+        );
+    }
+
+    #[tokio::test]
+    async fn packetaddr_retains_split_vless_frame_across_cancelled_receive() {
+        let destination = Endpoint {
+            host: "192.0.2.1".into(),
+            port: 53,
+        };
+        let (stream, mut peer) = tokio::io::duplex(64);
+        let inner = vless_datagram(Box::new(stream), packetaddr_magic_destination());
+        let mut datagram =
+            crate::vmess::PacketAddrDatagram::new(inner, destination, usize::from(u16::MAX))
+                .unwrap();
+        peer.write_all(&[0, 10, 1, 192]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), datagram.receive())
+                .await
+                .is_err()
+        );
+        peer.write_all(&[0, 2, 1, 0, 53, b'a', b'b', b'c'])
+            .await
+            .unwrap();
+        assert_eq!(datagram.receive().await.unwrap(), b"abc");
+    }
+
+    #[test]
+    fn packetaddr_with_vision_is_rejected_for_direct_tls_and_reality() {
+        let mut config = node("vless", 443);
+        config.options.tls = Some(pathchord_policy::TransitTls {
+            enabled: true,
+            ..Default::default()
+        });
+        config.options.packet_encoding = Some("packetaddr".into());
+        let credential = TransitCredential::new(BTreeMap::from([
+            ("uuid".into(), "6cbf3f72-3417-4922-bde6-67820d041f25".into()),
+            ("flow".into(), "xtls-rprx-vision".into()),
+        ]));
+        assert!(
+            matches!(NativeProtocolAdapter::from_config(&config, &credential, Duration::from_secs(1), crate::adapter_registry::native_tls_roots()), Err(TransitError::Unsupported(reason)) if reason.contains("Vision") && reason.contains("XUDP"))
+        );
+        config.options.tls.as_mut().unwrap().reality = Some(pathchord_policy::TransitReality {
+            public_key: "Q7VhOFla3pZJiGzjiNfwi3j-QfEr9FOdDpQIiDANtRM".into(),
+            short_id: "0123456789abcdef".into(),
+        });
+        assert!(
+            matches!(crate::reality_adapter::RealityVlessAdapter::from_config(&config, &credential, Duration::from_secs(1), crate::adapter_registry::native_tls_roots()), Err(TransitError::Unsupported(reason)) if reason.contains("Vision") && reason.contains("XUDP"))
+        );
+    }
+
+    #[test]
+    fn vless_request_encodes_vision_flow_addon() {
+        let uuid = [7; 16];
+        let request = vless_request_with_flow(
+            &uuid,
+            &Endpoint {
+                host: "remote.test".into(),
+                port: 443,
+            },
+            false,
+            false,
+            Some(crate::vision::FLOW_VISION),
+        )
+        .unwrap();
+        let flow = crate::vision::FLOW_VISION.as_bytes();
+        assert_eq!(request[17], (flow.len() + 2) as u8);
+        assert_eq!(&request[18..20], &[0x0a, flow.len() as u8]);
+        assert_eq!(&request[20..20 + flow.len()], flow);
+
+        let mux = vless_request_with_flow(
+            &uuid,
+            &Endpoint {
+                host: "remote.test".into(),
+                port: 443,
+            },
+            true,
+            true,
+            Some(crate::vision::FLOW_VISION),
+        )
+        .unwrap();
+        assert_eq!(
+            &mux[18..20 + flow.len()],
+            &[&[0x0a, flow.len() as u8], flow].concat()
+        );
+        assert_eq!(&mux[20 + flow.len()..], &[3]);
+    }
+
+    #[tokio::test]
+    async fn vision_udp_443_requires_explicit_variant_before_dialing() {
+        let mut node = node("vless", 1);
+        node.options.tls = Some(pathchord_policy::TransitTls {
+            enabled: true,
+            insecure: true,
+            ..Default::default()
+        });
+        let make_adapter = |flow: &str| {
+            let credential = TransitCredential::new(BTreeMap::from([
+                ("uuid".into(), "6cbf3f72-3417-4922-bde6-67820d041f25".into()),
+                ("flow".into(), flow.into()),
+            ]));
+            NativeProtocolAdapter::from_config(
+                &node,
+                &credential,
+                Duration::from_millis(250),
+                crate::adapter_registry::native_tls_roots(),
+            )
+            .unwrap()
+        };
+        let request = ConnectRequest {
+            destination: Endpoint {
+                host: "127.0.0.1".into(),
+                port: 443,
+            },
+        };
+        let ordinary = make_adapter(crate::vision::FLOW_VISION);
+        assert!(ordinary.supports_udp());
+        assert!(matches!(
+            ordinary.connect_udp(request.clone()).await,
+            Err(TransitError::Unsupported(_))
+        ));
+        let allow = make_adapter(crate::vision::FLOW_VISION_UDP443);
+        assert!(allow.supports_udp());
+        assert!(matches!(
+            allow.connect_udp(request).await,
+            Err(TransitError::Connection(_))
+        ));
     }
 
     #[tokio::test]
@@ -578,8 +943,13 @@ mod tests {
     }
 
     #[test]
-    fn native_protocols_reject_unimplemented_flow_and_transport_options() {
+    fn native_protocols_accept_vision_and_reject_other_flow_or_transport_options() {
         let mut node = node("vless", 443);
+        node.options.tls = Some(pathchord_policy::TransitTls {
+            enabled: true,
+            insecure: true,
+            ..Default::default()
+        });
         let credentials = TransitCredential::new(BTreeMap::from([
             ("uuid".into(), "6cbf3f72-3417-4922-bde6-67820d041f25".into()),
             ("flow".into(), "xtls-rprx-vision".into()),
@@ -588,6 +958,19 @@ mod tests {
             NativeProtocolAdapter::from_config(
                 &node,
                 &credentials,
+                Duration::from_secs(1),
+                crate::adapter_registry::native_tls_roots()
+            )
+            .is_ok()
+        );
+        let invalid_flow = TransitCredential::new(BTreeMap::from([
+            ("uuid".into(), "6cbf3f72-3417-4922-bde6-67820d041f25".into()),
+            ("flow".into(), "unsupported-flow".into()),
+        ]));
+        assert!(
+            NativeProtocolAdapter::from_config(
+                &node,
+                &invalid_flow,
                 Duration::from_secs(1),
                 crate::adapter_registry::native_tls_roots()
             )
@@ -602,6 +985,16 @@ mod tests {
             "uuid".into(),
             "6cbf3f72-3417-4922-bde6-67820d041f25".into(),
         )]));
+        assert!(
+            NativeProtocolAdapter::from_config(
+                &node,
+                &credentials,
+                Duration::from_secs(1),
+                crate::adapter_registry::native_tls_roots()
+            )
+            .is_ok()
+        );
+        node.options.transport.as_mut().unwrap().kind = "quic".into();
         assert!(
             NativeProtocolAdapter::from_config(
                 &node,

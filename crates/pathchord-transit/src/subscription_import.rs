@@ -6,6 +6,7 @@
 use base64::Engine as _;
 use pathchord_policy::{
     TransitMultiplex, TransitOptions, TransitReality, TransitTls, TransitTransport,
+    TransitVmessOptions,
 };
 use serde_json::{Map, Value};
 use url::Url;
@@ -36,6 +37,7 @@ const KNOWN_PROTOCOLS: &[&str] = &[
 
 #[derive(Default)]
 struct Node {
+    skip: bool,
     name: String,
     protocol: String,
     host: String,
@@ -72,6 +74,12 @@ impl Node {
         available: &BTreeSet<String>,
     ) -> NormalizedNode {
         self.protocol = canonical_protocol(&self.protocol);
+        if self.protocol == "xtls" {
+            if self.credentials.get("flow").is_none_or(String::is_empty) {
+                self.invalid.insert("flow".to_owned());
+            }
+            self.protocol = "vless".to_owned();
+        }
         if self.protocol == "direct" {
             self.host.clear();
             self.port = 1;
@@ -90,6 +98,13 @@ impl Node {
             self.invalid.insert("tags".to_owned());
         }
         let required: &[&str] = match self.protocol.as_str() {
+            "ss" if self
+                .credentials
+                .get("cipher")
+                .is_some_and(|cipher| matches!(cipher.as_str(), "none" | "plain")) =>
+            {
+                &["cipher"]
+            }
             "ss" => &["cipher", "password"],
             "vmess" | "vless" | "xtls" => &["uuid"],
             "trojan" | "hysteria2" | "anytls" => &["password"],
@@ -128,7 +143,7 @@ impl Node {
                 .get_or_insert_with(TransitTls::default)
                 .enabled = true;
         }
-        let diagnostic = if !self.invalid.is_empty() {
+        let mut diagnostic = if !self.invalid.is_empty() {
             Some(diagnostic(NodeUnavailableReason::InvalidNode, self.invalid))
         } else if !KNOWN_PROTOCOLS.contains(&self.protocol.as_str()) {
             Some(diagnostic(
@@ -155,17 +170,20 @@ impl Node {
             self.protocol = "invalid".to_owned();
         }
         if self.credentials.contains_key("sing_box_outbound") {
-            // The private raw outbound is authoritative for the external
-            // engine. Derived copies must not introduce a second, conflicting
-            // source of credential or private-key semantics.
+            // Preserve unsupported documents privately and expose a generic
+            // diagnostic without leaking their values.
             self.credentials.retain(|key, _| key == "sing_box_outbound");
             self.options = TransitOptions::default();
+            if diagnostic.is_none() {
+                diagnostic = Some(self::diagnostic(
+                    NodeUnavailableReason::AdapterUnavailable,
+                    BTreeSet::from(["sing_box_outbound".to_owned()]),
+                ));
+            }
         }
         let state = diagnostic.as_ref().map_or_else(
             || {
-                if self.credentials.contains_key("sing_box_outbound")
-                    && !available.contains("sing_box_outbound")
-                {
+                if self.credentials.contains_key("sing_box_outbound") {
                     DynamicNodeState::Unavailable(NodeUnavailableReason::AdapterUnavailable)
                 } else {
                     adapter_state(&self.protocol, available)
@@ -270,7 +288,13 @@ pub(super) fn normalize(
     Ok(nodes
         .into_iter()
         .enumerate()
-        .map(|(index, node)| node.finish(format, config, index, &mut used, available))
+        .filter_map(|(index, node)| {
+            let skip = node.skip;
+            // Reserve IDs for non-node entries as older versions did, so
+            // duplicate provider names keep their prior stable suffixes.
+            let normalized = node.finish(format, config, index, &mut used, available);
+            (!skip).then_some(normalized)
+        })
         .collect())
 }
 
@@ -557,6 +581,7 @@ fn clash_node(value: Value, index: usize) -> Node {
             ("up", "up_mbps"),
             ("down", "down_mbps"),
             ("ports", "server_ports"),
+            ("mport", "server_ports"),
             ("hop-interval", "hop_interval"),
             ("heartbeat-interval", "heartbeat"),
             ("token", "password"),
@@ -566,16 +591,70 @@ fn clash_node(value: Value, index: usize) -> Node {
         ],
         &mut node,
     );
+    if node.protocol == "vmess"
+        && let Some(cipher) = node.credentials.remove("cipher")
+    {
+        node.credentials.insert("security".to_owned(), cipher);
+    }
+    if matches!(node.protocol.as_str(), "vless" | "xtls")
+        && let Some(encryption) = text(&mut fields, "encryption", &mut node.invalid)
+        && encryption != "none"
+    {
+        node.unsupported.insert("encryption".to_owned());
+    }
     if let Some(value) = fields.remove("plugin-opts") {
         node.credentials
             .insert("plugin_opts".to_owned(), value.to_string());
     }
     node.options.udp = flag(&mut fields, "udp", &mut node.invalid);
+    if matches!(node.protocol.as_str(), "socks5" | "ss") {
+        let enabled = flag(&mut fields, "udp-over-tcp", &mut node.invalid);
+        let version = bounded_number::<u8>(&mut fields, "udp-over-tcp-version", &mut node.invalid);
+        if version.is_some_and(|value| !matches!(value, 1 | 2))
+            || version.is_some() && enabled != Some(true)
+        {
+            node.invalid.insert("udp-over-tcp-version".to_owned());
+        } else if enabled == Some(true) {
+            node.options.udp_over_tcp = Some(version.unwrap_or(1));
+        }
+    }
+    if node.protocol == "ss" && node.options.udp.is_none() {
+        // Mihomo's Shadowsocks `udp` flag defaults to false; an omitted value
+        // must not silently enable a capability absent from the source node.
+        node.options.udp = Some(false);
+    }
     node.options.tcp_fast_open = flag(&mut fields, "tfo", &mut node.invalid);
     node.options.bind_interface = text(&mut fields, "interface-name", &mut node.invalid);
     node.options.routing_mark =
         bounded_number::<u32>(&mut fields, "routing-mark", &mut node.invalid);
     node.options.packet_encoding = text(&mut fields, "packet-encoding", &mut node.invalid);
+    let vless_packet_explicit = node
+        .options
+        .packet_encoding
+        .as_ref()
+        .is_some_and(|value| !value.is_empty());
+    if node.protocol == "vmess" {
+        let global_padding =
+            flag(&mut fields, "global-padding", &mut node.invalid).unwrap_or(false);
+        let authenticated_length =
+            flag(&mut fields, "authenticated-length", &mut node.invalid).unwrap_or(false);
+        if global_padding || authenticated_length {
+            node.options.vmess = Some(TransitVmessOptions {
+                global_padding,
+                authenticated_length,
+            });
+        }
+    }
+    if matches!(node.protocol.as_str(), "vless" | "xtls") {
+        node.options.packet_encoding = match node.options.packet_encoding.take().as_deref() {
+            None | Some("") => Some("xudp".to_owned()),
+            Some("packet") => Some("packetaddr".to_owned()),
+            Some(value) => Some(value.to_owned()),
+        };
+    } else if node.protocol == "vmess" && node.options.packet_encoding.as_deref() == Some("packet")
+    {
+        node.options.packet_encoding = Some("packetaddr".to_owned());
+    }
     let headers = fields.remove("headers");
     node.options.headers = header_map(headers, "headers", &mut node);
     let mut tls = TransitTls {
@@ -590,6 +669,14 @@ fn clash_node(value: Value, index: usize) -> Node {
     tls.insecure = flag(&mut fields, "skip-cert-verify", &mut node.invalid).unwrap_or_default();
     tls.alpn = string_list(&mut fields, "alpn", &mut node.invalid);
     tls.fingerprint = text(&mut fields, "client-fingerprint", &mut node.invalid);
+    tls.certificate_sha256 = text(&mut fields, "fingerprint", &mut node.invalid);
+    if tls
+        .certificate_sha256
+        .as_deref()
+        .is_some_and(|value| pathchord_policy::parse_certificate_sha256(value).is_none())
+    {
+        node.invalid.insert("fingerprint".to_owned());
+    }
     tls.certificate = string_list(&mut fields, "certificate", &mut node.invalid);
     if let Some(reality) = fields.remove("reality-opts") {
         if let Some(mut reality) = reality.as_object().cloned() {
@@ -612,7 +699,11 @@ fn clash_node(value: Value, index: usize) -> Node {
         && network != "tcp"
     {
         node.options.transport = Some(TransitTransport {
-            kind: network,
+            kind: if network == "h2" {
+                "http".into()
+            } else {
+                network
+            },
             ..TransitTransport::default()
         });
     }
@@ -648,6 +739,16 @@ fn clash_node(value: Value, index: usize) -> Node {
     }
     if let Some(value) = fields.remove("smux") {
         node.options.multiplex = parse_multiplex(value, true, &mut node);
+    }
+    if matches!(node.protocol.as_str(), "vless" | "xtls")
+        && !vless_packet_explicit
+        && node
+            .options
+            .multiplex
+            .as_ref()
+            .is_some_and(|mux| mux.enabled)
+    {
+        node.options.packet_encoding = None;
     }
     // Explicit false options with no effect may be omitted; true values must
     // never vanish when the selected engine cannot represent their semantics.
@@ -767,12 +868,20 @@ fn sing_box(body: &[u8]) -> Result<Vec<Node>, SubscriptionError> {
 }
 
 fn sing_box_node(value: Value, index: usize) -> Node {
+    let skip = matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("direct" | "block" | "selector" | "urltest")
+    );
+    if let Some(node) = sing_box_native_node(&value, index) {
+        return node;
+    }
     let original = value.to_string();
     let mut fields = match map(value, index) {
         Ok(fields) => fields,
         Err(node) => return *node,
     };
     let mut node = Node::new(index);
+    node.skip = skip;
     node.protocol =
         canonical_protocol(&text(&mut fields, "type", &mut node.invalid).unwrap_or_default());
     if node.protocol == "socks5" {
@@ -837,6 +946,283 @@ fn sing_box_node(value: Value, index: usize) -> Node {
     node.credentials
         .insert("sing_box_outbound".to_owned(), original);
     node
+}
+
+/// Normalize a strict, representable subset to native adapters. Keep the
+/// original private document for every other combination so an unsupported
+/// field can never silently turn into a different connection.
+fn sing_box_native_node(value: &Value, index: usize) -> Option<Node> {
+    let mut fields = value.as_object()?.clone();
+    let protocol = canonical_protocol(fields.remove("type")?.as_str()?);
+    if !matches!(
+        protocol.as_str(),
+        "socks5"
+            | "http"
+            | "https"
+            | "ss"
+            | "vmess"
+            | "vless"
+            | "trojan"
+            | "anytls"
+            | "hysteria2"
+            | "tuic"
+    ) {
+        return None;
+    }
+    // sing-box's Trojan allows plaintext when TLS is absent, whereas the
+    // native adapter requires TLS. Preserve such nodes as unavailable.
+    if protocol == "trojan" && !fields.contains_key("tls") {
+        return None;
+    }
+    let mut node = Node::new(index);
+    node.protocol = protocol;
+    node.name = text(&mut fields, "tag", &mut node.invalid).unwrap_or(node.name);
+    node.host = text(&mut fields, "server", &mut node.invalid).unwrap_or_default();
+    node.port =
+        bounded_number::<u16>(&mut fields, "server_port", &mut node.invalid).unwrap_or_default();
+
+    if node.protocol == "socks5"
+        && let Some(version) = text(&mut fields, "version", &mut node.invalid)
+        && version != "5"
+    {
+        return None;
+    }
+    if matches!(node.protocol.as_str(), "socks5" | "ss")
+        && let Some(value) = fields.remove("udp_over_tcp")
+    {
+        node.options.udp_over_tcp = sing_box_udp_over_tcp(value)?;
+    }
+    if let Some(network) = fields.remove("network") {
+        let mut network_fields = Map::from_iter([("network".to_owned(), network)]);
+        let values = string_list(&mut network_fields, "network", &mut node.invalid);
+        let networks: BTreeSet<_> = values.iter().map(String::as_str).collect();
+        if networks != BTreeSet::from(["tcp", "udp"]) || values.len() != 2 {
+            return None;
+        }
+    }
+    let mut credential_fields = vec![];
+    match node.protocol.as_str() {
+        "socks5" => credential_fields.extend([("username", "username"), ("password", "password")]),
+        "http" | "https" => credential_fields.extend([
+            ("username", "username"),
+            ("password", "password"),
+            ("path", "http_path"),
+        ]),
+        "ss" => credential_fields.extend([
+            ("method", "cipher"),
+            ("password", "password"),
+            ("plugin", "plugin"),
+            ("plugin_opts", "plugin_opts"),
+        ]),
+        "vless" => credential_fields.extend([("uuid", "uuid"), ("flow", "flow")]),
+        "vmess" => credential_fields.extend([
+            ("uuid", "uuid"),
+            ("security", "security"),
+            ("alter_id", "alter_id"),
+        ]),
+        "trojan" | "anytls" => credential_fields.push(("password", "password")),
+        "hysteria2" => credential_fields.extend([
+            ("password", "password"),
+            ("up_mbps", "up_mbps"),
+            ("down_mbps", "down_mbps"),
+        ]),
+        "tuic" => credential_fields.extend([
+            ("uuid", "uuid"),
+            ("password", "password"),
+            ("congestion_control", "congestion_control"),
+            ("udp_relay_mode", "udp_relay_mode"),
+            ("heartbeat", "heartbeat"),
+        ]),
+        _ => unreachable!(),
+    }
+    credentials(&mut fields, &credential_fields, &mut node);
+    if node.protocol == "tuic" {
+        for field in ["zero_rtt_handshake", "udp_over_stream"] {
+            if let Some(value) = flag(&mut fields, field, &mut node.invalid) {
+                node.credentials.insert(field.to_owned(), value.to_string());
+            }
+        }
+    }
+    let vless_packet_implicit = node.protocol == "vless" && !fields.contains_key("packet_encoding");
+    if node.protocol == "vless" {
+        node.options.packet_encoding = match text(&mut fields, "packet_encoding", &mut node.invalid)
+        {
+            None => Some("xudp".to_owned()),
+            Some(value) if value.is_empty() => {
+                if node
+                    .credentials
+                    .get("flow")
+                    .is_some_and(|flow| !flow.is_empty())
+                {
+                    return None;
+                }
+                None
+            }
+            Some(value) => Some(value),
+        };
+    } else if node.protocol == "vmess" {
+        node.options.packet_encoding = text(&mut fields, "packet_encoding", &mut node.invalid)
+            .filter(|value| !value.is_empty());
+        let global_padding =
+            flag(&mut fields, "global_padding", &mut node.invalid).unwrap_or(false);
+        let authenticated_length =
+            flag(&mut fields, "authenticated_length", &mut node.invalid).unwrap_or(false);
+        if global_padding || authenticated_length {
+            node.options.vmess = Some(TransitVmessOptions {
+                global_padding,
+                authenticated_length,
+            });
+        }
+    }
+    if let Some(value) = fields.remove("multiplex") {
+        node.options.multiplex = parse_multiplex(value, false, &mut node);
+    }
+    if vless_packet_implicit
+        && node
+            .options
+            .multiplex
+            .as_ref()
+            .is_some_and(|mux| mux.enabled)
+    {
+        node.options.packet_encoding = None;
+    }
+    if let Some(value) = fields.remove("headers") {
+        node.options.headers = sing_box_headers(value, "headers", &mut node)?;
+    }
+    if let Some(value) = fields.remove("tls") {
+        let mut tls = value.as_object()?.clone();
+        let mut options = TransitTls {
+            enabled: flag(&mut tls, "enabled", &mut node.invalid).unwrap_or(false),
+            server_name: text(&mut tls, "server_name", &mut node.invalid),
+            insecure: flag(&mut tls, "insecure", &mut node.invalid).unwrap_or(false),
+            alpn: string_list(&mut tls, "alpn", &mut node.invalid),
+            certificate: string_list(&mut tls, "certificate", &mut node.invalid),
+            client_certificate: string_list(&mut tls, "client_certificate", &mut node.invalid),
+            ..TransitTls::default()
+        };
+        if let Some(key) = tls.remove("client_key") {
+            let mut map = Map::from_iter([("client_key".to_owned(), key)]);
+            let key = string_list(&mut map, "client_key", &mut node.invalid).join("\n");
+            node.credentials.insert("client_key".to_owned(), key);
+            options.client_key_field = Some("client_key".to_owned());
+        }
+        if let Some(value) = tls.remove("utls") {
+            let mut utls = value.as_object()?.clone();
+            let enabled = flag(&mut utls, "enabled", &mut node.invalid).unwrap_or(false);
+            let fingerprint = text(&mut utls, "fingerprint", &mut node.invalid);
+            if !utls.is_empty() || (!enabled && fingerprint.is_some()) {
+                return None;
+            }
+            if enabled {
+                options.fingerprint = Some(
+                    fingerprint
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "chrome".to_owned()),
+                );
+            }
+        }
+        if let Some(value) = tls.remove("reality") {
+            let mut reality = value.as_object()?.clone();
+            let enabled = flag(&mut reality, "enabled", &mut node.invalid).unwrap_or(false);
+            let public_key =
+                text(&mut reality, "public_key", &mut node.invalid).unwrap_or_default();
+            let short_id = text(&mut reality, "short_id", &mut node.invalid).unwrap_or_default();
+            if !reality.is_empty() || (!enabled && (!public_key.is_empty() || !short_id.is_empty()))
+            {
+                return None;
+            }
+            if enabled {
+                options.reality = Some(TransitReality {
+                    public_key,
+                    short_id,
+                });
+            }
+        }
+        if !tls.is_empty() {
+            return None;
+        }
+        node.options.tls = Some(options);
+    }
+    if let Some(value) = fields.remove("transport") {
+        let mut transport = value.as_object()?.clone();
+        let kind = text(&mut transport, "type", &mut node.invalid).unwrap_or_default();
+        let mut options = TransitTransport {
+            kind,
+            ..TransitTransport::default()
+        };
+        options.path = text(&mut transport, "path", &mut node.invalid);
+        options.host = string_list(&mut transport, "host", &mut node.invalid);
+        options.service_name = text(&mut transport, "service_name", &mut node.invalid);
+        options.max_early_data =
+            bounded_number::<u32>(&mut transport, "max_early_data", &mut node.invalid);
+        options.early_data_header_name =
+            text(&mut transport, "early_data_header_name", &mut node.invalid);
+        if let Some(value) = transport.remove("headers") {
+            options.headers = sing_box_headers(value, "transport.headers", &mut node)?;
+        }
+        if !transport.is_empty() {
+            return None;
+        }
+        node.options.transport = Some(options);
+    }
+    if node.protocol == "hysteria2"
+        && let Some(value) = fields.remove("obfs")
+    {
+        let mut obfs = value.as_object()?.clone();
+        credentials(
+            &mut obfs,
+            &[
+                ("type", "obfs"),
+                ("password", "obfs_password"),
+                ("min_packet_size", "gecko_min_packet_size"),
+                ("max_packet_size", "gecko_max_packet_size"),
+            ],
+            &mut node,
+        );
+        if !obfs.is_empty() {
+            return None;
+        }
+    }
+    if !fields.is_empty() || !node.invalid.is_empty() || !node.unsupported.is_empty() {
+        return None;
+    }
+    Some(node)
+}
+
+fn sing_box_udp_over_tcp(value: Value) -> Option<Option<u8>> {
+    if let Some(enabled) = value.as_bool() {
+        return Some(enabled.then_some(2));
+    }
+    let mut fields = value.as_object()?.clone();
+    let enabled = match fields.remove("enabled") {
+        Some(value) => value.as_bool()?,
+        None => false,
+    };
+    let version = match fields.remove("version") {
+        Some(value) => u8::try_from(value.as_u64()?).ok()?,
+        None => 0,
+    };
+    if !fields.is_empty() || !matches!(version, 0..=2) {
+        return None;
+    }
+    Some(enabled.then_some(if version == 0 { 2 } else { version }))
+}
+
+fn sing_box_headers(
+    value: Value,
+    field: &str,
+    node: &mut Node,
+) -> Option<BTreeMap<String, String>> {
+    let mut headers = value.as_object()?.clone();
+    for value in headers.values_mut() {
+        if let Value::Array(values) = value {
+            if values.len() != 1 || !values[0].is_string() {
+                return None;
+            }
+            *value = values[0].clone();
+        }
+    }
+    Some(header_map(Some(Value::Object(headers)), field, node))
 }
 
 fn decode_base64(text: &str) -> Option<Vec<u8>> {
@@ -907,6 +1293,9 @@ fn uri_node(uri: &str, index: usize) -> Node {
     let Ok(url) = Url::parse(uri) else {
         return Node::invalid(index, "uri");
     };
+    if url.scheme() == "trojan-go" {
+        return trojan_go_uri(&url, index);
+    }
     let mut node = Node::new(index);
     node.protocol = canonical_protocol(url.scheme());
     node.name = url
@@ -929,7 +1318,7 @@ fn uri_node(uri: &str, index: usize) -> Node {
     };
     let password = url.password().and_then(decode_percent);
     match node.protocol.as_str() {
-        "vless" => {
+        "vless" | "xtls" => {
             node.credentials.insert("uuid".to_owned(), username);
         }
         "trojan" => {
@@ -979,8 +1368,204 @@ fn uri_node(uri: &str, index: usize) -> Node {
     node
 }
 
+/// Normalize the Trojan-go share-link syntax without discarding its options.
+fn trojan_go_uri(url: &Url, index: usize) -> Node {
+    let mut node = Node::new(index);
+    node.protocol = "trojan".to_owned();
+    node.name = url
+        .fragment()
+        .and_then(decode_percent)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(node.name);
+    node.host = url
+        .host_str()
+        .map(|host| host.trim_matches(['[', ']']).to_owned())
+        .unwrap_or_default();
+    node.port = url.port().unwrap_or(443);
+    match decode_percent(url.username()) {
+        Some(password) if !password.is_empty() && url.password().is_none() => {
+            node.credentials.insert("password".to_owned(), password);
+        }
+        _ => {
+            node.invalid.insert("uri.userinfo".to_owned());
+        }
+    }
+    if !matches!(url.path(), "" | "/") {
+        node.unsupported.insert("uri.path".to_owned());
+    }
+    let mut query = Map::new();
+    if url.query().is_some_and(|raw| {
+        raw.split('&').any(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            decode_percent(key).is_none() || decode_percent(value).is_none()
+        })
+    }) {
+        node.invalid.insert("query.encoding".to_owned());
+    }
+    for (key, value) in url.query_pairs() {
+        if query
+            .insert(key.to_string(), Value::String(value.to_string()))
+            .is_some()
+        {
+            node.invalid.insert(format!("query.{key}"));
+        }
+    }
+
+    // dae accepts these additional spellings; reject contradictions rather
+    // than silently letting a false value override a true one.
+    let mut insecure = flag(&mut query, "allow_insecure", &mut node.invalid);
+    for alias in ["allowinsecure", "skipVerify"] {
+        if let Some(value) = flag(&mut query, alias, &mut node.invalid) {
+            if insecure.is_some_and(|previous| previous != value) {
+                node.invalid.insert(format!("query.{alias}"));
+            } else {
+                insecure = Some(value);
+            }
+        }
+    }
+    if let Some(value) = insecure {
+        query.insert("allow_insecure".to_owned(), Value::Bool(value));
+    }
+    if let Some(security) = text(&mut query, "security", &mut node.invalid)
+        && security != "tls"
+    {
+        node.unsupported.insert("query.security".to_owned());
+    }
+    if let Some(encryption) = text(&mut query, "encryption", &mut node.invalid) {
+        let encryption = zeroize::Zeroizing::new(encryption);
+        if encryption.is_empty() {
+            node.invalid.insert("query.encryption".to_owned());
+        } else if encryption.as_str() != "none" {
+            match encryption
+                .strip_prefix("ss;")
+                .and_then(|ss| ss.split_once(':'))
+            {
+                Some((_, "")) => {
+                    node.invalid.insert("query.encryption".to_owned());
+                }
+                Some((method, password))
+                    if matches!(
+                        method,
+                        "aes-128-gcm" | "aes-256-gcm" | "chacha20-ietf-poly1305"
+                    ) =>
+                {
+                    node.credentials
+                        .insert("trojan_go_ss_method".to_owned(), method.to_owned());
+                    node.credentials
+                        .insert("trojan_go_ss_password".to_owned(), password.to_owned());
+                }
+                _ => {
+                    // dae's ss;method;password mode writes an SS target header,
+                    // which is a different wire protocol from Trojan-Go's
+                    // encrypted stream and is therefore not silently reinterpreted.
+                    node.unsupported.insert("query.encryption".to_owned());
+                }
+            }
+        }
+    }
+    let network = text(&mut query, "type", &mut node.invalid).unwrap_or_default();
+    if matches!(network.as_str(), "" | "original" | "tcp")
+        && node.credentials.contains_key("trojan_go_ss_method")
+    {
+        // Trojan-Go's original TLS server performs HTTP request sniffing
+        // before handing the stream to its Trojan layer. The first encrypted
+        // SS record is arbitrary binary, so small writes can be held or
+        // discarded by that peer. WebSocket keeps a real HTTP handshake and
+        // does not have this ambiguity; keep the unsafe combination out of
+        // the selectable node set.
+        node.unsupported.insert("query.encryption".to_owned());
+    }
+    match network.as_str() {
+        "" | "original" | "tcp" => {}
+        "ws" | "httpupgrade" => {
+            query.insert("type".to_owned(), Value::String(network.clone()));
+            if query
+                .get("host")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                let host = if node.host.contains(':') {
+                    format!("[{}]", node.host)
+                } else {
+                    node.host.clone()
+                };
+                query.insert("host".to_owned(), Value::String(host));
+            }
+            if let Some(path) = text(&mut query, "path", &mut node.invalid) {
+                let path = if path.is_empty() {
+                    "/".to_owned()
+                } else if network == "httpupgrade" && !path.starts_with('/') {
+                    format!("/{path}")
+                } else {
+                    path
+                };
+                query.insert("path".to_owned(), Value::String(path));
+            }
+        }
+        "grpc" => {
+            let path =
+                text(&mut query, "path", &mut node.invalid).filter(|value| !value.is_empty());
+            let service = text(&mut query, "serviceName", &mut node.invalid)
+                .filter(|value| !value.is_empty());
+            if path
+                .as_ref()
+                .zip(service.as_ref())
+                .is_some_and(|(a, b)| a != b)
+            {
+                node.invalid.insert("query.serviceName".to_owned());
+            }
+            let service = service.or(path).unwrap_or_else(|| "GunService".to_owned());
+            // A leading slash selects the explicit gRPC service/method path;
+            // preserve slashes in dae's service name and append its Tun method.
+            query.insert(
+                "serviceName".to_owned(),
+                Value::String(format!("/{service}/Tun")),
+            );
+            query.insert("type".to_owned(), Value::String("grpc".to_owned()));
+        }
+        _ => {
+            node.unsupported.insert("query.type".to_owned());
+        }
+    }
+    apply_uri_query(&mut query, &mut node);
+    leftovers(query, "query.", &mut node);
+    node
+}
+
 fn apply_uri_query(query: &mut Map<String, Value>, node: &mut Node) {
     let security = text(query, "security", &mut node.invalid);
+    let mut server_name: Option<String> = None;
+    for field in ["sni", "peer", "servername"] {
+        if let Some(value) = text(query, field, &mut node.invalid).filter(|value| !value.is_empty())
+        {
+            if server_name
+                .as_ref()
+                .is_some_and(|previous| previous != &value)
+            {
+                node.invalid.insert(format!("query.{field}"));
+            } else {
+                server_name = Some(value);
+            }
+        }
+    }
+    let mut insecure = None;
+    for field in ["allowInsecure", "insecure", "allow_insecure"] {
+        if let Some(value) = flag(query, field, &mut node.invalid) {
+            if insecure.is_some_and(|previous| previous != value) {
+                node.invalid.insert(format!("query.{field}"));
+            } else {
+                insecure = Some(value);
+            }
+        }
+    }
+    let certificate_sha256 =
+        text(query, "pinSHA256", &mut node.invalid).filter(|value| !value.is_empty());
+    if certificate_sha256
+        .as_deref()
+        .is_some_and(|value| pathchord_policy::parse_certificate_sha256(value).is_none())
+    {
+        node.invalid.insert("query.pinSHA256".to_owned());
+    }
     let mut tls = TransitTls {
         enabled: security
             .as_deref()
@@ -989,14 +1574,11 @@ fn apply_uri_query(query: &mut Map<String, Value>, node: &mut Node) {
                 node.protocol.as_str(),
                 "https" | "trojan" | "hysteria" | "hysteria2" | "tuic"
             ),
-        server_name: text(query, "sni", &mut node.invalid)
-            .or_else(|| text(query, "peer", &mut node.invalid)),
-        insecure: flag(query, "allowInsecure", &mut node.invalid)
-            .or_else(|| flag(query, "insecure", &mut node.invalid))
-            .or_else(|| flag(query, "allow_insecure", &mut node.invalid))
-            .unwrap_or_default(),
+        server_name,
+        insecure: insecure.unwrap_or_default(),
         alpn: string_list(query, "alpn", &mut node.invalid),
         fingerprint: text(query, "fp", &mut node.invalid),
+        certificate_sha256,
         ..TransitTls::default()
     };
     if security.as_deref() == Some("reality") {
@@ -1013,20 +1595,77 @@ fn apply_uri_query(query: &mut Map<String, Value>, node: &mut Node) {
     if tls != TransitTls::default() {
         node.options.tls = Some(tls);
     }
+    for (field, accepted) in [
+        ("headerType", "none"),
+        ("quicSecurity", "none"),
+        ("pcs", ""),
+    ] {
+        if let Some(value) = text(query, field, &mut node.invalid)
+            && !value.is_empty()
+            && value != accepted
+        {
+            node.unsupported.insert(format!("query.{field}"));
+        }
+    }
+    if let Some(spider_path) = text(query, "spx", &mut node.invalid)
+        && !matches!(spider_path.as_str(), "" | "/")
+    {
+        node.unsupported.insert("query.spx".to_owned());
+    }
     let network = text(query, "type", &mut node.invalid)
         .or_else(|| text(query, "network", &mut node.invalid));
+    if network
+        .as_deref()
+        .is_none_or(|value| matches!(value, "tcp" | "none"))
+    {
+        for field in ["host", "path", "serviceName"] {
+            if let Some(value) = text(query, field, &mut node.invalid)
+                && !value.is_empty()
+            {
+                node.unsupported.insert(format!("query.{field}"));
+            }
+        }
+    }
     if let Some(network) = network
         && !matches!(network.as_str(), "tcp" | "none")
     {
-        node.options.transport = Some(TransitTransport {
-            kind: network,
-            path: text(query, "path", &mut node.invalid),
-            host: string_list(query, "host", &mut node.invalid),
-            service_name: text(query, "serviceName", &mut node.invalid),
-            max_early_data: bounded_number::<u32>(query, "ed", &mut node.invalid),
-            early_data_header_name: text(query, "eh", &mut node.invalid),
-            ..TransitTransport::default()
-        });
+        if network == "meek" {
+            match text(query, "url", &mut node.invalid) {
+                Some(url) if !url.is_empty() => {
+                    node.credentials.insert("meek_url".to_owned(), url);
+                }
+                _ => {
+                    node.invalid.insert("query.url".to_owned());
+                }
+            }
+            // Meek's complete URL is private. Unsupported aliases must not
+            // publish their potentially secret contents in typed options.
+            for field in ["path", "host", "serviceName", "ed", "eh"] {
+                if query.remove(field).is_some() {
+                    node.unsupported.insert(format!("query.{field}"));
+                }
+            }
+            node.options.transport = Some(TransitTransport {
+                kind: network,
+                ..TransitTransport::default()
+            });
+        } else {
+            let max_early_data = bounded_number::<u32>(query, "ed", &mut node.invalid);
+            let early_data_header_name = text(query, "eh", &mut node.invalid).or_else(|| {
+                (network == "ws" && max_early_data.is_some_and(|value| value > 0))
+                    .then(|| "Sec-WebSocket-Protocol".to_owned())
+            });
+            node.options.transport = Some(TransitTransport {
+                kind: network,
+                path: text(query, "path", &mut node.invalid),
+                host: string_list(query, "host", &mut node.invalid),
+                service_name: text(query, "serviceName", &mut node.invalid)
+                    .filter(|value| !value.is_empty()),
+                max_early_data,
+                early_data_header_name,
+                ..TransitTransport::default()
+            });
+        }
     }
     credentials(
         query,
@@ -1036,6 +1675,7 @@ fn apply_uri_query(query: &mut Map<String, Value>, node: &mut Node) {
             ("obfs-password", "obfs_password"),
             ("upmbps", "up_mbps"),
             ("downmbps", "down_mbps"),
+            ("mport", "server_ports"),
             ("congestion_control", "congestion_control"),
             ("udp_relay_mode", "udp_relay_mode"),
         ],
@@ -1081,13 +1721,16 @@ fn ss_uri(payload: &str, index: usize) -> Node {
     let Some((userinfo, endpoint)) = payload.rsplit_once('@') else {
         return Node::invalid(index, "ss.userinfo");
     };
-    let userinfo = if userinfo.contains(':') {
+    let userinfo = if userinfo.contains(':') || matches!(userinfo, "none" | "plain") {
         decode_percent(userinfo)
     } else {
         decode_base64(userinfo).and_then(|bytes| String::from_utf8(bytes).ok())
     };
-    let Some((cipher, password)) = userinfo.as_deref().and_then(|value| value.split_once(':'))
-    else {
+    let Some((cipher, password)) = userinfo.as_deref().and_then(|value| {
+        value
+            .split_once(':')
+            .or_else(|| matches!(value, "none" | "plain").then_some((value, "")))
+    }) else {
         return Node::invalid(index, "ss.userinfo");
     };
     node.credentials
@@ -1161,8 +1804,22 @@ fn vmess_uri(payload: &str, index: usize) -> Node {
     let network = text(&mut fields, "net", &mut node.invalid).unwrap_or_else(|| "tcp".to_owned());
     let header_type =
         text(&mut fields, "type", &mut node.invalid).unwrap_or_else(|| "none".to_owned());
-    let host = string_list(&mut fields, "host", &mut node.invalid);
-    let path = text(&mut fields, "path", &mut node.invalid);
+    let mut host = string_list(&mut fields, "host", &mut node.invalid);
+    let mut path = text(&mut fields, "path", &mut node.invalid);
+    if network == "meek" {
+        match path.take() {
+            Some(url) if !url.is_empty() => {
+                node.credentials.insert("meek_url".to_owned(), url);
+            }
+            _ => {
+                node.invalid.insert("path".to_owned());
+            }
+        }
+        if !host.is_empty() || header_type != "none" {
+            node.unsupported.insert("meek.options".to_owned());
+        }
+        host.clear();
+    }
     if network != "tcp" && network != "none" {
         let service_name = (network == "grpc").then(|| path.clone()).flatten();
         node.options.transport = Some(TransitTransport {
@@ -1280,7 +1937,7 @@ fn line_node(line: &str, format: &str, index: usize) -> Node {
                 "ss" => &["cipher", "password"],
                 "http" | "https" | "socks5" => &["username", "password"],
                 "trojan" | "hysteria2" => &["password"],
-                "vmess" | "vless" => &["uuid"],
+                "vmess" | "vless" | "xtls" => &["uuid"],
                 _ => &[],
             };
             for (offset, name) in names.iter().enumerate() {
@@ -1367,7 +2024,7 @@ fn line_node(line: &str, format: &str, index: usize) -> Node {
     } else if obfs_host.is_some() {
         node.unsupported.insert("obfs-host".to_owned());
     }
-    if matches!(node.protocol.as_str(), "vmess" | "vless")
+    if matches!(node.protocol.as_str(), "vmess" | "vless" | "xtls")
         && !node.credentials.contains_key("uuid")
         && let Some(uuid) = node.credentials.remove("password")
     {

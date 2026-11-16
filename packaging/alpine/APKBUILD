@@ -10,6 +10,7 @@ depends=""
 makedepends="cargo"
 pkgusers="pathchord"
 pkggroups="pathchord"
+install="$pkgname.pre-install"
 source="$pkgname-$pkgver.tar.gz::https://github.com/KagurazakaNyaa/PathChord/archive/refs/tags/v$pkgver.tar.gz"
 # Release automation should replace SKIP with the source archive digest.
 sha256sums="SKIP"

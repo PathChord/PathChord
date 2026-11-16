@@ -45,6 +45,20 @@ artifact. The package version defaults to the `[workspace.package]` version in
 artifact. Host tools (`dpkg-deb`, `abuild`, `makepkg`, FreeBSD `pkg`, and
 NSIS) are intentionally required only by the matching target.
 
+For Alpine x86_64 cross-builds, install the Rust musl target and use Rust's
+default static PIE linker rather than overriding Cargo's target linker with
+`musl-gcc`. For example, select an installed toolchain containing that target:
+
+```sh
+cargo +stable build --locked --release -p pathchord-cli --target x86_64-unknown-linux-musl
+PATHCHORD_BINARY=target/x86_64-unknown-linux-musl/release/pathchord make -C packaging package-alpine
+```
+
+Run `abuild` with a signing key in the package-building environment. The
+generated APK uses that key; a target host must trust its public key before
+installing it with signature verification. The package creates the
+`pathchord` system user and group if absent and preserves them on removal.
+
 The Windows service XML is compatible with WinSW. The installer also ships a
 PowerShell registration script so operators can choose the WinSW binary and
 service account policy available on their host; PathChord remains a normal

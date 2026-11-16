@@ -10,7 +10,7 @@ use rustls::ClientConfig;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     AdapterKind, BoxedTransitConnection, ConnectRequest, Endpoint, TransitAdapter,
@@ -26,6 +26,8 @@ pub struct HttpConnectTransitAdapter {
     proxy: Endpoint,
     authorization: Option<String>,
     headers: BTreeMap<String, String>,
+    host_override: Option<String>,
+    path: Option<Zeroizing<String>>,
     connect_timeout: Duration,
 }
 
@@ -61,8 +63,11 @@ impl HttpConnectTransitAdapter {
             ));
         }
         crate::adapter_registry::validate_native_options(config, false, true, false)?;
-        crate::adapter_registry::validate_credentials(credential, &["username", "password"])?;
-        validate_headers(&config.options.headers)?;
+        crate::adapter_registry::validate_credentials(
+            credential,
+            &["username", "password", "http_path"],
+        )?;
+        let (headers, host_override) = proxy_headers(&config.options.headers)?;
         Ok(Self {
             metadata: metadata(config, "http"),
             proxy: Endpoint {
@@ -70,7 +75,9 @@ impl HttpConnectTransitAdapter {
                 port: config.endpoint.port,
             },
             authorization: proxy_authorization(credential)?,
-            headers: config.options.headers.clone(),
+            headers,
+            host_override,
+            path: proxy_path(credential)?,
             connect_timeout,
         })
     }
@@ -95,6 +102,8 @@ impl TransitAdapter for HttpConnectTransitAdapter {
                 &request.destination,
                 self.authorization.as_deref(),
                 &self.headers,
+                self.host_override.as_deref(),
+                self.path.as_deref().map(String::as_str),
             ),
         )
         .await
@@ -109,6 +118,8 @@ pub struct HttpsConnectTransitAdapter {
     proxy: Endpoint,
     authorization: Option<String>,
     headers: BTreeMap<String, String>,
+    host_override: Option<String>,
+    path: Option<Zeroizing<String>>,
     connect_timeout: Duration,
     tls: Arc<ClientConfig>,
     server_name: rustls::pki_types::ServerName<'static>,
@@ -155,10 +166,10 @@ impl HttpsConnectTransitAdapter {
             .tls
             .as_ref()
             .and_then(|tls| tls.client_key_field.as_deref());
-        let mut allowed = vec!["username", "password"];
+        let mut allowed = vec!["username", "password", "http_path"];
         allowed.extend(key);
         crate::adapter_registry::validate_credentials(credential, &allowed)?;
-        validate_headers(&config.options.headers)?;
+        let (headers, host_override) = proxy_headers(&config.options.headers)?;
         let configure_options = config.options.tls.clone();
         let tls_options = match configure_options.clone() {
             None => pathchord_policy::TransitTls {
@@ -204,7 +215,9 @@ impl HttpsConnectTransitAdapter {
                 port: config.endpoint.port,
             },
             authorization: proxy_authorization(credential)?,
-            headers: config.options.headers.clone(),
+            headers,
+            host_override,
+            path: proxy_path(credential)?,
             connect_timeout,
             tls,
             server_name,
@@ -238,6 +251,8 @@ impl TransitAdapter for HttpsConnectTransitAdapter {
                 &request.destination,
                 self.authorization.as_deref(),
                 &self.headers,
+                self.host_override.as_deref(),
+                self.path.as_deref().map(String::as_str),
             ),
         )
         .await
@@ -279,19 +294,102 @@ fn proxy_authorization(
     }
 }
 
+fn proxy_path(
+    credential: Option<&TransitCredential>,
+) -> Result<Option<Zeroizing<String>>, TransitError> {
+    let Some(path) = credential.and_then(|value| value.field("http_path")) else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Ok(None);
+    }
+    if path.len() > 4096 || path.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(TransitError::Unsupported(
+            "HTTP proxy request path is invalid".into(),
+        ));
+    }
+    let mut decoded = Zeroizing::new(Vec::with_capacity(path.len()));
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let pair = bytes.get(index + 1..index + 3).ok_or_else(|| {
+                TransitError::Unsupported(
+                    "HTTP proxy request path has invalid percent encoding".into(),
+                )
+            })?;
+            let high = (pair[0] as char)
+                .to_digit(16)
+                .filter(|_| pair[0].is_ascii_hexdigit());
+            let low = (pair[1] as char)
+                .to_digit(16)
+                .filter(|_| pair[1].is_ascii_hexdigit());
+            let value = high
+                .zip(low)
+                .map(|(high, low)| ((high << 4) | low) as u8)
+                .ok_or_else(|| {
+                    TransitError::Unsupported(
+                        "HTTP proxy request path has invalid percent encoding".into(),
+                    )
+                })?;
+            if value.is_ascii_control() {
+                return Err(TransitError::Unsupported(
+                    "HTTP proxy request path is invalid".into(),
+                ));
+            }
+            decoded.push(value);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let raw_is_valid = bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"-._~/!$&'()*+,;=:@[]%".contains(byte));
+    if raw_is_valid {
+        return Ok(Some(Zeroizing::new(path.to_owned())));
+    }
+    let mut escaped = Zeroizing::new(String::with_capacity(decoded.len()));
+    for byte in decoded.iter().copied() {
+        if byte.is_ascii_alphanumeric() || b"-._~$&+,/:;=@".contains(&byte) {
+            escaped.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(escaped, "%{byte:02X}").expect("writing into a string cannot fail");
+        }
+        if escaped.len() > 12_288 {
+            return Err(TransitError::Unsupported(
+                "HTTP proxy request path is too long".into(),
+            ));
+        }
+    }
+    Ok(Some(escaped))
+}
+
 async fn establish_connect_tunnel<S>(
     stream: &mut S,
     destination: &Endpoint,
     authorization: Option<&str>,
     headers: &BTreeMap<String, String>,
+    host_override: Option<&str>,
+    path: Option<&str>,
 ) -> Result<(), TransitError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let authority = authority(destination);
-    let mut request = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n"
-    );
+    let host_override = host_override.filter(|host| *host != destination.host);
+    if host_override.is_some() && path.is_some() {
+        return Err(TransitError::Unsupported(
+            "HTTP proxy Host override and request path cannot be combined".into(),
+        ));
+    }
+    let request_target = path.unwrap_or(&authority);
+    let host = host_override.unwrap_or(&authority);
+    let mut request = Zeroizing::new(format!(
+        "CONNECT {request_target} HTTP/1.1\r\nHost: {host}\r\nProxy-Connection: Keep-Alive\r\n"
+    ));
     if let Some(authorization) = authorization {
         request.push_str("Proxy-Authorization: Basic ");
         request.push_str(authorization);
@@ -347,7 +445,9 @@ where
     Ok(())
 }
 
-fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), TransitError> {
+fn proxy_headers(
+    headers: &BTreeMap<String, String>,
+) -> Result<(BTreeMap<String, String>, Option<String>), TransitError> {
     if headers.len() > 64
         || headers.iter().any(|(name, value)| {
             name.is_empty()
@@ -360,7 +460,6 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), TransitErr
                     .bytes()
                     .any(|byte| byte.is_ascii_control() && byte != b'\t')
                 || [
-                    "host",
                     "proxy-authorization",
                     "proxy-connection",
                     "connection",
@@ -375,7 +474,26 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), TransitErr
             "HTTP proxy headers contain invalid or reserved fields".into(),
         ));
     }
-    Ok(())
+    let mut host_override = None;
+    let mut remaining = BTreeMap::new();
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("host") {
+            if host_override.is_some()
+                || value.is_empty()
+                || value
+                    .bytes()
+                    .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+            {
+                return Err(TransitError::Unsupported(
+                    "HTTP proxy Host override is invalid".into(),
+                ));
+            }
+            host_override = Some(value.clone());
+        } else {
+            remaining.insert(name.clone(), value.clone());
+        }
+    }
+    Ok((remaining, host_override))
 }
 
 fn authority(endpoint: &Endpoint) -> String {
@@ -503,6 +621,127 @@ mod tests {
         assert_tunnel(&adapter, target).await;
         target_task.await.unwrap();
         proxy_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_connect_uses_private_request_path_and_host_override() {
+        for (path, host, request_target, host_header) in [
+            (
+                Some("/token%2Fpart?x=1"),
+                None,
+                "/token/part%3Fx=1",
+                "target.test:443",
+            ),
+            (None, Some("front.test"), "target.test:443", "front.test"),
+            (
+                Some("/token%2Fpart"),
+                Some("target.test"),
+                "/token%2Fpart",
+                "target.test:443",
+            ),
+        ] {
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = proxy.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = proxy.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with(&format!("CONNECT {request_target} HTTP/1.1\r\n")));
+                assert!(request.contains(&format!("Host: {host_header}\r\n")));
+                assert!(request.contains("Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=\r\n"));
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut bytes = [0; 5];
+                stream.read_exact(&mut bytes).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
+            });
+            let mut node = config("http", address);
+            if let Some(host) = host {
+                node.options.headers.insert("Host".into(), host.into());
+            }
+            let mut fields = BTreeMap::from([
+                ("username".into(), "user".into()),
+                ("password".into(), "secret".into()),
+            ]);
+            if let Some(path) = path {
+                fields.insert("http_path".into(), path.into());
+            }
+            let adapter = HttpConnectTransitAdapter::from_config(
+                &node,
+                Some(&TransitCredential::new(fields)),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            assert!(!format!("{adapter:?}").contains("token"));
+            let mut stream = adapter
+                .connect(ConnectRequest {
+                    destination: Endpoint {
+                        host: "target.test".into(),
+                        port: 443,
+                    },
+                })
+                .await
+                .unwrap();
+            stream.write_all(b"hello").await.unwrap();
+            let mut response = [0; 5];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response, b"hello");
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn http_path_escaping_matches_sing_box_and_rejects_invalid_input() {
+        for (path, expected) in [
+            ("/a%41", "/a%41"),
+            ("/token%2Fpart?x=1", "/token/part%3Fx=1"),
+            ("plain", "plain"),
+            ("a b", "a%20b"),
+            ("/upload", "/upload"),
+        ] {
+            let credential =
+                TransitCredential::new(BTreeMap::from([("http_path".into(), path.into())]));
+            assert_eq!(
+                proxy_path(Some(&credential))
+                    .unwrap()
+                    .as_deref()
+                    .map(String::as_str),
+                Some(expected)
+            );
+        }
+        for path in ["/%", "/%xz", "/%0d%0aInjected", "/raw\r\nInjected"] {
+            let credential =
+                TransitCredential::new(BTreeMap::from([("http_path".into(), path.into())]));
+            let error = proxy_path(Some(&credential)).unwrap_err().to_string();
+            assert!(!error.contains(path));
+        }
+    }
+
+    #[tokio::test]
+    async fn host_override_and_path_conflict_fails_before_writing_request() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let result = establish_connect_tunnel(
+            &mut client,
+            &Endpoint {
+                host: "target.test".into(),
+                port: 443,
+            },
+            None,
+            &BTreeMap::new(),
+            Some("front.test"),
+            Some("/private"),
+        )
+        .await;
+        assert!(matches!(result, Err(TransitError::Unsupported(_))));
+        drop(client);
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
     }
 
     #[tokio::test]

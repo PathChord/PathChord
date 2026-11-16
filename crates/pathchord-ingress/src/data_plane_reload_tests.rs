@@ -6,7 +6,8 @@ use pathchord_policy::{
     RuleId,
 };
 use pathchord_transit::{
-    AdapterKind, BoxedTransitConnection, NoTransitCredentials, TransitMetadata,
+    AdapterKind, BoxedTransitConnection, BoxedTransitDatagram, NoTransitCredentials,
+    TransitDatagram, TransitMetadata,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -83,6 +84,15 @@ fn context() -> ConnectionContext {
     }
 }
 
+fn context_with_target(address: std::net::SocketAddr) -> ConnectionContext {
+    let mut context = context();
+    context.target = crate::TargetAddress {
+        host: crate::TargetHost::Ip(address.ip()),
+        port: address.port(),
+    };
+    context
+}
+
 async fn http_proxy(marker: u8) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = listener.local_addr().unwrap();
@@ -109,6 +119,876 @@ async fn http_proxy(marker: u8) -> (std::net::SocketAddr, tokio::task::JoinHandl
         }
     });
     (endpoint, task)
+}
+
+#[derive(Debug)]
+struct FailoverDatagram {
+    payload: Option<Vec<u8>>,
+}
+
+#[async_trait]
+impl TransitDatagram for FailoverDatagram {
+    async fn send(&mut self, payload: &[u8]) -> Result<(), TransitError> {
+        self.payload = Some(payload.to_vec());
+        Ok(())
+    }
+
+    async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
+        self.payload
+            .take()
+            .ok_or_else(|| TransitError::Connection("no datagram is queued".to_owned()))
+    }
+}
+
+#[derive(Debug)]
+struct FailingSendDatagram;
+
+#[async_trait]
+impl TransitDatagram for FailingSendDatagram {
+    async fn send(&mut self, _: &[u8]) -> Result<(), TransitError> {
+        Err(TransitError::Connection("UDP send failed".to_owned()))
+    }
+
+    async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
+        Err(TransitError::Connection("UDP receive failed".to_owned()))
+    }
+}
+
+#[derive(Debug)]
+struct FailoverAdapter {
+    metadata: TransitMetadata,
+    fail_tcp: bool,
+    fail_udp: bool,
+    fail_udp_send: bool,
+    fail_tcp_write: bool,
+    tcp_calls: Arc<AtomicUsize>,
+    udp_calls: Arc<AtomicUsize>,
+    tcp_release: Option<Arc<Notify>>,
+}
+
+#[async_trait]
+impl TransitAdapter for FailoverAdapter {
+    fn metadata(&self) -> &TransitMetadata {
+        &self.metadata
+    }
+
+    fn supports_udp(&self) -> bool {
+        true
+    }
+
+    async fn connect(&self, _: ConnectRequest) -> Result<BoxedTransitConnection, TransitError> {
+        self.tcp_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(release) = &self.tcp_release {
+            release.notified().await;
+        }
+        if self.fail_tcp {
+            return Err(TransitError::Connection(
+                "synthetic first candidate failure".to_owned(),
+            ));
+        }
+        if self.fail_tcp_write {
+            let (local, remote) = tokio::io::duplex(1024);
+            drop(remote);
+            return Ok(Box::new(local));
+        }
+        let (local, remote) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            let (mut read, mut write) = tokio::io::split(remote);
+            let _ = tokio::io::copy(&mut read, &mut write).await;
+        });
+        Ok(Box::new(local))
+    }
+
+    async fn connect_udp(&self, _: ConnectRequest) -> Result<BoxedTransitDatagram, TransitError> {
+        self.udp_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_udp {
+            return Err(TransitError::Connection(
+                "synthetic first UDP candidate failure".to_owned(),
+            ));
+        }
+        if self.fail_udp_send {
+            return Ok(Box::new(FailingSendDatagram));
+        }
+        Ok(Box::new(FailoverDatagram { payload: None }))
+    }
+}
+
+fn failover_adapter(
+    id: &str,
+    fail_tcp: bool,
+    fail_udp: bool,
+) -> (Arc<FailoverAdapter>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let tcp_calls = Arc::new(AtomicUsize::new(0));
+    let udp_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = Arc::new(FailoverAdapter {
+        metadata: TransitMetadata {
+            adapter_id: id.to_owned(),
+            kind: AdapterKind::ExternalProxy {
+                protocol: "synthetic".to_owned(),
+            },
+            labels: BTreeMap::new(),
+        },
+        fail_tcp,
+        fail_udp,
+        fail_udp_send: false,
+        fail_tcp_write: false,
+        tcp_calls: Arc::clone(&tcp_calls),
+        udp_calls: Arc::clone(&udp_calls),
+        tcp_release: None,
+    });
+    (adapter, tcp_calls, udp_calls)
+}
+
+fn ready_tcp_udp() -> TransitProxyRuntimeStatus {
+    TransitProxyRuntimeStatus {
+        state: RuntimeNodeState::Ready,
+        capabilities: BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp]),
+        selection_score: 1,
+        ..TransitProxyRuntimeStatus::default()
+    }
+}
+
+async fn register_fixture_adapter(
+    plane: &IngressDataPlane,
+    config: &TransitProxyConfig,
+    adapter: Arc<dyn TransitAdapter>,
+) {
+    plane
+        .register_transit_adapter(config.id.clone(), adapter, ready_tcp_udp())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_proxy_retries_the_next_eligible_tcp_candidate_before_admission() {
+    let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
+    let second_config = proxy("second", "127.0.0.1:9".parse().unwrap());
+    let plane = plane(policy(1, vec![first_config.clone(), second_config.clone()]));
+    let (first, first_tcp, _) = failover_adapter("first", true, false);
+    let (second, second_tcp, _) = failover_adapter("second", false, false);
+    register_fixture_adapter(&plane, &first_config, first).await;
+    register_fixture_adapter(&plane, &second_config, second).await;
+
+    let mut stream = plane.open_tcp(&context()).await.unwrap();
+    stream.write_all(b"failover").await.unwrap();
+    let mut echoed = [0; 8];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"failover");
+    assert_eq!(first_tcp.load(Ordering::SeqCst), 1);
+    assert_eq!(second_tcp.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ordinary_proxy_never_retries_after_an_admitted_tcp_flow_write_fails() {
+    let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
+    let second_config = proxy("second", "127.0.0.1:9".parse().unwrap());
+    let plane = plane(policy(1, vec![first_config.clone(), second_config.clone()]));
+    let (first, first_tcp, _) = failover_adapter("first", false, false);
+    let mut first = Arc::try_unwrap(first).unwrap();
+    first.fail_tcp_write = true;
+    let (second, second_tcp, _) = failover_adapter("second", false, false);
+    register_fixture_adapter(&plane, &first_config, Arc::new(first)).await;
+    register_fixture_adapter(&plane, &second_config, second).await;
+
+    let mut stream = plane.open_tcp(&context()).await.unwrap();
+    assert!(stream.write_all(b"already-admitted").await.is_err());
+    assert_eq!(first_tcp.load(Ordering::SeqCst), 1);
+    assert_eq!(second_tcp.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn ordinary_proxy_retries_after_real_connect_rejection_without_sending_payload() {
+    timeout(Duration::from_secs(5), async {
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first.local_addr().unwrap();
+        let first_task = tokio::spawn(async move {
+            let (mut stream, _) = first.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(stream.read_u8().await.unwrap());
+                assert!(header.len() < 8192);
+            }
+            assert!(header.starts_with(b"CONNECT target.invalid:80 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+                .await
+                .unwrap();
+            let mut extra = [0; 1];
+            assert_eq!(stream.read(&mut extra).await.unwrap(), 0);
+        });
+        let (second_address, second_task) = http_proxy(b'B').await;
+        let configs = vec![
+            proxy("first", first_address),
+            proxy("second", second_address),
+        ];
+        let plane = plane(policy(1, configs.clone()));
+        let registry = registry(&configs);
+        for config in &configs {
+            let adapter = registry.build(config).await.unwrap();
+            register_fixture_adapter(&plane, config, adapter).await;
+        }
+        let mut stream = plane.open_tcp(&context()).await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), b'B');
+        stream.write_all(b"payload").await.unwrap();
+        let mut echoed = [0; 7];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"payload");
+        first_task.await.unwrap();
+        second_task.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_proxy_retries_the_next_eligible_udp_candidate_before_admission() {
+    let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
+    let second_config = proxy("second", "127.0.0.1:9".parse().unwrap());
+    let plane = plane(policy(1, vec![first_config.clone(), second_config.clone()]));
+    let (first, _, first_udp) = failover_adapter("first", false, true);
+    let (second, _, second_udp) = failover_adapter("second", false, false);
+    register_fixture_adapter(&plane, &first_config, first).await;
+    register_fixture_adapter(&plane, &second_config, second).await;
+
+    let mut handle = plane.open_udp(&context()).await.unwrap();
+    handle.send(b"udp-failover".to_vec()).await.unwrap();
+    assert_eq!(handle.receive().await, Some(b"udp-failover".to_vec()));
+    assert_eq!(first_udp.load(Ordering::SeqCst), 1);
+    assert_eq!(second_udp.load(Ordering::SeqCst), 1);
+    handle.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_proxy_never_retries_after_an_admitted_udp_flow_send_fails() {
+    let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
+    let second_config = proxy("second", "127.0.0.1:9".parse().unwrap());
+    let plane = plane(policy(1, vec![first_config.clone(), second_config.clone()]));
+    let (first, _, first_udp) = failover_adapter("first", false, false);
+    let mut first = Arc::try_unwrap(first).unwrap();
+    first.fail_udp_send = true;
+    let (second, _, second_udp) = failover_adapter("second", false, false);
+    register_fixture_adapter(&plane, &first_config, Arc::new(first)).await;
+    register_fixture_adapter(&plane, &second_config, second).await;
+
+    let mut handle = plane.open_udp(&context()).await.unwrap();
+    assert!(handle.send(b"already-admitted".to_vec()).await.is_err());
+    assert_eq!(first_udp.load(Ordering::SeqCst), 1);
+    assert_eq!(second_udp.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn failed_ordinary_proxy_candidates_do_not_fall_back_to_direct() {
+    let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
+    let second_config = proxy("second", "127.0.0.1:9".parse().unwrap());
+    let config = policy(1, vec![first_config.clone(), second_config.clone()])
+        .config()
+        .clone();
+    let snapshot = ValidatedPolicySnapshot::new(
+        Generation::new(1),
+        PolicyConfig {
+            fallback: Some(FallbackAction::Direct),
+            ..config
+        },
+    )
+    .unwrap();
+    let plane = plane(snapshot);
+    let (first, _, _) = failover_adapter("first", true, false);
+    let (second, _, _) = failover_adapter("second", true, false);
+    register_fixture_adapter(&plane, &first_config, first).await;
+    register_fixture_adapter(&plane, &second_config, second).await;
+
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_address = target.local_addr().unwrap();
+    let result = plane.open_tcp(&context_with_target(target_address)).await;
+    assert!(matches!(result, Err(DataPlaneError::Transit(_))));
+    assert!(
+        timeout(Duration::from_millis(50), target.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn failed_ordinary_udp_candidates_do_not_fall_back_to_direct() {
+    let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
+    let second_config = proxy("second", "127.0.0.1:9".parse().unwrap());
+    let config = policy(1, vec![first_config.clone(), second_config.clone()])
+        .config()
+        .clone();
+    let snapshot = ValidatedPolicySnapshot::new(
+        Generation::new(1),
+        PolicyConfig {
+            fallback: Some(FallbackAction::Direct),
+            ..config
+        },
+    )
+    .unwrap();
+    let plane = plane(snapshot);
+    let (first, _, first_udp) = failover_adapter("first", false, true);
+    let (second, _, second_udp) = failover_adapter("second", false, true);
+    register_fixture_adapter(&plane, &first_config, first).await;
+    register_fixture_adapter(&plane, &second_config, second).await;
+
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let result = plane
+        .open_udp(&context_with_target(target.local_addr().unwrap()))
+        .await;
+    assert!(matches!(result, Err(DataPlaneError::Transit(_))));
+    assert_eq!(first_udp.load(Ordering::SeqCst), 1);
+    assert_eq!(second_udp.load(Ordering::SeqCst), 1);
+    let mut packet = [0; 16];
+    assert!(
+        timeout(Duration::from_millis(50), target.recv_from(&mut packet))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn ordinary_proxy_attempts_only_a_bounded_number_of_eligible_nodes() {
+    let configs: Vec<_> = (0..MAX_ORDINARY_PROXY_ATTEMPTS + 1)
+        .map(|index| proxy(&format!("node-{index:02}"), "127.0.0.1:9".parse().unwrap()))
+        .collect();
+    let plane = plane(policy(1, configs.clone()));
+    let mut calls = Vec::new();
+    for (index, config) in configs.iter().enumerate() {
+        let (adapter, tcp_calls, _) = failover_adapter(
+            config.id.as_str(),
+            index != MAX_ORDINARY_PROXY_ATTEMPTS,
+            false,
+        );
+        register_fixture_adapter(&plane, config, adapter).await;
+        calls.push(tcp_calls);
+    }
+    assert!(matches!(
+        plane.open_tcp(&context()).await,
+        Err(DataPlaneError::Transit(_))
+    ));
+    assert!(
+        calls[..MAX_ORDINARY_PROXY_ATTEMPTS]
+            .iter()
+            .all(|calls| calls.load(Ordering::SeqCst) == 1)
+    );
+    assert_eq!(calls[MAX_ORDINARY_PROXY_ATTEMPTS].load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn ordinary_proxy_times_out_a_stalled_candidate_and_tries_the_next() {
+    let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
+    let second_config = proxy("second", "127.0.0.1:9".parse().unwrap());
+    let mut config = IngressDataPlaneConfig::new(
+        "timeout-fixture",
+        pathchord_noise::generate_static_keypair().unwrap(),
+        policy(1, vec![first_config.clone(), second_config.clone()]),
+    );
+    config.path_connect_timeout = Duration::from_millis(20);
+    let plane = Arc::new(IngressDataPlane::new(config).unwrap());
+    let (first, first_tcp, _) = failover_adapter("first", true, false);
+    let mut first = Arc::try_unwrap(first).unwrap();
+    first.tcp_release = Some(Arc::new(Notify::new()));
+    let (second, second_tcp, _) = failover_adapter("second", false, false);
+    register_fixture_adapter(&plane, &first_config, Arc::new(first)).await;
+    register_fixture_adapter(&plane, &second_config, second).await;
+
+    let mut stream = timeout(Duration::from_secs(1), plane.open_tcp(&context()))
+        .await
+        .unwrap()
+        .unwrap();
+    stream.write_all(b"echo").await.unwrap();
+    let mut echoed = [0; 4];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"echo");
+    assert_eq!(first_tcp.load(Ordering::SeqCst), 1);
+    assert_eq!(second_tcp.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancelling_ordinary_proxy_dial_releases_the_publication_gate() {
+    let node = proxy("node", "127.0.0.1:9".parse().unwrap());
+    let plane = plane(policy(1, vec![node.clone()]));
+    let (adapter, calls, _) = failover_adapter("node", true, false);
+    let mut adapter = Arc::try_unwrap(adapter).unwrap();
+    adapter.tcp_release = Some(Arc::new(Notify::new()));
+    register_fixture_adapter(&plane, &node, Arc::new(adapter)).await;
+    let opening = {
+        let plane = Arc::clone(&plane);
+        tokio::spawn(async move { plane.open_tcp(&context()).await })
+    };
+    timeout(Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (replacement, _, _) = failover_adapter("replacement", false, false);
+    let mut update = {
+        let plane = Arc::clone(&plane);
+        tokio::spawn(async move {
+            plane
+                .register_transit_adapter(node.id, replacement, ready_tcp_udp())
+                .await
+        })
+    };
+    assert!(
+        timeout(Duration::from_millis(25), &mut update)
+            .await
+            .is_err()
+    );
+    opening.abort();
+    assert!(matches!(opening.await, Err(error) if error.is_cancelled()));
+    timeout(Duration::from_secs(1), update)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stalled_ordinary_proxy_attempts_cannot_indefinitely_delay_subscription_disable() {
+    let mut config = IngressDataPlaneConfig::new(
+        "timeout-fixture",
+        pathchord_noise::generate_static_keypair().unwrap(),
+        policy(1, Vec::new()),
+    );
+    config.path_connect_timeout = Duration::from_millis(100);
+    let plane = Arc::new(IngressDataPlane::new(config).unwrap());
+    let mut calls = Vec::new();
+    for id in ["first", "second"] {
+        let mut node = proxy(id, "127.0.0.1:9".parse().unwrap());
+        node.source = Some(pathchord_policy::TransitSource {
+            source_type: "clash".to_owned(),
+            subscription: "provider".to_owned(),
+        });
+        let (adapter, tcp_calls, _) = failover_adapter(id, true, false);
+        let mut adapter = Arc::try_unwrap(adapter).unwrap();
+        adapter.tcp_release = Some(Arc::new(Notify::new()));
+        plane
+            .register_dynamic_transit_adapter(node, Arc::new(adapter), ready_tcp_udp())
+            .await;
+        calls.push(tcp_calls);
+    }
+    let opening = {
+        let plane = Arc::clone(&plane);
+        tokio::spawn(async move { plane.open_tcp(&context()).await })
+    };
+    timeout(Duration::from_secs(1), async {
+        while calls[0].load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let disable = {
+        let plane = Arc::clone(&plane);
+        tokio::spawn(async move {
+            plane
+                .subscription_transaction("provider", || ((), Some(false)))
+                .await;
+        })
+    };
+    timeout(Duration::from_millis(500), disable)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        opening.await.unwrap(),
+        Err(DataPlaneError::Transit(_))
+    ));
+    assert_eq!(calls[0].load(Ordering::SeqCst), 1);
+    assert_eq!(calls[1].load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        plane.open_tcp(&context()).await,
+        Err(DataPlaneError::PolicyRejected)
+    ));
+}
+
+#[tokio::test]
+async fn disabling_a_subscription_cancels_queued_node_probes_without_affecting_static_nodes() {
+    let static_node = proxy("a-static", "127.0.0.1:9".parse().unwrap());
+    let plane = plane(policy(1, vec![static_node.clone()]));
+    let (blocker, static_calls, _) = failover_adapter("a-static", false, false);
+    let mut blocker = Arc::try_unwrap(blocker).unwrap();
+    let release = Arc::new(Notify::new());
+    blocker.tcp_release = Some(Arc::clone(&release));
+    register_fixture_adapter(&plane, &static_node, Arc::new(blocker)).await;
+
+    let mut dynamic_node = proxy("z-provider", "127.0.0.1:9".parse().unwrap());
+    dynamic_node.source = Some(pathchord_policy::TransitSource {
+        source_type: "clash".into(),
+        subscription: "provider".into(),
+    });
+    let (dynamic, dynamic_calls, _) = failover_adapter("z-provider", false, false);
+    plane
+        .register_dynamic_transit_adapter(dynamic_node, dynamic, ready_tcp_udp())
+        .await;
+
+    let mut config = crate::TransitProbeConfig::new(pathchord_transit::Endpoint {
+        host: "target.invalid".into(),
+        port: 80,
+    });
+    config.max_concurrency = 1;
+    config.timeout = Duration::from_secs(2);
+    plane.configure_node_probe(Some(config)).await.unwrap();
+    let probe = {
+        let plane = Arc::clone(&plane);
+        tokio::spawn(async move { plane.probe_transits().await })
+    };
+    timeout(Duration::from_secs(1), async {
+        while static_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    plane
+        .subscription_transaction("provider", || ((), Some(false)))
+        .await;
+    release.notify_one();
+    timeout(Duration::from_secs(2), probe)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(static_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(dynamic_calls.load(Ordering::SeqCst), 0);
+    let observations = plane.transit_observations().await;
+    assert_eq!(
+        observations[&static_node.id].state,
+        crate::TransitProbeState::Up
+    );
+}
+
+#[tokio::test]
+async fn disabling_a_subscription_cancels_an_inflight_node_probe() {
+    let static_node = proxy("z-static", "127.0.0.1:9".parse().unwrap());
+    let plane = plane(policy(1, vec![static_node.clone()]));
+    let (static_adapter, static_calls, _) = failover_adapter("z-static", false, false);
+    register_fixture_adapter(&plane, &static_node, static_adapter).await;
+
+    let mut dynamic_node = proxy("a-provider", "127.0.0.1:9".parse().unwrap());
+    dynamic_node.source = Some(pathchord_policy::TransitSource {
+        source_type: "clash".into(),
+        subscription: "provider".into(),
+    });
+    let dynamic_id = dynamic_node.id.clone();
+    let (dynamic, dynamic_calls, _) = failover_adapter("a-provider", false, false);
+    let mut dynamic = Arc::try_unwrap(dynamic).unwrap();
+    dynamic.tcp_release = Some(Arc::new(Notify::new()));
+    plane
+        .register_dynamic_transit_adapter(dynamic_node, Arc::new(dynamic), ready_tcp_udp())
+        .await;
+    let mut config = crate::TransitProbeConfig::new(pathchord_transit::Endpoint {
+        host: "target.invalid".into(),
+        port: 80,
+    });
+    config.max_concurrency = 1;
+    config.timeout = Duration::from_secs(10);
+    plane.configure_node_probe(Some(config)).await.unwrap();
+    let probe = {
+        let plane = Arc::clone(&plane);
+        tokio::spawn(async move { plane.probe_transits().await })
+    };
+    timeout(Duration::from_secs(1), async {
+        while dynamic_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    plane
+        .subscription_transaction("provider", || ((), Some(false)))
+        .await;
+    // The blocked dial must be dropped; waiting for its ten-second timeout
+    // would also block the independent static probe.
+    timeout(Duration::from_secs(1), probe)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dynamic_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(static_calls.load(Ordering::SeqCst), 1);
+    let observations = plane.transit_observations().await;
+    assert_eq!(observations[&dynamic_id].attempts, 0);
+    assert_eq!(
+        observations[&static_node.id].state,
+        crate::TransitProbeState::Up
+    );
+}
+
+#[tokio::test]
+async fn queued_probe_rechecks_the_subscription_admission_before_dialing() {
+    struct FixtureFetcher(Vec<u8>);
+    #[async_trait]
+    impl pathchord_transit::SubscriptionFetcher for FixtureFetcher {
+        async fn fetch(
+            &self,
+            _: pathchord_transit::SubscriptionFetchRequest,
+        ) -> Result<Vec<u8>, pathchord_transit::SubscriptionError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let static_node = proxy("a-static", "127.0.0.1:9".parse().unwrap());
+    let plane = plane(policy(1, vec![static_node.clone()]));
+    let (blocker, static_calls, _) = failover_adapter("a-static", false, false);
+    let mut blocker = Arc::try_unwrap(blocker).unwrap();
+    let release = Arc::new(Notify::new());
+    blocker.tcp_release = Some(Arc::clone(&release));
+    register_fixture_adapter(&plane, &static_node, Arc::new(blocker)).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let document =
+        format!("proxies: [{{name: node, type: http, server: 127.0.0.1, port: {port}}}]");
+    let source = pathchord_policy::SubscriptionConfig {
+        id: pathchord_policy::SubscriptionId::new("provider"),
+        enabled: true,
+        source: pathchord_policy::SubscriptionSource {
+            source_type: pathchord_policy::SubscriptionSourceType::Clash,
+            url: "https://example.test/sub".into(),
+            credentials_ref: None,
+            user_agent: None,
+        },
+        refresh: Default::default(),
+        cache: None,
+    };
+    let mut manager = pathchord_transit::SubscriptionManager::new(
+        Arc::new(FixtureFetcher(document.into_bytes())),
+        std::env::temp_dir(),
+        BTreeSet::from(["http".into()]),
+    );
+    assert!(matches!(
+        manager.refresh(&source).await,
+        pathchord_transit::RefreshOutcome::Published { .. }
+    ));
+    let registry = AdapterRegistry::for_configs(
+        Arc::new(NoTransitCredentials),
+        Duration::from_secs(1),
+        manager.snapshot().nodes.values().map(|node| &node.config),
+    )
+    .unwrap();
+    let prepared = manager.snapshot().prepare_adapters(&registry).await;
+    manager.commit_prepared_adapters(prepared).unwrap();
+    let node = manager.snapshot().selectable_nodes().next().unwrap();
+    let id = node.config.id.clone();
+    assert!(static_node.id < id);
+    let admission = manager.snapshot().validated_admission(&id).unwrap();
+    assert_eq!(
+        plane
+            .register_verified_dynamic_transit_adapter(
+                node.config.clone(),
+                admission,
+                ready_tcp_udp()
+            )
+            .await,
+        DynamicTransitRegistration::Registered
+    );
+
+    let mut config = crate::TransitProbeConfig::new(pathchord_transit::Endpoint {
+        host: "target.invalid".into(),
+        port: 80,
+    });
+    config.max_concurrency = 1;
+    config.timeout = Duration::from_secs(2);
+    plane.configure_node_probe(Some(config)).await.unwrap();
+    let probe = {
+        let plane = Arc::clone(&plane);
+        tokio::spawn(async move { plane.probe_transits().await })
+    };
+    timeout(Duration::from_secs(1), async {
+        while static_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Revoke through the subscription manager before any data-plane status
+    // update, so only the admission token can fence this queued adapter.
+    manager.reconcile(&[]);
+    release.notify_one();
+    timeout(Duration::from_secs(2), probe)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(plane.transit_observations().await[&id].attempts, 0);
+}
+
+#[tokio::test]
+async fn ordinary_proxy_candidate_snapshot_is_held_until_a_flow_is_admitted() {
+    let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
+    let second_config = proxy("second", "127.0.0.1:9".parse().unwrap());
+    let plane = plane(policy(1, vec![first_config.clone(), second_config.clone()]));
+    let release = Arc::new(Notify::new());
+    let first_tcp = Arc::new(AtomicUsize::new(0));
+    let first = Arc::new(FailoverAdapter {
+        metadata: TransitMetadata {
+            adapter_id: "first".to_owned(),
+            kind: AdapterKind::ExternalProxy {
+                protocol: "synthetic".to_owned(),
+            },
+            labels: BTreeMap::new(),
+        },
+        fail_tcp: true,
+        fail_udp: false,
+        fail_udp_send: false,
+        fail_tcp_write: false,
+        tcp_calls: Arc::clone(&first_tcp),
+        udp_calls: Arc::new(AtomicUsize::new(0)),
+        tcp_release: Some(Arc::clone(&release)),
+    });
+    let (second, second_tcp, _) = failover_adapter("second", false, false);
+    register_fixture_adapter(&plane, &first_config, first).await;
+    register_fixture_adapter(
+        &plane,
+        &second_config,
+        Arc::clone(&second) as Arc<dyn TransitAdapter>,
+    )
+    .await;
+
+    let opening = {
+        let plane = Arc::clone(&plane);
+        tokio::spawn(async move { plane.open_tcp(&context()).await })
+    };
+    timeout(Duration::from_secs(1), async {
+        while first_tcp.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let replacement_calls = Arc::new(AtomicUsize::new(0));
+    let replacement = Arc::new(FailoverAdapter {
+        metadata: TransitMetadata {
+            adapter_id: "second-replacement".to_owned(),
+            kind: AdapterKind::ExternalProxy {
+                protocol: "synthetic".to_owned(),
+            },
+            labels: BTreeMap::new(),
+        },
+        fail_tcp: false,
+        fail_udp: false,
+        fail_udp_send: false,
+        fail_tcp_write: false,
+        tcp_calls: Arc::clone(&replacement_calls),
+        udp_calls: Arc::new(AtomicUsize::new(0)),
+        tcp_release: None,
+    });
+    let mut register = {
+        let plane = Arc::clone(&plane);
+        let config = second_config.clone();
+        tokio::spawn(async move {
+            plane
+                .register_transit_adapter(config.id, replacement, ready_tcp_udp())
+                .await
+        })
+    };
+    assert!(
+        timeout(Duration::from_millis(50), &mut register)
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    let mut stream = timeout(Duration::from_secs(1), opening)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    stream.write_all(b"old").await.unwrap();
+    let mut echoed = [0; 3];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"old");
+    timeout(Duration::from_secs(1), register)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_tcp.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement_calls.load(Ordering::SeqCst), 0);
+    let opening = {
+        let plane = Arc::clone(&plane);
+        tokio::spawn(async move { plane.open_tcp(&context()).await })
+    };
+    timeout(Duration::from_secs(1), async {
+        while first_tcp.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    release.notify_one();
+    let _new_stream = timeout(Duration::from_secs(1), opening)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ordinary_proxy_retry_uses_the_original_static_configuration_generation() {
+    timeout(Duration::from_secs(5), async {
+        let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
+        let (old_address, old_task) = http_proxy(b'O').await;
+        let (new_address, new_task) = http_proxy(b'N').await;
+        let old_second = proxy("second", old_address);
+        let new_second = proxy("second", new_address);
+        let plane = plane(policy(1, vec![first_config.clone(), old_second.clone()]));
+        let (first, first_calls, _) = failover_adapter("first", true, false);
+        let release = Arc::new(Notify::new());
+        let mut first = Arc::try_unwrap(first).unwrap();
+        first.tcp_release = Some(Arc::clone(&release));
+        register_fixture_adapter(&plane, &first_config, Arc::new(first)).await;
+        let registry = registry(&[first_config.clone(), old_second.clone()]);
+        let old_adapter = registry.build(&old_second).await.unwrap();
+        register_fixture_adapter(&plane, &old_second, old_adapter).await;
+
+        let opening = {
+            let plane = Arc::clone(&plane);
+            tokio::spawn(async move { plane.open_tcp(&context()).await })
+        };
+        while first_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let next = policy(2, vec![first_config, new_second]);
+        let prepared = plane
+            .prepare_static_snapshot(&next, &registry)
+            .await
+            .unwrap();
+        let mut reload = {
+            let plane = Arc::clone(&plane);
+            tokio::spawn(async move { plane.commit_static_snapshot(prepared, || Ok(())).await })
+        };
+        assert!(
+            timeout(Duration::from_millis(50), &mut reload)
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        let mut old = opening.await.unwrap().unwrap();
+        assert_eq!(old.read_u8().await.unwrap(), b'O');
+        reload.await.unwrap().unwrap();
+        assert_eq!(plane.policy_generation(), 2);
+
+        let opening = {
+            let plane = Arc::clone(&plane);
+            tokio::spawn(async move { plane.open_tcp(&context()).await })
+        };
+        while first_calls.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_one();
+        let mut new = opening.await.unwrap().unwrap();
+        assert_eq!(new.read_u8().await.unwrap(), b'N');
+        old_task.abort();
+        new_task.abort();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

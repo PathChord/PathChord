@@ -860,6 +860,7 @@ impl LocalControlDispatcher {
                         "url_redaction_reason": "sensitive_source",
                         "origin": subscription_origin(&subscription.spec.url),
                         "credentials_ref": subscription.spec.credentials_ref,
+                        "user_agent": subscription.spec.user_agent,
                     },
                     "refresh": {
                         "interval_seconds": subscription.spec.refresh.interval_seconds,
@@ -2264,6 +2265,7 @@ fn parse_subscription_spec(body: &Value) -> Result<SubscriptionSpec, String> {
                 | "source_type"
                 | "url"
                 | "credentials_ref"
+                | "user_agent"
         ) {
             return Err(format!("unknown subscriptions.create field: {key}"));
         }
@@ -2289,7 +2291,10 @@ fn parse_subscription_spec(body: &Value) -> Result<SubscriptionSpec, String> {
         None => None,
         Some(Value::Object(source)) => {
             for key in source.keys() {
-                if !matches!(key.as_str(), "type" | "url" | "credentials_ref") {
+                if !matches!(
+                    key.as_str(),
+                    "type" | "url" | "credentials_ref" | "user_agent"
+                ) {
                     return Err(format!("unknown source field: {key}"));
                 }
             }
@@ -2319,6 +2324,12 @@ fn parse_subscription_spec(body: &Value) -> Result<SubscriptionSpec, String> {
             .and_then(|source| source.get("credentials_ref"))
             .or_else(|| object.get("credentials_ref")),
         "source.credentials_ref",
+    )?;
+    let user_agent = optional_string(
+        source
+            .and_then(|source| source.get("user_agent"))
+            .or_else(|| object.get("user_agent")),
+        "source.user_agent",
     )?;
 
     let refresh = match object.get("refresh") {
@@ -2391,6 +2402,7 @@ fn parse_subscription_spec(body: &Value) -> Result<SubscriptionSpec, String> {
         enabled,
         url,
         credentials_ref,
+        user_agent,
         refresh,
         cache,
     })
@@ -3268,7 +3280,8 @@ mod tests {
                 "source": {
                     "type": "clash",
                     "url": "https://provider.example/subscription",
-                    "credentials_ref": "provider-a-token"
+                    "credentials_ref": "provider-a-token",
+                    "user_agent": "CustomClient/1.0"
                 },
                 "refresh": {
                     "interval_seconds": 900,
@@ -3299,8 +3312,31 @@ mod tests {
         );
         assert_eq!(items[0]["source"]["origin"], "https://provider.example");
         assert_eq!(items[0]["source"]["credentials_ref"], "provider-a-token");
+        assert_eq!(items[0]["source"]["user_agent"], "CustomClient/1.0");
         assert_eq!(items[0]["refresh"]["interval_seconds"], 900);
         assert_eq!(items[0]["cache"]["path"], "provider-a.snapshot");
+    }
+
+    #[test]
+    fn subscription_create_rejects_invalid_user_agent_header_values() {
+        for value in ["", "   ", "bad\r\nInjected: value", "non-ascii-猫"] {
+            let mut dispatcher = dispatcher(SystemProxyPlatform::Linux);
+            let mut create = request(
+                "subscriptions.create",
+                &["subscriptions:write"],
+                json!({
+                    "id": "source-a",
+                    "source": {"type": "clash", "url": "https://example.test/sub", "user_agent": value}
+                }),
+            );
+            create.expected_generation = Some(GenerationExpectation {
+                scope: "configuration".into(),
+                value: 0,
+            });
+            let response = dispatcher.dispatch(create);
+            assert!(!response.ok, "invalid User-Agent was accepted: {value:?}");
+            assert!(dispatcher.service().snapshot().subscriptions.is_empty());
+        }
     }
 
     #[test]
@@ -3313,6 +3349,7 @@ mod tests {
             enabled: true,
             url: "https://provider.example/token-in-path?token=secret-query#secret-fragment".into(),
             credentials_ref: None,
+            user_agent: None,
             refresh: crate::SubscriptionRefreshSpec::default(),
             cache: None,
         };

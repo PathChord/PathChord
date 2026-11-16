@@ -31,6 +31,28 @@ use crate::unbuffered::{EncryptError, TransmitTlsData};
 use crate::{DistinguishedName, crypto};
 use crate::{KeyLog, WantsVersions, compress, sign, verify, versions};
 
+/// A ClientHello profile matching a specific upstream preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientHelloProfile {
+    /// dae 2.1.2's uTLS 1.8.2 Chrome 133 preset, with hybrid key exchange.
+    Chrome133,
+    /// The same preset with the hybrid group removed, as used by dae's
+    /// initial REALITY probe for older peers.
+    Chrome133Classic,
+    /// dae's uTLS 1.8.2 iOS 14 preset.
+    Ios14,
+    /// dae's uTLS 1.8.2 Safari 16.0 preset.
+    Safari16,
+    /// dae's uTLS 1.8.2 Edge 85 preset.
+    Edge85,
+    /// dae's uTLS 1.8.2 QQ 11.1 preset.
+    Qq111,
+    /// dae's uTLS 1.8.2 Firefox 120 preset.
+    Firefox120,
+    /// dae's uTLS 1.8.2 Android 11 OkHttp preset (TLS 1.2 only).
+    Android11,
+}
+
 /// Hook for protocols that must modify the serialized TLS ClientHello before
 /// it enters the transcript, such as REALITY's authenticated Session ID.
 pub trait RealityCallback: fmt::Debug + Send + Sync {
@@ -310,6 +332,9 @@ pub struct ClientConfig {
 
     /// Optional protocol callback applied to the initial ClientHello.
     pub reality_callback: Option<Arc<dyn RealityCallback>>,
+
+    /// Optional ClientHello wire profile, independent of REALITY.
+    pub client_hello_profile: Option<ClientHelloProfile>,
 }
 
 /// Desired session ticket counts for the RFC 9149 `ticket_request` extension.
@@ -436,7 +461,8 @@ impl ClientConfig {
     }
 
     pub(super) fn needs_key_share(&self) -> bool {
-        self.supports_version(ProtocolVersion::TLSv1_3, Protocol::Tcp)
+        self.client_hello_profile.is_some_and(|profile| profile != ClientHelloProfile::Android11)
+            || self.supports_version(ProtocolVersion::TLSv1_3, Protocol::Tcp)
     }
 
     /// We support a given TLS version if it's quoted in the configured
@@ -1091,6 +1117,7 @@ impl std::error::Error for EarlyDataError {}
 pub struct ClientConnectionData {
     pub(super) early_data: EarlyData,
     pub(super) ech_status: EchStatus,
+    pub(super) offered_profile_sct: bool,
 }
 
 impl ClientConnectionData {
@@ -1098,6 +1125,7 @@ impl ClientConnectionData {
         Self {
             early_data: EarlyData::new(),
             ech_status: EchStatus::NotOffered,
+            offered_profile_sct: false,
         }
     }
 }

@@ -323,6 +323,7 @@ mod tests {
                     source_type: SubscriptionSourceType::Auto,
                     url: format!("http://{endpoint}/subscription"),
                     credentials_ref: None,
+                    user_agent: None,
                 },
                 refresh: SubscriptionRefresh {
                     max_attempts: 1,
@@ -394,6 +395,7 @@ mod tests {
             .fetch_document(SubscriptionFetchRequest {
                 url: format!("http://{endpoint}/subscription"),
                 credentials_ref: None,
+                user_agent: None,
                 timeout: Duration::from_secs(2),
                 max_bytes: 1024,
             })
@@ -447,6 +449,7 @@ mod tests {
                 source_type: SubscriptionSourceType::Auto,
                 url: "https://root.invalid/sub".to_owned(),
                 credentials_ref: None,
+                user_agent: None,
             },
             refresh: SubscriptionRefresh {
                 max_attempts: 1,
