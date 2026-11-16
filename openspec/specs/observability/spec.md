@@ -69,7 +69,7 @@ Observation responses, events, and audits SHALL apply actor-capability redaction
 
 ### Requirement: Egress status is global and policy-free
 
-Egress status reports SHALL describe global Egress resource facts and SHALL NOT contain IngressRule, TransitRule, TrafficPolicy, rule demand, or class policy metadata. Path-local quality observations SHALL be owned by Ingress and derived from local Path traffic and control feedback.
+Egress status reports SHALL describe global Egress resource facts and SHALL NOT contain routing rules, Egress Transit selectors, TrafficPolicy identity, business-class policy, or Ingress demand metadata. Path-local quality observations SHALL be owned by Ingress and derived from local Path traffic and control feedback.
 
 #### Scenario: Egress reports shared capacity
 
@@ -96,12 +96,31 @@ Egress observations SHALL expose `admission_allowed` and a stable non-sensitive 
 
 ### Requirement: Directional Path observations remain Ingress-owned
 
-Ingress SHALL publish bounded upstream and downstream Path observations and SHALL use them for rule-specific scheduling and autoscaling. Egress status SHALL not duplicate those Path-local observations as a second authoritative source.
+Ingress SHALL publish bounded upstream and downstream Path observations and SHALL use them for Session-scoped scheduling and autoscaling under the Egress binding. Egress status SHALL not duplicate those Path-local observations as a second authoritative source. Rule identity or business class SHALL NOT partition the common Path target.
 
 #### Scenario: Path capacity is asymmetric
 
 - **WHEN** upstream and downstream observations differ for one Path
 - **THEN** Ingress retains separate directional values and computes the physical Path target from the larger directional requirement
+
+### Requirement: Session Path-pool observations
+
+Session observations SHALL identify the owning Egress, common minimum, current target, eligible Transit count, immutable policy snapshot, aggregate directional demand, and negotiated per-sender replication allowance. These fields SHALL follow existing authorization, generation, cardinality, and unknown-value rules without allocating per-rule or per-business-class observations.
+
+#### Scenario: Different routing rules use one Egress
+
+- **WHEN** flows selected by several routing rules share a Session
+- **THEN** queries expose one Session pool target, one policy snapshot, and aggregate directional demand rather than separate rule-specific targets or policies
+
+#### Scenario: The minimum cannot be met
+
+- **WHEN** at least one authenticated ready Path remains but usable non-draining Paths are below the minimum, or a negotiated ceiling prevents reaching that minimum
+- **THEN** observations show the minimum, bounded target, ready count, usable count, and a typed admission or shortfall reason, retaining degraded service while a ready Path remains and no separate hard failure occurs
+
+#### Scenario: A measurement is not available
+
+- **WHEN** a Session has no accepted replication negotiation or an aggregate demand window has no authoritative sample
+- **THEN** the corresponding field is null or explicitly unknown rather than a fabricated measured zero
 
 ## Detailed contract
 
@@ -235,7 +254,10 @@ admission_generation, created_at, last_change_at
 ready_path_count, active_streams, active_udp_associations
 control_pending, control_acked, control_retransmissions
 close_reason, reconnect_attempts
-traffic_class_name, traffic_class_priority, traffic_class_share
+minimum_usable_paths, target_path_count, usable_path_count
+eligible_transit_count, traffic_policy_id, traffic_policy_generation
+demand_upstream_bps, demand_downstream_bps
+replication_cap_bps, replication_upstream_used_bps, replication_downstream_used_bps
 ```
 
 Stream views expose:
@@ -246,7 +268,6 @@ target_kind, target_port, admitted_generation
 bytes_sent, bytes_received, bytes_acked
 reorder_buffer_bytes, receive_window, retransmissions
 opened_at, closed_at, close_reason
-traffic_class_name, traffic_class_priority, traffic_class_share
 ```
 
 Target connection views expose a stable local connection ID, SessionID and
@@ -264,7 +285,12 @@ publish a recommended Path count or per-Ingress quota. Ingress Path observations
 MUST include separate upstream/downstream RTT, jitter, loss, reordering,
 throughput, effective capacity, and connection-establishment quality.
 
-The scheduler uses the typed fields, not human-readable log text. A stale report
+The observation provider MUST also expose one Session pool minimum, bounded
+target, ready/usable counts, eligible relationships, captured policy identity
+and generation, aggregate upstream/downstream demand, and negotiated cap.
+Upstream usage is authoritative local sender accounting; downstream usage is
+null unless an authoritative Session-scoped producer exists. The global Egress
+replication allowance is not a substitute. The scheduler uses the typed fields, not human-readable log text. A stale report
 removes the Egress from new admission unless policy explicitly permits degraded
 operation. Quality degradation reduces allocation quickly; recovery and scale-in
 use the state-machine drain and stabilization rules. The observation API MUST
@@ -307,7 +333,7 @@ pathchord_udp_associations_total{state}
 pathchord_target_connections_total{result}
 pathchord_frames_total{direction, result}
 pathchord_control_retransmissions_total{direction}
-pathchord_bytes_total{direction, class}
+pathchord_bytes_total{direction}
 pathchord_path_rtt_ms
 pathchord_path_jitter_ms
 pathchord_path_loss_ratio

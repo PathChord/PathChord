@@ -180,12 +180,24 @@ pub struct EgressConfig {
     pub labels: BTreeMap<String, String>,
     pub capabilities: Capabilities,
     pub status_requirements: EgressStatusRequirements,
+    /// One Transit binding is shared by every Session for this Egress.
+    #[serde(default)]
+    pub transit: EgressTransitBinding,
+    /// One TrafficPolicy is captured when a Session is attached.
+    #[serde(default)]
+    pub traffic_policy: Option<TrafficPolicyId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressStatusRequirements {
     pub min_usable_paths: u32,
     pub capabilities: BTreeSet<FlowProtocol>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressTransitBinding {
+    pub require: Selector,
+    pub reject_tags: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -883,6 +895,17 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         .iter()
         .map(|item| item.id.as_str())
         .collect();
+    for egress in &config.egresses {
+        if let Some(policy_id) = &egress.traffic_policy
+            && (!policy_ids.contains(policy_id.as_str())
+                || policy_id.namespace() != egress.id.namespace())
+        {
+            return Err(ValidationError::UnknownTrafficPolicy {
+                rule_id: egress.id.as_str().to_owned(),
+                policy_id: policy_id.as_str().to_owned(),
+            });
+        }
+    }
     for rule in &config.transit_rules {
         if !policy_ids.contains(rule.traffic_policy.as_str())
             || rule.traffic_policy.namespace() != rule.id.namespace()
@@ -1197,6 +1220,8 @@ mod tests {
                     udp: true,
                 },
                 status_requirements: EgressStatusRequirements::default(),
+                transit: EgressTransitBinding::default(),
+                traffic_policy: None,
             }],
             traffic_policies: vec![TrafficPolicy {
                 id: TrafficPolicyId::new("default"),

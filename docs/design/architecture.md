@@ -26,7 +26,9 @@ Transit A  Transit B  Transit C
            Target
 ```
 
-The Egress is selected first. Transit Proxies are then admitted and scheduled for that Egress. A flow never spans multiple Egress nodes.
+The Egress is selected first. Its Ingress-side Transit binding then supplies one
+common candidate set and one Session Path pool. A flow never spans multiple
+Egress nodes, and routing rules do not select a Transit or Path subset.
 
 ## 3. Routing modes
 
@@ -43,11 +45,14 @@ Rules are ordered. For a new flow, the first rule whose conditions match and who
 
 If no Egress rule is effective, evaluate ordinary Proxy rules. If no ordinary Proxy rule matches, execute the global fallback.
 
-### Transit phase
+### Egress Path phase
 
-After an Egress is selected, evaluate the Egress-specific Transit Proxy rules in order. The first matching rule determines admission and base weight. A rule matching multiple usable Proxies may select any one for ordinary proxy mode; node order is not meaningful.
-
-For Egress mode, the admitted Proxy-to-Egress relationships form the multipath candidate set. Weights apply to the relationship as a whole; multiple Paths through one Proxy do not multiply its configured weight.
+After an Egress is selected, its `transit` binding filters same-namespace
+Transit Proxies by the configured common selectors and runtime state. The
+binding and its `trafficPolicyRef` are independent of flow matches. Admitted
+Proxy-to-Egress relationships form the multipath candidate set. Weights apply
+to the relationship as a whole; multiple Paths through one Proxy do not
+multiply its configured weight.
 
 ## 5. Runtime state
 
@@ -66,7 +71,7 @@ Egress reports aggregate resource facts over existing Paths: configured and
 effective wire capacity, current wire rate, active target connections, capacity
 confidence, service state, and global admission state. It does not report or
 evaluate Ingress rules. Ingress owns per-Path directional observations and
-per-Session rule demand. Cross-Ingress fairness is not guaranteed.
+per-Session aggregate demand. Cross-Ingress fairness is not guaranteed.
 
 The authored Egress resource has only global resource ceilings: the configured
 wire bandwidth cap (`maxWireBandwidthBps`) and maximum inbound target
@@ -77,7 +82,7 @@ desired Path counts and per-Ingress quotas are not configuration inputs.
 ## 6. Failure semantics
 
 - Transit Path failure: remove that Path; existing Streams may continue over other compliant Paths.
-- No compliant Path for one flow: terminate that flow; other flows in the shared Session continue.
+- Egress Session below its common usable-Path minimum: deny new business admission while ready Paths remain; existing flows continue.
 - Egress failure: both sides close all related Paths, Sessions, Streams, local connections, and Egress-to-target connections. The application must retry.
 - Either Ingress or Egress process restart invalidates related connections and Sessions.
 - Target FIN/RST is reflected to the local application; the proxy layer does not silently recreate the target TCP connection.
@@ -97,13 +102,16 @@ Paths. Relationship weight is applied once before those Path instances share
 the relationship allocation.
 
 Ingress creates, expands, drains, and closes Paths. Streams and UDP
-Associations are independent of Path identity and may migrate between Paths.
-Each EgressRule computes its own eligible Path requirement; shared compliant
-Paths may satisfy several rules, while ineligible Paths never count for a rule.
+Associations are independent of Path identity and may migrate within the
+common Egress Session pool. The Egress `statusRequirements.minUsablePaths` is
+the single configured common minimum; only non-draining ready Paths count for
+new admission. A Session below that minimum is degraded while existing work
+continues; losing the last ready Path closes the Session.
 
 Session control and optional extra replication use the negotiated Session hard
-cap. The first copy and ordinary reliable retransmissions remain available
-when optional replication is exhausted. Egress applies global resource limits
+cap. Each sender shares one outbound allowance across all flows and Paths; the
+two directions are bounded independently. The first copy and ordinary reliable
+retransmissions remain available when optional replication is exhausted. Egress applies global resource limits
 and strict priority for primary traffic, ordinary retransmission, and required
 control; it does not interpret Ingress rules or promise cross-Ingress fairness.
 An authenticated future ACK is a Session trust failure: every Path and business
@@ -119,17 +127,17 @@ stable admission reason. `recommendedPathCount` is not an Egress contract.
 
 Ingress measures each Path independently in the upstream and downstream
 directions using bounded counters, ACKs, heartbeat timing, data rate, loss,
-retransmission, RTT, jitter, and congestion feedback. It aggregates demand by
-Session-scoped rule/policy/class keys without retaining unbounded per-Stream
-history. Health sampling and demand windows are low-frequency; the data path
-only performs bounded counter updates.
+retransmission, RTT, jitter, and congestion feedback. It aggregates demand once
+per Session without retaining unbounded per-Stream or per-rule history. Health
+sampling and demand windows are low-frequency; the data path only performs
+bounded counter updates.
 
-For each matching EgressRule, Ingress computes a Path target from its minimum
-Path requirement, eligible Transit relationships, directional demand, Path
+For each Egress Session, Ingress computes one Path target from the common
+minimum, eligible Transit relationships, aggregate directional demand, Path
 quality, and the Egress hard safety ceiling. The physical Path target covers
 the larger upstream/downstream requirement. Scale-out and scale-in use
-hysteresis, retain a compliant Path during drain, and exclude candidates whose
-incremental capacity is below scheduling overhead.
+hysteresis, count only usable non-draining Paths after all selected drains,
+and exclude candidates whose incremental capacity is below scheduling overhead.
 
 Egress's effective capacity is a global scheduler/resource estimate. It is
 bounded by the configured wire cap and is derived passively from aggregate
@@ -182,7 +190,13 @@ an explicit command-line source before environment configuration and account
 defaults. Directory files are loaded deterministically, validated together,
 and published as one snapshot; failed candidates retain the prior graph.
 
-Egress topology, Egress public keys, and Ingress local private keys are static and require Ingress restart when changed. Transit Proxy lists are runtime data, refreshed from subscriptions into a disk cache and hot-reloaded. Failed refreshes keep the current list; deleted subscription Proxies drain. Egress capacity and global connection limits are resource ceilings; desired Path counts remain Ingress runtime decisions.
+Egress topology, Egress public keys, Transit bindings, common Path requirements,
+resolved TrafficPolicies, and Ingress local private keys are static and require
+Ingress restart when changed. Transit Proxy lists are runtime data, refreshed
+from subscriptions into a disk cache and hot-reloaded. Failed refreshes keep the
+current list; deleted subscription Proxies drain. Egress capacity and global
+connection limits are resource ceilings; desired Path counts remain Ingress
+runtime decisions.
 
 Static rule configuration is compiled at startup. Subscription-derived data and
 approved dynamic rule snapshots may be compiled off-thread and hot-reloaded

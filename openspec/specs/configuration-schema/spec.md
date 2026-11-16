@@ -10,7 +10,7 @@ Define the versioned human-authored configuration schema, complete-bundle valida
 
 ### Requirement: Versioned schema conformance
 
-The v1 schema SHALL expose Egress aggregate wire capacity and global inbound target-connection limits while keeping desired Path count, per-Ingress stream quotas, and Path safety ceilings outside the authored Egress policy surface.
+The v1 schema SHALL expose Egress aggregate wire capacity and global inbound target-connection limits while keeping desired Path count, per-Ingress stream quotas, and Path safety ceilings outside the authored Egress policy surface. Each Ingress-side Egress SHALL declare one Transit binding and one TrafficPolicy reference for its Session Path pool.
 
 #### Scenario: Removed desired-Path fields are authored
 
@@ -42,21 +42,36 @@ Ingress SHALL select command-line configuration before environment configuration
 
 ### Requirement: Atomic publication and resilient watching
 
-The complete candidate SHALL pass parsing, validation, normalization, compilation, and required persistence before one immutable generation is published. Invalid candidates SHALL retain the last good bundle; atomic file and root-directory replacement SHALL preserve watching, and startup-only changes SHALL report restart required.
+The complete candidate SHALL pass parsing, validation, normalization, compilation, and required persistence before one immutable generation is published. Invalid candidates SHALL retain the last good bundle; atomic file and root-directory replacement SHALL preserve watching. Changes to an Egress binding, common admission minimum, referenced policy, or resolved policy contents SHALL report restart required and retain the active bundle.
 
 #### Scenario: Atomic replacement contains an invalid candidate
 
 - **WHEN** a watched configuration file is atomically replaced by an invalid resource candidate
 - **THEN** the last good bundle remains active and watching continues for subsequent valid replacements
 
+#### Scenario: A referenced policy changes without changing its name
+
+- **WHEN** a reload changes the contents of a TrafficPolicy referenced by an Egress while retaining the same reference name
+- **THEN** Ingress reports restart required and retains the active configuration and Session policy snapshots
+
+#### Scenario: Only Transit membership changes
+
+- **WHEN** a subscription or authorized administrator-metadata update changes nodes under an unchanged Egress binding
+- **THEN** Ingress publishes the valid dynamic generation and drains removed candidates without requiring a new Egress policy snapshot
+
 ### Requirement: Deterministic bounded rule compilation
 
-Rules SHALL use explicit unique order values and deterministic, bounded, I/O-free evaluation. Invalid policy and class references SHALL be rejected. A TransitRule whose runtime candidates exceed one without the required TrafficPolicy SHALL reject that flow without entering Proxy rules or fallback.
+Rules SHALL use explicit unique order values and deterministic, bounded, I/O-free evaluation. EgressRule output SHALL select only an Egress action and diagnostic rule identity. Each Egress SHALL resolve one TrafficPolicy during complete-bundle validation, independent of runtime candidate cardinality. Retired TransitRule and traffic-class configuration SHALL be rejected explicitly.
 
 #### Scenario: Multiple Transit relationships lack a policy
 
-- **WHEN** a rule omits `trafficPolicyRef` and more than one admitted Transit relationship can carry the flow
-- **THEN** the flow is rejected without continuing to ordinary Proxy rules or global fallback
+- **WHEN** an Egress with several possible Transit relationships omits `trafficPolicyRef`
+- **THEN** complete-bundle validation rejects the missing reference before publication rather than admitting a single-path configuration that fails after nodes are added
+
+#### Scenario: Only one Transit is currently available
+
+- **WHEN** an Egress has only one currently available Transit relationship but omits its policy reference
+- **THEN** the same validation failure occurs without creating an implicit single-Transit policy
 
 ### Requirement: Persistent subscription ownership
 
@@ -207,7 +222,7 @@ authored. Runtime `status` is read-only and is exposed separately by the
 control plane.
 
 The supported resource kinds are `Egress`, `TransitProxy`, `Subscription`,
-`EgressRule`, `TransitRule`, `ProxyRule`, `TrafficPolicy`, `Listener`,
+`EgressRule`, `ProxyRule`, `TrafficPolicy`, `Listener`,
 `DNSPolicy`, `FallbackPolicy`, `GeoSiteDatabase`, `GeoIpDatabase`,
 `EgressService`, and `NodeProbePolicy`. The last two are role-specific service resources: `EgressService` selects the
 Egress identity, listener, authorization store, and service limits for one
@@ -287,10 +302,16 @@ operator labels are carried by `metadata`:
 | `publicKey` | yes | 32-byte unpadded base64url Curve25519 public key |
 | `capabilities` | no | mapping `tcp`/`udp` to booleans; both default `false` |
 | `statusRequirements` | no | `minUsablePaths` and optional capability set; default `minUsablePaths: 1` |
+| `transit` | yes | common same-namespace Transit binding with optional `require` and `reject` selectors |
+| `trafficPolicyRef` | yes | exactly one same-namespace TrafficPolicy for every Session using this Egress |
 
 At least one of `capabilities.tcp` or `capabilities.udp` MUST be true. An
-Egress reference MUST resolve to an Egress object. Egress topology and local key
-material are startup configuration and are not hot-reloaded.
+Egress reference MUST resolve to an Egress object. `transit: {}` explicitly
+admits all otherwise eligible same-namespace Transit nodes. Its `require`
+selector uses labels, tags, and capabilities; `reject.tags` excludes matching
+nodes. The binding cannot contain flow matches, order, a second weight, a Path
+subset, or a desired Path count. Egress topology, the binding, and its resolved
+TrafficPolicy are startup configuration and are not hot-reloaded.
 
 ### EgressService and NodeProbePolicy
 
@@ -408,7 +429,7 @@ are external inputs, not resource documents, and MUST be outside a scanned
 configuration directory or use an unscanned extension.
 
 `targetGeoSites` and `targetGeoIps` are optional non-empty sequences of at most
-256 strings on an EgressRule, TransitRule, or ProxyRule `match`. A geosite
+256 strings on an EgressRule or ProxyRule `match`. A geosite
 reference is `set` or `set@attribute`, optionally prefixed `geosite:`; a geoip
 reference is `set`, optionally prefixed `geoip:`. The appropriate prefix is
 normalized away; an incompatible prefix is rejected. Set and attribute names use
@@ -432,8 +453,8 @@ Configurations without geodata references require no database files.
 ### Rules and selectors
 
 Rules are ordered by the REQUIRED `spec.order` integer; List item order has no
-semantic meaning and ties are rejected. Each `EgressRule`,
-`TransitRule`, and `ProxyRule` has an optional `match` and an action-specific
+semantic meaning and ties are rejected. Each `EgressRule` and `ProxyRule` has
+an optional `match` and an action-specific
 selector. A present `match: {}` is invalid; omit `match`
 only when an explicit catch-all rule is intended. Match fields are ANDed, and
 multiple values within one field are ORed. Supported match fields are
@@ -453,16 +474,12 @@ The mapping selector MUST contain at least one criterion. `mode: none` is
 ordinary Proxy mode and MUST NOT create a PathChord Session. `proxy: direct` is
 the built-in direct Transit adapter and is not an Egress selector.
 
-`EgressRule.spec` accepts `requirements.minUsablePaths` (default `1`) and an
-optional capability set. The first rule whose match, selector, capability, and
-current Egress usability all pass wins. `TransitRule` objects are evaluated after an
-Egress is selected; `egressRef` is an Egress name, `require` and `reject` are
-selectors, `weight` defaults to `100`, and `trafficPolicyRef` is required when
-more than one admitted relationship can carry the flow. If a rule omits that
-reference and its runtime candidates grow beyond one, the flow is rejected
-without entering Proxy rules or fallback. `trafficClassRef` optionally selects a key in the selected TrafficPolicy class map; an unknown key is invalid. A rule with no admitted
-Transit Proxy causes the next Egress rule to be considered; it does not silently
-fall through to an arbitrary Proxy.
+`EgressRule.spec` has no `requirements`, Transit selector, policy override, or
+traffic-class field. The first rule whose match, selector, capability, and
+current Egress usability all pass wins. The selected Egress binding supplies
+the common Transit candidates, Path minimum, and TrafficPolicy for every flow.
+If the binding has no admitted Transit Proxy, the next Egress rule is
+considered; evaluation does not silently fall through to an arbitrary Proxy.
 
 `ProxyRule` objects select an ordinary Proxy. `select` is `any` or a selector; the
 default is `any`. `any` chooses uniformly among the highest-scoring usable
@@ -487,20 +504,22 @@ Each `kind: TrafficPolicy` object has the following `spec` fields:
 |---|---|---|
 | `scheduler` | no | `effectiveCapacityWeighted` |
 | `sessionReplicationBudgetBps` | no | `0` (no replication) |
-| `classReplicationBudgetBps` | no | absent; bounded by Session budget |
 | `retransmissionReplication` | no | `disabled` |
-| `classes` | no | `{}`; map of class to `{priority, share}` |
 
-Budgets are non-negative integers no greater than `10^12`. A class `priority`
-is `0..=255` and a `share` is `1..=1_000_000`. The Session budget is the hard
-upper bound; control traffic is accounted against it. The scheduler considers
+Budgets are non-negative integers no greater than `10^12`. The Session budget is
+the hard upper bound per sending direction; control traffic is accounted
+against it. `retransmissionReplication: disabled` requests zero even when the
+budget is positive; `allowed` requests the budget divided by eight, rounded
+down to wire bytes per second, within profile hard caps. A zero cap disables
+optional business and control copies while preserving primary traffic,
+necessary control, and ordinary reliable retransmission. The scheduler considers
 relationship weight, the optional billing multiplier, effective capacity,
 congestion window, RTT, jitter, and loss. A policy cannot grant a Path more than
 its advertised flow control limit.
 
-`TransitRule.spec.trafficClassRef` optionally assigns admitted flows to one key
-in the selected `TrafficPolicy.classes` map. Unknown class references are
-validation errors. A missing reference uses the default class.
+`classes`, `classReplicationBudgetBps`, and `trafficClassRef` are retired and
+rejected, including empty or zero values. The policy is captured once per
+Session; a later Path attachment cannot replace it or raise its negotiated cap.
 
 ### Listener
 

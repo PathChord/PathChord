@@ -543,6 +543,8 @@ fn policy(
                     min_usable_paths: 1,
                     capabilities: BTreeSet::from([FlowProtocol::Tcp]),
                 },
+                transit: pathchord_policy::EgressTransitBinding::default(),
+                traffic_policy: Some(traffic_policy_id.clone()),
             }],
             transit_proxies: vec![TransitProxyConfig {
                 options: Default::default(),

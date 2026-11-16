@@ -19,12 +19,17 @@
 
 ### Requirement: Ordered routing and explicit fallback
 
-Ingress 必须（SHALL）先评估有效 Egress 规则，再评估普通 Proxy 规则和必需的全局回退。有序 Egress 和 Transit 规则必须（SHALL）选择首个可准入的匹配，不支持的普通 UDP 路由必须（SHALL）按策略失败，不得绕过为 direct。
+Ingress 必须（SHALL）先评估有效 Egress 规则，再评估普通 Proxy 规则和必需的全局回退。Egress 规则只能选择 Egress 引用或选择器，或通过 `mode: none` 明确进入普通 Proxy 模式；Transit 选择来自被选 Egress 的绑定。不支持的普通 UDP 路由必须（SHALL）按策略失败，不得绕过为 direct。
 
 #### Scenario: No effective Egress route is selected
 
 - **WHEN** 有序的有效 Egress 规则没有为新 flow 选出可准入路由
 - **THEN** Ingress 按顺序评估普通 Proxy 规则，然后应用配置的全局回退
+
+#### Scenario: Different rules select the same Egress
+
+- **WHEN** 两个 flow 匹配不同的 Egress 规则但选择同一个 Egress
+- **THEN** 两者都使用该 Egress 的 Session Path 池和 TrafficPolicy，规则不得为它们推导不同的 Transit 候选或 Path 要求
 
 ### Requirement: Bounded ordinary Proxy pre-admission failover
 
@@ -46,17 +51,27 @@ Ingress 必须（SHALL）先评估有效 Egress 规则，再评估普通 Proxy �
 
 ### Requirement: Bounded replication policy
 
-每个已准入 Stream 或 UDP Association SHALL 使用所选 TrafficPolicy 的不可变复制预算；一个协商的 Session 上限仍是硬上限。低预算 flow 不得永久降低同一 Session 后续 flow 的独立预算。`trafficClassRef` 必须解析到所选 TrafficPolicy 中的类别；缺少引用时使用默认类别。
+每个 Session SHALL 捕获其 Egress 选择的 TrafficPolicy，并在每个发送方向共享一个受协商 Session 上限约束的复制额度。该 Session 中所有 Stream 和 UDP Association 使用同一个不可变策略，不得被规则、flow 或业务类别覆盖。即使引用同一 TrafficPolicy，不同 Session 仍独立记账。
+
+#### Scenario: Two flows use different Egress policies
+
+- **WHEN** 两个 flow 选择具有不同 TrafficPolicy 的 Egress
+- **THEN** 每个 flow 使用自身 Session 的策略和共享额度，不改变另一个 Session 的预算
 
 #### Scenario: Two flows use different policies
 
-- **WHEN** 低复制预算 flow 和高复制预算 flow 共用一个 Session
-- **THEN** 每个 flow 使用自身的策略和类别预算，仅共享 Session 全局剩余上限
+- **WHEN** 两个 flow 选择具有不同 TrafficPolicy 的 Egress
+- **THEN** 每个 flow 使用自身 Session 的策略和共享额度，不改变另一个 Session 的预算
 
 #### Scenario: Unknown traffic class is configured
 
-- **WHEN** TransitRule 引用了其所选 TrafficPolicy 中不存在的类别
-- **THEN** 验证必须拒绝该引用，不得以任意类别准入该 flow
+- **WHEN** 配置包含业务类别引用或已退休的类别策略字段
+- **THEN** 验证拒绝该字段，不得使用默认或任意业务类别准入 flow
+
+#### Scenario: Several flows share the replication allowance
+
+- **WHEN** 一个 Session 中的 Stream 和 UDP Association 在同一发送方向并发请求可选副本
+- **THEN** 合计记账保持在该方向的 Session 剩余额度内，必要控制预留优先，额度不随 flow 数量倍增
 
 ### Requirement: Atomic dynamic updates and draining
 
@@ -85,23 +100,43 @@ Ingress 必须（SHALL）为每个已配置 Egress 维护一个 Session 槽位�
 - **WHEN** Egress 在先前 Session 已因硬故障销毁后重新上线
 - **THEN** Ingress 创建新的 Session 和 Path 集合，不得恢复旧 Session
 
+#### Scenario: Egress warms before a business match
+
+- **WHEN** Ingress 启动时 Egress 绑定有效但还没有业务 flow 命中规则
+- **THEN** Ingress 可以直接为该 Egress 建立初始 Path，不得为此构造目标、监听器、flow tag 或 geodata 匹配
+
+#### Scenario: Only destination-specific routing rules exist
+
+- **WHEN** Ingress 启动时 Egress 绑定有效但还没有业务 flow 命中规则
+- **THEN** Ingress 可以直接为该 Egress 建立初始 Path，不得为此构造目标、监听器、flow tag 或 geodata 匹配
+
 ### Requirement: Ingress owns Path target decisions
 
-Ingress SHALL 根据匹配的 EgressRule 最小要求、合规 Transit 关系、方向性 demand、Path 质量和 Egress 硬资源上限计算 Path target。Egress 不提供或覆盖 Path recommendation。
+Ingress SHALL 为每个 Session 根据所选 Egress 最小要求、合规 Transit 关系、聚合方向性 demand、Path 质量和 Egress 硬资源上限计算一个 Path target。路由身份和 flow 匹配不得定义额外 Path target，Egress 不提供或覆盖该决定。
 
 #### Scenario: Egress has no Path recommendation
 
 - **WHEN** Egress 只报告容量和准入状态而不提供 Path 数建议
-- **THEN** Ingress 仍根据自身策略和运行时观测为每条匹配 EgressRule 计算有界 target
+- **THEN** Ingress 根据 Egress 配置和运行时观测计算一个有界 Session target
 
-### Requirement: Rule-specific Path eligibility is enforced
+### Requirement: Egress Session Path eligibility
 
-EgressRule SHALL 只统计其 TransitRule 集合在关系、能力、健康和当前准入状态上都合规的 Path。仅有 namespace 归属不得使 Path 对规则合规。
+同一 Session 中的所有 Stream 和 UDP Association SHALL 共享由 Egress Transit 绑定、Path 认证就绪、健康及生命周期状态定义的 Path 资格。flow 的路由、目标、监听器或业务协议不得缩小 Transit 集合；Egress 协议能力和每个资源的流控仍必须执行。
 
 #### Scenario: Warmup finds an ineligible Transit
 
-- **WHEN** ready Transit adapter 不匹配选定 EgressRule 的 TransitRule
-- **THEN** 该 adapter 不计入规则最小 Path 要求，也不被该规则的新 flow 选择
+- **WHEN** ready Transit adapter 不满足 Egress Transit 绑定
+- **THEN** 该 adapter 从 Session 池排除，也不计入 Egress 最小要求
+
+#### Scenario: TCP-only Transit carries Egress UDP
+
+- **WHEN** Transit 提供合规字节流且所选 Egress 支持 UDP
+- **THEN** UDP Association 可以使用共享 Path 池，不要求 Transit 自身支持原生 UDP
+
+#### Scenario: One Transit carries several Paths
+
+- **WHEN** 一个合规 Transit 关系承载多个独立认证的 Path
+- **THEN** 该关系中非排空的 `ACTIVE` 或 `DEGRADED` Path 可以满足 Egress 最小要求，并共享该关系的配置权重
 
 ### Requirement: Resource failure does not fall through silently
 
@@ -112,23 +147,28 @@ EgressRule SHALL 只统计其 TransitRule 集合在关系、能力、健康和�
 - **WHEN** 所有合规 Egress 候选在 Stream 准入前都返回资源限制
 - **THEN** 本地 flow 失败并返回可重试资源错误，不使用未配置的 fallback
 
-### Requirement: Rule demand aggregation is bounded
+### Requirement: Session demand aggregation is bounded
 
-Ingress SHALL 按 Session 作用域的 rule、policy 和 class key 使用有界 counter 和低频窗口聚合 demand，不得保留无界 per-flow 历史，也不得将规则元数据发送给 Egress。
+Ingress SHALL 每个 Session 聚合上行和下行 demand，使用有界 counter 和低频窗口。路由身份、policy ID 和业务类别不得划分 Path demand。替换后的 Session 必须从空 counter 和观测开始；不得保留无界 per-flow 历史或将本地策略元数据发送给 Egress。
 
 #### Scenario: A Session reconnects
 
 - **WHEN** 新 SessionID 替换失败 Session
 - **THEN** 新 Session 的 demand counter 和 EWMA 从空状态开始，旧值只能作为有界观测保留
 
+#### Scenario: Many matching rules share an Egress
+
+- **WHEN** 多条路由规则将流量发送到同一个 Egress
+- **THEN** 这些流量进入同一 Session 的方向性 demand 窗口，不为每条规则分配独立 Path 要求或 demand 历史
+
 ### Requirement: Geodata predicates participate in ordered routing
 
-EgressRule、TransitRule 和 ProxyRule 的 flow match SHALL 使用与其余路由决策相同的不可变 geodata 代次，对配置的 geosite 和 geoip 条件求值。这些条件 SHALL 遵循 [geodata 路由契约](../geodata-routing/spec.zh-CN.md)，不改变规则顺序或隐式回退行为。
+EgressRule 和 ProxyRule 的 flow match SHALL 使用与其余路由决策相同的不可变 geodata 代次，对配置的 geosite 和 geoip 条件求值。这些条件 SHALL 遵循 [geodata 路由契约](../geodata-routing/spec.zh-CN.md)，不改变规则顺序或隐式回退行为，也不得在 Egress 内选择 Transit 关系。
 
 #### Scenario: Hugging Face redirect uses the same Egress policy
 
 - **WHEN** 显式代理 flow 的目标主机名属于已配置的 `huggingface` geosite 集合，包括 CDN 子域名
-- **THEN** 匹配的 Egress 和 Transit 规则选择其配置路由，无需逐一列出主机名
+- **THEN** 匹配的 Egress 规则选择其配置的 Egress，flow 使用该 Egress 的共享 Path 池，无需逐一列出主机名
 
 #### Scenario: GeoIP predicate receives an original destination address
 
@@ -169,6 +209,15 @@ items:
       capabilities:
         tcp: true
         udp: true
+      statusRequirements:
+        minUsablePaths: 2
+      transit:
+        require:
+          labels:
+            region: jp
+        reject:
+          tags: [quota-exhausted]
+      trafficPolicyRef: jp-default
   - apiVersion: pathchord.io/v1
     kind: DNSPolicy
     metadata:
@@ -260,37 +309,11 @@ spec:
     flowTags: [gaming]
     protocols: [tcp, udp]
   egressRef: jp-1
-  requirements:
-    minUsablePaths: 1
 ```
 
-首个条件匹配且 Egress 当前可用的规则胜出。Egress 可用性由运行时状态管理器预先计算。Geosite 和 geoip 条件使用 flow 的原始主机名或原始目标 IP 以及不可变的 [geodata 路由](../geodata-routing/spec.zh-CN.md)代次；事实缺失时不匹配，也不触发 DNS。
+首个条件匹配且选定 Egress 当前可用的规则胜出。Egress 可用性由运行时状态管理器预先计算。Geosite 和 geoip 条件使用 flow 的原始主机名或原始目标 IP 以及不可变的 [geodata 路由](../geodata-routing/spec.zh-CN.md)代次；事实缺失时不匹配，也不触发 DNS。规则只选择 Egress，不选择 Transit 关系、Path 子集、最小数量或 TrafficPolicy。
 
-### Egress 专用 Proxy 规则
-
-```yaml
-apiVersion: pathchord.io/v1
-kind: TransitRule
-metadata:
-  name: jp-1-gaming
-spec:
-  order: 20
-  egressRef: jp-1
-  match:
-    flowTags: [gaming]
-  require:
-    labels:
-      region: jp
-    capabilities: [udp]
-  reject:
-    tags: [quota-exhausted]
-  weight: 100
-  trafficPolicyRef: gaming-default
-```
-
-规则按顺序执行。首个匹配规则决定准入和关系的基础权重。
-
-流量策略可以定义多路径调度和复制预算；`TransitRule.spec.trafficClassRef` 可以将准入 flow 分配到所选策略的类别，未知引用必须拒绝，缺少引用时使用默认类别：
+TrafficPolicy 可以定义多路径调度和复制预算：
 
 ```yaml
 apiVersion: pathchord.io/v1
@@ -300,11 +323,12 @@ metadata:
 spec:
   scheduler: effectiveCapacityWeighted
   sessionReplicationBudgetBps: 2000000
-  classReplicationBudgetBps: 1000000
   retransmissionReplication: allowed
 ```
 
-Session 预算是硬性上限。流量类别预算可以减少该类别的分配量，但不能超过 Session 的剩余预算。
+`retransmissionReplication: disabled` 即使配置了正预算也请求零 Session 复制上限；`allowed` 请求策略 bit rate 除以 8 后向下取整的 wire bytes/s，Egress 可以接受更低值。零上限会在两个方向禁用可选业务和控制副本，但保留首份数据、必要控制和普通可靠重传。`TrafficPolicy.classes`、`classReplicationBudgetBps` 和规则级 `trafficClassRef` 已退休。
+
+Session 预算在每个发送方向都是硬上限。同一 Session 的所有 Stream 和 UDP Association 共享 Egress 策略及其额度；路由身份不会划分 demand 或复制记账。Ingress 根据 Egress 最小要求、合规 Transit 关系、聚合方向性 demand、Path 观测和 Egress 全局安全上限计算一个有界 Session Path target。Egress 状态不提供或覆盖 Path 数建议。非排空的 `ACTIVE` 或 `DEGRADED` Path 才计入新业务准入；排空 Path 只完成已有工作。
 
 ### 普通 Proxy 规则与回退
 
@@ -426,11 +450,12 @@ billing.*   optional provider billing metadata
 
 ### 动态更新规则
 
-- 静态 Egress 拓扑变更需要重启 Ingress。
+- 静态 Egress 拓扑、Transit 绑定、公共 Path 要求以及引用的已解析 TrafficPolicy 的规范化值变化需要重启 Ingress。
 - Transit Proxy 订阅更新以原子方式替换动态快照。
 - 订阅刷新失败时保留上一次成功的快照。
 - 已移除的 Transit Proxy 进入排空状态，并从新的选择中排除。
 - 使用已移除 Transit Proxy 的现有 Path 会保留到排空完成或发生故障。
+- 在 Egress 绑定不变时，Transit 成员变化可以动态发布，并排空被移除的关系。
 - 已编译规则以原子方式替换；编译失败时保留上一个规则快照。
 - 运行时观测独立于配置代次更新。
 
@@ -442,4 +467,4 @@ Ingress 管理员 label/tag 编辑属于控制面动态 mutation，只能更新 
 
 ### Session 维护
 
-Ingress 为每个已配置的 Egress 维护一个 Session 槽位。Ingress 启动时，会尝试为当前有效状态为在线的 Egress 建立 Session。Session 在空闲期间保持存活，并由后续 Stream 和 UDP Association 复用。当 Egress 离线或进入硬故障状态时，其 Session 和所有相关业务连接都会被销毁。Egress 再次上线后，Ingress 会创建新的 Session 和 Path 集合。
+Ingress 为每个已配置 Egress 维护一个 Session 槽位，并可以在任何业务 flow 命中规则前根据 Egress 绑定预热该槽位。Session 捕获一个不可变 TrafficPolicy 和协商的复制上限，拥有一个公共 Path 池；空闲时由后续 Stream、UDP Association 以及经 Egress 路由的 DNS 复用。当 Session 低于公共可用 Path 最小值但仍有 ready Path 时，进入 degraded 并拒绝新业务；最后一个 ready Path 丢失或 Egress 发生硬故障时，销毁 Session 和相关业务连接。Egress 再次上线后，Ingress 创建新的 Session 和 Path 集合。

@@ -66,12 +66,22 @@ Peers SHALL use protocol version 1, the exact configured EgressID prologue, and 
 
 ### Requirement: Ordered Session control envelopes
 
-Session control SHALL use the registered envelope, per-sender sequence space, dependency ordering, eligible Path list, acknowledgement rules, and idempotent cancellation encoding. Replicated copies SHALL preserve their control sequence and payload while using new Path frame sequences and Noise nonces.
+Session control SHALL use the registered envelope, per-sender sequence space, dependency ordering, acknowledgement rules, and idempotent opaque cancellation encoding. Encoders SHALL emit an empty eligible-Path list for new operations; receivers SHALL reject retired non-empty open restrictions before target admission. Replicated copies SHALL preserve their control sequence and payload while using new Path frame sequences and Noise nonces.
 
 #### Scenario: Control operation is replicated
 
 - **WHEN** copies of one `SESSION_CONTROL` operation arrive over multiple eligible Paths
 - **THEN** the receiver applies its control sequence once, after its dependency, and acknowledges it through the Session control sequence space
+
+#### Scenario: A new open uses the Session pool
+
+- **WHEN** a sender encodes `STREAM_OPEN` or `UDP_OPEN` in a Session-control envelope
+- **THEN** it writes `eligible_path_count=0` with no PathID entries and the admitted flow uses the Session pool in both directions
+
+#### Scenario: A peer supplies a retired per-flow list
+
+- **WHEN** an otherwise valid Stream or UDP open carries a non-empty canonical eligible-Path list
+- **THEN** the receiver rejects that open with the operation-specific error and `LOCAL_POLICY`, creates no target connection, and processes the rejection and control acknowledgement idempotently without narrowing the pool
 
 ### Requirement: Typed Stream and UDP payload semantics
 
@@ -93,12 +103,22 @@ Stream and UDP payloads SHALL use the registered field order, target forms, addr
 
 ### Requirement: Session replication cap is negotiated during attachment
 
-`SESSION_ATTACH` SHALL carry an Ingress requested Session replication cap, and `SESSION_ATTACH_OK` SHALL carry the Egress accepted effective cap. Both values SHALL be bounded wire byte rates; the effective cap SHALL be no greater than either peer's accepted hard limit and SHALL apply to every Path in the Session.
+`SESSION_ATTACH` SHALL carry the Egress policy's requested replication cap and `SESSION_ATTACH_OK` its accepted cap as wire byte rates. Disabled replication SHALL request zero; allowed replication SHALL request the policy bit rate divided by eight and rounded down within profile limits. The accepted cap SHALL NOT exceed the request or either peer's limit. Each sender SHALL enforce it across outbound Session traffic; every Path SHALL retain that negotiation.
 
 #### Scenario: Egress accepts a lower cap
 
 - **WHEN** the Egress cannot accept the requested cap but can admit the Session with a lower cap
 - **THEN** it returns the lower effective cap, and both peers use that value as the Session hard ceiling while ordinary reliability remains available
+
+#### Scenario: Replication is disabled with a positive configured budget
+
+- **WHEN** the Egress policy sets `retransmissionReplication: disabled` and a positive `sessionReplicationBudgetBps`
+- **THEN** Ingress requests zero, Egress accepts zero, and neither sender emits optional business or control copies while primary traffic, necessary control, and ordinary reliable retransmission remain available
+
+#### Scenario: A later Path joins the Session
+
+- **WHEN** another Path attaches after flows have consumed replication allowance
+- **THEN** it uses the Session's captured request and effective cap without replacing the policy, broadening the cap, or resetting accounting
 
 ### Requirement: Global status carries explicit capacity and admission state
 
@@ -428,11 +448,14 @@ UDP_OPEN_OK, UDP_OPEN_ERR, or UDP_CLOSE.
 `inner_payload` is its canonical payload without a frame header. The complete
 SESSION_CONTROL payload, including this envelope, is bounded by
 `max_control_payload`. A dependency MUST be less than the control sequence.
-Only STREAM_OPEN and UDP_OPEN may carry a
-non-empty eligible Path list. An empty list means no explicit Path restriction;
-otherwise the Path carrying the opening operation MUST be in the list. The
-Egress applies the list to both directions of that flow. A listed Path must
-still have been independently admitted to the same Session before it is used.
+Senders MUST encode `eligible_path_count=0` and no PathID entries. For
+STREAM_OPEN and UDP_OPEN, zero means the common Session Path pool in both
+directions, subject to authentication, readiness, draining, and flow-control
+constraints. A well-formed non-empty list is a retired per-flow restriction;
+the receiver MUST reject the open with STREAM_OPEN_ERR or UDP_OPEN_ERR and
+LOCAL_POLICY before target dialing, acknowledge the applied control sequence,
+and return the same idempotent rejection for duplicate copies. It MUST NOT
+narrow the pool or block later valid control operations.
 Each sender has an independent Session-wide control sequence starting at zero.
 The receiver applies operations in sequence order and discards duplicates;
 an operation is not applied before its dependency. The sender retains and
@@ -450,9 +473,9 @@ Closing a Session retains the receiver long enough to acknowledge a retried
 SESSION_CLOSE, and the initiating endpoint closes after receiving its ACK or
 losing the Session transport.
 
-If a flow loses all its eligible Paths, SESSION_CONTROL_CANCEL may replace an
-unacknowledged operation for that flow at the same control sequence. It may also
-use a new sequence when no operation for that flow remains unacknowledged:
+SESSION_CONTROL_CANCEL may replace an unacknowledged operation for a flow at
+the same control sequence. It may also use a new sequence when no operation for
+that flow remains unacknowledged:
 
 ~~~text
 control_seqno         varint

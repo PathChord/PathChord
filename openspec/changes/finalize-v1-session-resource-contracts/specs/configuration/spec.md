@@ -11,6 +11,16 @@ Each admitted Stream or UDP Association SHALL use the selected TrafficPolicy's i
 - **WHEN** a low-replication flow and a high-replication flow share a Session
 - **THEN** each flow uses its own policy/class budget, and only the Session-wide remaining cap is shared
 
+#### Scenario: Two flows use different Egress policies
+
+- **WHEN** two flows select Egresses with different TrafficPolicies
+- **THEN** each uses the policy and shared allowance of its own Session, without changing the other Session's budget
+
+#### Scenario: Several flows share the replication allowance
+
+- **WHEN** Streams and UDP Associations in one Session request optional copies concurrently
+- **THEN** their combined accounting stays within the Session's remaining allowance after required control reservations, without multiplying it by the number of flows
+
 #### Scenario: Unknown traffic class is configured
 
 - **WHEN** a TransitRule names a class that does not exist in its selected TrafficPolicy

@@ -148,6 +148,8 @@ spec:
   port: {egress_port}
   publicKey: {public}
   capabilities: {{tcp: true, udp: true}}
+  transit: {{}}
+  trafficPolicyRef: default
 ---
 apiVersion: pathchord.io/v1
 kind: TransitProxy
@@ -163,11 +165,6 @@ apiVersion: pathchord.io/v1
 kind: EgressRule
 metadata: {{name: egress-route}}
 spec: {{order: 10, catchAll: true, egressRef: exit}}
----
-apiVersion: pathchord.io/v1
-kind: TransitRule
-metadata: {{name: transit-route}}
-spec: {{order: 20, catchAll: true, egressRef: exit, trafficPolicyRef: default}}
 ---
 apiVersion: pathchord.io/v1
 kind: Listener

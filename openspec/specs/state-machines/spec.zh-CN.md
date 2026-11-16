@@ -69,12 +69,17 @@
 
 ### Requirement: Bounded scheduling and autoscaling guards
 
-调度 SHALL 保留不可变的已协商类别快照、有界优先级偏好、加权公平服务、关系及质量权重和复制预算计费。自动扩缩容 SHALL 执行规定的滞回、合规 Path 保留、排空动作、新增容量排除及计数器重置规则。
+调度 SHALL 保留一个不可变的 Egress Session 策略快照、有界公平服务、关系及方向性质量权重和按发送方共享的复制记账。自动扩缩容 SHALL 使用一个 Session Path target，并执行规定的滞回、公共最小值保留、排空动作、新增容量排除及计数器重置规则。
 
 #### Scenario: Autoscaler scales a Path in
 
-- **WHEN** 容量富余持续达到配置的非零缩容窗口，且仍有另一条合规 Path
+- **WHEN** 容量富余持续达到配置的非零缩容窗口，移除所有选中的排空候选后仍保留合规可用 Path 且满足 Egress 最小值
 - **THEN** 选中的 Path 在移除前进入 `DRAINING`，并保留规定的滞回和预算守卫
+
+#### Scenario: A draining Path cannot justify another drain
+
+- **WHEN** 公共最小值为 2、已有 2 条可用 Path，且另有 1 条 Path 正在排空
+- **THEN** owner 拒绝排空任一可用 Path，并在检查最小值时扣除并发选中的排空候选
 
 ### Requirement: One owner validates lifecycle transitions
 
@@ -96,21 +101,31 @@ Egress service state SHALL 表示生命周期和健康；独立的 admission sta
 
 ### Requirement: Reconnected Sessions start fresh
 
-Session 因 Egress 故障、Path 丢失、授权失败或协议信任失败关闭时，替代 Session SHALL 使用新的 SessionID，并重置 demand、Path target、复制用量和生命周期观测。
+Session 因 Egress 故障、Path 丢失、授权失败或协议信任失败关闭时，替代 Session SHALL 使用新的 SessionID，捕获配置的 Egress 策略，并重置聚合 demand、Path target、复制用量和生命周期观测。
 
 #### Scenario: Egress recovers after Session closure
 
 - **WHEN** Ingress 重新连接同一配置 Egress
-- **THEN** 新 Session 从规则最小值和新鲜观测开始，不复用旧 Session 状态
+- **THEN** 新 Session 从 Egress 最小值和新鲜观测开始，不复用旧 Session 状态
 
-### Requirement: Rule-specific Path targets share Path instances
+### Requirement: Egress Session Path pool lifecycle
 
-Ingress SHALL 为每个匹配 EgressRule 独立计算 Path 要求，同时允许一条合规 Path 实例满足多条规则。只有关系、能力、健康和策略资格都满足时，Path 才能计入规则。
+Ingress Session owner SHALL 为一个 Egress 关系维护一个认证的公共 Path 池，不依赖命中的路由规则。扩展和排空必须保持公共资格及硬安全上限。低于公共最小值时拒绝新业务但不能仅因短缺关闭已有工作；最后一条 ready Path 丢失时废弃 Session。
 
-#### Scenario: Two rules share a Session
+#### Scenario: Ready Paths fall below the configured minimum
 
-- **WHEN** 一条规则需要三条合规 Path，另一条需要一条，且有两条 Path 同时合规
-- **THEN** Session 保持满足两条规则的最小物理 Path 集合，不把不合规 Path 计入任一规则
+- **WHEN** Egress 要求两条可用 Path，但故障后只剩一条认证且非排空的 ready Path
+- **THEN** Session 进入 degraded，拒绝新的 Stream 和 UDP Association，已有工作可继续使用剩余 Path，并进行有界恢复尝试
+
+#### Scenario: Only draining Paths remain
+
+- **WHEN** Session 只剩认证的 draining Path
+- **THEN** 已有工作遵循排空截止时间，新业务被拒绝，排空 Path 不计入新准入最小值
+
+#### Scenario: Last ready Path is lost
+
+- **WHEN** 公共池最后一条 ready Path 失败
+- **THEN** 关闭所有相关业务资源，废弃的 SessionID 不得复用
 
 ### Requirement: Directional Path capacity drives scaling
 
@@ -123,7 +138,7 @@ Ingress SHALL 分别维护上行和下行 Path 观测。双向 Session target SH
 
 ### Requirement: Autoscaling remains bounded and low-frequency
 
-Path 健康采样和规则 demand 聚合 SHALL 使用有界 counter 和低频窗口。自动扩缩容 SHALL 对扩容和缩容使用独立滞回，缩容保留合规 Path，并排除新增容量低于调度开销的候选。
+Path 健康采样和 Session demand 聚合 SHALL 使用有界 counter 和低频窗口。自动扩缩容 SHALL 对扩容和缩容使用独立滞回，计划缩容保留 Egress 公共最小值，并排除新增容量低于调度开销的候选。
 
 #### Scenario: Unknown capacity at startup
 
@@ -322,10 +337,9 @@ FAILED → APPLYING
 
 ### 调度和自动扩缩容守卫
 
-每个准入的 Stream 和 UDP Association 可以保存 Ingress-local TrafficPolicy 类别快照，类别身份不跨 wire。
-调度器先提供有界优先级偏好，再按 `share` 提供
-加权公平服务，并在同一类别的有待发送 Stream 之间轮询。Stream 只有在其排队 DATA 已发送并确认后
-才能发出 FIN；已关闭 Stream 的观测可以保留在有界的近期历史中。
+每个准入的 Stream 和 UDP Association 使用其 Egress Session 捕获的不可变 TrafficPolicy 快照。
+业务类别的 priority/share 不再是公开配置面；调度器提供有界公平服务，并在有待发送的 Stream 之间轮询。
+Stream 只有在其排队 DATA 已发送并确认后才能发出 FIN；已关闭 Stream 的观测可以保留在有界的近期历史中。
 
 对于每条符合条件的 Path，调度器计算：
 
@@ -338,11 +352,13 @@ score(path) = relationship_weight
 
 `quality_factor` 是由拥塞窗口、RTT、抖动、丢包和乱序推导出的有界值。具体系数属于配置，但MUST
 单调，即质量变差不能提高 Path 评分。同一关系的多条 Path 在分配关系权重后再按 Path 评分分配。
-必要控制和普通重传优先于可选业务复制；可选副本 MUST NOT 超过剩余 Session allowance。
+必要控制和普通重传优先于可选业务复制；每个发送方的可选副本 MUST NOT 超过其剩余 outbound Session allowance，
+上下行分别受同一已接受的标量上限约束。
 
-自动扩缩容MUST 使用滞回：只有当聚合容量低于需求或规则 target 超过活跃数量，并持续达到配置的
-连续采样窗口时才能增加 Path；只有当容量富余持续达到另一个非零窗口且至少保留一条其他合规 Path 时
-才能移除 Path。缩容前MUST 进入 `DRAINING`。当新增容量低于调度开销时MUST 排除 Path，并在观测中暴露原因。
+自动扩缩容MUST 使用滞回：只有当聚合容量低于需求或 Session target 超过活跃数量，并持续达到配置的
+连续采样窗口时才能增加 Path；只有当容量富余持续达到另一个非零窗口，且移除所有选中排空候选后剩余的
+非排空可用 Path 仍满足公共 Egress 最小值时才能移除 Path。缩容前MUST 进入 `DRAINING`。当新增容量低于
+调度开销时MUST 排除 Path，并在观测中暴露原因。
 状态变化或探测失败后MUST 重置反向计数器。阈值和窗口MAY 配置，但这些守卫、滞回、排空动作和预算计费规则
 具有规范性。
 

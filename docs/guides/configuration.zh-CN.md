@@ -46,7 +46,7 @@ pathchord ingress
 - `DNSPolicy` 决定 DNS 查询如何到达解析器，独立于普通连接路由。修改 `local.servers` 可以使用自己的解析器；其他路由见[平台与 DNS 契约](../../openspec/specs/platform-and-dns/spec.zh-CN.md#dns-配置)。
 - `FallbackPolicy` 决定没有前序路由胜出时如何处理。明确需要直连回退时使用 `direct`，需要拒绝未匹配 flow 时使用 `reject`。
 
-通过订阅提供节点的普通第三方代理路由需要增加 `Subscription` 和 `ProxyRule` 资源。受控 Egress 路由需要增加 `Egress`、`EgressRule`、`TransitRule` 和合适的 `TrafficPolicy`。路由先考虑有效 Egress 规则，再考虑普通 Proxy 规则，最后使用全局回退。资源关系见[配置模型](../../openspec/specs/configuration/spec.zh-CN.md)；支持的节点选项和订阅格式见[Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)。
+通过订阅提供节点的普通第三方代理路由需要增加 `Subscription` 和 `ProxyRule` 资源。受控 Egress 路由需要增加 `Egress`、`EgressRule`、公共 `transit` 绑定和合适的 `TrafficPolicy`。路由先考虑有效 Egress 规则，再考虑普通 Proxy 规则，最后使用全局回退。选择同一 Egress 的 flow 共享该 Egress 的 Session Path 池和 TrafficPolicy。资源关系见[配置模型](../../openspec/specs/configuration/spec.zh-CN.md)；支持的节点选项和订阅格式见[Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)。
 
 资源通过所属 namespace 内的 `metadata.name` 相互引用。名称和显式规则顺序决定资源图；文件名不提供覆写层。重复资源身份或无法解析的引用会使候选配置被拒绝。完整资源图中保留恰好一个 `DNSPolicy` 和一个 `FallbackPolicy`。
 
@@ -72,8 +72,8 @@ sha256sum -c dlc.dat.sha256sum
 sha256sum -c geoip.dat.sha256sum
 ```
 
-在完整配置中加入以下资源和规则；该配置还应已定义 Egress `egress-jp-1` 及其合规的
-TransitRule 和 TrafficPolicy：
+在完整配置中加入以下资源和规则；该配置还应已定义 Egress `egress-jp-1`、公共 Transit
+绑定和 TrafficPolicy：
 
 ```yaml
 apiVersion: pathchord.io/v1
@@ -93,7 +93,6 @@ spec:
   order: 10
   match:
     targetGeoSites: [huggingface]
-  requirements: {minUsablePaths: 3}
   egressRef: egress-jp-1
 ---
 apiVersion: pathchord.io/v1
@@ -192,7 +191,8 @@ Brutal 会补偿丢包，正常经过 pacing 的 QUIC 发包速率最高可达�
 profile 计算 Path 安全上限及 pending reservation。不要再配置
 `recommendedPathCount`、`maxConcurrentPaths` 或 `maxStreamsPerIngress`；Path target 属于
 Ingress 规则和运行时观测。STATUS_REPORT 提供配置/有效/当前容量、容量可信度、准入状态和当前复制
-allowance，不携带规则或 TrafficClass 元数据。
+allowance；公共 Path 最小值位于 Ingress 侧 Egress 的 `statusRequirements.minUsablePaths`，
+target 由 Session 运行时决定，不携带规则或 TrafficClass 元数据。
 
 支持 TLS 的 Transit 节点默认使用系统根证书。需要自定义根时，将有序 `truststore` 列表设置为
 `system` 和/或本地 PEM/DER 文件。相对路径从选定的配置来源解析。空列表表示明确不加载信任锚点，
@@ -203,6 +203,6 @@ allowance，不携带规则或 TrafficClass 元数据。
 
 服务会监听选定资源目录中的新增、编辑、移除和重命名，并在发布前验证完整候选配置。支持原子替换文件。解析、资源图验证、规则编译、持久化或缓存写入失败时，最近一次成功配置继续生效；通过结构化 status 查看失败，修正候选后等待重新加载。
 
-订阅节点、编译后的动态规则、管理员 label/tag 和 DNS 运行时健康可以动态更新。静态 Egress 拓扑、本地私钥、监听器绑定设置或平台路由设置发生变化时，需要重启服务。将未改变的资源移到其他文件不会改变其身份，也不需要重启。新 flow 在完整路由决策中使用同一已发布代次；现有资源遵循准入时的契约及正常排空/失败规则。
+订阅节点、编译后的动态规则、管理员 label/tag 和 DNS 运行时健康可以动态更新。静态 Egress 拓扑、Transit 绑定、公共 Path 要求、已解析 TrafficPolicy、本地私钥、监听器绑定设置或平台路由设置发生变化时，需要重启服务。将未改变的资源移到其他文件不会改变其身份，也不需要重启。新 flow 在完整路由决策中使用同一已发布代次；现有资源遵循准入时的契约及正常排空/失败规则。
 
 声明式订阅通过管理操作发生的变更，在其声明未改变时会跨重载和重启继续生效。编辑或移除声明时，应用对应的新期望状态。精确的发布和所有权规则见[重载契约](../../openspec/specs/configuration-schema/spec.zh-CN.md#快照发布和重载)。
