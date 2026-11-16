@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -38,7 +38,7 @@ const MAX_PATH_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct EgressNodeConfig {
-    pub bind: SocketAddr,
+    pub binds: Vec<SocketAddr>,
     pub egress_id: String,
     pub keypair: Arc<StaticKeypair>,
     pub authorizations: Arc<AuthorizationStore>,
@@ -57,6 +57,8 @@ pub struct EgressNodeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressNodeSnapshot {
     pub local_addr: SocketAddr,
+    pub local_addrs: Vec<SocketAddr>,
+    pub listeners: Vec<EgressListenerSnapshot>,
     pub authorization_generation: u64,
     pub accepted_paths: u64,
     pub admitted_paths: u64,
@@ -76,6 +78,13 @@ pub struct EgressNodeSnapshot {
     pub running: bool,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressListenerSnapshot {
+    pub endpoint_index: usize,
+    pub state: &'static str,
+    pub failure_reason: Option<&'static str>,
 }
 
 /// Bounded, credential-free observation of the latest Egress target-open
@@ -111,8 +120,10 @@ pub enum EgressNodeError {
 }
 
 pub struct EgressNode<C> {
-    listener: TcpListener,
+    listeners: Vec<Arc<TcpListener>>,
     local_addr: SocketAddr,
+    local_addrs: Vec<SocketAddr>,
+    listeners_state: Arc<Mutex<Vec<EgressListenerSnapshot>>>,
     config: EgressNodeConfig,
     admission: EgressPathAdmissionConfig,
     admission_timeout: Duration,
@@ -162,8 +173,25 @@ where
             local_limits: config.protocol_limits,
             ready_limits: config.ready_limits.clone(),
         };
-        let listener = TcpListener::bind(config.bind).await?;
-        let local_addr = listener.local_addr()?;
+        let mut listeners = Vec::with_capacity(config.binds.len());
+        let mut local_addrs = Vec::with_capacity(config.binds.len());
+        for bind in &config.binds {
+            let listener = TcpListener::bind(*bind).await?;
+            local_addrs.push(listener.local_addr()?);
+            listeners.push(Arc::new(listener));
+        }
+        let local_addr = local_addrs[0];
+        let listeners_state = Arc::new(Mutex::new(
+            local_addrs
+                .iter()
+                .enumerate()
+                .map(|(endpoint_index, _)| EgressListenerSnapshot {
+                    endpoint_index,
+                    state: "configured",
+                    failure_reason: None,
+                })
+                .collect(),
+        ));
         let session_status = EgressStatusConfig {
             capacity_bps: config.capacity_bps,
             max_inbound_target_connections: config.max_inbound_target_connections,
@@ -185,8 +213,10 @@ where
         });
         let target_slots = Arc::new(Semaphore::new(config.max_inbound_target_connections));
         Ok(Self {
-            listener,
+            listeners,
             local_addr,
+            local_addrs,
+            listeners_state,
             config,
             admission,
             admission_timeout: DEFAULT_PATH_ADMISSION_TIMEOUT,
@@ -242,6 +272,12 @@ where
             .map_err(|_| EgressNodeError::RuntimeStateLock)?;
         Ok(EgressNodeSnapshot {
             local_addr: self.local_addr,
+            local_addrs: self.local_addrs.clone(),
+            listeners: self
+                .listeners_state
+                .lock()
+                .map_err(|_| EgressNodeError::RuntimeStateLock)?
+                .clone(),
             authorization_generation: generation,
             accepted_paths: self.observations.accepted.load(Ordering::Relaxed),
             admitted_paths: self.observations.admitted.load(Ordering::Relaxed),
@@ -327,6 +363,16 @@ where
             .runtime
             .lock()
             .map_err(|_| EgressNodeError::RuntimeStateLock)?;
+        let endpoint_by_path = runtime
+            .paths
+            .values()
+            .filter_map(|control| {
+                control
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| (metadata.path_id, metadata.endpoint_index))
+            })
+            .collect::<HashMap<_, _>>();
         let mut paths = Vec::new();
         let mut streams = Vec::new();
         for ((_, session_id), session) in &runtime.sessions {
@@ -338,6 +384,7 @@ where
                 paths.push(serde_json::json!({
                     "path_id": path_id.to_string(), "session_id": session_id.to_string(),
                     "egress_id": self.config.egress_id,
+                    "endpoint_index": endpoint_by_path.get(&path_id).copied(),
                     "state": snapshot.path_states.get(&path_id)
                         .map(|state| format!("{state:?}").to_ascii_lowercase()),
                     "rtt_ms": quality.rtt_ms, "jitter_ms": quality.jitter_ms,
@@ -490,13 +537,59 @@ where
         let (events_sender, mut events) = mpsc::channel(1024);
         let events_tx = NodeEventSender(events_sender);
         let mut tasks = JoinSet::new();
+        let (accepted_sender, mut accepted) = mpsc::channel(1024);
+        let mut acceptors = JoinSet::new();
+        for (endpoint_index, listener) in self.listeners.iter().cloned().enumerate() {
+            let accepted_sender = accepted_sender.clone();
+            acceptors.spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
+                            if accepted_sender
+                                .send(ListenerEvent::Accepted {
+                                    endpoint_index,
+                                    stream,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = accepted_sender
+                                .send(ListenerEvent::Failed {
+                                    endpoint_index,
+                                    reason: error.to_string(),
+                                })
+                                .await;
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        drop(accepted_sender);
         let mut shutdown = Box::pin(shutdown);
 
         loop {
             tokio::select! {
                 () = shutdown.as_mut() => break,
-                accepted = self.listener.accept() => {
-                    let (stream, _) = accepted?;
+                event = accepted.recv() => {
+                    let Some(event) = event else { break };
+                    let (endpoint_index, stream) = match event {
+                        ListenerEvent::Accepted {
+                            endpoint_index,
+                            stream,
+                        } => (endpoint_index, stream),
+                        ListenerEvent::Failed {
+                            endpoint_index,
+                            reason,
+                        } => {
+                            self.mark_listener_failed(endpoint_index, &reason)?;
+                            continue;
+                        }
+                    };
                     self.observations.accepted.fetch_add(1, Ordering::Relaxed);
                     if !self.status_provider.sample().admission_allowed {
                         self.observations.rejected.fetch_add(1, Ordering::Relaxed);
@@ -540,6 +633,7 @@ where
                     ));
                     runtime.paths.insert(token, PathControl {
                             abort: task,
+                            endpoint_index,
                             metadata: None,
                         });
                 }
@@ -569,6 +663,14 @@ where
         }
         tasks.abort_all();
         while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                self.observations.failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        acceptors.abort_all();
+        while let Some(result) = acceptors.join_next().await {
             if let Err(error) = result
                 && !error.is_cancelled()
             {
@@ -631,6 +733,7 @@ where
                     ingress_public_key,
                     session_id,
                     path_id,
+                    endpoint_index: control.endpoint_index,
                     active_targets,
                     controller: existing.clone(),
                 });
@@ -700,11 +803,35 @@ where
         }
         Ok(())
     }
+
+    fn mark_listener_failed(
+        &self,
+        endpoint_index: usize,
+        _reason: &str,
+    ) -> Result<(), EgressNodeError> {
+        let mut listeners = self
+            .listeners_state
+            .lock()
+            .map_err(|_| EgressNodeError::RuntimeStateLock)?;
+        if let Some(listener) = listeners.get_mut(endpoint_index) {
+            listener.state = "failed";
+            listener.failure_reason = Some("accept");
+        }
+        Ok(())
+    }
 }
 
 fn validate_config(config: &EgressNodeConfig) -> Result<(), EgressNodeError> {
     if config.egress_id.is_empty() {
         return Err(EgressNodeError::InvalidConfig("EgressID is empty"));
+    }
+    if config.binds.is_empty() || config.binds.len() > 32 || {
+        let mut unique = BTreeSet::new();
+        config.binds.iter().any(|bind| !unique.insert(*bind))
+    } {
+        return Err(EgressNodeError::InvalidConfig(
+            "binds must contain 1 to 32 unique SocketAddr values",
+        ));
     }
     if config.max_concurrent_paths == 0 {
         return Err(EgressNodeError::InvalidConfig(
@@ -757,6 +884,17 @@ struct NodeRuntimeState {
     sessions: HashMap<(String, SessionId), SessionRegistration>,
 }
 
+enum ListenerEvent {
+    Accepted {
+        endpoint_index: usize,
+        stream: TcpStream,
+    },
+    Failed {
+        endpoint_index: usize,
+        reason: String,
+    },
+}
+
 struct CleanupBarrier {
     cleanup: AuthorizationCleanup,
     tokens: HashSet<u64>,
@@ -770,6 +908,7 @@ struct SessionRegistration {
 
 struct PathControl {
     abort: AbortHandle,
+    endpoint_index: usize,
     metadata: Option<ActivePathMetadata>,
 }
 
@@ -778,6 +917,7 @@ struct ActivePathMetadata {
     ingress_public_key: [u8; 32],
     session_id: SessionId,
     path_id: pathchord_core::PathId,
+    endpoint_index: usize,
     active_targets: Arc<AtomicU64>,
     controller: Option<EgressSessionController>,
 }
@@ -1652,7 +1792,7 @@ mod tests {
         store: Arc<AuthorizationStore>,
     ) -> EgressNodeConfig {
         EgressNodeConfig {
-            bind: "127.0.0.1:0".parse().expect("bind address"),
+            binds: vec!["127.0.0.1:0".parse().expect("bind address")],
             egress_id: "runtime-egress".to_owned(),
             keypair,
             authorizations: store,
@@ -1731,9 +1871,17 @@ mod tests {
     where
         C: TargetConnector + 'static,
     {
-        let stream = TcpStream::connect(node.local_addr())
-            .await
-            .expect("connect Egress");
+        dial_ingress_at(node.local_addr(), ingress, egress, session, path).await
+    }
+
+    async fn dial_ingress_at(
+        address: SocketAddr,
+        ingress: &StaticKeypair,
+        egress: &StaticKeypair,
+        session: u128,
+        path: u128,
+    ) -> pathchord_path::PathAdmissionOutcome<pathchord_path::IngressAdmittedPath<TcpStream>> {
+        let stream = TcpStream::connect(address).await.expect("connect Egress");
         dial_path(
             stream,
             ingress.private(),
@@ -1742,6 +1890,81 @@ mod tests {
         )
         .await
         .expect("Ingress admission result")
+    }
+
+    #[tokio::test]
+    async fn one_identity_accepts_authenticated_paths_on_multiple_listeners() {
+        let egress_key = Arc::new(generate_static_keypair().unwrap());
+        let ingress_key = generate_static_keypair().unwrap();
+        let store = Arc::new(
+            AuthorizationStore::open(
+                ":memory:",
+                EgressId::new("runtime-egress"),
+                *egress_key.public(),
+            )
+            .unwrap(),
+        );
+        enroll(&store, &ingress_key);
+        let first_bind = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first_bind.local_addr().unwrap();
+        drop(first_bind);
+        let second_bind = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = second_bind.local_addr().unwrap();
+        drop(second_bind);
+        let mut config = node_config(Arc::clone(&egress_key), Arc::clone(&store));
+        config.binds = vec![first_address, second_address];
+        let node = Arc::new(
+            EgressNode::bind(config, EchoConnector::default())
+                .await
+                .unwrap(),
+        );
+        let addresses = node.snapshot().unwrap().local_addrs;
+        assert_eq!(addresses.len(), 2);
+        let (shutdown, signal) = oneshot::channel();
+        let task = tokio::spawn(run_node(Arc::clone(&node), signal));
+        let _first = dial_ingress_at(addresses[0], &ingress_key, &egress_key, 1, 1).await;
+        let _second = dial_ingress_at(addresses[1], &ingress_key, &egress_key, 2, 2).await;
+        let snapshot = node.snapshot().unwrap();
+        assert!(snapshot.active_paths >= 2);
+        let (path_metrics, _) = node.management_resources().unwrap();
+        let endpoint_indexes = path_metrics
+            .iter()
+            .filter_map(|path| {
+                path.get("endpoint_index")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(endpoint_indexes.contains(&0));
+        assert!(endpoint_indexes.contains(&1));
+        let _ = shutdown.send(());
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_multi_listener_bind_does_not_leave_an_earlier_socket_open() {
+        let egress_key = Arc::new(generate_static_keypair().unwrap());
+        let store = Arc::new(
+            AuthorizationStore::open(
+                ":memory:",
+                EgressId::new("runtime-egress"),
+                *egress_key.public(),
+            )
+            .unwrap(),
+        );
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first.local_addr().unwrap();
+        drop(first);
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_address = occupied.local_addr().unwrap();
+        let mut config = node_config(egress_key, store);
+        config.binds = vec![first_address, occupied_address];
+        assert!(matches!(
+            EgressNode::bind(config, EchoConnector::default()).await,
+            Err(EgressNodeError::Io(_))
+        ));
+        TcpListener::bind(first_address)
+            .await
+            .expect("first listener was released after the second bind failed");
     }
 
     #[derive(Clone, Default)]
@@ -2062,6 +2285,7 @@ mod tests {
             99,
             PathControl {
                 abort: task.abort_handle(),
+                endpoint_index: 0,
                 metadata: None,
             },
         );

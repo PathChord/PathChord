@@ -56,14 +56,15 @@ mod udp_flow;
 
 pub use control::{
     ConnectionObservation, ConnectionState, ControlError, ControlEvent, ControlEventKind,
-    DEFAULT_OBSERVATION_STALE_AFTER_MS, IngressControlService, IngressControlSnapshot,
-    IngressObservationHandle, MAX_CONNECTION_OBSERVATIONS, MAX_EVENT_COUNT, MAX_NODE_COUNT,
-    MAX_REFRESH_QUEUE_COUNT, MAX_REQUEST_CACHE_COUNT, MAX_SUBSCRIPTION_COUNT, MutationReceipt,
-    NodeAdminPatch, NodeAdminState, NodeHealthState, NodeId, NodeObservation, ObservationSnapshot,
-    PathObservation, RuntimeCounts, RuntimeSnapshotState, SessionObservation, StreamObservation,
-    SubscriptionCache, SubscriptionCacheSpec, SubscriptionId, SubscriptionRefresh,
-    SubscriptionRefreshSpec, SubscriptionRefreshState, SubscriptionSpec, SubscriptionState,
-    SystemProxyMutation, SystemProxyPlatform, SystemProxyState, SystemProxyStatus,
+    DEFAULT_OBSERVATION_STALE_AFTER_MS, EndpointStateObservation, IngressControlService,
+    IngressControlSnapshot, IngressObservationHandle, MAX_CONNECTION_OBSERVATIONS, MAX_EVENT_COUNT,
+    MAX_NODE_COUNT, MAX_REFRESH_QUEUE_COUNT, MAX_REQUEST_CACHE_COUNT, MAX_SUBSCRIPTION_COUNT,
+    MutationReceipt, NodeAdminPatch, NodeAdminState, NodeHealthState, NodeId, NodeObservation,
+    ObservationSnapshot, PathObservation, RuntimeCounts, RuntimeSnapshotState, SessionObservation,
+    StreamObservation, SubscriptionCache, SubscriptionCacheSpec, SubscriptionId,
+    SubscriptionRefresh, SubscriptionRefreshSpec, SubscriptionRefreshState, SubscriptionSpec,
+    SubscriptionState, SystemProxyMutation, SystemProxyPlatform, SystemProxyState,
+    SystemProxyStatus,
 };
 pub use control_views::{
     ListenerInventory, ListenerSelectionError, ListenerView, ListenerViewState,

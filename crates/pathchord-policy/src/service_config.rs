@@ -12,6 +12,8 @@ use crate::Endpoint;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressServiceSpec {
     pub bind: Option<SocketAddr>,
+    #[serde(default)]
+    pub binds: Option<Vec<SocketAddr>>,
     pub egress_id: Option<String>,
     pub identity: Option<PathBuf>,
     pub authorization_db: Option<PathBuf>,
@@ -32,6 +34,23 @@ pub struct EgressServiceSpec {
 
 impl EgressServiceSpec {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.bind.is_some() && self.binds.is_some() {
+            return Err("EgressService bind and binds are mutually exclusive");
+        }
+        if self.bind.is_some_and(|bind| bind.port() == 0)
+            || self.binds.as_ref().is_some_and(|binds| {
+                binds.is_empty()
+                    || binds.len() > 32
+                    || binds.iter().any(|bind| bind.port() == 0)
+                    || binds.windows(2).any(|pair| pair[0] == pair[1])
+                    || {
+                        let mut unique = BTreeSet::new();
+                        binds.iter().any(|bind| !unique.insert(*bind))
+                    }
+            })
+        {
+            return Err("EgressService bind list is invalid");
+        }
         if self
             .egress_id
             .as_ref()
@@ -108,5 +127,56 @@ impl NodeProbePolicySpec {
             return Err("NodeProbePolicy target or bounds are invalid");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_multiple_ipv4_and_ipv6_binds() {
+        let spec = EgressServiceSpec {
+            binds: Some(vec![
+                "0.0.0.0:7443".parse().unwrap(),
+                "[::]:8443".parse().unwrap(),
+            ]),
+            ..EgressServiceSpec::default()
+        };
+        assert_eq!(spec.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_conflicting_duplicate_or_out_of_bound_binds() {
+        let bind = "127.0.0.1:7443".parse().unwrap();
+        assert_eq!(
+            EgressServiceSpec {
+                bind: Some(bind),
+                binds: Some(vec![bind]),
+                ..EgressServiceSpec::default()
+            }
+            .validate(),
+            Err("EgressService bind and binds are mutually exclusive")
+        );
+        assert_eq!(
+            EgressServiceSpec {
+                binds: Some(vec![bind, bind]),
+                ..EgressServiceSpec::default()
+            }
+            .validate(),
+            Err("EgressService bind list is invalid")
+        );
+        assert_eq!(
+            EgressServiceSpec {
+                binds: Some(
+                    (0..33)
+                        .map(|port| SocketAddr::from(([127, 0, 0, 1], 7000 + port)))
+                        .collect()
+                ),
+                ..EgressServiceSpec::default()
+            }
+            .validate(),
+            Err("EgressService bind list is invalid")
+        );
     }
 }

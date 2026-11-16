@@ -38,6 +38,12 @@ negotiated during attachment, and each sender shares its outbound allowance
 across all flows and Paths; extra copies use only residual capacity after
 primary traffic, ordinary retransmission, and required control traffic.
 
+One Egress runtime may own multiple public listener sockets under the same
+identity and authorization store. Ingress keeps an ordered endpoint candidate
+list and selects a candidate per Path, while the Session, policy, wire budget,
+and target limits remain shared. The endpoint candidate is local transport
+metadata and does not enter the Noise prologue or wire status layout.
+
 The Egress resource surface is intentionally small: authored configuration
 provides only the aggregate wire cap and global inbound target-connection cap.
 Path safety ceilings and reservations are computed in the runtime. The Egress

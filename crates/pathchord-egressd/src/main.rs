@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use clap::{Args, Parser};
+use clap::{ArgAction, Args, Parser};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use pathchord_config::{
     EgressServiceResource, load_configuration_documents, parse_egress_service_documents,
@@ -49,8 +49,8 @@ struct EgressArgs {
     /// Egress resource directory; mutually exclusive with --config.
     #[arg(short = 'C', long, conflicts_with = "config")]
     config_dir: Option<PathBuf>,
-    #[arg(long)]
-    bind: Option<SocketAddr>,
+    #[arg(long = "bind", action = ArgAction::Append)]
+    binds: Vec<SocketAddr>,
     #[arg(long)]
     egress_id: Option<String>,
     #[arg(long)]
@@ -80,7 +80,7 @@ struct EgressArgs {
 #[derive(Debug, Clone)]
 struct EgressConfiguration {
     source_path: Option<PathBuf>,
-    bind: SocketAddr,
+    binds: Vec<SocketAddr>,
     egress_id: String,
     identity: PathBuf,
     authorization_db: PathBuf,
@@ -148,7 +148,7 @@ async fn run(args: EgressArgs) -> Result<(), ServiceError> {
     let node = Arc::new(
         EgressNode::bind(
             EgressNodeConfig {
-                bind: args.bind,
+                binds: args.binds,
                 egress_id: args.egress_id,
                 keypair: identity,
                 authorizations: Arc::clone(&authorizations),
@@ -195,6 +195,12 @@ async fn run(args: EgressArgs) -> Result<(), ServiceError> {
                 Ok(serde_json::json!({
                     "running": snapshot.running,
                     "local_addr": snapshot.local_addr.to_string(),
+                    "local_addrs": snapshot.local_addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "listeners": snapshot.listeners.iter().map(|listener| serde_json::json!({
+                        "endpoint_index": listener.endpoint_index,
+                        "state": listener.state,
+                        "failure_reason": listener.failure_reason,
+                    })).collect::<Vec<_>>(),
                     "accepted_paths": snapshot.accepted_paths,
                     "admitted_paths": snapshot.admitted_paths,
                     "active_paths": snapshot.active_paths,
@@ -371,10 +377,16 @@ fn merge(
     );
     let resolved = EgressConfiguration {
         source_path,
-        bind: args
-            .bind
-            .or(spec.bind)
-            .unwrap_or_else(|| DEFAULT_BIND.parse().expect("constant address")),
+        binds: if !args.binds.is_empty() {
+            args.binds
+        } else if let Some(binds) = &spec.binds {
+            binds.clone()
+        } else {
+            vec![
+                spec.bind
+                    .unwrap_or_else(|| DEFAULT_BIND.parse().expect("constant address")),
+            ]
+        },
         egress_id,
         identity,
         authorization_db: path(
@@ -423,6 +435,7 @@ fn merge(
 
 fn validate(config: EgressConfiguration) -> Result<EgressConfiguration, ServiceError> {
     EgressServiceSpec {
+        binds: Some(config.binds.clone()),
         egress_id: Some(config.egress_id.clone()),
         identity: Some(config.identity.clone()),
         authorization_db: Some(config.authorization_db.clone()),

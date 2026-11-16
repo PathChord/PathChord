@@ -10,18 +10,18 @@ use pathchord_egress::{
     TcpTargetConnector,
 };
 use pathchord_ingress::{
-    HttpConnectListener, IngressDataPlane, IngressDataPlaneConfig, ListenerDescriptor, ListenerId,
-    ListenerKind, ListenerRuntime,
+    ConnectionContext, HttpConnectListener, IngressDataPlane, IngressDataPlaneConfig,
+    ListenerDescriptor, ListenerId, ListenerKind, ListenerRuntime, TargetAddress,
 };
 use pathchord_noise::generate_static_keypair;
 use pathchord_policy::{
     Capabilities, EgressConfig, EgressId, EgressRule, EgressSelection, EgressStatusRequirements,
     Endpoint, FallbackAction, FlowMatch, FlowProtocol, Generation, PolicyConfig,
-    RetransmissionReplication, RuleId, Scheduler, Selector, TrafficPolicy, TrafficPolicyId,
-    TransitProxyConfig, TransitProxyId, TransitRule, ValidatedPolicySnapshot,
+    RetransmissionReplication, RuleId, Scheduler, Selector, TargetHost, TrafficPolicy,
+    TrafficPolicyId, TransitProxyConfig, TransitProxyId, TransitRule, ValidatedPolicySnapshot,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 
 struct StalledTransit {
@@ -100,7 +100,7 @@ async fn retiring_a_replaced_transit_path_prevents_new_streams_from_using_it() {
         let egress = Arc::new(
             EgressNode::bind(
                 EgressNodeConfig {
-                    bind: "127.0.0.1:0".parse().unwrap(),
+                    binds: vec!["127.0.0.1:0".parse().unwrap()],
                     egress_id: "egress-a".into(),
                     keypair: Arc::clone(&egress_key),
                     authorizations: store,
@@ -336,7 +336,7 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
     let egress = Arc::new(
         EgressNode::bind(
             EgressNodeConfig {
-                bind: egress_bind.parse().unwrap(),
+                binds: vec![egress_bind.parse().unwrap()],
                 egress_id: "egress-a".into(),
                 keypair: Arc::clone(&egress_key),
                 authorizations: Arc::clone(&store),
@@ -347,7 +347,7 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
                     max_session_buffering: 4 * 1024 * 1024,
                 },
                 required_capabilities: 1,
-                supported_capabilities: 1,
+                supported_capabilities: 0b11,
                 max_concurrent_paths: 8,
                 capacity_bps: 1_000_000_000,
                 max_inbound_target_connections: 128,
@@ -371,7 +371,26 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
             .await
     });
 
-    let base_policy = policy(namespace, egress_address, egress_key.public());
+    let failed_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed endpoint");
+    let failed_endpoint = failed_listener
+        .local_addr()
+        .expect("failed endpoint address");
+    drop(failed_listener);
+    let base_policy = policy_with_endpoints(
+        namespace,
+        &[failed_endpoint, egress_address],
+        egress_key.public(),
+    );
+    let mut base_config = base_policy.config().clone();
+    base_config.egresses[0].capabilities.udp = true;
+    base_config.egresses[0].status_requirements.min_usable_paths = 3;
+    base_config.egresses[0].endpoints.push(Endpoint {
+        host: "localhost".into(),
+        port: egress_address.port(),
+    });
+    let base_policy = ValidatedPolicySnapshot::new(Generation::new(1), base_config).unwrap();
     let stalled_id = TransitProxyId::in_namespace(namespace, "aaa-stalled");
     let mut config = base_policy.config().clone();
     config.transit_proxies.push(TransitProxyConfig {
@@ -399,7 +418,28 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
     );
     data_plane.warmup().await;
     data_plane.warmup().await;
-    assert_eq!(data_plane.snapshot().await.ready_paths, 2);
+    data_plane.warmup().await;
+    assert_eq!(data_plane.snapshot().await.ready_paths, 4);
+    let session_snapshot = data_plane
+        .session_snapshots()
+        .await
+        .into_iter()
+        .next()
+        .expect("Egress session snapshot");
+    assert!(session_snapshot.endpoint_states[0].failures >= 1);
+    assert_eq!(session_snapshot.endpoint_states[1].state, "available");
+    assert!(
+        session_snapshot
+            .path_endpoint
+            .values()
+            .any(|index| *index == 1)
+    );
+    assert!(
+        session_snapshot
+            .path_endpoint
+            .values()
+            .any(|index| *index == 2)
+    );
     data_plane
         .register_transit_adapter(
             stalled_id,
@@ -498,6 +538,42 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
     client.shutdown().await.expect("client half-close");
     drop(client);
 
+    let udp_target = UdpSocket::bind("127.0.0.1:0").await.expect("UDP target");
+    let udp_target_address = udp_target.local_addr().expect("UDP target address");
+    let udp_target_task = tokio::spawn(async move {
+        let mut buffer = [0_u8; 128];
+        let (length, peer) = udp_target
+            .recv_from(&mut buffer)
+            .await
+            .expect("UDP receive");
+        udp_target
+            .send_to(&buffer[..length], peer)
+            .await
+            .expect("UDP echo");
+    });
+    let udp_context = ConnectionContext {
+        flow_tags: BTreeSet::new(),
+        listener_id: ListenerId::in_namespace(namespace, "udp-e2e"),
+        source: "127.0.0.1:10001".parse().unwrap(),
+        authentication_identity: None,
+        process: None,
+        protocol: FlowProtocol::Udp,
+        target: TargetAddress {
+            host: TargetHost::Ip(udp_target_address.ip()),
+            port: udp_target_address.port(),
+        },
+    };
+    let mut udp_flow = data_plane.open_udp(&udp_context).await.expect("UDP flow");
+    udp_flow
+        .send(b"real-pathchord-udp".to_vec())
+        .await
+        .expect("UDP send");
+    assert_eq!(
+        udp_flow.receive().await,
+        Some(b"real-pathchord-udp".to_vec())
+    );
+    udp_flow.close().await.expect("UDP close");
+
     stop_listener.send(()).expect("listener shutdown");
     listener_task
         .await
@@ -510,6 +586,7 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
         .expect("Egress task")
         .expect("Egress runtime");
     target_task.await.expect("target task");
+    udp_target_task.await.expect("UDP target task");
     assert_eq!(
         egress.snapshot().expect("Egress snapshot").active_sessions,
         0
@@ -521,6 +598,14 @@ fn policy(
     egress_address: std::net::SocketAddr,
     egress_public_key: &[u8; 32],
 ) -> ValidatedPolicySnapshot {
+    policy_with_endpoints(namespace, &[egress_address], egress_public_key)
+}
+
+fn policy_with_endpoints(
+    namespace: &str,
+    egress_endpoints: &[std::net::SocketAddr],
+    egress_public_key: &[u8; 32],
+) -> ValidatedPolicySnapshot {
     let egress_id = EgressId::in_namespace(namespace, "egress-a");
     let transit_id = TransitProxyId::in_namespace(namespace, "direct-a");
     let traffic_policy_id = TrafficPolicyId::in_namespace(namespace, "default");
@@ -529,10 +614,13 @@ fn policy(
         PolicyConfig {
             egresses: vec![EgressConfig {
                 id: egress_id.clone(),
-                endpoint: Endpoint {
-                    host: egress_address.ip().to_string(),
-                    port: egress_address.port(),
-                },
+                endpoints: egress_endpoints
+                    .iter()
+                    .map(|endpoint| Endpoint {
+                        host: endpoint.ip().to_string(),
+                        port: endpoint.port(),
+                    })
+                    .collect(),
                 public_key: URL_SAFE_NO_PAD.encode(egress_public_key),
                 labels: BTreeMap::new(),
                 capabilities: Capabilities {

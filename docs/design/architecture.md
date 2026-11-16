@@ -30,6 +30,13 @@ The Egress is selected first. Its Ingress-side Transit binding then supplies one
 common candidate set and one Session Path pool. A flow never spans multiple
 Egress nodes, and routing rules do not select a Transit or Path subset.
 
+One Egress identity may expose several public Path listener binds. The binds
+share the authorization store and runtime resource limits. The Ingress-side
+Egress resource carries an ordered endpoint candidate list, and each Path may
+use a different candidate while the Session and TrafficPolicy remain shared.
+An endpoint failure removes or replaces only Paths using that endpoint while a
+healthy endpoint-backed Path remains available.
+
 ## 3. Routing modes
 
 - `egress: <id-or-selector>`: Ingress reaches the selected Egress through one or more Transit Paths. Multipath aggregation is the default.

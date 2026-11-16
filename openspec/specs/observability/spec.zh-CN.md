@@ -44,12 +44,51 @@
 
 ### Requirement: Egress status is global and policy-free
 
-Egress status SHALL 只描述全局 Egress 资源事实，不得包含路由规则、Egress Transit selector、TrafficPolicy identity、业务类别策略或 Ingress demand 元数据。Path-local 质量观测由 Ingress 从本地 Path 流量和控制反馈推导并拥有。
+Egress status SHALL 只描述跨所有配置 listener endpoint 聚合的全局 Egress 资源事实，不得包含路由规则、Egress Transit selector、TrafficPolicy identity、业务类别策略或 Ingress demand 元数据。Path-local 质量观测由 Ingress 从本地 Path 流量和控制反馈推导并拥有。
 
 #### Scenario: Egress reports shared capacity
 
 - **WHEN** 一个 Egress 服务多个 Ingress Session
 - **THEN** status 报告聚合 wire 速率、容量、活跃目标连接、服务状态和全局准入状态，不暴露规则信息
+
+#### Scenario: Egress has multiple listener endpoints
+
+- **WHEN** 一个 Egress 通过多个配置 listener 为 Path 服务
+- **THEN** 容量、目标连接数、授权影响和准入状态只作为 Egress 聚合事实报告一次，不按 listener 复制或分区
+
+### Requirement: Local observations identify bounded Egress endpoints
+
+授权的本地运行视图 SHALL 暴露有界的规范化 endpoint 清单及每条 Path 选择的 endpoint。endpoint 观测 SHALL 使用稳定有界的 ordinal 或 ID，保留 `configured`、`available`、`degraded`、`draining`、`failed` 或 `unknown` 之一及类型化原因和有界计数，不得成为无界指标标签。
+
+#### Scenario: Inspect Egress endpoint inventory
+
+- **WHEN** 授权运维人员查询 Egress 或 Session 资源
+- **THEN** 响应报告配置 endpoint 数量及每个 endpoint 的有界状态，同时脱敏凭据和含秘密配置
+
+#### Scenario: Inspect a Path's selected endpoint
+
+- **WHEN** 授权运维人员查询 ready、draining 或 failed Path
+- **THEN** 响应标识该 Path 使用的规范 endpoint ordinal，不声称使用了其他 endpoint
+
+#### Scenario: An endpoint has repeated failures
+
+- **WHEN** 一个 endpoint 累积有界连接或 listener 故障
+- **THEN** 本地观测暴露类型化故障状态和有界计数，不改变 Egress 聚合容量，也不创建新 Egress identity
+
+### Requirement: Endpoint details stay out of wire status and metric labels
+
+endpoint 级本地观测 SHALL 不把原始 endpoint 主机名、端口或失败文本加入 Prometheus 标签集合或认证
+`STATUS_REPORT` 布局。聚合 Egress 健康和容量继续使用现有有界字段。
+
+#### Scenario: Prometheus metrics are rendered
+
+- **WHEN** 指标端点渲染含多个 endpoint 的 Egress
+- **THEN** 只输出有界的 Egress 聚合 gauge，不为每个 endpoint 主机名或端口创建无界标签值
+
+#### Scenario: An authenticated peer receives Egress status
+
+- **WHEN** Ingress 通过 Path 收到认证的 Egress 状态报告
+- **THEN** 报告保持现有聚合 wire 布局，不泄露 Egress listener 清单
 
 ### Requirement: Capacity state is explicit
 

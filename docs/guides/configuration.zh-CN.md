@@ -195,6 +195,12 @@ Ingress 规则和运行时观测。STATUS_REPORT 提供配置/有效/当前容�
 allowance；公共 Path 最小值位于 Ingress 侧 Egress 的 `statusRequirements.minUsablePaths`，
 target 由 Session 运行时决定，不携带规则或 TrafficClass 元数据。
 
+`EgressService` 可以使用 `binds` 配置多个公共 Path listener，包括在不同端口上的 IPv4 和 IPv6
+地址。旧的单数 `bind` 仍然是一个 listener 的简写。Ingress 侧在同一个 Egress ID 有多个可达域名或
+端口时使用 `endpoints`；每项包含 `address` 和 `port`。旧的 `address`/`port` 仍然是单个 endpoint
+的简写。所有 bind 和 endpoint 必须使用相同的 Egress ID、identity、公钥和授权数据库。endpoint
+拓扑属于启动配置，变化后需要重启。
+
 支持 TLS 的 Transit 节点默认使用系统根证书。需要自定义根时，将有序 `truststore` 列表设置为
 `system` 和/或本地 PEM/DER 文件。相对路径从选定的配置来源解析。空列表表示明确不加载信任锚点，
 只有 `insecure: true` 才能绕过证书校验。无效、过大、目录或错误符号链接来源会拒绝节点，不会降级

@@ -26,6 +26,16 @@ The complete candidate SHALL pass parsing, validation, normalization, compilatio
 - **WHEN** a candidate adds, removes, reorders, or changes an Egress endpoint or an EgressService bind
 - **THEN** the candidate is validated as a complete snapshot, the active runtime remains unchanged, and the reload result reports restart required
 
+#### Scenario: Normalization preserves an Egress policy
+
+- **WHEN** a reload changes only file or mapping order or writes equivalent explicit defaults
+- **THEN** the normalized Egress policy fingerprint is unchanged and does not require a restart
+
+#### Scenario: Only an unreferenced policy changes
+
+- **WHEN** a reload changes a TrafficPolicy that no configured Egress references
+- **THEN** that change alone does not trigger the Egress startup boundary or alter any live Session policy
+
 ## ADDED Requirements
 
 ### Requirement: Egress service supports one identity across multiple binds

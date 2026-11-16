@@ -11,7 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use getrandom::fill;
 use pathchord_core::{PathReady, PathState, ProtocolLimits, SessionState};
 #[cfg(test)]
@@ -26,16 +26,16 @@ use pathchord_ingress::UnsupportedPlatformProxyAdapter;
 use pathchord_ingress::WindowsSystemProxyAdapter;
 use pathchord_ingress::{
     Actor, ConfigHotReloader, ConfigReloadHandle, DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS,
-    DnsAdapters, DnsRuntime, DynamicTransitRegistration, ErrorCode, IngressControlService,
-    IngressControlStore, IngressDataPlane, IngressDataPlaneConfig, IngressPlatformConfig,
-    IngressPlatformFactories, IngressPlatformRuntime, LOCAL_API_VERSION, ListenerCredentialError,
-    ListenerCredentialVerifier, ListenerCredentialVerifierFactory, ListenerDescriptor,
-    ListenerKind, LocalControlDispatcher, LocalControlServer, LocalDnsAdapter, LocalProtocolError,
-    NodeHealthState, NodeId, NodeObservation, PathObservation, PlatformProxyAdapter,
-    ProtectedEndpointSet, RejectListenerCredentials, RequestEnvelope, ResponseEnvelope,
-    RuntimeCounts, RuntimeError, SessionObservation, StaticListenerCredentialVerifier,
-    StreamObservation, SubscriptionCacheSpec as ControlSubscriptionCacheSpec,
-    SubscriptionId as ControlSubscriptionId,
+    DnsAdapters, DnsRuntime, DynamicTransitRegistration, EndpointStateObservation, ErrorCode,
+    IngressControlService, IngressControlStore, IngressDataPlane, IngressDataPlaneConfig,
+    IngressPlatformConfig, IngressPlatformFactories, IngressPlatformRuntime, LOCAL_API_VERSION,
+    ListenerCredentialError, ListenerCredentialVerifier, ListenerCredentialVerifierFactory,
+    ListenerDescriptor, ListenerKind, LocalControlDispatcher, LocalControlServer, LocalDnsAdapter,
+    LocalProtocolError, NodeHealthState, NodeId, NodeObservation, PathObservation,
+    PlatformProxyAdapter, ProtectedEndpointSet, RejectListenerCredentials, RequestEnvelope,
+    ResponseEnvelope, RuntimeCounts, RuntimeError, SessionObservation,
+    StaticListenerCredentialVerifier, StreamObservation,
+    SubscriptionCacheSpec as ControlSubscriptionCacheSpec, SubscriptionId as ControlSubscriptionId,
     SubscriptionRefreshSpec as ControlSubscriptionRefreshSpec,
     SubscriptionSpec as ControlSubscriptionSpec, SystemProxyPlatform, TcpFlowOpener,
     TransitProbeConfig, TransitProbeState, UdpFlowOpener, WebBearerToken, WebGateway,
@@ -159,9 +159,9 @@ pub struct EgressArgs {
     /// Configuration directory; overrides environment and account defaults.
     #[arg(short = 'C', long, conflicts_with = "config")]
     pub config_dir: Option<PathBuf>,
-    /// Public Path listener address.
-    #[arg(long)]
-    pub bind: Option<SocketAddr>,
+    /// Public Path listener address; may be repeated.
+    #[arg(long = "bind", action = ArgAction::Append)]
+    pub binds: Vec<SocketAddr>,
     /// Canonical Egress identity bound into the Noise prologue.
     #[arg(long)]
     pub egress_id: Option<String>,
@@ -1048,6 +1048,17 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                             replication_cap_bps: entry.replication_cap_bps,
                             replication_upstream_used_bps: None,
                             replication_downstream_used_bps: None,
+                            endpoint_count: entry.endpoint_states.len(),
+                            endpoint_states: entry
+                                .endpoint_states
+                                .iter()
+                                .map(|state| EndpointStateObservation {
+                                    state: state.state.to_owned(),
+                                    attempts: state.attempts,
+                                    failures: state.failures,
+                                })
+                                .collect(),
+                            path_endpoints: entry.path_endpoint.clone(),
                         }
                     });
                     let paths = session_snapshots.iter().flat_map(|entry| {
@@ -1072,6 +1083,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                                 path_id,
                                 session_id: entry.session.session_id,
                                 egress_id: Some(entry.egress_id.clone()),
+                                endpoint_index: entry.path_endpoint.get(&path_id).copied(),
                                 transit_proxy_id: entry.path_transit.get(&path_id).cloned(),
                                 state,
                                 ready_since_ms: None,
@@ -1213,7 +1225,7 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
     let node = Arc::new(
         EgressNode::bind(
             EgressNodeConfig {
-                bind: args.bind,
+                binds: args.binds,
                 egress_id: args.egress_id,
                 keypair: identity,
                 authorizations: Arc::clone(&authorizations),
@@ -1958,13 +1970,18 @@ async fn collect_protected_endpoints(
     dynamic: Option<&DynamicTransitSnapshot>,
 ) -> BTreeSet<SocketAddr> {
     let mut endpoints = dns.map(DnsRuntime::protected_endpoints).unwrap_or_default();
-    for endpoint in policy.egresses.iter().map(|egress| &egress.endpoint).chain(
-        policy
-            .transit_proxies
-            .iter()
-            .filter(|proxy| proxy.protocol != "direct")
-            .map(|proxy| &proxy.endpoint),
-    ) {
+    for endpoint in policy
+        .egresses
+        .iter()
+        .flat_map(|egress| egress.endpoints.iter())
+        .chain(
+            policy
+                .transit_proxies
+                .iter()
+                .filter(|proxy| proxy.protocol != "direct")
+                .map(|proxy| &proxy.endpoint),
+        )
+    {
         if let Ok(address) = endpoint.host.parse() {
             endpoints.insert(SocketAddr::new(address, endpoint.port));
             continue;
@@ -3243,8 +3260,9 @@ mod tests {
         .expect("Egress args");
         assert!(matches!(
             egress.command,
-            Command::Egress(EgressArgs { egress_id, bind, .. })
-                if egress_id.as_deref() == Some("egress-a") && bind == Some("127.0.0.1:7443".parse().unwrap())
+            Command::Egress(EgressArgs { egress_id, binds, .. })
+                if egress_id.as_deref() == Some("egress-a")
+                    && binds == vec!["127.0.0.1:7443".parse().unwrap()]
         ));
     }
 

@@ -137,6 +137,13 @@ pathchord-egressd --egress-id exit --identity egress.key.json \
   --bind 127.0.0.1:9443 --control-socket /tmp/pathchord-egress.sock
 ```
 
+`--bind` may be repeated when one Egress process owns several public Path
+listeners. The same list can be authored as `spec.binds` in an `EgressService`.
+Use one Ingress `Egress` resource with an ordered `spec.endpoints` list for
+different IPv4, IPv6, hostname, or port candidates; all entries use the same
+verified Egress ID and public key. A single `--bind` and the older
+`address`/`port` form remain valid for one-endpoint deployments.
+
 On the Egress machine, explicitly enroll the Ingress public key. Replace
 `INGRESS_PUBLIC_KEY` with the public output from the Ingress key generation.
 Generation 0 applies to a new authorization database; subsequent mutations
@@ -149,10 +156,12 @@ pathchordctl --socket /tmp/pathchord-egress.sock enroll add \
 ```
 
 In `examples/ingress-egress.yaml`, replace `REPLACE_WITH_EGRESS_PUBLIC_KEY`
-with the Egress public key. The example uses a loopback Egress address;
-cross-machine deployments MUST set the reachable Egress bind/address and keep
-the same explicitly verified key and canonical Egress ID. Start Ingress in a
-separate terminal:
+with the Egress public key. The example contains loopback, IPv6, and hostname
+endpoint candidates; keep only reachable candidates for a local deployment or
+replace them with the public endpoints exposed by Egress. Cross-machine
+deployments MUST set reachable Egress binds/endpoints and keep the same
+explicitly verified key and canonical Egress ID. Start Ingress in a separate
+terminal:
 
 ```sh
 pathchord-ingressd --socket /tmp/pathchord-ingress.sock \

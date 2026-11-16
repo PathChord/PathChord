@@ -3,8 +3,13 @@ kind: Egress
 metadata:
   name: exit
 spec:
-  address: 127.0.0.1
-  port: 9443
+  endpoints:
+    - address: 127.0.0.1
+      port: 9443
+    - address: "::1"
+      port: 8443
+    - address: egress.example.net
+      port: 443
   publicKey: REPLACE_WITH_EGRESS_PUBLIC_KEY
   capabilities: {tcp: true, udp: true}
   statusRequirements:

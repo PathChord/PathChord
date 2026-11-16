@@ -240,6 +240,15 @@ runtime decision. STATUS_REPORT exposes configured/effective/current capacity,
 capacity confidence, admission state, and the current replication allowance;
 it does not expose rule or TrafficClass metadata.
 
+An EgressService may use `binds` for multiple public Path listeners, including
+IPv4 and IPv6 addresses on different ports. The older singular `bind` remains
+valid as a one-listener shorthand. On the Ingress side, use `endpoints` when
+one Egress ID has several reachable names or ports; each entry contains an
+`address` and `port`. The older `address`/`port` pair remains a one-endpoint
+shorthand. Keep the Egress ID, identity, public key, and authorization database
+the same across every bind and endpoint. Endpoint topology is startup
+configuration and changes require a restart.
+
 TLS-capable Transit nodes use system roots by default. Set the ordered
 `truststore` list to `system` and/or local PEM/DER files when custom roots are
 needed. Relative files resolve from the selected configuration source. An

@@ -12,7 +12,7 @@ use crate::{
 };
 
 pub(crate) struct EgressConfiguration {
-    pub bind: SocketAddr,
+    pub binds: Vec<SocketAddr>,
     pub egress_id: String,
     pub identity: PathBuf,
     pub authorization_db: PathBuf,
@@ -110,10 +110,16 @@ fn merge(
         })
         .unwrap_or_else(default_egress_socket_path);
     let resolved = EgressConfiguration {
-        bind: args
-            .bind
-            .or(spec.bind)
-            .unwrap_or_else(|| DEFAULT_EGRESS_BIND.parse().expect("constant address")),
+        binds: if !args.binds.is_empty() {
+            args.binds
+        } else if let Some(binds) = &spec.binds {
+            binds.clone()
+        } else {
+            vec![
+                spec.bind
+                    .unwrap_or_else(|| DEFAULT_EGRESS_BIND.parse().expect("constant address")),
+            ]
+        },
         egress_id,
         identity,
         authorization_db: path(
@@ -158,6 +164,7 @@ fn merge(
             .unwrap_or(false),
     };
     EgressServiceSpec {
+        binds: Some(resolved.binds.clone()),
         egress_id: Some(resolved.egress_id.clone()),
         identity: Some(resolved.identity.clone()),
         authorization_db: Some(resolved.authorization_db.clone()),
@@ -217,12 +224,60 @@ mod tests {
             &base,
         )
         .unwrap();
-        assert_eq!(config.bind.port(), 4321);
+        assert_eq!(config.binds, vec!["127.0.0.1:4321".parse().unwrap()]);
         assert_eq!(config.egress_id, "edge");
         assert_eq!(config.identity, base.join("identity.json"));
         assert_eq!(config.authorization_db, Path::new("cli.db"));
         assert!(config.remote_dns_only);
         assert!(!config.web_protected_transport);
+    }
+
+    #[test]
+    fn repeated_cli_binds_override_resource_bind_list_in_order() {
+        let spec = EgressServiceSpec {
+            binds: Some(vec![
+                "127.0.0.1:1234".parse().unwrap(),
+                "[::1]:1234".parse().unwrap(),
+            ]),
+            ..Default::default()
+        };
+        let config = merge(
+            args(&[
+                "--bind",
+                "192.0.2.10:7443",
+                "--bind",
+                "[2001:db8::10]:8443",
+                "--egress-id",
+                "edge",
+                "--identity",
+                "identity.key",
+            ]),
+            Some(("edge", &spec)),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(
+            config.binds,
+            vec![
+                "192.0.2.10:7443".parse().unwrap(),
+                "[2001:db8::10]:8443".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_bind_list_is_used_when_cli_does_not_override_it() {
+        let spec = EgressServiceSpec {
+            binds: Some(vec![
+                "127.0.0.1:1234".parse().unwrap(),
+                "[::1]:1234".parse().unwrap(),
+            ]),
+            egress_id: Some("edge".into()),
+            identity: Some("identity.key".into()),
+            ..Default::default()
+        };
+        let config = merge(args(&[]), Some(("edge", &spec)), Path::new(".")).unwrap();
+        assert_eq!(config.binds, spec.binds.clone().unwrap());
     }
 
     #[tokio::test]
