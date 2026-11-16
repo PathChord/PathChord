@@ -28,7 +28,8 @@ use tokio::task::{AbortHandle, JoinSet};
 
 use crate::{
     AuthorizationCleanup, AuthorizationDecision, AuthorizationState, AuthorizationStore,
-    AuthorizationStoreError, BoxedTargetConnection, IngressId, TargetConnector, TargetRequest,
+    AuthorizationStoreError, BoxedTargetConnection, IngressId, TargetConnectError, TargetConnector,
+    TargetRequest,
 };
 
 const DEFAULT_PATH_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,9 +67,25 @@ pub struct EgressNodeSnapshot {
     pub active_sessions: usize,
     pub active_streams: usize,
     pub active_target_connections: u64,
+    pub target_open_attempts: u64,
+    pub target_open_successes: u64,
+    pub target_open_failures: u64,
+    pub last_target_open: Option<TargetOpenObservation>,
     pub running: bool,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: u32,
+}
+
+/// Bounded, credential-free observation of the latest Egress target-open
+/// attempt. The hostname is the target supplied by Ingress and is retained
+/// only to distinguish DNS/TCP failures for one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetOpenObservation {
+    pub hostname: String,
+    pub port: u16,
+    pub phase: &'static str,
+    pub result: &'static str,
+    pub error_kind: Option<&'static str>,
 }
 
 #[derive(Debug, Error)]
@@ -249,6 +266,24 @@ where
                 .map(|controller| controller.snapshot().active_streams)
                 .sum(),
             active_target_connections: self.observations.active_targets.load(Ordering::Relaxed),
+            target_open_attempts: self
+                .observations
+                .target_open_attempts
+                .load(Ordering::Relaxed),
+            target_open_successes: self
+                .observations
+                .target_open_successes
+                .load(Ordering::Relaxed),
+            target_open_failures: self
+                .observations
+                .target_open_failures
+                .load(Ordering::Relaxed),
+            last_target_open: self
+                .observations
+                .last_target_open
+                .lock()
+                .map_err(|_| EgressNodeError::RuntimeStateLock)?
+                .clone(),
             running: self.running.load(Ordering::Relaxed),
             quota_remaining: self.config.quota_remaining,
             traffic_multiplier_basis_points: self.config.traffic_multiplier_basis_points,
@@ -749,6 +784,78 @@ struct NodeObservations {
     duplicates: AtomicU64,
     completed: AtomicU64,
     active_targets: Arc<AtomicU64>,
+    target_open_attempts: AtomicU64,
+    target_open_successes: AtomicU64,
+    target_open_failures: AtomicU64,
+    last_target_open: Mutex<Option<TargetOpenObservation>>,
+}
+
+impl NodeObservations {
+    fn observe_target_attempt(&self, request: &TargetRequest) {
+        self.target_open_attempts.fetch_add(1, Ordering::Relaxed);
+        self.set_target_observation(request, "target_connect", "pending", None);
+    }
+
+    fn observe_target_success(&self, request: &TargetRequest) {
+        self.target_open_successes.fetch_add(1, Ordering::Relaxed);
+        self.set_target_observation(request, "target_connect", "opened", None);
+    }
+
+    fn observe_target_failure(&self, request: &TargetRequest, error: &TargetConnectError) {
+        self.target_open_failures.fetch_add(1, Ordering::Relaxed);
+        self.set_target_observation(
+            request,
+            "target_connect",
+            "failed",
+            Some(target_error_kind(error)),
+        );
+    }
+
+    fn set_target_observation(
+        &self,
+        request: &TargetRequest,
+        phase: &'static str,
+        result: &'static str,
+        error_kind: Option<&'static str>,
+    ) {
+        let hostname = request
+            .original_hostname
+            .as_deref()
+            .map(safe_target_hostname)
+            .unwrap_or_else(|| "<ip-candidates>".to_owned());
+        if let Ok(mut latest) = self.last_target_open.lock() {
+            *latest = Some(TargetOpenObservation {
+                hostname,
+                port: request.port,
+                phase,
+                result,
+                error_kind,
+            });
+        }
+    }
+}
+
+fn safe_target_hostname(hostname: &str) -> String {
+    if hostname.len() <= 253
+        && hostname
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-:_[]".contains(&byte))
+    {
+        hostname.to_owned()
+    } else {
+        "<redacted>".to_owned()
+    }
+}
+
+fn target_error_kind(error: &TargetConnectError) -> &'static str {
+    match error {
+        TargetConnectError::InvalidPort
+        | TargetConnectError::EmptyHostname
+        | TargetConnectError::MissingDestination => "invalid_target",
+        TargetConnectError::Connection(message) if message.contains("resolution") => "dns",
+        TargetConnectError::Connection(message) if message.contains("timed out") => "timeout",
+        TargetConnectError::Connection(_) => "connection",
+    }
 }
 
 struct NodeStatusProvider {
@@ -1084,6 +1191,7 @@ async fn run_path_task<C>(
     }
     let factory = ConnectorStreamFactory {
         connector,
+        observations: Arc::clone(&observations),
         session_targets: Arc::clone(&active_targets),
         global_targets: Arc::clone(&observations.active_targets),
         target_slots: Arc::clone(&target_slots),
@@ -1176,6 +1284,7 @@ impl PathAuthorizer for StorePathAuthorizer {
 
 struct ConnectorStreamFactory<C> {
     connector: Arc<C>,
+    observations: Arc<NodeObservations>,
     session_targets: Arc<AtomicU64>,
     global_targets: Arc<AtomicU64>,
     target_slots: Arc<Semaphore>,
@@ -1241,9 +1350,20 @@ where
             resolved_ip_candidates,
             port: target.port,
         };
-        let connection = self.connector.connect(request).await.map_err(|error| {
-            EgressStreamOpenError::new(ErrorClass::TargetFailure, error.to_string().into_bytes())
-        })?;
+        self.observations.observe_target_attempt(&request);
+        let connection = match self.connector.connect(request.clone()).await {
+            Ok(connection) => {
+                self.observations.observe_target_success(&request);
+                connection
+            }
+            Err(error) => {
+                self.observations.observe_target_failure(&request, &error);
+                return Err(EgressStreamOpenError::new(
+                    ErrorClass::TargetFailure,
+                    error.to_string().into_bytes(),
+                ));
+            }
+        };
         self.session_targets.fetch_add(1, Ordering::Relaxed);
         self.global_targets.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(TrackedTargetStream {
@@ -1620,6 +1740,7 @@ mod tests {
         let connector = Arc::new(RecordingConnector::default());
         let factory = ConnectorStreamFactory {
             connector: Arc::clone(&connector),
+            observations: Arc::new(NodeObservations::default()),
             session_targets: Arc::new(AtomicU64::new(0)),
             global_targets: Arc::new(AtomicU64::new(0)),
             target_slots: Arc::new(Semaphore::new(1)),
@@ -1647,6 +1768,7 @@ mod tests {
         let connector = Arc::new(RecordingConnector::default());
         let factory = ConnectorStreamFactory {
             connector,
+            observations: Arc::new(NodeObservations::default()),
             session_targets: Arc::new(AtomicU64::new(0)),
             global_targets: Arc::new(AtomicU64::new(0)),
             target_slots: Arc::new(Semaphore::new(1)),
@@ -2147,6 +2269,14 @@ mod tests {
         let mut echoed = Vec::new();
         stream.read_to_end(&mut echoed).await.expect("read target");
         assert_eq!(echoed, payload);
+        let live = node.snapshot().expect("Egress target observation");
+        assert_eq!(live.target_open_attempts, 1);
+        assert_eq!(live.target_open_successes, 1);
+        assert_eq!(live.target_open_failures, 0);
+        assert_eq!(
+            live.last_target_open.as_ref().map(|item| item.result),
+            Some("opened")
+        );
         ingress.shutdown().await.expect("Ingress shutdown");
 
         shutdown.send(()).expect("node shutdown");

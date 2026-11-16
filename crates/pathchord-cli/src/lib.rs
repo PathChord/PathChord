@@ -237,7 +237,7 @@ pub struct EnrollmentAddArgs {
     #[arg(long)]
     pub egress_id: String,
     /// Unpadded base64url Curve25519 public key.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub public_key: String,
     #[arg(long)]
     pub expected_generation: u64,
@@ -822,7 +822,9 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     } else {
         None
     };
-    data_plane.warmup().await;
+    // Give startup one bounded opportunity to establish a catch-all Path.
+    // Maintenance continues after listeners start even if this node stalls.
+    let _ = tokio::time::timeout(Duration::from_secs(1), data_plane.warmup()).await;
     let protected_endpoints = ProtectedEndpointSet::default();
     protected_endpoints.replace(
         collect_protected_endpoints(
@@ -1234,6 +1236,18 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
                     "active_sessions": snapshot.active_sessions,
                     "active_streams": snapshot.active_streams,
                     "active_target_connections": snapshot.active_target_connections,
+                    "target_open": {
+                        "attempts": snapshot.target_open_attempts,
+                        "successes": snapshot.target_open_successes,
+                        "failures": snapshot.target_open_failures,
+                        "last": snapshot.last_target_open.as_ref().map(|last| serde_json::json!({
+                            "hostname": last.hostname,
+                            "port": last.port,
+                            "phase": last.phase,
+                            "result": last.result,
+                            "error_kind": last.error_kind,
+                        })),
+                    },
                     "authorization_activity": activity,
                     "quota_remaining": snapshot.quota_remaining,
                     "traffic_multiplier_basis_points": snapshot.traffic_multiplier_basis_points,
@@ -1601,7 +1615,6 @@ impl SubscriptionWorker {
                         adapter_diagnostics = publish_dynamic_transit(data_plane.as_ref(), &mut manager).await;
                         *dynamic_snapshot.write().await = manager.snapshot().clone();
                         drop(dispatcher);
-                        data_plane.warmup().await;
                         let policy = reload.snapshot()?.config;
                         protected_endpoints.replace(
                             collect_protected_endpoints(
@@ -1746,7 +1759,10 @@ async fn run_data_plane_maintenance(
     probe_interval: Option<Duration>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), CliError> {
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    // Path replacement is a transport-recovery action rather than a slow
+    // capacity adjustment. Poll the Session snapshot at one-second cadence so
+    // a reserved Path is attached promptly after a disconnect.
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
     let mut probe_tick =
         tokio::time::interval(probe_interval.unwrap_or(Duration::from_secs(86_400)));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2848,6 +2864,28 @@ mod tests {
             }) if ingress_id == "ingress-a"
                 && egress_id == "egress-a"
                 && labels == vec!["admin.region=jp"]
+        ));
+
+        let leading_hyphen_key = "-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let add = Cli::try_parse_from([
+            "pathchord",
+            "enroll",
+            "add",
+            "--ingress-id",
+            "ingress-a",
+            "--egress-id",
+            "egress-a",
+            "--public-key",
+            leading_hyphen_key,
+            "--expected-generation",
+            "4",
+        ])
+        .expect("base64url keys can begin with a hyphen");
+        assert!(matches!(
+            add.command,
+            Command::Enroll(EnrollmentArgs {
+                command: EnrollmentCommand::Add(EnrollmentAddArgs { public_key, .. })
+            }) if public_key == leading_hyphen_key
         ));
 
         let revoke = Cli::try_parse_from([

@@ -213,7 +213,7 @@ impl PathAutoscaler {
         self.scale_out_streak = 0;
 
         if utilization < u64::from(self.config.scale_in_utilization_basis_points)
-            && input.ready_paths > self.config.min_paths
+            && input.ready_paths > target_paths
             && self.recovery_streak >= self.config.recovery_samples
         {
             self.low_utilization_streak = self.low_utilization_streak.saturating_add(1);
@@ -283,6 +283,26 @@ mod tests {
         assert_eq!(
             scaler.evaluate(input(100, 2_000, 2), 500),
             AutoscaleDecision::Hold
+        );
+    }
+
+    #[test]
+    fn scale_in_preserves_the_requested_reserve_target() {
+        let mut scaler = PathAutoscaler::new(PathAutoscalerConfig {
+            recovery_samples: 1,
+            scale_in_samples: 1,
+            ..PathAutoscalerConfig::default()
+        })
+        .unwrap();
+        let mut sample = input(0, 1_000, 2);
+        sample.target_path_count = Some(2);
+        for now in 0..10 {
+            assert_eq!(scaler.evaluate(sample, now), AutoscaleDecision::Hold);
+        }
+        sample.ready_paths = 3;
+        assert_eq!(
+            scaler.evaluate(sample, 10),
+            AutoscaleDecision::Drain { count: 1 }
         );
     }
 

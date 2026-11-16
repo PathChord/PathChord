@@ -53,6 +53,10 @@ const MAX_RETRANSMISSION_ATTEMPTS: u32 = 3;
 const MAX_PENDING_CONTROL_MESSAGES: usize = 32;
 const MAX_SESSION_CONTROL_MESSAGES: usize = 4096;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+// A stalled carrier must not hold the Session actor past heartbeat liveness
+// deadlines for all other Paths. A partially written Noise record cannot be
+// resumed safely, so a timeout is treated as a failure of that Path.
+const PATH_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_RETRANSMISSION_TIMEOUT: Duration = Duration::from_millis(500);
 const PATH_DEGRADED_AFTER: Duration = Duration::from_secs(3);
 const PATH_FAILED_AFTER: Duration = Duration::from_secs(6);
@@ -412,6 +416,11 @@ pub enum SessionRuntimeError {
     UnexpectedFrame(FrameType),
     #[error("Session Path closed")]
     PathClosed,
+    #[error("Path {path_id} write failed: {source}")]
+    PathWrite {
+        path_id: PathId,
+        source: Box<SessionRuntimeError>,
+    },
     #[error(
         "Session Path closed with {bytes} unacknowledged bytes; timed retransmission is unavailable"
     )]
@@ -434,6 +443,25 @@ pub enum SessionRuntimeError {
     WrongSession,
     #[error("Session UDP runtime failed: {0}")]
     Udp(#[from] crate::UdpRuntimeError),
+}
+
+impl SessionRuntimeError {
+    fn failed_path(&self) -> Option<PathId> {
+        match self {
+            Self::PathWrite { path_id, .. } => Some(*path_id),
+            _ => None,
+        }
+    }
+
+    fn is_flow_recoverable(&self) -> bool {
+        matches!(
+            self,
+            Self::PathClosed
+                | Self::Multipath(MultipathError::NoSchedulablePath)
+                | Self::Multipath(MultipathError::UnknownPath(_))
+                | Self::WireBudgetExhausted
+        )
+    }
 }
 
 pub struct IngressSessionHandle {
@@ -1606,6 +1634,8 @@ struct SessionActor<W> {
     extra_paths: HashMap<PathId, ExtraPath>,
     multipath: MultipathSession,
     path_health: HashMap<PathId, PathHealth>,
+    retired_path_states: BTreeMap<PathId, pathchord_core::PathState>,
+    retired_path_order: VecDeque<PathId>,
     next_status_report_seq: u64,
     status_provider: Arc<dyn EgressStatusProvider>,
     trust_failure: bool,
@@ -1749,6 +1779,8 @@ where
             extra_paths: HashMap::new(),
             multipath,
             path_health,
+            retired_path_states: BTreeMap::new(),
+            retired_path_order: VecDeque::new(),
             next_status_report_seq: 0,
             status_provider,
             trust_failure: false,
@@ -1851,8 +1883,10 @@ where
                 command = receive_command(&mut self.commands) => {
                     match command {
                         Some(command) => {
-                            if self.handle_command(command).await? {
-                                return Ok(());
+                            match self.handle_command(command).await {
+                                Ok(true) => return Ok(()),
+                                Ok(false) => {},
+                                Err(error) => self.handle_runtime_error(error, None).await?,
                             }
                         }
                         None => self.commands = None,
@@ -1869,18 +1903,7 @@ where
                             match self.handle_frame(path_id, frame).await {
                                 Ok(true) => return Ok(()),
                                 Ok(false) => {},
-                                Err(error) => {
-                                    if matches!(
-                                        error,
-                                        SessionRuntimeError::SessionTrustFailure
-                                            | SessionRuntimeError::EgressHardFailure
-                                    ) {
-                                        return Err(error);
-                                    }
-                                    if self.handle_path_failure(path_id).await? {
-                                        return Err(error);
-                                    }
-                                }
+                                Err(error) => self.handle_runtime_error(error, Some(path_id)).await?,
                             }
                         }
                         Some(ReaderEvent::Closed { path_id }) => {
@@ -1904,19 +1927,29 @@ where
                     }
                 }
                 event = self.stream_events.recv() => {
-                    if let Some(event) = event {
-                        self.handle_stream_event(event).await?;
+                    if let Some(event) = event
+                        && let Err(error) = self.handle_stream_event(event).await
+                    {
+                        self.handle_runtime_error(error, None).await?;
                     }
                 }
                 completion = self.factory_results.recv() => {
-                    if let Some(completion) = completion {
-                        self.handle_factory_completion(completion).await?;
+                    if let Some(completion) = completion
+                        && let Err(error) = self.handle_factory_completion(completion).await
+                    {
+                        self.handle_runtime_error(error, None).await?;
                     }
                 }
                 _ = retransmission_tick.tick() => {
-                    self.retry_session_controls().await?;
-                    self.handle_retransmission_timeouts().await?;
-                    self.poll_udp_targets().await?;
+                    if let Err(error) = self.retry_session_controls().await {
+                        self.handle_runtime_error(error, None).await?;
+                    }
+                    if let Err(error) = self.handle_retransmission_timeouts().await {
+                        self.handle_runtime_error(error, None).await?;
+                    }
+                    if let Err(error) = self.poll_udp_targets().await {
+                        self.handle_runtime_error(error, None).await?;
+                    }
                     if self.handle_path_health().await? {
                         return Err(SessionRuntimeError::PathClosed);
                     }
@@ -1929,13 +1962,51 @@ where
                 let Ok(event) = self.stream_events.try_recv() else {
                     break;
                 };
-                self.handle_stream_event(event).await?;
+                if let Err(error) = self.handle_stream_event(event).await {
+                    self.handle_runtime_error(error, None).await?;
+                }
             }
-            self.flush_business().await?;
-            self.finish_pending_udp_closes().await?;
+            if let Err(error) = self.flush_business().await {
+                self.handle_runtime_error(error, None).await?;
+            }
+            if let Err(error) = self.finish_pending_udp_closes().await {
+                self.handle_runtime_error(error, None).await?;
+            }
             self.retire_drained_udp();
             self.publish_snapshot(false);
         }
+    }
+
+    /// Attribute a failed write to the Path that actually failed. A business
+    /// frame can be received on one Path while its ACK or response is sent on
+    /// another; using the receiving Path here would incorrectly retire a
+    /// healthy Path. Recoverable scheduling failures are kept at flow scope as
+    /// long as another Path remains available.
+    async fn handle_runtime_error(
+        &mut self,
+        error: SessionRuntimeError,
+        received_path_id: Option<PathId>,
+    ) -> Result<(), SessionRuntimeError> {
+        if matches!(
+            &error,
+            SessionRuntimeError::SessionTrustFailure | SessionRuntimeError::EgressHardFailure
+        ) {
+            return Err(error);
+        }
+        let received_path_id = (!error.is_flow_recoverable())
+            .then_some(received_path_id)
+            .flatten();
+        if let Some(path_id) = error.failed_path().or(received_path_id) {
+            if self.handle_path_failure(path_id).await? {
+                return Err(error);
+            }
+            return Ok(());
+        }
+        if error.is_flow_recoverable() && self.multipath.ready_path_count() > 0 {
+            self.cancel_unroutable_flows().await?;
+            return Ok(());
+        }
+        Err(error)
     }
 
     async fn handle_command(
@@ -2124,7 +2195,13 @@ where
                         .await
                     {
                         let _ = reply.send(Err(SessionRuntimeError::PathClosed));
-                        return Err(error);
+                        if error.failed_path().is_none() && !error.is_flow_recoverable() {
+                            return Err(error);
+                        }
+                        if self.handle_path_failure(path_id).await? {
+                            return Err(error);
+                        }
+                        return Ok(false);
                     }
                     match self.handle_path_failure(path_id).await {
                         Ok(session_closed) => {
@@ -2148,7 +2225,13 @@ where
                         .await
                     {
                         let _ = reply.send(Err(SessionRuntimeError::PathClosed));
-                        return Err(error);
+                        if error.failed_path().is_none() && !error.is_flow_recoverable() {
+                            return Err(error);
+                        }
+                        if self.handle_path_failure(path_id).await? {
+                            return Err(error);
+                        }
+                        return Ok(false);
                     }
                     let result = self.multipath.drain_path(path_id).map_err(Into::into);
                     if let Some(health) = self.path_health.get_mut(&path_id) {
@@ -2431,6 +2514,20 @@ where
         } else {
             self.multipath.mark_path_failed(path_id)?
         };
+        self.retired_path_states.insert(
+            path_id,
+            if drained {
+                pathchord_core::PathState::Closed
+            } else {
+                pathchord_core::PathState::Failed
+            },
+        );
+        self.retired_path_order.push_back(path_id);
+        while self.retired_path_order.len() > 128 {
+            if let Some(oldest) = self.retired_path_order.pop_front() {
+                self.retired_path_states.remove(&oldest);
+            }
+        }
         if !outcome.session_closed {
             self.cancel_unroutable_flows().await?;
             let retained: Vec<_> = self
@@ -2467,8 +2564,24 @@ where
                     )
                     .await
                 {
-                    if !matches!(error, SessionRuntimeError::WireBudgetExhausted) {
+                    if !matches!(&error, SessionRuntimeError::WireBudgetExhausted) {
+                        if let Some(failed_path_id) = error.failed_path()
+                            && failed_path_id != path_id
+                            && self.path_health.contains_key(&failed_path_id)
+                        {
+                            if Box::pin(self.retire_path(failed_path_id, false)).await? {
+                                return Ok(true);
+                            }
+                            continue;
+                        }
                         return Err(error);
+                    }
+                    if let Some(stream) = self.streams.get_mut(&stream_id)
+                        && let Some(retained) = stream.retained.get_mut(&offset)
+                    {
+                        // This was a local budget refusal, not a wire
+                        // attempt. Retry when capacity returns.
+                        retained.last_sent_at = Instant::now();
                     }
                     continue;
                 }
@@ -2497,6 +2610,7 @@ where
                 .await?;
             }
         }
+        self.forget_unreferenced_terminal_paths()?;
         Ok(outcome.session_closed)
     }
 
@@ -2569,7 +2683,18 @@ where
                 )
                 .await
             {
-                if matches!(error, SessionRuntimeError::WireBudgetExhausted) {
+                if matches!(&error, SessionRuntimeError::WireBudgetExhausted) {
+                    if let Some(stream) = self.streams.get_mut(&stream_id)
+                        && let Some(retained) = stream.retained.get_mut(&offset)
+                    {
+                        retained.last_sent_at = now;
+                    }
+                    continue;
+                }
+                if let Some(failed_path_id) = error.failed_path() {
+                    if self.handle_path_failure(failed_path_id).await? {
+                        return Err(error);
+                    }
                     continue;
                 }
                 return Err(error);
@@ -2587,6 +2712,34 @@ where
             }
             self.send_additional_replica(stream_id, offset, plan.path_id, eligible.as_ref())
                 .await?;
+        }
+        self.forget_unreferenced_terminal_paths()?;
+        Ok(())
+    }
+
+    /// Retain terminal Path metadata only while an unacknowledged range still
+    /// needs its retransmission timeout. This keeps recovery bounded even if
+    /// the range is later acknowledged or its Stream is reset.
+    fn forget_unreferenced_terminal_paths(&mut self) -> Result<(), SessionRuntimeError> {
+        let referenced: BTreeSet<_> = self
+            .streams
+            .values()
+            .flat_map(|stream| stream.retained.values().map(|range| range.last_path))
+            .collect();
+        let terminal: Vec<_> = self
+            .multipath
+            .path_states()
+            .into_iter()
+            .filter_map(|(path_id, state)| {
+                (matches!(
+                    state,
+                    pathchord_core::PathState::Failed | pathchord_core::PathState::Closed
+                ) && !referenced.contains(&path_id))
+                .then_some(path_id)
+            })
+            .collect();
+        for path_id in terminal {
+            self.multipath.forget_terminal_path(path_id)?;
         }
         Ok(())
     }
@@ -3948,8 +4101,13 @@ where
             }
         }
         for (message, eligible) in retry {
-            self.send_control_copies(message.message(), eligible.as_ref())
-                .await?;
+            if let Err(error) = self
+                .send_control_copies(message.message(), eligible.as_ref())
+                .await
+                && !error.is_flow_recoverable()
+            {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -4977,10 +5135,20 @@ where
             sender
                 .send(PathWriterCommand::Send { message, reply })
                 .await
-                .map_err(|_| SessionRuntimeError::PathClosed)?;
+                .map_err(|_| SessionRuntimeError::PathWrite {
+                    path_id,
+                    source: Box::new(SessionRuntimeError::PathClosed),
+                })?;
             result
                 .await
-                .map_err(|_| SessionRuntimeError::PathClosed)??;
+                .map_err(|_| SessionRuntimeError::PathWrite {
+                    path_id,
+                    source: Box::new(SessionRuntimeError::PathClosed),
+                })?
+                .map_err(|error| SessionRuntimeError::PathWrite {
+                    path_id,
+                    source: Box::new(error),
+                })?;
             if let Some(health) = self.path_health.get_mut(&path_id) {
                 health.bytes_since_observation =
                     health.bytes_since_observation.saturating_add(data_bytes);
@@ -5009,7 +5177,13 @@ where
             payload,
             self.limits,
         )?;
-        self.writer.send(frame).await?;
+        self.writer
+            .send(frame)
+            .await
+            .map_err(|error| SessionRuntimeError::PathWrite {
+                path_id,
+                source: Box::new(error),
+            })?;
         self.next_frame_seq = self
             .next_frame_seq
             .checked_add(1)
@@ -5069,12 +5243,14 @@ where
                 )
             })
             .collect();
+        let mut path_states = self.retired_path_states.clone();
+        path_states.extend(self.multipath.path_states());
         SessionSnapshot {
             session_id: self.session_id,
             path_id: self.path_id,
             ready_paths: self.multipath.ready_path_count(),
             ready_path_ids: self.multipath.ready_path_ids(),
-            path_states: self.multipath.path_states(),
+            path_states,
             degraded_paths: self.multipath.degraded_path_count(),
             effective_capacity_bps: self.multipath.effective_capacity_bps(),
             egress_aggregate_capacity_bps: self.egress_aggregate_capacity_bps,
@@ -5401,8 +5577,12 @@ where
                 .map_err(|_| SessionRuntimeError::NoiseStatePoisoned)?;
             noise.seal_frame(&frame, self.limits)?.encode()
         };
-        self.io.write_all(&encoded).await?;
-        self.io.flush().await?;
+        tokio::time::timeout(PATH_WRITE_TIMEOUT, async {
+            self.io.write_all(&encoded).await?;
+            self.io.flush().await
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Path write timed out"))??;
         Ok(())
     }
 }
@@ -6354,6 +6534,12 @@ mod tests {
         drop_all: Arc<AtomicBool>,
     }
 
+    struct FailWrites<S> {
+        inner: S,
+        fail: Arc<AtomicBool>,
+        stall: bool,
+    }
+
     impl<S> AsyncRead for DropAllWrites<S>
     where
         S: AsyncRead + Unpin,
@@ -6421,6 +6607,55 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             if self.drop_next.swap(false, Ordering::AcqRel) {
                 return Poll::Ready(Ok(buffer.len()));
+            }
+            Pin::new(&mut self.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
+    impl<S> AsyncRead for FailWrites<S>
+    where
+        S: AsyncRead + Unpin,
+    {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(context, buffer)
+        }
+    }
+
+    impl<S> AsyncWrite for FailWrites<S>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.fail.load(Ordering::Acquire) {
+                if self.stall {
+                    return Poll::Pending;
+                }
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test Path write failure",
+                )));
             }
             Pin::new(&mut self.inner).poll_write(context, buffer)
         }
@@ -6533,6 +6768,49 @@ mod tests {
         let ingress_io = DropNextWrite {
             inner: ingress_io,
             drop_next,
+        };
+        let (ingress, egress) = tokio::join!(
+            dial_path(
+                ingress_io,
+                ingress_key.private(),
+                egress_key.public(),
+                &ingress_config,
+            ),
+            accept_path(
+                egress_io,
+                egress_key.private(),
+                &egress_config,
+                &authorization,
+            ),
+        );
+        let PathAdmissionOutcome::Ready(ingress) = ingress.expect("Ingress admission") else {
+            panic!("Ingress Path should be ready");
+        };
+        let PathAdmissionOutcome::Ready(egress) = egress.expect("Egress admission") else {
+            panic!("Egress Path should be ready");
+        };
+        (ingress, egress)
+    }
+
+    async fn admitted_pair_for_with_failing_egress_write(
+        ingress_key: &StaticKeypair,
+        egress_key: &StaticKeypair,
+        path_id: u128,
+        fail: Arc<AtomicBool>,
+        stall: bool,
+    ) -> (
+        IngressAdmittedPath<DuplexStream>,
+        EgressAdmittedPath<FailWrites<DuplexStream>>,
+    ) {
+        let mut ingress_config = ingress_config();
+        ingress_config.path_id = PathId::new(path_id);
+        let egress_config = egress_config();
+        let authorization = authorization(ingress_key);
+        let (ingress_io, egress_io) = duplex(512 * 1024);
+        let egress_io = FailWrites {
+            inner: egress_io,
+            fail,
+            stall,
         };
         let (ingress, egress) = tokio::join!(
             dial_path(
@@ -6998,6 +7276,66 @@ mod tests {
         ingress.shutdown().await.unwrap();
         egress.wait().await.unwrap();
         factory.join().await;
+    }
+
+    #[tokio::test]
+    async fn business_response_path_failure_keeps_the_other_path_alive() {
+        for stall in [false, true] {
+            tokio::time::timeout(Duration::from_secs(6), async {
+                let (ingress_key, egress_key) = keys();
+                let (ingress_primary, egress_primary) =
+                    admitted_pair_for(&ingress_key, &egress_key, 302).await;
+                let fail = Arc::new(AtomicBool::new(false));
+                let (ingress_secondary, egress_secondary) =
+                    admitted_pair_for_with_failing_egress_write(
+                        &ingress_key,
+                        &egress_key,
+                        301,
+                        Arc::clone(&fail),
+                        stall,
+                    )
+                    .await;
+                let factory = EchoFactory::default();
+                let egress = EgressSessionHandle::start(egress_primary, factory.clone()).unwrap();
+                let egress_controller = egress.controller();
+                let ingress = IngressSessionHandle::start(ingress_primary).unwrap();
+                egress_controller
+                    .add_path(egress_secondary, MultipathPathObservation::default())
+                    .await
+                    .unwrap();
+                ingress
+                    .add_path(ingress_secondary, MultipathPathObservation::default())
+                    .await
+                    .unwrap();
+
+                // Path 301 is first in the control-copy order. Its writer fails
+                // after admission, so the Egress response must be retried over
+                // Path 302 instead of closing the Session.
+                fail.store(true, Ordering::Release);
+                let mut stream = tokio::time::timeout(
+                    Duration::from_secs(4),
+                    ingress.open_tcp(target("response-failover.test")),
+                )
+                .await
+                .expect("Stream open should fail over to the surviving Path")
+                .expect("Stream should remain admissible");
+                stream.write_all(b"surviving-path").await.unwrap();
+                let mut echoed = [0_u8; 14];
+                stream.read_exact(&mut echoed).await.unwrap();
+                assert_eq!(&echoed, b"surviving-path");
+                assert!(!ingress.snapshot().closed);
+                assert_eq!(ingress.snapshot().ready_paths, 1);
+                assert_eq!(egress_controller.snapshot().ready_paths, 1);
+
+                stream.shutdown().await.unwrap();
+                stream.read_to_end(&mut Vec::new()).await.unwrap();
+                ingress.shutdown().await.unwrap();
+                egress.wait().await.unwrap();
+                factory.join().await;
+            })
+            .await
+            .unwrap();
+        }
     }
 
     #[tokio::test]
