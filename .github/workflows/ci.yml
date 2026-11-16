@@ -31,6 +31,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Build role binaries used by process smoke tests
+        run: cargo build --locked --workspace --bins
+
       - name: Run tests
         run: cargo test --locked --workspace --all-targets
 
