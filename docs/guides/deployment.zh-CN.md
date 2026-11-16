@@ -10,14 +10,15 @@
 
 ## 配置目录与覆写
 
-没有显式配置选项时，Ingress 为普通账号加载 `~/.config/pathchord`，为 root/服务账号加载
-`/etc/pathchord`。显式命令行来源覆盖环境变量，环境变量覆盖账号默认值。例如：
+没有显式配置选项时，Ingress 为普通账号加载 `~/.config/pathchord/ingress`，为软件包服务账号加载
+`/etc/pathchord/ingress`。Egress 使用独立的 `~/.config/pathchord/egress` 或
+`/etc/pathchord/egress`。显式命令行来源覆盖环境变量，环境变量覆盖角色默认值。例如：
 
 ```sh
-pathchord ingress
-PATHCHORD_CONFIG_DIR=/opt/pathchord/conf.d pathchord ingress
-pathchord ingress --config-dir /opt/pathchord/conf.d
-pathchord ingress --config /opt/pathchord/single.yaml
+pathchord-ingressd
+PATHCHORD_CONFIG_DIR=/opt/pathchord/ingress pathchord-ingressd
+pathchord-ingressd --config-dir /opt/pathchord/ingress
+pathchord-ingressd --config /opt/pathchord/single.yaml
 ```
 
 `PATHCHORD_CONFIG` 也接受文件或目录。未指定命令行来源时，只能设置一个非空配置环境变量。
@@ -34,8 +35,8 @@ pathchord ingress --config /opt/pathchord/single.yaml
 构建可执行文件并运行直接路由示例：
 
 ```sh
-cargo build --locked --release -p pathchord-cli
-./target/release/pathchord ingress --config examples/ingress-direct.yaml
+cargo build --locked --release --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
+./target/release/pathchord-ingressd --config examples/ingress-direct.yaml
 ```
 
 普通 Unix 用户的 Ingress 控制 socket 默认使用
@@ -57,7 +58,7 @@ curl -x socks5h://127.0.0.1:7890 https://example.com
 匹配节点的 flow。使用前必须替换其 provider URL：
 
 ```sh
-pathchord ingress --config examples/ingress-subscriptions.yaml
+pathchord-ingressd --config examples/ingress-subscriptions.yaml
 ```
 
 ## Linux 透明代理与 TUN 监听器
@@ -84,8 +85,8 @@ Windows 通过原生适配器提供 TUN 支持。
 显式指定任一示例启动，避免特权配置被账号默认配置意外加载：
 
 ```sh
-sudo ./target/release/pathchord ingress --config examples/ingress-tproxy.yaml
-sudo ./target/release/pathchord ingress --config examples/ingress-tun.yaml
+sudo ./target/release/pathchord-ingressd --config examples/ingress-tproxy.yaml
+sudo ./target/release/pathchord-ingressd --config examples/ingress-tun.yaml
 ```
 
 TPROXY 和 TUN 监听器接收 IP flow，因此路由匹配原始 IP 地址、端口、协议和可用的进程元数据。
@@ -100,14 +101,14 @@ PathChord 不启动或嵌入外部代理进程作为兼容后端。见
 在各自对应的机器上生成私有身份。命令只打印公钥；私有文件必须保留在其所有者本地：
 
 ```sh
-pathchord keygen --output ingress.key.json
-pathchord keygen --output egress.key.json
+pathchordctl keygen --output ingress.key.json
+pathchordctl keygen --output egress.key.json
 ```
 
 在独立终端中启动 Egress。Unix 控制 socket 位于 Egress 本机：
 
 ```sh
-pathchord egress --egress-id exit --identity egress.key.json \
+pathchord-egressd --egress-id exit --identity egress.key.json \
   --bind 127.0.0.1:9443 --control-socket /tmp/pathchord-egress.sock
 ```
 
@@ -115,7 +116,7 @@ pathchord egress --egress-id exit --identity egress.key.json \
 打印的公钥。代次 0 适用于新授权数据库；后续变更必须使用其观测到的代次：
 
 ```sh
-pathchord --socket /tmp/pathchord-egress.sock enroll add \
+pathchordctl --socket /tmp/pathchord-egress.sock enroll add \
   --ingress-id entry --egress-id exit --public-key INGRESS_PUBLIC_KEY \
   --expected-generation 0
 ```
@@ -125,11 +126,11 @@ pathchord --socket /tmp/pathchord-egress.sock enroll add \
 已经显式核验的公钥和规范 Egress ID。在另一个独立终端中启动 Ingress：
 
 ```sh
-pathchord --socket /tmp/pathchord-ingress.sock ingress \
+pathchord-ingressd --socket /tmp/pathchord-ingress.sock \
   --ingress-id entry --identity ingress.key.json \
   --config examples/ingress-egress.yaml
-pathchord --socket /tmp/pathchord-ingress.sock status
-pathchord --socket /tmp/pathchord-egress.sock enroll list
+pathchordctl --socket /tmp/pathchord-ingress.sock status
+pathchordctl --socket /tmp/pathchord-egress.sock enroll list
 ```
 
 示例的 `direct-path` 是到经过认证的 Egress 的直接传输。将它替换为 HTTP、HTTPS、SOCKS5、

@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use pathchord_policy::{EgressServiceSpec, KubeConfig};
+use pathchord_policy::EgressServiceSpec;
 
 use crate::configuration::ConfigSelection;
 use crate::{
@@ -48,33 +48,21 @@ async fn resolve_source(
         return merge(args, None, Path::new("."));
     }
     source.validate()?;
-    let documents = pathchord_ingress::load_configuration_documents(source.path.clone())
+    let documents = pathchord_config::load_configuration_documents(source.path.clone())
         .await
         .map_err(|error| CliError::ConfigurationLoad {
             path: source.path.clone(),
-            source: error,
+            source: error.into(),
         })?;
-    let kube = KubeConfig::from_service_documents(documents.iter().map(String::as_str))?;
-    let mut services = kube
-        .resources
-        .iter()
-        .filter_map(|resource| resource.egress_service());
-    let service = services.next();
-    if services.next().is_some() {
-        return Err(CliError::EgressConfiguration(
-            "select exactly one EgressService per process",
-        ));
-    }
+    let service =
+        pathchord_config::parse_egress_service_documents(documents.iter().map(String::as_str))
+            .map_err(|error| CliError::EgressConfigurationSource(error.to_string()))?;
     let base = if source.directory {
         source.path.as_path()
     } else {
         source.path.parent().unwrap_or(Path::new("."))
     };
-    merge(
-        args,
-        service.map(|(metadata, spec)| (metadata.name.as_str(), spec)),
-        base,
-    )
+    merge(args, Some((&service.name, &service.spec)), base)
 }
 
 fn merge(
@@ -289,7 +277,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             resolve_source(args(&[]), source()).await,
-            Err(CliError::EgressConfiguration(_))
+            Err(CliError::EgressConfigurationSource(_))
         ));
         std::fs::remove_dir_all(root).unwrap();
     }

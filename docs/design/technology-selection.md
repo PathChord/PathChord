@@ -56,7 +56,11 @@ pathchord-policy     configuration snapshots, rule compiler, selectors
 pathchord-transit    Transit Proxy adapters and subscription normalization
 pathchord-egress     target dialing, Egress status, authorization store
 pathchord-ingress    local listeners, transparent interception, process metadata
-pathchord-cli        local management API client and operational commands
+pathchordctl         local management API client and operational commands
+pathchord-config      shared role-scoped configuration loading
+pathchord-control     shared local control transport and Web Gateway
+pathchord-ingressd    Ingress service entry point
+pathchord-egressd     Egress service entry point
 ```
 
 `pathchord-core` must not depend on Linux, Windows, FreeBSD, subscription formats, or listener implementations. Platform adapters communicate through narrow traits for byte transport, local sockets, target dialing, and process metadata.

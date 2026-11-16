@@ -13,8 +13,14 @@ SetDatablockOptimize on
 !ifndef APP_VERSION
   !define APP_VERSION "0.1.0"
 !endif
-!ifndef BINARY_PATH
-  !define BINARY_PATH "..\..\target\release\pathchord.exe"
+!ifndef INGRESS_BINARY_PATH
+  !define INGRESS_BINARY_PATH "..\..\target\release\pathchord-ingressd.exe"
+!endif
+!ifndef EGRESS_BINARY_PATH
+  !define EGRESS_BINARY_PATH "..\..\target\release\pathchord-egressd.exe"
+!endif
+!ifndef CTL_BINARY_PATH
+  !define CTL_BINARY_PATH "..\..\target\release\pathchordctl.exe"
 !endif
 !ifndef OUTPUT_PATH
   !define OUTPUT_PATH "PathChord-${APP_VERSION}-windows-x86_64-setup.exe"
@@ -55,18 +61,22 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "GPL-3.0-only"
 Section "PathChord runtime" SecRuntime
   SectionIn RO
   SetOutPath "$INSTDIR"
-  File "${BINARY_PATH}"
+  File "${INGRESS_BINARY_PATH}"
+  File "${EGRESS_BINARY_PATH}"
+  File "${CTL_BINARY_PATH}"
   File "..\..\LICENSE"
   File "..\common\pathchord.1"
   File "..\common\default-config.yaml"
 
-  SetOutPath "$COMMONAPPDATA\PathChord\config"
-  IfFileExists "$COMMONAPPDATA\PathChord\config\ingress.yaml" config_exists
+  SetOutPath "$COMMONAPPDATA\PathChord\config\ingress"
+  IfFileExists "$COMMONAPPDATA\PathChord\config\ingress\ingress.yaml" config_exists
     File /oname=ingress.yaml "..\common\default-config.yaml"
   config_exists:
+  CreateDirectory "$COMMONAPPDATA\PathChord\config\egress"
 
-  CreateDirectory "$COMMONAPPDATA\PathChord\data"
-  CreateDirectory "$COMMONAPPDATA\PathChord\credentials"
+  CreateDirectory "$COMMONAPPDATA\PathChord\data\ingress"
+  CreateDirectory "$COMMONAPPDATA\PathChord\data\egress"
+  CreateDirectory "$COMMONAPPDATA\PathChord\credentials\ingress"
   CreateDirectory "$COMMONAPPDATA\PathChord\logs"
 
   SetOutPath "$INSTDIR\services"
@@ -95,7 +105,9 @@ Section "Uninstall"
     ExecWait '"$INSTDIR\pathchord-egress-service.exe" stop'
     ExecWait '"$INSTDIR\pathchord-egress-service.exe" uninstall'
 
-  Delete "$INSTDIR\pathchord.exe"
+  Delete "$INSTDIR\pathchord-ingressd.exe"
+  Delete "$INSTDIR\pathchord-egressd.exe"
+  Delete "$INSTDIR\pathchordctl.exe"
   Delete "$INSTDIR\pathchord.1"
   Delete "$INSTDIR\default-config.yaml"
   Delete "$INSTDIR\LICENSE"

@@ -4,11 +4,15 @@ set -eu
 output_dir=${1:-dist}
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 version=${PATHCHORD_VERSION:-$("$root_dir/packaging/version.sh")}
-binary=${PATHCHORD_BINARY:-$root_dir/target/release/pathchord}
-case "$binary" in
-  /*) ;;
-  *) binary="$root_dir/$binary" ;;
-esac
+ingress_binary=${PATHCHORD_INGRESS_BINARY:-$root_dir/target/release/pathchord-ingressd}
+egress_binary=${PATHCHORD_EGRESS_BINARY:-$root_dir/target/release/pathchord-egressd}
+ctl_binary=${PATHCHORDCTL_BINARY:-$root_dir/target/release/pathchordctl}
+for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
+  case "$binary" in
+    /*) ;;
+    *) binary="$root_dir/$binary" ;;
+  esac
+done
 
 case "$version" in
   ''|*[!0-9A-Za-z.+_-]*)
@@ -17,11 +21,12 @@ case "$version" in
     ;;
 esac
 
-if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-  printf '%s\n' "FreeBSD package input binary was not found: $binary" >&2
-  printf '%s\n' 'Build pathchord for FreeBSD first and set PATHCHORD_BINARY to that artifact.' >&2
-  exit 1
-fi
+for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
+  if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+    printf '%s\n' "FreeBSD package input binary was not found: $binary" >&2
+    exit 1
+  fi
+done
 if ! command -v pkg >/dev/null 2>&1; then
   printf '%s\n' 'FreeBSD pkg(8) is required to assemble a .pkg artifact.' >&2
   exit 1
@@ -32,14 +37,18 @@ stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/pathchord-pkg.XXXXXX")
 cleanup() { rm -rf "$stage_dir"; }
 trap cleanup EXIT INT TERM
 
-install -d "$stage_dir/usr/local/bin" "$stage_dir/usr/local/etc/pathchord" \
+install -d "$stage_dir/usr/local/bin" "$stage_dir/usr/local/etc/pathchord/ingress" \
+  "$stage_dir/usr/local/etc/pathchord/egress" \
   "$stage_dir/usr/local/etc/rc.d" "$stage_dir/usr/local/share/man/man1" \
   "$stage_dir/usr/local/share/pathchord" \
-  "$stage_dir/usr/local/share/licenses/pathchord" "$stage_dir/var/db/pathchord"
-install -m 0755 "$binary" "$stage_dir/usr/local/bin/pathchord"
+  "$stage_dir/usr/local/share/licenses/pathchord" "$stage_dir/var/db/pathchord-ingress" \
+  "$stage_dir/var/db/pathchord-egress"
+install -m 0755 "$ingress_binary" "$stage_dir/usr/local/bin/pathchord-ingressd"
+install -m 0755 "$egress_binary" "$stage_dir/usr/local/bin/pathchord-egressd"
+install -m 0755 "$ctl_binary" "$stage_dir/usr/local/bin/pathchordctl"
 install -m 0644 "$root_dir/LICENSE" "$stage_dir/usr/local/share/licenses/pathchord/LICENSE"
 install -m 0644 "$root_dir/packaging/common/default-config.yaml" \
-  "$stage_dir/usr/local/etc/pathchord/ingress.yaml"
+  "$stage_dir/usr/local/etc/pathchord/ingress/ingress.yaml"
 install -m 0644 "$root_dir/packaging/common/pathchord.1" \
   "$stage_dir/usr/local/share/man/man1/pathchord.1"
 sed 's/%%PREFIX%%/\/usr\/local/g' "$root_dir/packaging/freebsd/pkg-message" \

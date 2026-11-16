@@ -8,10 +8,7 @@ publish.workspace = true
 description = "Adaptive multipath proxy runtime and local management CLI"
 repository = "https://github.com/KagurazakaNyaa/PathChord"
 readme = "../../README.md"
-
-[[bin]]
-name = "pathchord"
-path = "src/main.rs"
+autobins = false
 
 [dependencies]
 async-trait.workspace = true
@@ -19,6 +16,7 @@ base64.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 pathchord-core = { path = "../pathchord-core" }
+pathchord-config = { path = "../pathchord-config" }
 pathchord-egress = { path = "../pathchord-egress" }
 pathchord-ingress = { path = "../pathchord-ingress" }
 pathchord-noise = { path = "../pathchord-noise" }

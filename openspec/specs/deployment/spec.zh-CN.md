@@ -12,7 +12,12 @@
 
 ### Requirement: Independent service processes and explicit proxy operation
 
-Ingress 和 Egress SHALL 通过独立服务调用运行，各自拥有进程和本地管理端点。普通显式 HTTP/SOCKS 代理操作 SHALL NOT 要求流量拦截或 TUN 权限。监听器协议行为 SHALL 遵循[平台契约](../platform-and-dns/spec.zh-CN.md#http-和-socks-监听器)。
+Ingress 和 Egress SHALL 通过独立服务调用运行，各自使用角色专用可执行文件，拥有独立进程和本地管理端点。`pathchordctl` SHALL 是两者的管理客户端。普通显式 HTTP/SOCKS 代理操作 SHALL NOT 要求流量拦截或 TUN 权限。监听器协议行为 SHALL 遵循[平台契约](../platform-and-dns/spec.zh-CN.md#http-和-socks-监听器)。
+
+#### Scenario: Dedicated service executable selection
+
+- **WHEN** 软件包启动 Ingress 或 Egress 服务
+- **THEN** 它直接调用对应的 `pathchord-ingressd` 或 `pathchord-egressd`，不通过共享服务子命令选择角色。
 
 #### Scenario: Ordinary local proxy setup
 
@@ -22,12 +27,26 @@ Ingress 和 Egress SHALL 通过独立服务调用运行，各自拥有进程和�
 #### Scenario: Unix local control endpoint defaults
 
 - **WHEN** 普通 Unix 账号启动 Ingress，且没有显式指定控制 socket
-- **THEN** 运行目录可用时端点为 `$XDG_RUNTIME_DIR/pathchord/ingress.sock`，否则为 `~/.config/pathchord/ingress.sock`；root 和软件包服务账号使用 `/run/pathchord/ingress.sock`，并在启动前创建运行目录。
+- **THEN** 运行目录可用时端点为 `$XDG_RUNTIME_DIR/pathchord/ingress.sock`，否则为 `~/.config/pathchord/ingress.sock`；root 和软件包服务账号使用 `/run/pathchord/ingress.sock`，并在启动前创建运行目录。Ingress 配置默认位于对应的 `ingress` 目录。
 
 #### Scenario: Explicit enrollment socket selection
 
 - **WHEN** 登记客户端选择控制端点
-- **THEN** 它默认使用对应的本地 `egress.sock` 端点，显式指定的 socket 优先；该端点属于 Egress 服务所在机器。
+- **THEN** `pathchordctl enroll` 默认使用对应的本地 `egress.sock` 端点，显式指定的 socket 优先；该端点属于 Egress 服务所在机器。Egress 配置默认位于对应的 `egress` 目录。
+
+### Requirement: Role-specific service artifact boundaries
+
+Ingress 服务可执行文件 SHALL 包含其声明的本地监听器、Transit Proxy、订阅、DNS 和透明/TUN 平台行为。Egress 服务可执行文件 SHALL 提供认证的 Path/Session 转发、TCP/UDP 目标连接、授权和全局资源保护，且不要求 Ingress listener、Transit Proxy、订阅、TUN 或 eBPF 运行时组件。
+
+#### Scenario: Egress starts without Ingress platform privileges
+
+- **WHEN** Egress 在没有 TUN 访问权且没有 `CAP_NET_ADMIN` 或 `CAP_NET_RAW` 的主机上启动
+- **THEN** 它可以绑定配置的 Path listener、打开授权库，并在普通目标转发前提满足时接受已显式登记的 Ingress Session。
+
+#### Scenario: Dedicated management client
+
+- **WHEN** 操作者使用 `pathchordctl` 查询状态或执行登记
+- **THEN** 客户端连接选定的本地控制端点而不启动任一服务，并保留版本化 control envelope 和代次检查。
 
 ### Requirement: Explicit configuration-source precedence
 
@@ -41,7 +60,7 @@ Ingress SHALL 遵循[配置来源契约](../configuration-schema/spec.zh-CN.md#�
 #### Scenario: Account configuration defaults
 
 - **WHEN** 既没有选择命令行来源，也没有选择配置环境变量
-- **THEN** Ingress 为普通账号加载 `~/.config/pathchord`，为 root 和服务账号加载 `/etc/pathchord`。
+- **THEN** Ingress 为普通账号加载 `~/.config/pathchord/ingress`，为软件包服务账号加载 `/etc/pathchord/ingress`；Egress 使用对应的 `egress` 目录。
 
 #### Scenario: Source options conflict
 

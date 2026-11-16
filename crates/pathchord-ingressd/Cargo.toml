@@ -1,0 +1,29 @@
+[package]
+name = "pathchord-ingressd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PathChord Ingress service"
+
+[[bin]]
+name = "pathchord-ingressd"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+pathchord-config = { path = "../pathchord-config" }
+pathchord-control = { path = "../pathchord-control" }
+pathchord-core = { path = "../pathchord-core" }
+pathchord-cli = { path = "../pathchord-cli" }
+pathchord-ingress = { path = "../pathchord-ingress" }
+pathchord-noise = { path = "../pathchord-noise" }
+pathchord-policy = { path = "../pathchord-policy" }
+pathchord-transit = { path = "../pathchord-transit" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "macros", "time", "signal"] }
+zeroize.workspace = true
+
+[lints]
+workspace = true

@@ -215,8 +215,8 @@ items:
 `TrafficPolicy`、`Listener`、`DNSPolicy`、`FallbackPolicy`、`GeoSiteDatabase`、`GeoIpDatabase`、
 `EgressService` 和 `NodeProbePolicy`。
 后两者是角色专用的服务资源：`EgressService` 为一个 Egress 进程选择身份、监听器、授权存储和服务限制；
-`NodeProbePolicy` 配置可选的有界 Transit 节点探测。Ingress 消费 `NodeProbePolicy`，Egress 消费
-`EgressService`；两者都可以存在于同一已验证资源包中。
+`NodeProbePolicy` 配置可选的有界 Transit 节点探测。Ingress 消费 `NodeProbePolicy` 和完整策略图；
+Egress 消费只含一个 `EgressService` 的 Egress 专用来源。Ingress 和 Egress 来源不能视为同一资源包。
 一个 namespace 中同一 `(kind, name)`
 最多只能有一个对象。完整配置必须恰好包含一个 DNSPolicy 和一个 FallbackPolicy；其余资源按引用和
 路由验证决定是否需要。没有 Listener 的 List 可以作为库快照存在，但不能启动 Ingress。
@@ -290,6 +290,11 @@ desired Path 数量、per-Ingress stream 配额和 Path 安全上限由运行时
 `remoteDnsOnly` 默认 false。设为 true 且存在原始主机名时，Egress 对 TCP 和 UDP 使用自身系统
 解析器解析该名称，不使用 Ingress 提供的地址候选。没有主机名的字面 IP 仍是有效目标。
 该选项作用于目标名称，不改变独立的 Ingress DNS 路由策略。
+
+Egress 来源不得包含 Listener、TransitProxy、Subscription、EgressRule、ProxyRule、TrafficPolicy、
+DNSPolicy、FallbackPolicy、GeoSiteDatabase、GeoIpDatabase 或 NodeProbePolicy。私有身份、授权库、
+控制 socket 和 bearer token 路径相对于 Egress 来源根解析，并保留在用户资源文档之外。
+EgressService 字段属于启动配置；来源变化时报告需要重启，活动 Egress 运行时保留原值。
 
 `NodeProbePolicy.spec.target` 是包含 `host` 和 `port` 的对象。`intervalSeconds` 默认 30、
 范围为 1..=86400；`timeoutSeconds` 默认 5、范围为 1..=30；`maxConcurrency`、`windowSize` 和
@@ -446,13 +451,14 @@ spec:
 
 ### 配置来源
 
-Ingress 接受一个资源文件或一棵目录树。配置来源按以下优先级从高到低选择：
+Ingress 接受一个资源文件或一棵目录树；Egress 接受包含一个 EgressService 的来源。每个角色按以下优先级从高到低选择：
 
 1. 显式 `--config`（`-c`）或 `--config-dir`（`-C`），两个选项互斥。`--config` 接受文件或
    目录；`--config-dir` 要求目录。
 2. 非空的 `PATHCHORD_CONFIG` 或 `PATHCHORD_CONFIG_DIR`，两者在环境变量层互斥，文件/目录
    语义与对应命令行选项相同。显式命令行来源覆盖两个环境变量，包括它们之间的冲突。
-3. 账号默认值：普通用户为 `~/.config/pathchord`，root 或服务账号为 `/etc/pathchord`。
+3. 账号默认值：Ingress 普通用户为 `~/.config/pathchord/ingress`、服务账号为 `/etc/pathchord/ingress`；
+   Egress 使用 `~/.config/pathchord/egress` 或 `/etc/pathchord/egress`。
    Unix 使用有效 UID；小于 1000 的系统 UID，以及 shell 为 `nologin` 或 `false` 的账号，
    视为服务账号。普通 Unix 用户的主目录来自 `HOME`，缺失时回退到账号数据库。Windows
    使用 `USERPROFILE`（然后回退到 `HOME`）；标准 System/Local Service/Network Service

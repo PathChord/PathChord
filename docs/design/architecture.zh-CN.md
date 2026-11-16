@@ -166,3 +166,14 @@ Egress 拓扑、Egress 公钥、Transit 绑定、公共 Path 要求、已解析 
 静态规则配置在启动时编译。订阅派生数据和获准的动态规则快照可以在后台编译并原子热重载。运行时分别维护策略、Egress、Proxy、认证和指标快照。Ingress 内部流量绕过自身的透明拦截，以防止形成环路。
 
 Ingress 管理员元数据和订阅操作属于控制面 mutation。它们原子发布新的代次，使用期望代次检查处理并发编辑；刷新失败时保留最近一次成功的订阅快照。Web/API 适配器调用拥有者的类型化 service，不能直接编辑配置文件或缓存。
+
+## 12. 服务 artifact
+
+PathChord 在同一个版本化 release bundle 中发布三个可执行文件：
+`pathchord-ingressd` 负责本地监听器、Transit Proxy 适配器、订阅、DNS、策略以及透明/TUN 平台集成；
+`pathchord-egressd` 负责认证的 Path 准入、TCP/UDP 目标转发、授权和全局资源上限；
+`pathchordctl` 是角色无关的本地管理客户端。两个服务以独立进程运行，使用独立的控制 socket、身份、凭据和状态目录。管理客户端不会启动服务。
+
+Ingress 从 Ingress 配置根读取完整策略资源图。Egress 从 Egress 配置根读取恰好一个
+`EgressService`，不会加载 listener、Transit Proxy、subscription、routing、DNS、fallback 或 geodata 资源。
+Egress 不包含 TUN、TPROXY、eBPF 或 system-proxy 运行时依赖，打包时不授予网络管理 capability。Egress 启动字段发生变化时报告需要重启，活动运行时继续使用原配置。

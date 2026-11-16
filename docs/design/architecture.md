@@ -209,3 +209,22 @@ mutations. They publish new generations atomically, use expected-generation
 checks for concurrent edits, and retain the last successful subscription
 snapshot after a failed refresh. Web/API adapters call the owning typed service
 and never edit configuration files or caches directly.
+
+## 12. Service artifacts
+
+PathChord publishes three executables in one versioned release bundle:
+`pathchord-ingressd` owns local listeners, Transit Proxy adapters,
+subscriptions, DNS, policy, and transparent/TUN platform integration;
+`pathchord-egressd` owns authenticated Path admission, target TCP/UDP
+forwarding, authorization, and global resource limits; `pathchordctl` is the
+role-neutral local management client. The service binaries run as separate
+processes and use separate control sockets, identities, credentials, and state
+roots. The management client never starts a service.
+
+Ingress reads its complete policy resource graph from the Ingress source root.
+Egress reads exactly one `EgressService` from its Egress source root and does
+not load listener, Transit Proxy, subscription, routing, DNS, fallback, or
+geodata resources. Egress has no TUN, TPROXY, eBPF, or system-proxy runtime
+dependency and is packaged without network-administration capabilities. A
+change to Egress startup fields is reported as restart required while the
+active runtime keeps its original configuration.

@@ -16,7 +16,17 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 
-const BIN: &str = env!("CARGO_BIN_EXE_pathchord");
+fn binary(name: &str) -> PathBuf {
+    let mut path = std::env::current_exe().expect("test executable path");
+    for _ in 0..8 {
+        path.pop();
+        let candidate = path.join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!("could not locate role binary {name}");
+}
 
 struct Directory(PathBuf);
 impl Drop for Directory {
@@ -43,14 +53,13 @@ fn port() -> u16 {
 
 fn start(directory: &Path, socket: &Path, identity: &Path, config: &Path) -> Process {
     Process(
-        Command::new(BIN)
+        Command::new(binary("pathchord-ingressd"))
             .current_dir(directory)
             .env_remove("PATHCHORD_CONFIG")
             .env_remove("PATHCHORD_CONFIG_DIR")
             .args([
                 "--socket",
                 socket.to_str().unwrap(),
-                "ingress",
                 "--ingress-id",
                 "entry",
                 "--identity",
@@ -218,7 +227,7 @@ async fn disabled_and_deleted_subscriptions_stay_unselectable_across_process_res
             let directory = Directory(std::env::temp_dir().join(format!("pathchord-subscription-{}-{}", std::process::id(), port())));
             std::fs::create_dir_all(&directory.0).unwrap();
             let identity = directory.0.join("identity");
-            assert!(Command::new(BIN).args(["keygen", "--output", identity.to_str().unwrap()]).stdout(Stdio::null()).status().unwrap().success());
+            assert!(Command::new(binary("pathchordctl")).args(["keygen", "--output", identity.to_str().unwrap()]).stdout(Stdio::null()).status().unwrap().success());
             let socket = directory.0.join("ingress.sock");
             let config = directory.0.join("config.yaml");
             let proxy_port = port();

@@ -5,11 +5,15 @@ set -eu
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 output_dir=${1:-"$root_dir/dist"}
 version=${PATHCHORD_VERSION:-$("$root_dir/packaging/version.sh")}
-binary=${PATHCHORD_BINARY:-"$root_dir/target/release/pathchord"}
-case "$binary" in
-	/*) ;;
-	*) binary="$root_dir/$binary" ;;
-esac
+ingress_binary=${PATHCHORD_INGRESS_BINARY:-"$root_dir/target/release/pathchord-ingressd"}
+egress_binary=${PATHCHORD_EGRESS_BINARY:-"$root_dir/target/release/pathchord-egressd"}
+ctl_binary=${PATHCHORDCTL_BINARY:-"$root_dir/target/release/pathchordctl"}
+for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
+	case "$binary" in
+		/*) ;;
+		*) binary="$root_dir/$binary" ;;
+	esac
+done
 
 case "$version" in
 	''|*[!0-9A-Za-z.+_-]*)
@@ -17,10 +21,12 @@ case "$version" in
 		exit 2
 		;;
 esac
-if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-	echo "PathChord binary is missing or not executable: $binary" >&2
-	exit 1
-fi
+for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
+	if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+		echo "PathChord binary is missing or not executable: $binary" >&2
+		exit 1
+	fi
+done
 if ! command -v abuild >/dev/null 2>&1; then
 	echo "abuild is required to build an Alpine package" >&2
 	exit 127
@@ -46,7 +52,9 @@ mkdir -p "$output_dir"
 work=$(mktemp -d "${TMPDIR:-/tmp}/pathchord-alpine.XXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
-cp "$binary" "$work/pathchord"
+cp "$ingress_binary" "$work/pathchord-ingressd"
+cp "$egress_binary" "$work/pathchord-egressd"
+cp "$ctl_binary" "$work/pathchordctl"
 cp "$root_dir/LICENSE" "$work/LICENSE"
 cp "$root_dir/packaging/common/pathchord.1" "$work/pathchord.1"
 cp "$root_dir/packaging/common/default-config.yaml" "$work/default-config.yaml"
@@ -67,7 +75,7 @@ makedepends=""
 pkgusers="pathchord"
 pkggroups="pathchord"
 install="$pkgname.pre-install"
-source="pathchord LICENSE pathchord.1 default-config.yaml pathchord.initd pathchord-egress.initd"
+source="pathchord-ingressd pathchord-egressd pathchordctl LICENSE pathchord.1 default-config.yaml pathchord.initd pathchord-egress.initd"
 sha256sums="
 SKIP
 SKIP
@@ -82,11 +90,13 @@ build() {
 }
 
 package() {
-	install -Dm0755 "$srcdir/pathchord" "$pkgdir/usr/bin/pathchord"
+	install -Dm0755 "$srcdir/pathchord-ingressd" "$pkgdir/usr/bin/pathchord-ingressd"
+	install -Dm0755 "$srcdir/pathchord-egressd" "$pkgdir/usr/bin/pathchord-egressd"
+	install -Dm0755 "$srcdir/pathchordctl" "$pkgdir/usr/bin/pathchordctl"
 	install -Dm0644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/pathchord/LICENSE"
 	install -Dm0644 "$srcdir/pathchord.1" "$pkgdir/usr/share/man/man1/pathchord.1"
 	gzip -n -9 "$pkgdir/usr/share/man/man1/pathchord.1"
-	install -Dm0644 "$srcdir/default-config.yaml" "$pkgdir/etc/pathchord/ingress.yaml"
+	install -Dm0644 "$srcdir/default-config.yaml" "$pkgdir/etc/pathchord/ingress/ingress.yaml"
 	install -Dm0755 "$srcdir/pathchord.initd" "$pkgdir/etc/init.d/pathchord"
 	install -Dm0755 "$srcdir/pathchord-egress.initd" "$pkgdir/etc/init.d/pathchord-egress"
 }

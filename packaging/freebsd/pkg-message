@@ -1,5 +1,5 @@
 PathChord installs a loopback-only default Ingress configuration at
-%%PREFIX%%/etc/pathchord/ingress.yaml and creates a pathchord service account.
+%%PREFIX%%/etc/pathchord/ingress/ingress.yaml and creates a pathchord service account.
 
 Enable the local listener in /etc/rc.conf:
 
@@ -11,6 +11,6 @@ it only after replacing the example values in /etc/rc.conf:
   pathchord_egress_enable="YES"
   pathchord_egress_id="exit"
   pathchord_egress_bind="0.0.0.0:7443"
-  pathchord_egress_identity="/var/db/pathchord/egress.key.json"
+  pathchord_egress_identity="/var/db/pathchord-egress/egress.key.json"
 
-The package includes the pathchord(1) manual and rc.d service definitions.
+The package includes the pathchordctl(1) manual and rc.d service definitions.

@@ -102,21 +102,22 @@ openspec validate --all --strict --no-interactive
 
 ## 命令界面
 
-Ingress 为普通用户默认加载 `~/.config/pathchord`，为 root/服务账号默认加载 `/etc/pathchord`。
-`--config-dir` 将目录中的 YAML/YML/JSON 资源递归载入并统一验证。优先级为命令行，
-然后是 `PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`，最后是账号默认值。
+`pathchord-ingressd` 为普通用户默认加载 `~/.config/pathchord/ingress`，为软件包服务账号默认加载
+`/etc/pathchord/ingress`。Egress 使用独立的 `~/.config/pathchord/egress` 或
+`/etc/pathchord/egress`。`--config-dir` 将目录中的 YAML/YML/JSON 资源递归载入并统一验证。
+优先级为命令行，然后是 `PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`，最后是角色默认值。
 
 ```text
-pathchord ingress
-pathchord ingress --config-dir /path/to/conf.d
-pathchord egress
-pathchord status
-pathchord enroll
+pathchord-ingressd
+pathchord-ingressd --config-dir /path/to/ingress
+pathchord-egressd --config-dir /path/to/egress
+pathchordctl status
+pathchordctl enroll list
 ```
 
-在 Unix 上，`ingress` 命令会启动配置的监听器、持久化本地控制 socket、订阅
-worker 和请求的 Web Gateway。`egress` 会启动经过认证的 Path 监听器和授权
-控制 socket；`status`、`system-proxy` 与 `enroll` 通过对应的本地控制端点工作。
+在 Unix 上，`pathchord-ingressd` 会启动配置的监听器、持久化本地控制 socket、订阅
+worker 和请求的 Web Gateway。`pathchord-egressd` 会启动经过认证的 Path 监听器和授权
+控制 socket；`pathchordctl` 通过对应的本地控制端点查询和修改服务。
 只有在策略没有 Egress/Transit 路由且显式选择 direct fallback 时，才会使用 direct
 target bridge。
 
@@ -124,8 +125,8 @@ target bridge。
 
 [`packaging/`](packaging/README.md) 下提供 Debian（`.deb`）、Alpine（`.apk`）、
 Arch Linux（`.pkg.tar.*`）、FreeBSD（`.pkg`）和 Windows NSIS（`.exe`）的原生
-打包配方。每个软件包都包含 `pathchord(1)` 手册页、服务定义和仅监听回环地址的
-配置模板。先构建 release 二进制，再使用 `make -C packaging` 选择软件包目标；
+打包配方。每个软件包都包含 `pathchordctl(1)` 手册页、服务定义和仅监听回环地址的
+配置模板以及 `pathchord-ingressd`、`pathchord-egressd` 和 `pathchordctl`。先构建 release 二进制，再使用 `make -C packaging` 选择软件包目标；
 软件包指南说明所需的原生构建工具以及交叉编译产物覆盖方式。
 
 ## 开发
@@ -136,7 +137,7 @@ Arch Linux（`.pkg.tar.*`）、FreeBSD（`.pkg`）和 Windows NSIS（`.exe`）�
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
-cargo run -p pathchord-cli -- --help
+cargo run -p pathchordctl -- --help
 ```
 
 工作区在 dev/test profile 中关闭 rustc 增量产物，以便已配置的 `RUSTC_WRAPPER=sccache` 复用完整编译单元。仓库不强制机器专属 wrapper；是否使用 sccache 由本地 Cargo 配置决定。

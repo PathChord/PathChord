@@ -227,8 +227,10 @@ The supported resource kinds are `Egress`, `TransitProxy`, `Subscription`,
 `EgressService`, and `NodeProbePolicy`. The last two are role-specific service resources: `EgressService` selects the
 Egress identity, listener, authorization store, and service limits for one
 Egress process; `NodeProbePolicy` configures the optional bounded Transit node
-probe. Ingress consumes `NodeProbePolicy` and Egress consumes `EgressService`;
-both may be present in the same validated resource bundle. A namespace MUST contain at most one object
+probe. Ingress consumes `NodeProbePolicy` and the complete policy graph;
+Egress consumes an Egress-only source containing exactly one `EgressService`.
+Ingress and Egress sources MUST NOT be treated as one shared resource bundle.
+A namespace MUST contain at most one object
 for each `(kind, metadata.name)`. A complete configuration MUST contain exactly
 one `DNSPolicy` and one `FallbackPolicy`; all other kinds are optional subject
 to reference and routing validation. A `List` with no listener is valid as a
@@ -330,6 +332,14 @@ present, Egress resolves it using its own system resolver for TCP and UDP and
 does not use Ingress-provided candidates. A literal IP without a hostname is
 still a valid target. The option applies to target names, not the independent
 Ingress DNS routing policy.
+
+An Egress source MUST reject Listener, TransitProxy, Subscription, EgressRule,
+ProxyRule, TrafficPolicy, DNSPolicy, FallbackPolicy, GeoSiteDatabase,
+GeoIpDatabase, and NodeProbePolicy resources. Relative private paths resolve
+from the selected Egress source root and identity, authorization database,
+control socket, and bearer token remain outside authored resource documents.
+EgressService fields are startup-only; a changed source is reported as restart
+required while the active Egress runtime retains its previous values.
 
 `NodeProbePolicy.spec.target` is an object containing `host` and `port`.
 `intervalSeconds` defaults to 30 and is bounded by 1..=86400;
@@ -574,8 +584,9 @@ spec:
 
 ### Configuration sources
 
-Ingress accepts one resource file or one directory tree. Source selection uses
-the following priority, from highest to lowest:
+Ingress accepts one resource file or one directory tree. Egress accepts one
+EgressService resource file or directory tree. Each role selects its source
+using the following priority, from highest to lowest:
 
 1. Explicit `--config` (`-c`) or `--config-dir` (`-C`). The options are mutually
    exclusive. `--config` accepts a file or directory; `--config-dir` requires a
@@ -584,8 +595,9 @@ the following priority, from highest to lowest:
    exclusive at the environment tier and have the same file/directory meaning
    as their corresponding command-line options. An explicit command-line
    source overrides both environment variables, including their conflict.
-3. The account default: `~/.config/pathchord` for a regular user and
-   `/etc/pathchord` for root or a service account. Unix uses the effective UID;
+3. The account default: Ingress uses `~/.config/pathchord/ingress` for a
+   regular user and `/etc/pathchord/ingress` for a service account; Egress uses
+   `~/.config/pathchord/egress` or `/etc/pathchord/egress`. Unix uses the effective UID;
    system UIDs below 1000 and accounts with `nologin` or `false` shells are
    classified as service accounts. A regular Unix user's home comes from
    `HOME`, falling back to the account database. Windows uses `USERPROFILE`

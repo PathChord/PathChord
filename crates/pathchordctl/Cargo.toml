@@ -1,0 +1,27 @@
+[package]
+name = "pathchordctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PathChord local management client"
+
+[[bin]]
+name = "pathchordctl"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+pathchord-control = { path = "../pathchord-control" }
+pathchord-core = { path = "../pathchord-core" }
+pathchord-noise = { path = "../pathchord-noise" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "macros", "time"] }
+zeroize.workspace = true
+
+[lints]
+workspace = true

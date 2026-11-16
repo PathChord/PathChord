@@ -1,9 +1,14 @@
-bin/pathchord
-etc/pathchord/ingress.yaml
+bin/pathchord-ingressd
+bin/pathchord-egressd
+bin/pathchordctl
+etc/pathchord/ingress/ingress.yaml
 etc/rc.d/pathchord
 etc/rc.d/pathchord-egress
 share/licenses/pathchord/LICENSE
 share/man/man1/pathchord.1
 share/pathchord/pkg-message
 @dir(0750,pathchord,pathchord) etc/pathchord
-@dir(0750,pathchord,pathchord) var/db/pathchord
+@dir(0750,pathchord,pathchord) etc/pathchord/ingress
+@dir(0750,pathchord,pathchord) etc/pathchord/egress
+@dir(0750,pathchord,pathchord) var/db/pathchord-ingress
+@dir(0750,pathchord,pathchord) var/db/pathchord-egress

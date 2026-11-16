@@ -13,7 +13,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::configuration_source::{ConfigurationSource, is_configuration_file};
+use pathchord_config::{ConfigurationError, ConfigurationSource, is_configuration_file};
 
 const MAX_WATCH_EVENTS: usize = 64;
 const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(40);
@@ -86,6 +86,20 @@ pub enum ReloadError {
     ControlCommit,
     #[error("configuration reload state lock is unavailable")]
     Lock,
+}
+
+impl From<ConfigurationError> for ReloadError {
+    fn from(error: ConfigurationError) -> Self {
+        match error {
+            ConfigurationError::Io => Self::Io,
+            ConfigurationError::TooLarge => Self::TooLarge,
+            ConfigurationError::TooManyFiles => Self::TooManyFiles,
+            ConfigurationError::TooDeep => Self::TooDeep,
+            ConfigurationError::EmptyDirectory => Self::EmptyDirectory,
+            ConfigurationError::UnsupportedSource => Self::UnsupportedSource,
+            ConfigurationError::Symlink => Self::Symlink,
+        }
+    }
 }
 
 #[derive(Clone)]

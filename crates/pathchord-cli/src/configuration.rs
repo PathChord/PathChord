@@ -36,6 +36,19 @@ impl ConfigSelection {
         )
     }
 
+    pub fn resolve_ingress(
+        file: Option<&Path>,
+        directory: Option<&Path>,
+    ) -> Result<Self, ConfigurationError> {
+        select(
+            file,
+            directory,
+            std::env::var_os("PATHCHORD_CONFIG"),
+            std::env::var_os("PATHCHORD_CONFIG_DIR"),
+            default_ingress_selection,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), ConfigurationError> {
         if self.directory && !self.path.is_dir() {
             return Err(ConfigurationError::ExpectedDirectory(self.path.clone()));
@@ -103,6 +116,27 @@ fn account_selection(
     })
 }
 
+fn account_selection_for_role(
+    service: bool,
+    home: Option<PathBuf>,
+    role: &str,
+) -> Result<ConfigSelection, ConfigurationError> {
+    let path = if service {
+        PathBuf::from("/etc/pathchord").join(role)
+    } else {
+        home.filter(|home| home.is_absolute())
+            .ok_or(ConfigurationError::MissingHome)?
+            .join(".config")
+            .join("pathchord")
+            .join(role)
+    };
+    Ok(ConfigSelection {
+        path,
+        directory: true,
+        explicit: false,
+    })
+}
+
 #[cfg(unix)]
 fn default_selection() -> Result<ConfigSelection, ConfigurationError> {
     use nix::unistd::{Uid, User};
@@ -118,6 +152,23 @@ fn default_selection() -> Result<ConfigSelection, ConfigurationError> {
         .map(PathBuf::from)
         .or_else(|| account.map(|account| account.dir));
     account_selection(service, home)
+}
+
+#[cfg(unix)]
+fn default_ingress_selection() -> Result<ConfigSelection, ConfigurationError> {
+    use nix::unistd::{Uid, User};
+    let uid = Uid::effective();
+    if uid.is_root() {
+        return account_selection_for_role(true, None, "ingress");
+    }
+    let account = User::from_uid(uid).ok().flatten();
+    let shell = account.as_ref().map(|account| account.shell.as_path());
+    let service = service_account(uid.as_raw(), shell);
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| account.map(|account| account.dir));
+    account_selection_for_role(service, home, "ingress")
 }
 
 #[cfg(unix)]
@@ -195,6 +246,21 @@ fn default_selection() -> Result<ConfigSelection, ConfigurationError> {
     account_selection(service, home)
 }
 
+#[cfg(not(unix))]
+fn default_ingress_selection() -> Result<ConfigSelection, ConfigurationError> {
+    let name = std::env::var("USERNAME")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let service = matches!(
+        name.as_str(),
+        "system" | "local service" | "network service"
+    );
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    account_selection_for_role(service, home, "ingress")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +321,23 @@ mod tests {
             account_selection(false, None),
             Err(ConfigurationError::MissingHome)
         ));
+    }
+
+    #[test]
+    fn ingress_account_defaults_use_a_role_specific_root() {
+        let home = std::env::temp_dir().join("account-home-ingress");
+        assert_eq!(
+            account_selection_for_role(false, Some(home.clone()), "ingress")
+                .unwrap()
+                .path,
+            home.join(".config/pathchord/ingress")
+        );
+        assert_eq!(
+            account_selection_for_role(true, Some(home), "ingress")
+                .unwrap()
+                .path,
+            Path::new("/etc/pathchord/ingress")
+        );
     }
 
     #[cfg(unix)]

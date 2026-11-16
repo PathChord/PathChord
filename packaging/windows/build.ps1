@@ -4,7 +4,9 @@ param(
     [string] $Cargo = 'cargo',
     [string] $MakeNSIS = 'makensis',
     [string] $Version = '',
-    [string] $Binary = '',
+    [string] $IngressBinary = '',
+    [string] $EgressBinary = '',
+    [string] $CtlBinary = '',
     [string] $OutputDirectory = '',
     [switch] $SkipBuild
 )
@@ -23,23 +25,39 @@ if ([string]::IsNullOrWhiteSpace($version)) {
     $version = $versionMatch.Groups[1].Value
 }
 
-if ([string]::IsNullOrWhiteSpace($Binary)) {
-    $Binary = Join-Path $repoRoot "target\$Target\release\pathchord.exe"
-} elseif (-not [IO.Path]::IsPathRooted($Binary)) {
-    $Binary = Join-Path $repoRoot $Binary
+if ([string]::IsNullOrWhiteSpace($IngressBinary)) {
+    $IngressBinary = Join-Path $repoRoot "target\$Target\release\pathchord-ingressd.exe"
+} elseif (-not [IO.Path]::IsPathRooted($IngressBinary)) {
+    $IngressBinary = Join-Path $repoRoot $IngressBinary
 }
-if (-not $SkipBuild -and [string]::IsNullOrWhiteSpace($PSBoundParameters['Binary'])) {
-    & $Cargo build --locked --release -p pathchord-cli --target $Target
+if ([string]::IsNullOrWhiteSpace($EgressBinary)) {
+    $EgressBinary = Join-Path $repoRoot "target\$Target\release\pathchord-egressd.exe"
+} elseif (-not [IO.Path]::IsPathRooted($EgressBinary)) {
+    $EgressBinary = Join-Path $repoRoot $EgressBinary
+}
+if ([string]::IsNullOrWhiteSpace($CtlBinary)) {
+    $CtlBinary = Join-Path $repoRoot "target\$Target\release\pathchordctl.exe"
+} elseif (-not [IO.Path]::IsPathRooted($CtlBinary)) {
+    $CtlBinary = Join-Path $repoRoot $CtlBinary
+}
+if (-not $SkipBuild -and [string]::IsNullOrWhiteSpace($PSBoundParameters['IngressBinary'])) {
+    & $Cargo build --locked --release --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl --target $Target
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit code $LASTEXITCODE)." }
 }
 
-$binary = $Binary
-if (-not (Test-Path -LiteralPath $binary -PathType Leaf) -and
-    (Test-Path -LiteralPath "$binary.exe" -PathType Leaf)) {
-    $binary = "$binary.exe"
+$binaries = @{
+    Ingress = $IngressBinary
+    Egress = $EgressBinary
+    Ctl = $CtlBinary
 }
-if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
-    throw "Expected Windows binary was not found at $binary."
+foreach ($entry in $binaries.GetEnumerator()) {
+    if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf) -and
+        (Test-Path -LiteralPath "$($entry.Value).exe" -PathType Leaf)) {
+        $binaries[$entry.Key] = "$($entry.Value).exe"
+    }
+    if (-not (Test-Path -LiteralPath $binaries[$entry.Key] -PathType Leaf)) {
+        throw "Expected Windows $($entry.Key) binary was not found at $($binaries[$entry.Key])."
+    }
 }
 
 $outputPath = $OutputDirectory
@@ -50,7 +68,9 @@ New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
 $outputFile = Join-Path $outputPath "PathChord-$version-windows-x86_64-setup.exe"
 $makensisArgs = @(
     "/DAPP_VERSION=$version",
-    "/DBINARY_PATH=$binary",
+    "/DINGRESS_BINARY_PATH=$($binaries['Ingress'])",
+    "/DEGRESS_BINARY_PATH=$($binaries['Egress'])",
+    "/DCTL_BINARY_PATH=$($binaries['Ctl'])",
     "/DOUTPUT_PATH=$outputFile",
     (Join-Path $PSScriptRoot 'pathchord.nsi')
 )

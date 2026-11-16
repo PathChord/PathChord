@@ -8,7 +8,17 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-const BIN: &str = env!("CARGO_BIN_EXE_pathchord");
+fn binary(name: &str) -> PathBuf {
+    let mut path = std::env::current_exe().expect("test executable path");
+    for _ in 0..8 {
+        path.pop();
+        let candidate = path.join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!("could not locate role binary {name}");
+}
 
 struct Process(Child);
 impl Drop for Process {
@@ -31,7 +41,10 @@ impl<T> Drop for Task<T> {
 }
 
 fn command_json(arguments: &[&str]) -> Value {
-    let output = Command::new(BIN).args(arguments).output().expect("run CLI");
+    let output = Command::new(binary("pathchordctl"))
+        .args(arguments)
+        .output()
+        .expect("run CLI");
     assert!(
         output.status.success(),
         "CLI command failed: {}",
@@ -41,9 +54,24 @@ fn command_json(arguments: &[&str]) -> Value {
 }
 
 fn spawn(arguments: &[&str], directory: &Path) -> Process {
-    let mut command = Command::new(BIN);
+    let role_index = arguments
+        .iter()
+        .position(|argument| matches!(*argument, "ingress" | "egress"))
+        .expect("service role");
+    let role = arguments[role_index];
+    let binary_name = match role {
+        "ingress" => "pathchord-ingressd",
+        "egress" => "pathchord-egressd",
+        other => panic!("unknown service role {other}"),
+    };
+    let mut command = Command::new(binary(binary_name));
+    let service_arguments = arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (index != role_index).then_some(*argument))
+        .collect::<Vec<_>>();
     command
-        .args(arguments)
+        .args(service_arguments)
         .current_dir(directory)
         .env_remove("PATHCHORD_CONFIG")
         .env_remove("PATHCHORD_CONFIG_DIR");
