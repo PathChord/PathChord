@@ -1,0 +1,12 @@
+apiVersion: pathchord.io/v1
+kind: EgressService
+metadata:
+  name: exit
+spec:
+  bind: 0.0.0.0:7443
+  egressId: exit
+  identity: ../secrets/egress.key.json
+  authorizationDb: ../data/authorizations.db
+  controlSocket: /run/pathchord/egress.sock
+  maxWireBandwidthBps: 1000000000
+  maxInboundTargetConnections: 4096

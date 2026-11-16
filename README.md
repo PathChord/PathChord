@@ -136,33 +136,36 @@ specs, and affected design/user documents. Completed change history belongs in
 
 ## Command surface
 
-Ingress defaults to `~/.config/pathchord` for regular users and `/etc/pathchord`
-for root/service accounts. `--config-dir` loads YAML/YML/JSON resources
-recursively as one validated bundle. Selection priority is command line,
-then `PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`, then the account default.
+`pathchord-ingressd` defaults to `~/.config/pathchord/ingress` for regular users
+and `/etc/pathchord/ingress` for packaged services. `--config-dir` loads
+YAML/YML/JSON resources recursively as one validated bundle. Egress uses a
+separate `EgressService` source under `~/.config/pathchord/egress` or
+`/etc/pathchord/egress`. Selection priority is command line, then
+`PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`, then the role account default.
 
 ```text
-pathchord ingress
-pathchord ingress --config-dir /path/to/conf.d
-pathchord egress
-pathchord status
-pathchord enroll
+pathchord-ingressd
+pathchord-ingressd --config-dir /path/to/ingress
+pathchord-egressd --config-dir /path/to/egress
+pathchordctl status
+pathchordctl enroll list
 ```
 
-On Unix, the `ingress` command starts configured listeners, the durable local
-control socket, the subscription worker, and any requested Web Gateway.
-`egress` starts the authenticated Path listener and authorization control
-socket; `status`, `system-proxy`, and `enroll` use the corresponding local
-control endpoint. The direct target bridge remains available only for an
-explicit policy with no Egress/Transit route.
+`pathchord-ingressd` starts configured listeners, the durable local control
+socket, the subscription worker, and any requested Web Gateway.
+`pathchord-egressd` starts the authenticated Path listener and authorization
+control socket. `pathchordctl` queries or mutates either endpoint. The direct
+target bridge remains available only for an explicit policy with no
+Egress/Transit route.
 
 ## Packages
 
 Native package recipes are kept under [`packaging/`](packaging/README.md) for
 Debian (`.deb`), Alpine (`.apk`), Arch Linux (`.pkg.tar.*`), FreeBSD (`.pkg`),
-and Windows NSIS (`.exe`). Each package carries the `pathchord(1)` manual,
-service definitions, and a loopback-only configuration template. Build the
-release binary and select a package target with `make -C packaging`; the
+and Windows NSIS (`.exe`). Each package carries `pathchord-ingressd`,
+`pathchord-egressd`, `pathchordctl`, service definitions, and a loopback-only
+configuration template. Build the three release binaries and select a package
+target with `make -C packaging`; the
 package guide documents the required native host tools and cross-compiled
 artifact override.
 
@@ -174,7 +177,7 @@ Development uses the pinned Rust 1.100.0 toolchain with rustfmt and Clippy.
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
-cargo run -p pathchord-cli -- --help
+cargo run -p pathchordctl -- --help
 ```
 
 The workspace disables rustc incremental artifacts in dev/test profiles so a configured `RUSTC_WRAPPER=sccache` can reuse complete compilation units. The repository does not require a machine-specific wrapper; local Cargo configuration decides whether sccache is available.

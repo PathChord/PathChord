@@ -12,7 +12,12 @@ For setup commands and examples, see the [deployment usage guide](../../../docs/
 
 ### Requirement: Independent service processes and explicit proxy operation
 
-Ingress and Egress SHALL run as separate service invocations, each owning its process and local management endpoint. Ordinary explicit HTTP/SOCKS proxy operation SHALL NOT require packet interception or TUN privileges. Listener protocol behavior SHALL follow the [platform contract](../platform-and-dns/spec.md#http-and-socks-listeners).
+Ingress and Egress SHALL run as separate service invocations, each using its dedicated role executable, owning its process, and exposing its local management endpoint. `pathchordctl` SHALL be the management client for both endpoints. Ordinary explicit HTTP/SOCKS proxy operation SHALL NOT require packet interception or TUN privileges. Listener protocol behavior SHALL follow the [platform contract](../platform-and-dns/spec.md#http-and-socks-listeners).
+
+#### Scenario: Dedicated service executable selection
+
+- **WHEN** a packaged Ingress or Egress service starts
+- **THEN** it invokes `pathchord-ingressd` or `pathchord-egressd` directly and does not select the role through a shared service subcommand.
 
 #### Scenario: Ordinary local proxy setup
 
@@ -22,12 +27,36 @@ Ingress and Egress SHALL run as separate service invocations, each owning its pr
 #### Scenario: Unix local control endpoint defaults
 
 - **WHEN** a regular Unix account starts Ingress without an explicit control socket
-- **THEN** the endpoint is `$XDG_RUNTIME_DIR/pathchord/ingress.sock` when that runtime directory is available, otherwise `~/.config/pathchord/ingress.sock`; root and packaged service accounts use `/run/pathchord/ingress.sock` with the runtime directory created before startup.
+- **THEN** the endpoint is `$XDG_RUNTIME_DIR/pathchord/ingress.sock` when that runtime directory is available, otherwise `~/.config/pathchord/ingress.sock`; root and packaged service accounts use `/run/pathchord/ingress.sock` with the runtime directory created before startup. Ingress resources default to `~/.config/pathchord/ingress` or `/etc/pathchord/ingress`.
 
 #### Scenario: Explicit enrollment socket selection
 
 - **WHEN** the enrollment client selects a control endpoint
-- **THEN** it defaults to the corresponding local `egress.sock` endpoint and an explicitly supplied socket takes precedence; the endpoint belongs to the Egress service machine.
+- **THEN** `pathchordctl enroll` defaults to the corresponding local `egress.sock` endpoint and an explicitly supplied socket takes precedence; the endpoint belongs to the Egress service machine. Egress resources default to `~/.config/pathchord/egress` or `/etc/pathchord/egress`.
+
+### Requirement: Role-specific service artifact boundaries
+
+The Ingress service executable SHALL contain the local listener, Transit Proxy,
+subscription, DNS, and transparent/TUN platform behavior it advertises. The
+Egress service executable SHALL provide authenticated Path/Session forwarding,
+TCP/UDP target connections, authorization, and global resource protection
+without requiring Ingress listener, Transit Proxy, subscription, TUN, or eBPF
+runtime components.
+
+#### Scenario: Egress starts without Ingress platform privileges
+
+- **WHEN** Egress starts on a host without TUN access and without
+  `CAP_NET_ADMIN` or `CAP_NET_RAW`
+- **THEN** it can bind its configured Path listener, open its authorization
+  store, and admit an explicitly enrolled Ingress Session when ordinary target
+  forwarding prerequisites are available.
+
+#### Scenario: Dedicated management client
+
+- **WHEN** an operator invokes `pathchordctl` for status or enrollment
+- **THEN** the client connects to the selected local control endpoint without
+  starting either service executable and preserves the versioned control
+  envelope and generation checks.
 
 ### Requirement: Explicit configuration-source precedence
 
@@ -41,7 +70,7 @@ Ingress SHALL follow the [configuration source contract](../configuration-schema
 #### Scenario: Account configuration defaults
 
 - **WHEN** neither a command-line source nor a configuration environment variable is selected
-- **THEN** Ingress loads `~/.config/pathchord` for a regular account or `/etc/pathchord` for root and service accounts.
+- **THEN** Ingress loads `~/.config/pathchord/ingress` for a regular account or `/etc/pathchord/ingress` for packaged service accounts, while Egress uses the corresponding `egress` directory.
 
 #### Scenario: Source options conflict
 

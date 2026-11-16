@@ -5,11 +5,15 @@ set -eu
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 output_dir=${1:-"$root_dir/dist"}
 version=${PATHCHORD_VERSION:-$("$root_dir/packaging/version.sh")}
-binary=${PATHCHORD_BINARY:-"$root_dir/target/release/pathchord"}
-case "$binary" in
-	/*) ;;
-	*) binary="$root_dir/$binary" ;;
-esac
+ingress_binary=${PATHCHORD_INGRESS_BINARY:-"$root_dir/target/release/pathchord-ingressd"}
+egress_binary=${PATHCHORD_EGRESS_BINARY:-"$root_dir/target/release/pathchord-egressd"}
+ctl_binary=${PATHCHORDCTL_BINARY:-"$root_dir/target/release/pathchordctl"}
+for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
+	case "$binary" in
+		/*) ;;
+		*) binary="$root_dir/$binary" ;;
+	esac
+done
 
 case "$version" in
 	''|*[!0-9A-Za-z.+_-]*)
@@ -17,10 +21,12 @@ case "$version" in
 		exit 2
 		;;
 esac
-if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-	echo "PathChord binary is missing or not executable: $binary" >&2
-	exit 1
-fi
+for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
+	if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+		echo "PathChord binary is missing or not executable: $binary" >&2
+		exit 1
+	fi
+done
 if ! command -v makepkg >/dev/null 2>&1; then
 	echo "makepkg is required to build an Arch package" >&2
 	exit 127
@@ -45,7 +51,9 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/pathchord-arch.XXXXXX")
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT HUP INT TERM
 mkdir -p "$work/src/common"
-cp "$binary" "$work/src/pathchord"
+cp "$ingress_binary" "$work/src/pathchord-ingressd"
+cp "$egress_binary" "$work/src/pathchord-egressd"
+cp "$ctl_binary" "$work/src/pathchordctl"
 cp "$root_dir/packaging/common/pathchord.1" "$work/src/common/pathchord.1"
 cp "$root_dir/packaging/common/default-config.yaml" "$work/src/common/default-config.yaml"
 cp "$root_dir/LICENSE" "$work/src/common/LICENSE"
@@ -71,12 +79,14 @@ build() {
 }
 
 package() {
-    install -Dm0755 "$srcdir/pathchord" "$pkgdir/usr/bin/pathchord"
+    install -Dm0755 "$srcdir/pathchord-ingressd" "$pkgdir/usr/bin/pathchord-ingressd"
+    install -Dm0755 "$srcdir/pathchord-egressd" "$pkgdir/usr/bin/pathchord-egressd"
+    install -Dm0755 "$srcdir/pathchordctl" "$pkgdir/usr/bin/pathchordctl"
     install -Dm0644 "$srcdir/common/LICENSE" "$pkgdir/usr/share/licenses/pathchord/LICENSE"
     install -Dm0644 "$srcdir/common/pathchord.1" \
         "$pkgdir/usr/share/man/man1/pathchord.1"
     install -Dm0644 "$srcdir/common/default-config.yaml" \
-        "$pkgdir/etc/pathchord/ingress.yaml"
+        "$pkgdir/etc/pathchord/ingress/ingress.yaml"
     install -Dm0644 "$srcdir/common/pathchord-ingress.service" \
         "$pkgdir/usr/lib/systemd/system/pathchord-ingress.service"
     install -Dm0644 "$srcdir/common/pathchord-egress.service" \

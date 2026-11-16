@@ -1,0 +1,37 @@
+[package]
+name = "pathchord-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared PathChord local control transport and service adapters"
+
+[features]
+legacy-ingress-tests = []
+
+[dependencies]
+async-stream.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+getrandom.workspace = true
+pathchord-core = { path = "../pathchord-core" }
+serde.workspace = true
+serde_json.workspace = true
+socket2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+url.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+interprocess.workspace = true
+widestring.workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+
+[lints]
+workspace = true

@@ -1,56 +1,51 @@
-.TH PATHCHORD 1 "November 2026" "PathChord" "PathChord manual"
+.TH PATHCHORDCTL 1 "November 2026" "PathChord" "PathChord manual"
 .SH NAME
-pathchord \- PathChord ingress and egress proxy runtime
+pathchordctl \- PathChord local management client
 .SH SYNOPSIS
-.B pathchord
-.RI [ global-options ]
-.B ingress
+.B pathchord-ingressd
 .RI [ options ]
 .br
-.B pathchord
-.RI [ global-options ]
-.B egress
+.B pathchord-egressd
 .RI [ options ]
 .br
-.B pathchord
+.B pathchordctl
 .RI [ global-options ]
 .B status
 .br
-.B pathchord keygen --output
+.B pathchordctl keygen --output
 .I identity.json
 .SH DESCRIPTION
 PathChord provides local HTTP forwarding, HTTP CONNECT, SOCKS4/4a/5, and
-same-port mixed listeners.  The
-.B ingress
-command starts the local listener runtime and the
-.B egress
-command starts an authenticated remote Path listener.  Each service is a
-separate process.
+same-port mixed listeners through the Ingress service.  The Egress service
+accepts authenticated Path connections and forwards TCP and UDP targets.
+Each service has a dedicated executable and process.  The
+.B pathchordctl
+client queries and mutates their local control endpoints.
 .PP
 Configuration is a directory of YAML, YML, or JSON resources.  Resources are
 validated as one graph and are reloaded atomically.  Private identity and
 credential files must be kept outside the configuration directory.
 .SH COMMANDS
 .TP
-.B ingress
+.B pathchord-ingressd
 Start the Ingress runtime.  Use
 .B --config
 for one resource file or
 .B --config-dir
 for a resource directory.
 .TP
-.B egress
+.B pathchord-egressd
 Start the Egress runtime.  The Egress service owns its authorization database
 and public Path listener.
 .TP
-.B status
+.B pathchordctl status
 Query the local control endpoint.
 .TP
-.B keygen
+.B pathchordctl keygen
 Create a new private static identity.  Existing output files are never
 overwritten; the public key is printed to standard output.
 .TP
-.B enroll
+.B pathchordctl enroll
 Manage Egress authorization records from a protected local control endpoint.
 .SH OPTIONS
 .TP
@@ -81,10 +76,14 @@ Show the package version.
 Command-line options take precedence over environment variables.  When no
 option is supplied, PATHCHORD_CONFIG or PATHCHORD_CONFIG_DIR is used.  The
 account default is
-.I ~/.config/pathchord
-for regular users and
-.I /etc/pathchord
-for root and service accounts on Linux and Alpine.  FreeBSD packages use
+.I ~/.config/pathchord/ingress
+for regular Ingress users and
+.I /etc/pathchord/ingress
+for packaged Ingress services.  Egress uses the corresponding
+.I ~/.config/pathchord/egress
+or
+.I /etc/pathchord/egress
+source.  FreeBSD packages use the matching role directories under
 .I /usr/local/etc/pathchord .
 On Windows the corresponding service default is under the system profile;
 packaged services pass an explicit configuration directory.
@@ -94,11 +93,17 @@ cannot be combined, and a directory source does not have last-file-wins
 semantics.
 .SH FILES
 .TP
-.I /etc/pathchord/
-System configuration directory on Linux and Alpine service installations.
+.I /etc/pathchord/ingress/
+Ingress system configuration directory on Linux and Alpine.
 .TP
-.I /usr/local/etc/pathchord/
-System configuration directory on FreeBSD package installations.
+.I /etc/pathchord/egress/
+Egress system configuration directory on Linux and Alpine.
+.TP
+.I /usr/local/etc/pathchord/ingress/
+Ingress configuration directory on FreeBSD.
+.TP
+.I /usr/local/etc/pathchord/egress/
+Egress configuration directory on FreeBSD.
 .TP
 .I /run/pathchord/ingress.sock
 Ingress local control socket for root and service accounts on Unix.
@@ -113,13 +118,17 @@ are placed under ~/.config/pathchord/.
 .I /var/run/pathchord/
 FreeBSD runtime directory for the local control sockets.
 .TP
-.I %ProgramData%\\PathChord\\config\\
-Packaged Windows service configuration directory.
+.I %ProgramData%\\PathChord\\config\\ingress\\
+Packaged Windows Ingress configuration directory.
+.TP
+.I %ProgramData%\\PathChord\\config\\egress\\
+Packaged Windows Egress configuration directory.
 .SH EXAMPLES
 .EX
-pathchord ingress --config-dir /etc/pathchord
-pathchord keygen --output /var/lib/pathchord/ingress.key.json
-pathchord --socket /run/pathchord/egress.sock status
+pathchord-ingressd --config-dir /etc/pathchord/ingress
+pathchord-egressd --config-dir /etc/pathchord/egress
+pathchordctl keygen --output /var/lib/pathchord-egress/egress.key.json
+pathchordctl --socket /run/pathchord/egress.sock status
 .EE
 .SH SECURITY
 Do not place private keys, bearer tokens, or credential values in a published
@@ -127,6 +136,6 @@ configuration template.  Restrict service data and control endpoints to the
 service account and administrators.  Replace the loopback default before
 exposing a listener to another network.
 .SH SEE ALSO
-.BR pathchord (1),
+.BR pathchordctl (1),
 .BR systemd.service (5),
 .BR rc.conf (5)

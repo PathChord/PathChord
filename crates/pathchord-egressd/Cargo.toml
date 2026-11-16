@@ -1,0 +1,31 @@
+[package]
+name = "pathchord-egressd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "PathChord Egress service"
+
+[[bin]]
+name = "pathchord-egressd"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+notify = "8.2.0"
+pathchord-config = { path = "../pathchord-config" }
+pathchord-control = { path = "../pathchord-control" }
+pathchord-core = { path = "../pathchord-core" }
+pathchord-egress = { path = "../pathchord-egress" }
+pathchord-noise = { path = "../pathchord-noise" }
+pathchord-path = { path = "../pathchord-path" }
+pathchord-policy = { path = "../pathchord-policy" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "macros", "time", "signal"] }
+zeroize.workspace = true
+
+[lints]
+workspace = true

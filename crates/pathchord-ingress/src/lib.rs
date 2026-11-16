@@ -20,7 +20,6 @@ pub use pathchord_policy::{
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-mod configuration_source;
 mod control;
 mod control_views;
 mod credentials;
@@ -41,9 +40,6 @@ mod linux_transparent;
 #[cfg(target_os = "linux")]
 mod linux_udp_runtime;
 mod local_dispatch;
-mod local_protocol;
-mod local_server;
-mod metrics_export;
 mod mixed;
 mod node_probe;
 mod platform;
@@ -57,9 +53,7 @@ mod store;
 mod tun_device;
 mod tun_netstack;
 mod udp_flow;
-mod web_gateway;
 
-pub use configuration_source::load_configuration_documents;
 pub use control::{
     ConnectionObservation, ConnectionState, ControlError, ControlEvent, ControlEventKind,
     DEFAULT_OBSERVATION_STALE_AFTER_MS, IngressControlService, IngressControlSnapshot,
@@ -118,17 +112,17 @@ pub use linux_udp_runtime::{
     run_transparent_udp,
 };
 pub use local_dispatch::LocalControlDispatcher;
-pub use local_protocol::{
-    Actor, ErrorBody, ErrorCode, GenerationExpectation, LOCAL_API_VERSION, LocalProtocolError,
-    MAX_ENVELOPE_BYTES, RequestEnvelope, ResponseEnvelope, decode_object, encode_object,
-    read_object, read_object_with_deadlines, write_object,
-};
-pub use local_server::{
-    DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS, LocalControlServer, LocalServerError,
-};
 pub use mixed::MixedListener;
 pub use node_probe::{
     TransitProbeConfig, TransitProbeFailure, TransitProbeObservation, TransitProbeState,
+};
+pub use pathchord_config::load_configuration_documents;
+pub use pathchord_control::{
+    Actor, DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS, ErrorBody, ErrorCode, GenerationExpectation,
+    LOCAL_API_VERSION, LocalControlServer, LocalProtocolError, LocalServerError,
+    MAX_ENVELOPE_BYTES, RequestEnvelope, ResponseEnvelope, SharedManagementDispatcher,
+    WebBearerToken, WebGateway, WebGatewayConfig, WebGatewayError, decode_object, encode_object,
+    read_object, read_object_with_deadlines, write_object,
 };
 #[cfg(windows)]
 pub use platform::WindowsSystemProxyAdapter;
@@ -169,9 +163,6 @@ pub use tun_netstack::{
     TunFlowRuntime, TunFlowRuntimeConfig, TunFlowRuntimeError, TunFlowRuntimeReport,
 };
 pub use udp_flow::{BoxedUdpFlowHandle, UdpFlowError, UdpFlowHandle, UdpFlowOpener};
-pub use web_gateway::{
-    SharedManagementDispatcher, WebBearerToken, WebGateway, WebGatewayConfig, WebGatewayError,
-};
 
 pub trait LocalConnection: AsyncRead + AsyncWrite + Send + Unpin {}
 

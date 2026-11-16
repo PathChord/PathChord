@@ -132,10 +132,10 @@ pub struct IngressArgs {
     #[arg(long)]
     pub identity: Option<PathBuf>,
     /// Runtime cache and durable local data directory.
-    #[arg(long, default_value = "pathchord-data")]
+    #[arg(long, default_value = "pathchord-ingress-data")]
     pub data_dir: PathBuf,
     /// Directory containing private JSON credential maps named by credentialsRef.
-    #[arg(long, default_value = "pathchord-secrets")]
+    #[arg(long, default_value = "pathchord-ingress-secrets")]
     pub credentials_dir: PathBuf,
     /// Optional Web Gateway bind. Omit to keep the browser adapter disabled.
     #[arg(long)]
@@ -311,6 +311,8 @@ pub enum CliError {
     },
     #[error("Egress configuration is invalid: {0}")]
     EgressConfiguration(&'static str),
+    #[error("Egress configuration source is invalid: {0}")]
+    EgressConfigurationSource(String),
     #[error("configuration validation failed: {0}")]
     Config(#[from] pathchord_policy::ConfigError),
     #[error("local control server failed: {0}")]
@@ -610,6 +612,17 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+/// Starts the Ingress service from its dedicated service executable.
+pub async fn run_ingress_service(
+    socket: Option<PathBuf>,
+    args: IngressArgs,
+) -> Result<(), CliError> {
+    let socket = socket.unwrap_or_else(|| {
+        configuration::default_control_socket("ingress.sock", DEFAULT_SOCKET_PATH)
+    });
+    run_ingress(&socket, args).await
+}
+
 async fn local_configuration_generation(
     socket: &std::path::Path,
     actor: &str,
@@ -666,7 +679,7 @@ async fn run_enrollment(
 }
 
 async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), CliError> {
-    let source = configuration::ConfigSelection::resolve(
+    let source = configuration::ConfigSelection::resolve_ingress(
         args.config.as_deref(),
         args.config_dir.as_deref(),
     )?;

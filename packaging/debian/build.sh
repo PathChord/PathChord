@@ -5,11 +5,15 @@ set -eu
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 output_dir=${1:-"$root_dir/dist"}
 version=${PATHCHORD_VERSION:-$("$root_dir/packaging/version.sh")}
-binary=${PATHCHORD_BINARY:-"$root_dir/target/release/pathchord"}
-case "$binary" in
-	/*) ;;
-	*) binary="$root_dir/$binary" ;;
-esac
+ingress_binary=${PATHCHORD_INGRESS_BINARY:-"$root_dir/target/release/pathchord-ingressd"}
+egress_binary=${PATHCHORD_EGRESS_BINARY:-"$root_dir/target/release/pathchord-egressd"}
+ctl_binary=${PATHCHORDCTL_BINARY:-"$root_dir/target/release/pathchordctl"}
+for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
+	case "$binary" in
+		/*) ;;
+		*) binary="$root_dir/$binary" ;;
+	esac
+done
 
 case "$version" in
 	''|*[!0-9A-Za-z.+:~_-]*)
@@ -18,10 +22,12 @@ case "$version" in
 		;;
 esac
 
-if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-	echo "PathChord binary is missing or not executable: $binary" >&2
-	exit 1
-fi
+for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
+	if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
+		echo "PathChord binary is missing or not executable: $binary" >&2
+		exit 1
+	fi
+done
 
 if [ -n "${PATHCHORD_DEB_ARCH:-}" ]; then
 	deb_arch=$PATHCHORD_DEB_ARCH
@@ -47,15 +53,19 @@ install -d "$stage/DEBIAN" \
 	"$stage/usr/share/doc/pathchord" \
 	"$stage/usr/share/man/man1" \
 	"$stage/usr/lib/systemd/system" \
-	"$stage/etc/pathchord" \
-	"$stage/var/lib/pathchord"
-install -m0755 "$binary" "$stage/usr/bin/pathchord"
+	"$stage/etc/pathchord/ingress" \
+	"$stage/etc/pathchord/egress" \
+	"$stage/var/lib/pathchord-ingress" \
+	"$stage/var/lib/pathchord-egress"
+install -m0755 "$ingress_binary" "$stage/usr/bin/pathchord-ingressd"
+install -m0755 "$egress_binary" "$stage/usr/bin/pathchord-egressd"
+install -m0755 "$ctl_binary" "$stage/usr/bin/pathchordctl"
 install -m0644 "$root_dir/LICENSE" "$stage/usr/share/doc/pathchord/copyright"
 install -m0644 "$root_dir/packaging/common/pathchord.1" \
 	"$stage/usr/share/man/man1/pathchord.1"
 gzip -n -9 "$stage/usr/share/man/man1/pathchord.1"
 install -m0644 "$root_dir/packaging/common/default-config.yaml" \
-	"$stage/etc/pathchord/ingress.yaml"
+	"$stage/etc/pathchord/ingress/ingress.yaml"
 install -m0644 "$root_dir/packaging/debian/pathchord-ingress.service" \
 	"$stage/usr/lib/systemd/system/pathchord-ingress.service"
 install -m0644 "$root_dir/packaging/debian/pathchord-egress.service" \
@@ -75,7 +85,7 @@ Description: PathChord multipath proxy runtime
 EOF
 
 cat >"$stage/DEBIAN/conffiles" <<'EOF'
-/etc/pathchord/ingress.yaml
+/etc/pathchord/ingress/ingress.yaml
 EOF
 
 cat >"$stage/DEBIAN/postinst" <<'EOF'
@@ -90,11 +100,13 @@ if [ "${1:-}" = configure ]; then
 		adduser --system --ingroup pathchord --home /nonexistent \
 			--no-create-home --shell /usr/sbin/nologin pathchord
 	fi
-	install -d -o pathchord -g pathchord -m 0750 /var/lib/pathchord
-	install -d -o root -g pathchord -m 0750 /etc/pathchord/secrets
+	install -d -o pathchord -g pathchord -m 0750 /var/lib/pathchord-ingress
+	install -d -o pathchord -g pathchord -m 0750 /var/lib/pathchord-egress
+	install -d -o root -g pathchord -m 0750 /etc/pathchord/ingress/secrets
+	install -d -o pathchord -g pathchord -m 0750 /etc/pathchord/egress
 	install -d -o pathchord -g pathchord -m 0750 /run/pathchord
-	chown root:pathchord /etc/pathchord
-	chmod 0750 /etc/pathchord
+	chown root:pathchord /etc/pathchord /etc/pathchord/ingress /etc/pathchord/egress
+	chmod 0750 /etc/pathchord /etc/pathchord/ingress /etc/pathchord/egress
 	if command -v systemctl >/dev/null 2>&1; then
 		systemctl daemon-reload || true
 	fi

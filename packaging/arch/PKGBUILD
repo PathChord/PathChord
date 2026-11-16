@@ -18,18 +18,20 @@ sha256sums=('SKIP')
 
 build() {
     cd "PathChord-$pkgver"
-    cargo build --release --locked --bin pathchord
+    cargo build --release --locked --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
 }
 
 package() {
     cd "PathChord-$pkgver"
 
-    install -Dm0755 target/release/pathchord "$pkgdir/usr/bin/pathchord"
+    install -Dm0755 target/release/pathchord-ingressd "$pkgdir/usr/bin/pathchord-ingressd"
+    install -Dm0755 target/release/pathchord-egressd "$pkgdir/usr/bin/pathchord-egressd"
+    install -Dm0755 target/release/pathchordctl "$pkgdir/usr/bin/pathchordctl"
     install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/pathchord/LICENSE"
     install -Dm0644 packaging/common/pathchord.1 \
         "$pkgdir/usr/share/man/man1/pathchord.1"
     install -Dm0644 packaging/common/default-config.yaml \
-        "$pkgdir/etc/pathchord/ingress.yaml"
+        "$pkgdir/etc/pathchord/ingress/ingress.yaml"
     install -Dm0644 packaging/arch/pathchord-ingress.service \
         "$pkgdir/usr/lib/systemd/system/pathchord-ingress.service"
     install -Dm0644 packaging/arch/pathchord-egress.service \

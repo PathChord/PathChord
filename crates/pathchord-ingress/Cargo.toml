@@ -25,6 +25,8 @@ orion.workspace = true
 # the Netlink compatibility patch's package test without a resolver panic.
 netsock.workspace = true
 pathchord-core = { path = "../pathchord-core" }
+pathchord-config = { path = "../pathchord-config" }
+pathchord-control = { path = "../pathchord-control" }
 pathchord-noise = { path = "../pathchord-noise" }
 pathchord-path = { path = "../pathchord-path" }
 pathchord-policy = { path = "../pathchord-policy" }

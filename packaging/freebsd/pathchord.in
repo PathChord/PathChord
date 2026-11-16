@@ -12,14 +12,14 @@ load_rc_config "$name"
 
 : "${pathchord_enable:=NO}"
 : "${pathchord_user:=pathchord}"
-: "${pathchord_config_dir:=/usr/local/etc/pathchord}"
-: "${pathchord_data_dir:=/var/db/pathchord}"
+: "${pathchord_config_dir:=/usr/local/etc/pathchord/ingress}"
+: "${pathchord_data_dir:=/var/db/pathchord-ingress}"
 : "${pathchord_credentials_dir:=${pathchord_config_dir}/secrets}"
 
 command="/usr/sbin/daemon"
-procname="/usr/local/bin/pathchord"
+procname="/usr/local/bin/pathchord-ingressd"
 pidfile="/var/run/${name}.pid"
-command_args="-f -p ${pidfile} -u ${pathchord_user} -- ${procname} --socket /var/run/pathchord/ingress.sock ingress --config-dir ${pathchord_config_dir} --data-dir ${pathchord_data_dir} --credentials-dir ${pathchord_credentials_dir}"
+command_args="-f -p ${pidfile} -u ${pathchord_user} -- ${procname} --socket /var/run/pathchord/ingress.sock --config-dir ${pathchord_config_dir} --data-dir ${pathchord_data_dir} --credentials-dir ${pathchord_credentials_dir}"
 
 start_precmd="pathchord_precmd"
 pathchord_precmd()

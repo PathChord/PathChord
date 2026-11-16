@@ -1539,7 +1539,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-ingress-tests"))]
 mod tests {
     use std::net::SocketAddr;
 

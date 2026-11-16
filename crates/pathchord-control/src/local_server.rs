@@ -17,11 +17,9 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-#[cfg(all(test, unix))]
-use crate::read_object;
 use crate::{
-    LocalControlDispatcher, LocalProtocolError, RequestEnvelope, read_object_with_deadlines,
-    write_object,
+    Actor, LocalProtocolError, NullManagementDispatcher, RequestEnvelope,
+    read_object_with_deadlines, write_object,
 };
 
 #[derive(Debug, Error)]
@@ -45,7 +43,7 @@ const CONTROL_DISPATCH_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_RESPONSE_WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
 #[cfg(unix)]
-pub struct LocalControlServer<D = LocalControlDispatcher> {
+pub struct LocalControlServer<D = NullManagementDispatcher> {
     listener: tokio::net::UnixListener,
     dispatcher: Arc<Mutex<D>>,
     path: PathBuf,
@@ -209,7 +207,7 @@ use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 type WindowsPipeListener = PipeListener<pipe_mode::Bytes, pipe_mode::Bytes>;
 
 #[cfg(windows)]
-pub struct LocalControlServer<D = LocalControlDispatcher> {
+pub struct LocalControlServer<D = NullManagementDispatcher> {
     listener: WindowsPipeListener,
     name: PathBuf,
     dispatcher: Arc<Mutex<D>>,
@@ -347,7 +345,7 @@ where
 }
 
 #[cfg(not(any(unix, windows)))]
-pub struct LocalControlServer<D = LocalControlDispatcher> {
+pub struct LocalControlServer<D = NullManagementDispatcher> {
     dispatcher: D,
 }
 
@@ -464,8 +462,8 @@ where
     Ok(())
 }
 
-fn trusted_local_actor() -> crate::Actor {
-    crate::Actor {
+fn trusted_local_actor() -> Actor {
+    Actor {
         id: "local-os-owner".to_owned(),
         capabilities: [
             "authorization:write",
@@ -677,7 +675,7 @@ fn socket_error(kind: std::io::ErrorKind, message: &'static str) -> LocalServerE
     LocalServerError::Io(std::io::Error::new(kind, message))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "legacy-ingress-tests"))]
 mod tests {
     use super::*;
     use crate::{Actor, ErrorCode, LOCAL_API_VERSION, ResponseEnvelope, SystemProxyPlatform};

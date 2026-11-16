@@ -2463,6 +2463,7 @@ dependencies = [
  "clap",
  "getrandom 0.4.3",
  "nix",
+ "pathchord-config",
  "pathchord-core",
  "pathchord-egress",
  "pathchord-ingress",
@@ -2473,6 +2474,39 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "url",
+ "zeroize",
+]
+
+[[package]]
+name = "pathchord-config"
+version = "0.1.0"
+dependencies = [
+ "noyalib-serde-yaml",
+ "pathchord-policy",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "pathchord-control"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "getrandom 0.4.3",
+ "interprocess",
+ "pathchord-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "socket2",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "widestring",
  "zeroize",
 ]
 
@@ -2504,6 +2538,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathchord-egressd"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "notify",
+ "pathchord-config",
+ "pathchord-control",
+ "pathchord-core",
+ "pathchord-egress",
+ "pathchord-noise",
+ "pathchord-path",
+ "pathchord-policy",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "pathchord-ingress"
 version = "0.1.0"
 dependencies = [
@@ -2523,6 +2577,8 @@ dependencies = [
  "nix",
  "notify",
  "orion",
+ "pathchord-config",
+ "pathchord-control",
  "pathchord-core",
  "pathchord-noise",
  "pathchord-path",
@@ -2541,6 +2597,24 @@ dependencies = [
  "url",
  "widestring",
  "windows-registry",
+ "zeroize",
+]
+
+[[package]]
+name = "pathchord-ingressd"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "pathchord-cli",
+ "pathchord-config",
+ "pathchord-control",
+ "pathchord-core",
+ "pathchord-ingress",
+ "pathchord-noise",
+ "pathchord-policy",
+ "pathchord-transit",
+ "thiserror 2.0.21",
+ "tokio",
  "zeroize",
 ]
 
@@ -2633,6 +2707,22 @@ dependencies = [
  "x25519-dalek",
  "x509-parser",
  "yamux",
+ "zeroize",
+]
+
+[[package]]
+name = "pathchordctl"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "getrandom 0.4.3",
+ "pathchord-control",
+ "pathchord-core",
+ "pathchord-noise",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
  "zeroize",
 ]
 

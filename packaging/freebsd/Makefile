@@ -17,10 +17,13 @@ USES=           cargo
 USERS=          pathchord
 GROUPS=         pathchord
 
-CARGO_BUILD_ARGS= --bin pathchord
+CARGO_BUILD_ARGS= --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
 
 post-install:
-	${MKDIR} ${STAGEDIR}${PREFIX}/etc/pathchord \
+	${MKDIR} ${STAGEDIR}${PREFIX}/etc/pathchord/ingress \
+		${STAGEDIR}${PREFIX}/etc/pathchord/egress \
+		${STAGEDIR}/var/db/pathchord-ingress \
+		${STAGEDIR}/var/db/pathchord-egress \
 		${STAGEDIR}${PREFIX}/etc/rc.d \
 		${STAGEDIR}${PREFIX}/share/licenses/pathchord \
 		${STAGEDIR}${PREFIX}/share/man/man1 \
@@ -28,7 +31,7 @@ post-install:
 	${INSTALL_DATA} ${WRKSRC}/LICENSE \
 		${STAGEDIR}${PREFIX}/share/licenses/pathchord/LICENSE
 	${INSTALL_DATA} ${WRKSRC}/packaging/common/default-config.yaml \
-		${STAGEDIR}${PREFIX}/etc/pathchord/ingress.yaml
+		${STAGEDIR}${PREFIX}/etc/pathchord/ingress/ingress.yaml
 	${INSTALL_DATA} ${WRKSRC}/packaging/common/pathchord.1 \
 		${STAGEDIR}${PREFIX}/share/man/man1/pathchord.1
 	${INSTALL_SCRIPT} ${WRKSRC}/packaging/freebsd/pathchord.in \

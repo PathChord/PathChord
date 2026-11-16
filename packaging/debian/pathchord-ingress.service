@@ -8,17 +8,17 @@ After=network-online.target
 Type=simple
 User=pathchord
 Group=pathchord
-ExecStart=/usr/bin/pathchord --socket /run/pathchord/ingress.sock ingress --config-dir /etc/pathchord --data-dir /var/lib/pathchord --credentials-dir /etc/pathchord/secrets
+ExecStart=/usr/bin/pathchord-ingressd --socket /run/pathchord/ingress.sock --config-dir /etc/pathchord/ingress --data-dir /var/lib/pathchord-ingress --credentials-dir /etc/pathchord/ingress/secrets
 Restart=on-failure
 RestartSec=5s
 RuntimeDirectory=pathchord
-StateDirectory=pathchord
+StateDirectory=pathchord-ingress
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/pathchord
+ReadWritePaths=/var/lib/pathchord-ingress
 
 [Install]
 WantedBy=multi-user.target

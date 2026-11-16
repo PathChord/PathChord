@@ -11,6 +11,7 @@
 | 为本机提供 HTTP/SOCKS 代理并直连目标 | [ingress-direct.yaml](../../examples/ingress-direct.yaml) | Mixed 监听器绑定 `127.0.0.1:7890`；DNS 使用配置的本地解析器，未匹配流量直接连接。 |
 | 使用订阅提供的普通代理节点 | [ingress-subscriptions.yaml](../../examples/ingress-subscriptions.yaml) | 替换 provider URL。ProxyRule 选择可用节点；回退策略拒绝未匹配流量。 |
 | 经已注册的 Egress 转发 | [ingress-egress.yaml](../../examples/ingress-egress.yaml) | 设置 Egress 地址和已核验的公钥，然后按照[部署指南](deployment.zh-CN.md)完成注册。 |
+| Egress 服务上限和私有路径 | [egress-service.yaml](../../examples/egress-service.yaml) | 只将此来源交给 `pathchord-egressd`；身份和数据库路径必须位于资源树之外。 |
 | Linux 透明 TCP/UDP 接管 | [ingress-tproxy.yaml](../../examples/ingress-tproxy.yaml) | 检查监听地址、包标记、路由表和主机包过滤设置。 |
 | 使用可选 eBPF classifier 的 Linux 接管 | [ingress-tproxy-ebpf.yaml](../../examples/ingress-tproxy-ebpf.yaml) | 将 `lan0` 和 `192.168.1.0/24` 替换为实际入口接口和允许的来源网段。 |
 | 从 TUN 接口接入 TCP/UDP flow | [ingress-tun.yaml](../../examples/ingress-tun.yaml) | 检查接口名称、`198.18.0.1/30` 地址、平台支持和主机路由。 |
@@ -19,20 +20,20 @@
 
 ## 选择配置来源
 
-将 `pathchord` 放入 `PATH` 后，选择以下命令之一。示例路径相对于仓库根目录；目录占位路径需替换为自己的资源目录。
+将角色可执行文件放入 `PATH` 后，选择以下命令之一。示例路径相对于仓库根目录；目录占位路径需替换为自己的资源目录。
 
 ```sh
-pathchord ingress --config examples/ingress-direct.yaml
-pathchord ingress --config-dir /path/to/conf.d
-PATHCHORD_CONFIG_DIR=/path/to/conf.d pathchord ingress
-pathchord ingress
+pathchord-ingressd --config examples/ingress-direct.yaml
+pathchord-ingressd --config-dir /path/to/ingress
+PATHCHORD_CONFIG_DIR=/path/to/ingress pathchord-ingressd
+pathchord-egressd --config examples/egress-service.yaml
 ```
 
 配置来源按以下顺序选择：
 
 1. 显式 `--config`（`-c`）或 `--config-dir`（`-C`）。两者只能选一个：`--config` 接受文件或目录，`--config-dir` 要求目录。显式命令行来源覆盖配置环境变量，也覆盖两个环境变量之间的冲突。
 2. 非空的 `PATHCHORD_CONFIG` 或 `PATHCHORD_CONFIG_DIR`，文件/目录语义与对应命令行选项相同。未提供显式来源时，只设置其中一个。
-3. 账号默认值：普通用户使用 `~/.config/pathchord`，root/服务账号使用 `/etc/pathchord`。不会回退查找工作目录中的配置。[来源选择契约](../../openspec/specs/configuration-schema/spec.zh-CN.md#配置来源)定义账号分类和主目录解析规则。
+3. 角色账号默认值：Ingress 使用 `~/.config/pathchord/ingress` 或 `/etc/pathchord/ingress`，Egress 使用 `~/.config/pathchord/egress` 或 `/etc/pathchord/egress`。不会回退查找工作目录中的配置。[来源选择契约](../../openspec/specs/configuration-schema/spec.zh-CN.md#配置来源)定义账号分类和主目录解析规则。
 
 原生服务软件包可能在服务命令中显式选择配置目录；修改已安装部署时，先检查实际服务定义。
 
@@ -186,7 +187,7 @@ Brutal 会补偿丢包，正常经过 pacing 的 QUIC 发包速率最高可达�
 
 ## 配置 Egress 资源上限
 
-`EgressService` authored 配置只提供全局资源上限
+Egress 来源必须包含恰好一个 `EgressService`，不能包含 Ingress listener、Transit Proxy、subscription、routing、DNS、fallback 或 geodata 资源。可以从 [egress-service.yaml](../../examples/egress-service.yaml) 开始。`EgressService` authored 配置只提供全局资源上限
 `maxWireBandwidthBps` 和 `maxInboundTargetConnections`。Egress 运行时结合这些上限和本地
 profile 计算 Path 安全上限及 pending reservation。不要再配置
 `recommendedPathCount`、`maxConcurrentPaths` 或 `maxStreamsPerIngress`；Path target 属于

@@ -11,6 +11,7 @@ Start with the example closest to your routing goal, then split it into files if
 | Local HTTP/SOCKS proxy with direct target connections | [ingress-direct.yaml](../../examples/ingress-direct.yaml) | The Mixed listener binds `127.0.0.1:7890`; DNS uses the configured local resolver and unmatched traffic goes direct. |
 | Ordinary proxy nodes from a subscription | [ingress-subscriptions.yaml](../../examples/ingress-subscriptions.yaml) | Replace the provider URL. The ProxyRule selects an available node; the fallback rejects unmatched traffic. |
 | Forward through an enrolled Egress | [ingress-egress.yaml](../../examples/ingress-egress.yaml) | Set the Egress address and verified public key, then complete enrollment using the [deployment guide](deployment.md). |
+| Egress service limits and private paths | [egress-service.yaml](../../examples/egress-service.yaml) | Use this source only with `pathchord-egressd`; keep the referenced identity and database outside the resource tree. |
 | Linux transparent TCP/UDP interception | [ingress-tproxy.yaml](../../examples/ingress-tproxy.yaml) | Review the listener address, packet mark, routing table, and host packet-filter setup. |
 | Linux interception with the optional eBPF classifier | [ingress-tproxy-ebpf.yaml](../../examples/ingress-tproxy-ebpf.yaml) | Replace `lan0` and `192.168.1.0/24` with the actual ingress interface and allowed source network. |
 | TCP/UDP flows from a TUN interface | [ingress-tun.yaml](../../examples/ingress-tun.yaml) | Review the interface name, `198.18.0.1/30` address, platform support, and host routes. |
@@ -19,20 +20,20 @@ Transparent and TUN examples need platform privileges and host routing setup. Th
 
 ## Select a configuration source
 
-With `pathchord` on `PATH`, run one of these commands. Example paths are relative to the repository root; replace the directory placeholder with your own resource directory.
+With the role executables on `PATH`, run one of these commands. Example paths are relative to the repository root; replace the directory placeholder with your own resource directory.
 
 ```sh
-pathchord ingress --config examples/ingress-direct.yaml
-pathchord ingress --config-dir /path/to/conf.d
-PATHCHORD_CONFIG_DIR=/path/to/conf.d pathchord ingress
-pathchord ingress
+pathchord-ingressd --config examples/ingress-direct.yaml
+pathchord-ingressd --config-dir /path/to/ingress
+PATHCHORD_CONFIG_DIR=/path/to/ingress pathchord-ingressd
+pathchord-egressd --config examples/egress-service.yaml
 ```
 
 Source selection follows this order:
 
 1. Explicit `--config` (`-c`) or `--config-dir` (`-C`). Choose one: `--config` accepts a file or directory, while `--config-dir` requires a directory. An explicit command-line source overrides configuration environment variables, including a conflict between them.
 2. Non-empty `PATHCHORD_CONFIG` or `PATHCHORD_CONFIG_DIR`, with the same file/directory meanings. Set only one when no explicit source is supplied.
-3. The account default: `~/.config/pathchord` for a regular user, or `/etc/pathchord` for root/service accounts. There is no working-directory configuration fallback. The [source-selection contract](../../openspec/specs/configuration-schema/spec.md#configuration-sources) defines account classification and home-directory resolution.
+3. The role account default: `~/.config/pathchord/ingress` or `/etc/pathchord/ingress` for Ingress, and `~/.config/pathchord/egress` or `/etc/pathchord/egress` for Egress. There is no working-directory configuration fallback. The [source-selection contract](../../openspec/specs/configuration-schema/spec.md#configuration-sources) defines account classification and home-directory resolution.
 
 Native service packages may select a configuration directory explicitly in their service command; check the installed service definition when editing a packaged deployment.
 
@@ -226,7 +227,10 @@ complete negotiation rules and option boundaries.
 
 ## Configure Egress resource ceilings
 
-An `EgressService` authors only the global resource limits
+An Egress source contains exactly one `EgressService`; it does not include
+Ingress listeners, Transit Proxies, subscriptions, routing rules, DNS,
+fallback, or geodata resources. Use [egress-service.yaml](../../examples/egress-service.yaml)
+as the starting point. An `EgressService` authors only the global resource limits
 `maxWireBandwidthBps` and `maxInboundTargetConnections`. The Egress runtime
 computes its Path safety ceiling and pending reservations from these limits and
 the local profile. Do not add `recommendedPathCount`, `maxConcurrentPaths`, or

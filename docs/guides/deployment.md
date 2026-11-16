@@ -4,25 +4,26 @@
 
 This guide walks through local proxy setup, privileged Linux listeners, and explicit Ingress/Egress enrollment. Start with the [configuration guide](configuration.md) to choose resources and routing. Required service behavior is defined by the [deployment specification](../../openspec/specs/deployment/spec.md).
 
-The `pathchord` executable provides the Ingress and Egress service subcommands
-and local management commands. Each service invocation owns a separate
-process. The ordinary examples use explicit proxy listeners and require no
+The release provides `pathchord-ingressd`, `pathchord-egressd`, and
+`pathchordctl`. Each service executable owns a separate process. The ordinary
+examples use explicit proxy listeners and require no
 packet interception or TUN privileges. Linux transparent and TUN examples are
 provided separately and require the platform privileges and routing setup
 described below.
 
 ## Configuration directory and overrides
 
-With no explicit configuration option, Ingress loads `~/.config/pathchord` for
-a regular account or `/etc/pathchord` for root/service accounts. An explicit
+With no explicit configuration option, Ingress loads
+`~/.config/pathchord/ingress` for a regular account or
+`/etc/pathchord/ingress` for packaged service accounts. An explicit
 command-line source overrides environment variables, which override the
 account default. For example:
 
 ```sh
-pathchord ingress
-PATHCHORD_CONFIG_DIR=/opt/pathchord/conf.d pathchord ingress
-pathchord ingress --config-dir /opt/pathchord/conf.d
-pathchord ingress --config /opt/pathchord/single.yaml
+pathchord-ingressd
+PATHCHORD_CONFIG_DIR=/opt/pathchord/ingress pathchord-ingressd
+pathchord-ingressd --config-dir /opt/pathchord/ingress
+pathchord-ingressd --config /opt/pathchord/single.yaml
 ```
 
 `PATHCHORD_CONFIG` also accepts a file or directory. Set only one non-empty
@@ -43,8 +44,8 @@ the complete valid graph atomically; a failed candidate retains the old one.
 Build the executable and run the direct-routing example:
 
 ```sh
-cargo build --locked --release -p pathchord-cli
-./target/release/pathchord ingress --config examples/ingress-direct.yaml
+cargo build --locked --release --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
+./target/release/pathchord-ingressd --config examples/ingress-direct.yaml
 ```
 
 For a regular Unix user, the default Ingress control socket uses
@@ -68,7 +69,7 @@ uses ordinary third-party Proxy routing and explicitly rejects flows with no
 usable matching node. Its provider URL MUST be replaced before use:
 
 ```sh
-pathchord ingress --config examples/ingress-subscriptions.yaml
+pathchord-ingressd --config examples/ingress-subscriptions.yaml
 ```
 
 ## Linux transparent and TUN listeners
@@ -106,8 +107,8 @@ Start either example explicitly so a privileged configuration is never picked
 up accidentally from the account default:
 
 ```sh
-sudo ./target/release/pathchord ingress --config examples/ingress-tproxy.yaml
-sudo ./target/release/pathchord ingress --config examples/ingress-tun.yaml
+sudo ./target/release/pathchord-ingressd --config examples/ingress-tproxy.yaml
+sudo ./target/release/pathchord-ingressd --config examples/ingress-tun.yaml
 ```
 
 TPROXY and TUN listeners accept IP flows, so routing matches the original IP
@@ -125,14 +126,14 @@ Generate a private identity on each corresponding machine. The command prints
 only the public key; the private file MUST remain local to its owner:
 
 ```sh
-pathchord keygen --output ingress.key.json
-pathchord keygen --output egress.key.json
+pathchordctl keygen --output ingress.key.json
+pathchordctl keygen --output egress.key.json
 ```
 
 Start Egress in its own terminal. The Unix control socket is local to Egress:
 
 ```sh
-pathchord egress --egress-id exit --identity egress.key.json \
+pathchord-egressd --egress-id exit --identity egress.key.json \
   --bind 127.0.0.1:9443 --control-socket /tmp/pathchord-egress.sock
 ```
 
@@ -142,7 +143,7 @@ Generation 0 applies to a new authorization database; subsequent mutations
 MUST use its observed generation:
 
 ```sh
-pathchord --socket /tmp/pathchord-egress.sock enroll add \
+pathchordctl --socket /tmp/pathchord-egress.sock enroll add \
   --ingress-id entry --egress-id exit --public-key INGRESS_PUBLIC_KEY \
   --expected-generation 0
 ```
@@ -154,11 +155,11 @@ the same explicitly verified key and canonical Egress ID. Start Ingress in a
 separate terminal:
 
 ```sh
-pathchord --socket /tmp/pathchord-ingress.sock ingress \
+pathchord-ingressd --socket /tmp/pathchord-ingress.sock \
   --ingress-id entry --identity ingress.key.json \
   --config examples/ingress-egress.yaml
-pathchord --socket /tmp/pathchord-ingress.sock status
-pathchord --socket /tmp/pathchord-egress.sock enroll list
+pathchordctl --socket /tmp/pathchord-ingress.sock status
+pathchordctl --socket /tmp/pathchord-egress.sock enroll list
 ```
 
 The example's `direct-path` is a direct transport to the authenticated Egress.

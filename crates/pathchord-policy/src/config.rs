@@ -562,6 +562,26 @@ pub enum KubeResource {
 }
 
 impl KubeResource {
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::EgressService(_) => "EgressService",
+            Self::NodeProbePolicy(_) => "NodeProbePolicy",
+            Self::Egress(_) => "Egress",
+            Self::TransitProxy(_) => "TransitProxy",
+            Self::Subscription(_) => "Subscription",
+            Self::GeoSiteDatabase(_) => "GeoSiteDatabase",
+            Self::GeoIpDatabase(_) => "GeoIpDatabase",
+            Self::EgressRule(_) => "EgressRule",
+            Self::TransitRule(_) => "TransitRule",
+            Self::ProxyRule(_) => "ProxyRule",
+            Self::TrafficPolicy(_) => "TrafficPolicy",
+            Self::Listener(_) => "Listener",
+            Self::DnsPolicy(_) => "DNSPolicy",
+            Self::FallbackPolicy(_) => "FallbackPolicy",
+        }
+    }
+
     fn key(&self) -> (&str, &str, &str) {
         match self {
             Self::EgressService(value) => {

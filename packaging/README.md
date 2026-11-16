@@ -1,10 +1,12 @@
 # PathChord packages
 
-The package recipes in this directory install the same `pathchord` binary,
-the shared manual page, and the loopback-only configuration template. Linux
-and Alpine service packages use `/etc/pathchord`, the FreeBSD port uses
-`/usr/local/etc/pathchord`, and packaged Windows services use
-`%ProgramData%\PathChord\config`.
+The package recipes in this directory install `pathchord-ingressd`,
+`pathchord-egressd`, `pathchordctl`, the shared manual page, and the
+loopback-only Ingress configuration template. Linux and Alpine service
+packages use `/etc/pathchord/ingress` and `/etc/pathchord/egress`, the FreeBSD
+port uses matching role directories under `/usr/local/etc/pathchord`, and
+packaged Windows services use `%ProgramData%\PathChord\config\ingress` and
+`egress`.
 
 The template deliberately exposes only a loopback mixed listener. Replace it,
 or add validated resources beside it, before enabling a listener for another
@@ -21,8 +23,8 @@ must remain outside the configuration directory.
 | FreeBSD | `freebsd/Makefile` | `rc.d/pathchord`, `rc.d/pathchord-egress` | `.pkg` |
 | Windows | `windows/pathchord.nsi` | WinSW-compatible service XML and installer script | `.exe` |
 
-All Unix recipes install `pathchord.1` as `pathchord(1)` and install
-`default-config.yaml` as `ingress.yaml` in the package's configuration
+All Unix recipes install `pathchord.1` for the `pathchordctl(1)` client and
+install `default-config.yaml` as `ingress/ingress.yaml` in the package's configuration
 directory. Package-native service files use that directory explicitly so a
 service cannot accidentally consume a working-directory configuration.
 
@@ -31,7 +33,7 @@ service cannot accidentally consume a working-directory configuration.
 Build the release binary first, then select a native package target:
 
 ```sh
-cargo build --locked --release -p pathchord-cli
+cargo build --locked --release --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
 make -C packaging package-deb
 make -C packaging package-alpine
 make -C packaging package-arch
@@ -39,8 +41,9 @@ make -C packaging package-freebsd
 make -C packaging package-windows
 ```
 
-The package scripts accept `PATHCHORD_BINARY` for a cross-compiled or CI
-artifact. The package version defaults to the `[workspace.package]` version in
+The package scripts accept `PATHCHORD_INGRESS_BINARY`,
+`PATHCHORD_EGRESS_BINARY`, and `PATHCHORDCTL_BINARY` for cross-compiled or CI
+artifacts. The package version defaults to the `[workspace.package]` version in
 `Cargo.toml`; set `PATHCHORD_VERSION` when producing a release from a tagged
 artifact. Host tools (`dpkg-deb`, `abuild`, `makepkg`, FreeBSD `pkg`, and
 NSIS) are intentionally required only by the matching target.
@@ -50,8 +53,8 @@ default static PIE linker rather than overriding Cargo's target linker with
 `musl-gcc`. For example, select an installed toolchain containing that target:
 
 ```sh
-cargo +stable build --locked --release -p pathchord-cli --target x86_64-unknown-linux-musl
-PATHCHORD_BINARY=target/x86_64-unknown-linux-musl/release/pathchord make -C packaging package-alpine
+cargo +stable build --locked --release --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl --target x86_64-unknown-linux-musl
+PATHCHORD_INGRESS_BINARY=target/x86_64-unknown-linux-musl/release/pathchord-ingressd PATHCHORD_EGRESS_BINARY=target/x86_64-unknown-linux-musl/release/pathchord-egressd PATHCHORDCTL_BINARY=target/x86_64-unknown-linux-musl/release/pathchordctl make -C packaging package-alpine
 ```
 
 Run `abuild` with a signing key in the package-building environment. The

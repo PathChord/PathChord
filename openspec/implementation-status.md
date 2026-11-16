@@ -43,6 +43,18 @@ are present in the local implementation.
 The evidence below remains local Linux build/test evidence unless a section
 explicitly names a native host, external peer, cross-machine run, or soak.
 
+The pre-0.1.0 service artifact split is implemented in the local worktree.
+`pathchord-ingressd`, `pathchord-egressd`, and `pathchordctl` build as separate
+targets. The shared configuration and control crates are independent of the
+Ingress runtime; Egress configuration accepts exactly one EgressService and
+Egress dependency inspection excludes Ingress and Transit runtime crates.
+Local smoke checks started Ingress on `127.0.0.1:7890`, started an unprivileged
+Egress with a private identity and authorization database, and queried both
+control sockets through `pathchordctl`. Native package assembly remains
+host-dependent: Debian `dpkg-deb`, Alpine `abuild`, Arch `makepkg`, FreeBSD
+`pkg(8)`, Windows PowerShell/NSIS, and native service-control checks were not
+available on this Linux host.
+
 The scheduling slice now has deterministic coverage for independent mixed-flow
 replication budgets, reserved control/retransmission priority, directional
 autoscale inputs, rule-union Path planning, and Egress capacity hysteresis.
@@ -236,10 +248,13 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   to start collecting evidence. A deterministic local regression ages a real
   Egress's sample after a Noise Session and echo, then verifies a second Session
   and echo; separate tests cover active-work staleness and idle rate decay.
-- Ingress and Egress consume the same file/directory resource bundle. Egress
-  selects one EgressService resource, resolves relative paths from its source,
-  and applies command-line, environment, then account-default precedence while
-  retaining complete legacy CLI-only startup when the default bundle is absent.
+- Ingress and Egress use role-specific service artifacts and roots. Ingress
+  consumes the complete policy resource graph from its Ingress source;
+  Egress consumes exactly one EgressService from its Egress source and reports
+  restart-required when the startup source changes without replacing the active
+  runtime. `pathchordctl` owns status, enrollment, key generation, and local
+  control operations. The unreleased multi-call service binary is no longer a
+  package target.
 - Policy parsing preserves subscriptions, DNSPolicy, opaque credential
   references, listener platform/protocol/process fields, and flow tags.
   `CompiledPolicy` evaluates Egress, Transit, ordinary Proxy, and fallback

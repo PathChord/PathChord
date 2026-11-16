@@ -43,7 +43,11 @@ pathchord-policy     configuration snapshots, rule compiler, selectors
 pathchord-transit    Transit Proxy adapters and subscription normalization
 pathchord-egress     target dialing, Egress status, authorization store
 pathchord-ingress    local listeners, transparent interception, process metadata
-pathchord-cli        local management API client and operational commands
+pathchordctl         local management API client and operational commands
+pathchord-config      共享的角色配置加载层
+pathchord-control     共享的本地控制传输和 Web Gateway
+pathchord-ingressd    Ingress 服务入口
+pathchord-egressd     Egress 服务入口
 ```
 
 `pathchord-core` 不得依赖 Linux、Windows、FreeBSD、订阅格式或监听器实现。平台适配器通过面向字节传输、本地套接字、目标拨号和进程元数据的窄 trait 进行通信。
