@@ -106,7 +106,6 @@ implementation or native-host validation.
 | --- | --- |
 | [Native platforms](openspec/changes/validate-native-platforms/tasks.md) | Windows/FreeBSD listeners and local control; privileged Linux transparent/TUN/eBPF checks. |
 | [Providers and runtime reliability](openspec/changes/validate-provider-and-runtime-reliability/tasks.md) | Real provider exports, independent peers, cross-machine flows, and failure/restart soak tests. |
-| [Existing proxy compatibility](openspec/changes/support-sing-box-dae-transit-protocols/tasks.md) | Complete the existing native protocols and connection options used by sing-box and dae. |
 | [Scheduling and observability](openspec/changes/complete-scheduling-and-observability/tasks.md) | Policy/class budgets, Egress coordination, typed observations, and deployed monitoring. |
 | [Native packages](openspec/changes/validate-native-packages/tasks.md) | Debian, Alpine, Arch Linux, FreeBSD, and NSIS package-host acceptance. |
 
