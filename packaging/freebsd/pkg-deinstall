@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+case "${2:-}" in
+DEINSTALL|PRE-DEINSTALL)
+    for role in ingress egress; do
+        daemon="pathchord-${role}d"
+        if [ -x "/usr/local/bin/$daemon" ] && service "$daemon" onestatus >/dev/null 2>&1; then
+            touch "/var/run/pathchord/.restart-$role"
+            service "$daemon" onestop
+        fi
+    done
+    ;;
+esac

@@ -391,6 +391,68 @@ async fn stale_subscription_registration_cannot_follow_deletion() {
 }
 
 #[tokio::test]
+async fn unchanged_refresh_keeps_verified_siblings_selectable_before_republication() {
+    struct UnchangedFetcher;
+    #[async_trait]
+    impl pathchord_transit::SubscriptionFetcher for UnchangedFetcher {
+        async fn fetch(
+            &self,
+            _: pathchord_transit::SubscriptionFetchRequest,
+        ) -> Result<Vec<u8>, pathchord_transit::SubscriptionError> {
+            Ok(b"proxies: [{name: node, type: http, server: 127.0.0.1, port: 8080}, {name: unsupported, type: ssr, server: 127.0.0.1, port: 1}]".to_vec())
+        }
+    }
+    let (subscription, _) = observation_test_subscription().await;
+    let mut manager = SubscriptionManager::new(
+        Arc::new(UnchangedFetcher),
+        std::env::temp_dir(),
+        BTreeSet::from(["http".into()]),
+    );
+    manager.refresh(&subscription).await;
+    let registry = AdapterRegistry::for_configs(
+        Arc::new(FileTransitCredentialProvider::new(std::env::temp_dir()).unwrap()),
+        Duration::from_secs(1),
+        manager.snapshot().nodes.values().map(|node| &node.config),
+    )
+    .unwrap();
+    let prepared = manager.snapshot().prepare_adapters(&registry).await;
+    manager.commit_prepared_adapters(prepared).unwrap();
+    let plane = observation_test_plane();
+    assert!(
+        publish_dynamic_transit(&plane, &mut manager)
+            .await
+            .is_empty()
+    );
+    let prior = manager.snapshot().clone();
+    let old = prior.selectable_nodes().next().unwrap();
+    let old_admission = prior.validated_admission(&old.config.id).unwrap();
+    let control = observation_test_control();
+    let generation = declare_subscription(&control, &subscription).await;
+    let candidate = manager.prepare_refresh(&subscription, generation).await;
+    let mut dispatcher = control.lock().await;
+    let outcome = commit_subscription_refresh(
+        &mut manager,
+        candidate,
+        generation,
+        &mut dispatcher,
+        &ControlSubscriptionId::new("provider").unwrap(),
+        &plane,
+        &registry,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, RefreshOutcome::Published { .. }));
+    assert!(old_admission.matches_config(&old.config));
+    assert_eq!(prior.selectable_nodes().count(), 1);
+    assert_eq!(manager.snapshot().selectable_nodes().count(), 1);
+    let retained = manager
+        .snapshot()
+        .validated_admission(&old.config.id)
+        .unwrap();
+    assert!(Arc::ptr_eq(&old_admission.adapter(), &retained.adapter()));
+}
+
+#[tokio::test]
 async fn rejected_refresh_restores_the_previous_verified_adapter() {
     use std::collections::VecDeque;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

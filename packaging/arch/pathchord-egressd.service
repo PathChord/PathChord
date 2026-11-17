@@ -1,6 +1,6 @@
 [Unit]
 Description=PathChord Egress proxy runtime
-Documentation=man:pathchordctl(1)
+Documentation=man:pathchord(1)
 Wants=network-online.target
 After=network-online.target
 
@@ -11,8 +11,11 @@ Group=pathchord
 ExecStart=/usr/bin/pathchord-egressd --config-dir /etc/pathchord/egress --egress-id egress --identity /var/lib/pathchord-egress/egress.key.json --authorization-db /var/lib/pathchord-egress/authorizations.db --control-socket /run/pathchord/egress.sock
 Restart=on-failure
 RestartSec=5s
-StateDirectory=pathchord-egress
 RuntimeDirectory=pathchord
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=pathchord-egress
+StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=true
 PrivateDevices=true
@@ -22,7 +25,7 @@ AmbientCapabilities=
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/pathchord-egress
+ReadWritePaths=/var/lib/pathchord-egress /run/pathchord
 
 [Install]
 WantedBy=multi-user.target

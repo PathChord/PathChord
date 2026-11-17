@@ -1,90 +1,47 @@
 #!/bin/sh
 set -eu
-
-output_dir=${1:-dist}
-root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+root_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../common/package-role.sh
+. "$root_dir/packaging/common/package-role.sh"
+output_dir=${1:-"$root_dir/dist"}
 version=${PATHCHORD_VERSION:-$("$root_dir/packaging/version.sh")}
-ingress_binary=${PATHCHORD_INGRESS_BINARY:-$root_dir/target/release/pathchord-ingressd}
-egress_binary=${PATHCHORD_EGRESS_BINARY:-$root_dir/target/release/pathchord-egressd}
-ctl_binary=${PATHCHORDCTL_BINARY:-$root_dir/target/release/pathchordctl}
-for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
-  case "$binary" in
-    /*) ;;
-    *) binary="$root_dir/$binary" ;;
-  esac
-done
-
-case "$version" in
-  ''|*[!0-9A-Za-z.+_-]*)
-    printf '%s\n' "invalid PathChord package version: $version" >&2
-    exit 2
-    ;;
-esac
-
-for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
-  if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-    printf '%s\n' "FreeBSD package input binary was not found: $binary" >&2
-    exit 1
-  fi
-done
-if ! command -v pkg >/dev/null 2>&1; then
-  printf '%s\n' 'FreeBSD pkg(8) is required to assemble a .pkg artifact.' >&2
-  exit 1
-fi
-
+case "$version" in ''|*[!0-9A-Za-z.+_-]*) exit 2 ;; esac
+command -v pkg >/dev/null
 mkdir -p "$output_dir"
-stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/pathchord-pkg.XXXXXX")
-cleanup() { rm -rf "$stage_dir"; }
-trap cleanup EXIT INT TERM
-
-install -d "$stage_dir/usr/local/bin" "$stage_dir/usr/local/etc/pathchord/ingress" \
-  "$stage_dir/usr/local/etc/pathchord/egress" \
-  "$stage_dir/usr/local/etc/rc.d" "$stage_dir/usr/local/share/man/man1" \
-  "$stage_dir/usr/local/share/pathchord" \
-  "$stage_dir/usr/local/share/licenses/pathchord" "$stage_dir/var/db/pathchord-ingress" \
-  "$stage_dir/var/db/pathchord-egress"
-install -m 0755 "$ingress_binary" "$stage_dir/usr/local/bin/pathchord-ingressd"
-install -m 0755 "$egress_binary" "$stage_dir/usr/local/bin/pathchord-egressd"
-install -m 0755 "$ctl_binary" "$stage_dir/usr/local/bin/pathchordctl"
-install -m 0644 "$root_dir/LICENSE" "$stage_dir/usr/local/share/licenses/pathchord/LICENSE"
-install -m 0644 "$root_dir/packaging/common/default-config.yaml" \
-  "$stage_dir/usr/local/etc/pathchord/ingress/ingress.yaml"
-install -m 0644 "$root_dir/packaging/common/pathchord.1" \
-  "$stage_dir/usr/local/share/man/man1/pathchord.1"
-sed 's/%%PREFIX%%/\/usr\/local/g' "$root_dir/packaging/freebsd/pkg-message" \
-  > "$stage_dir/usr/local/share/pathchord/pkg-message"
-cp "$root_dir/packaging/freebsd/pathchord-ingressd.in" "$stage_dir/usr/local/etc/rc.d/pathchord-ingressd"
-cp "$root_dir/packaging/freebsd/pathchord-egressd.in" "$stage_dir/usr/local/etc/rc.d/pathchord-egressd"
-chmod 0755 "$stage_dir/usr/local/etc/rc.d/pathchord-ingressd" "$stage_dir/usr/local/etc/rc.d/pathchord-egressd"
-
-cat > "$stage_dir/+PRE-INSTALL" <<'EOF'
-#!/bin/sh
-if ! pw groupshow pathchord >/dev/null 2>&1; then
-  pw groupadd pathchord -r
-fi
-if ! pw usershow pathchord >/dev/null 2>&1; then
-  pw useradd pathchord -r -g pathchord -d /var/empty -s /usr/sbin/nologin
-fi
-EOF
-chmod 0755 "$stage_dir/+PRE-INSTALL"
-
-cat > "$stage_dir/+MANIFEST" <<EOF
-name: "pathchord"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/pathchord-pkg.XXXXXX")
+trap 'rm -rf "$stage"' EXIT HUP INT TERM
+install -d "$stage/usr/local/bin" "$stage/usr/local/libexec" "$stage/usr/local/etc/rc.d" \
+    "$stage/usr/local/share/man/man1" "$stage/usr/local/share/licenses/$package_name" \
+    "$stage/usr/local/etc/pathchord/$role" "$stage/var/db/pathchord-$role"
+install -m0755 "$daemon_binary" "$stage/usr/local/bin/$package_name"
+install -m0755 "$ctl_binary" "$stage/usr/local/bin/pathchordctl"
+install -m0755 "$root_dir/packaging/common/setup-layout.sh" "$stage/usr/local/libexec/pathchord-setup-layout"
+install -m0755 "$root_dir/packaging/freebsd/$package_name.in" "$stage/usr/local/etc/rc.d/$package_name"
+install -m0644 "$root_dir/LICENSE" "$stage/usr/local/share/licenses/$package_name/LICENSE"
+install -m0644 "$root_dir/packaging/common/pathchord.1" "$stage/usr/local/share/man/man1/pathchord.1"
+if [ "$role" = ingress ]; then template=default-config.yaml; else template=default-egress-config.yaml; fi
+sed -e 's@/var/lib/pathchord-@/var/db/pathchord-@g' -e 's@/run/pathchord/@/var/run/pathchord/@g' \
+    "$root_dir/packaging/common/$template" > "$stage/usr/local/etc/pathchord/$role/$role.yaml.sample"
+cp "$root_dir/packaging/freebsd/pkg-install" "$stage/+INSTALL"
+cp "$root_dir/packaging/freebsd/pkg-deinstall" "$stage/+DEINSTALL"
+cat > "$stage/+MANIFEST" <<EOF
+name: "$package_name"
 version: "$version"
-origin: "net/pathchord"
-comment: "Adaptive multipath proxy runtime with HTTP and SOCKS listeners"
-maintainer: "PathChord contributors <pathchord@example.invalid>"
+origin: "net/$package_name"
+comment: "PathChord $role runtime and local management client"
+maintainer: "PathChord contributors <pathchord@invalid.example>"
 www: "https://github.com/KagurazakaNyaa/PathChord"
 prefix: "/usr/local"
 licenselogic: "single"
 licenses: [ "GPL-3.0-only" ]
-users: [ "pathchord" ]
-groups: [ "pathchord" ]
-desc: <<EOD
-PathChord provides local HTTP forwarding, CONNECT, SOCKS4/4a/5, mixed
-listeners, and authenticated Egress Paths.
-EOD
+annotations: { "pathchord-role": "$role", "pathchord-conflicts": "$other_package,pathchord" }
+desc: "Single-role PathChord $role service and management client."
 EOF
-
-pkg create -r "$stage_dir" -m "$stage_dir/+MANIFEST" -o "$output_dir"
-printf '%s\n' "Created FreeBSD package in $output_dir"
+(cd "$stage" && find usr -type f -print | sed 's@^@/@') > "$stage/+PLIST"
+cat >> "$stage/+PLIST" <<EOF
+@dir(root,wheel,0755) /usr/local/etc/pathchord
+@dir(root,pathchord,0750) /usr/local/etc/pathchord/$role
+@dir(pathchord,pathchord,0700) /var/db/pathchord-$role
+EOF
+pkg create -r "$stage" -m "$stage" -p "$stage/+PLIST" -o "$output_dir"

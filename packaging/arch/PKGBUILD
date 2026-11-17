@@ -1,43 +1,40 @@
-# Maintainer: PathChord contributors
-#
-# pkgver is kept in sync with the workspace package version by the release
-# tooling.  For a tagged source build, set pkgver to the tag without the v
-# prefix before running makepkg.
-pkgname=pathchord
+# Build explicitly with PATHCHORD_ROLE=ingress or PATHCHORD_ROLE=egress.
+case "${PATHCHORD_ROLE:-}" in ingress) role=ingress; other=egress;; egress) role=egress; other=ingress;; *) echo 'set PATHCHORD_ROLE to ingress or egress' >&2; return 2;; esac
+pkgname=pathchord-${role}d
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Multipath proxy runtime with HTTP, SOCKS, and Egress listeners'
+pkgdesc="PathChord $role runtime and local management client"
 arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')
 url='https://github.com/KagurazakaNyaa/PathChord'
 license=('GPL-3.0-only')
 depends=('glibc')
+if [ "$role" = ingress ]; then depends+=('ca-certificates'); fi
 makedepends=('cargo')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/KagurazakaNyaa/PathChord/archive/refs/tags/v$pkgver.tar.gz")
-# Release automation should replace SKIP with the source archive digest.
+conflicts=("pathchord-${other}d" 'pathchord')
+backup=("etc/pathchord/$role/$role.yaml")
+install=pathchord.install
+source=("PathChord-$pkgver.tar.gz::https://github.com/KagurazakaNyaa/PathChord/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
-
 build() {
     cd "PathChord-$pkgver"
-    cargo build --release --locked --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
+    cargo build --release --locked --bin "$pkgname" --bin pathchordctl
 }
-
 package() {
     cd "PathChord-$pkgver"
-
-    install -Dm0755 target/release/pathchord-ingressd "$pkgdir/usr/bin/pathchord-ingressd"
-    install -Dm0755 target/release/pathchord-egressd "$pkgdir/usr/bin/pathchord-egressd"
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
     install -Dm0755 target/release/pathchordctl "$pkgdir/usr/bin/pathchordctl"
-    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/pathchord/LICENSE"
-    install -Dm0644 packaging/common/pathchord.1 \
-        "$pkgdir/usr/share/man/man1/pathchord.1"
-    install -Dm0644 packaging/common/default-config.yaml \
-        "$pkgdir/etc/pathchord/ingress/ingress.yaml"
-    install -Dm0644 packaging/arch/pathchord-ingressd.service \
-        "$pkgdir/usr/lib/systemd/system/pathchord-ingressd.service"
-    install -Dm0644 packaging/arch/pathchord-egressd.service \
-        "$pkgdir/usr/lib/systemd/system/pathchord-egressd.service"
-    install -Dm0644 packaging/arch/pathchord.sysusers \
-        "$pkgdir/usr/lib/sysusers.d/pathchord.conf"
-    install -Dm0644 packaging/arch/pathchord.tmpfiles \
-        "$pkgdir/usr/lib/tmpfiles.d/pathchord.conf"
+    install -Dm0755 packaging/common/setup-layout.sh "$pkgdir/usr/libexec/pathchord-setup-layout"
+    install -Dm0644 packaging/common/pathchord.1 "$pkgdir/usr/share/man/man1/pathchord.1"
+    if [ "$role" = ingress ]; then
+        template=default-config.yaml
+        install -Dm0644 packaging/common/ingress-transparent.conf "$pkgdir/usr/share/pathchord/systemd/transparent.conf"
+        install -Dm0644 packaging/common/ingress-ebpf.conf "$pkgdir/usr/share/pathchord/systemd/ebpf.conf"
+    else template=default-egress-config.yaml; fi
+    install -Dm0644 "packaging/common/$template" "$pkgdir/etc/pathchord/$role/$role.yaml"
+    chmod 0750 "$pkgdir/etc/pathchord/$role"
+    install -Dm0644 "packaging/arch/$pkgname.service" "$pkgdir/usr/lib/systemd/system/$pkgname.service"
+    install -Dm0644 packaging/arch/pathchord.sysusers "$pkgdir/usr/lib/sysusers.d/pathchord.conf"
+    install -d "$pkgdir/usr/lib/tmpfiles.d"
+    printf 'd /etc/pathchord/%s 0750 root pathchord - -\nd /var/lib/pathchord-%s 0700 pathchord pathchord - -\nd /run/pathchord 0700 pathchord pathchord - -\n' "$role" "$role" > "$pkgdir/usr/lib/tmpfiles.d/pathchord.conf"
 }

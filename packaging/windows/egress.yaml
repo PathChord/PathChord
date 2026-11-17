@@ -1,0 +1,10 @@
+apiVersion: pathchord.io/v1
+kind: EgressService
+metadata:
+  name: egress
+spec:
+  binds: ['127.0.0.1:7443']
+  egressId: egress
+  identity: ../../data/egress/egress.key.json
+  authorizationDb: ../../data/egress/authorizations.db
+  controlSocket: '\\.\pipe\pathchord-egress'

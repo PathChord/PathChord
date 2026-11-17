@@ -4101,16 +4101,23 @@ spec: {{order: {}, require: {{labels: {{region: jp}}}}}}
             "linux",
             "  backend: ebpf\n  bind: 0.0.0.0:15001\n  interface: lan0\n  allowedSources: [192.168.1.0/24]\n  mark: 1\n  routeTable: 100\n  protocols: [tcp, udp]\n",
         );
-        let policy = KubeConfig::from_yaml(&input)
-            .unwrap()
-            .into_policy_config()
-            .unwrap();
-        let listener = policy
-            .listeners
-            .iter()
-            .find(|listener| listener.id.as_str() == "platform-listener")
-            .unwrap();
-        assert_eq!(listener.backend, TransparentBackend::Ebpf);
+        let policy = KubeConfig::from_yaml(&input).unwrap().into_policy_config();
+        if cfg!(target_os = "linux") {
+            let policy = policy.unwrap();
+            let listener = policy
+                .listeners
+                .iter()
+                .find(|listener| listener.id.as_str() == "platform-listener")
+                .unwrap();
+            assert_eq!(listener.backend, TransparentBackend::Ebpf);
+        } else {
+            assert!(
+                policy
+                    .unwrap_err()
+                    .to_string()
+                    .contains("listener platform linux is not supported by this build")
+            );
+        }
 
         let missing_source = platform_listener_yaml(
             "tproxy",

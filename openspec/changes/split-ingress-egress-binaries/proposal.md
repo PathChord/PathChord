@@ -30,14 +30,19 @@ protocol contracts.
   `EgressService` settings and private service paths; Ingress continues to own
   the complete policy resource graph and its reload behavior.
 - Keep Egress authorization, identity, control socket, and target forwarding
-  isolated from Ingress state, credentials, listener resources, and data
+  independent from Ingress state, credentials, listener resources, and data
   directories.
 - Update Cargo targets, package contents, service definitions, installers,
   documentation, and validation so each service starts its dedicated
-  executable with role-specific privileges and paths.
-- Release the role binaries and management client as one versioned bundle with
-  matching wire and control protocol revisions; this change does not introduce
-  independent rolling-version compatibility.
+  executable with role-specific privileges and paths. A package installs exactly
+  one selected role and the management client; opposite-role packages conflict.
+- Use the local non-login `pathchord` account for the selected Unix service.
+  Ingress clients and Egress hosts are separate devices in the supported
+  deployment model; simultaneous packaged roles on one system are outside it.
+- Publish the role packages and management client in one versioned release with
+  matching wire and control protocol revisions; each installed package upgrades
+  its selected daemon and management client together. This change does not
+  introduce independent rolling-version compatibility.
 
 ## Capabilities
 
@@ -49,7 +54,8 @@ protocol contracts.
 ### Modified Capabilities
 
 - `deployment`: Service artifacts, role-specific executable ownership,
-  management-client invocation, and package/service privilege boundaries change.
+  management-client invocation, single-role installation, and service privileges
+  change.
 - `configuration-schema`: Egress configuration sources and the allowed
   Egress-only resource subset change while Ingress retains complete-bundle
   validation.
@@ -65,7 +71,7 @@ without depending on Ingress runtime modules.
 
 The control socket protocol, authorization operation registry, Noise enrollment,
 Session/Path wire behavior, and per-Path trust model remain unchanged. Debian,
-Alpine, Arch, FreeBSD, and Windows packaging must install and start the two
-role binaries plus the management client. Existing guides, the English and
+Alpine, Arch, FreeBSD, and Windows packaging must install and start only the
+selected role binary plus the management client. Existing guides, the English and
 Chinese deployment/configuration documents, and the implementation status
 snapshot must be updated together with the authoritative capability deltas.

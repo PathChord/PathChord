@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+case "${2:-}" in
+PRE-INSTALL)
+    case "${1:-}" in
+        pathchord-ingressd|pathchord-ingressd-*) role=ingress; other=pathchord-egressd ;;
+        pathchord-egressd|pathchord-egressd-*) role=egress; other=pathchord-ingressd ;;
+        *) echo 'Unknown PathChord package role' >&2; exit 1 ;;
+    esac
+    # Native pkg checks shared-file conflicts before extraction; this explicit
+    # guard also rejects a conflicting role before account or state setup.
+    if pkg info -e "$other" || pkg info -e pathchord; then
+        echo 'Remove the installed PathChord role explicitly before changing roles' >&2
+        exit 1
+    fi
+    # pkg add -f replaces an installed version without invoking its deinstall
+    # hook. Stop a matching active role here before extracting replacement files.
+    if [ -x "/usr/local/bin/pathchord-${role}d" ] && service "pathchord-${role}d" onestatus >/dev/null 2>&1; then
+        touch "/var/run/pathchord/.restart-$role"
+        service "pathchord-${role}d" onestop
+    fi
+    pw groupshow pathchord >/dev/null 2>&1 || pw groupadd pathchord
+    pw usershow pathchord >/dev/null 2>&1 || pw useradd pathchord -g pathchord -d /var/empty -s /usr/sbin/nologin
+    ;;
+POST-INSTALL)
+    if [ -x /usr/local/bin/pathchord-ingressd ] && [ ! -e /usr/local/bin/pathchord-egressd ]; then role=ingress
+    elif [ -x /usr/local/bin/pathchord-egressd ] && [ ! -e /usr/local/bin/pathchord-ingressd ]; then role=egress
+    else echo 'PathChord requires exactly one installed service role' >&2; exit 1; fi
+    /usr/local/libexec/pathchord-setup-layout "$role"
+    config="/usr/local/etc/pathchord/$role/$role.yaml"
+    sample="$config.sample"
+    # Unlike pkg add -f overwriting @config payloads, an operator-owned actual
+    # file is initialized once and is never overwritten by package extraction.
+    if [ ! -e "$config" ]; then
+        (umask 077; set -C; cat "$sample" > "$config")
+        chown root:pathchord "$config"
+        chmod 0640 "$config"
+    fi
+    if [ -e "/var/run/pathchord/.restart-$role" ]; then
+        echo "PathChord $role was stopped for replacement. After pkg exits, run: service pathchord-${role}d onestart"
+    fi
+    ;;
+esac

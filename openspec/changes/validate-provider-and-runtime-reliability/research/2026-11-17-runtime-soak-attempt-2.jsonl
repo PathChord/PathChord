@@ -1,0 +1,3 @@
+{"binary_sha256": {"pathchord-egressd": "24b83b72eab0011c4806b9fa4abfe8fea490e6f321899478956e2348b01f25f1", "pathchord-ingressd": "4ee06c188ea6eb1d54db84a1f6a034042d31eb736f84c43125ae202f6d7e0a8b", "pathchordctl": "f0dcff5e883c9d857d1417aec357ec4e07d8c7235b78ea2c2a1e663d6d60b59d"}, "cycles": 12, "event": "started", "minimum_soak_seconds": 300.0, "script_sha256": "c4d9f79a25320abcc0d946a5c5fddf7f5e473f1c856924bb7e069c2246c9f140"}
+{"checks": {"authorization_revoke": 1, "dns_failure": 1, "endpoint_restart": 1, "node_drain": 1, "path_churn": 1, "provider_fetch": 1, "provider_parse": 1, "reload": 1}, "cycle": 1, "seconds": 9.26, "traffic": {"path": 70, "provider": 206}}
+{"check": "runtime_bound_ready_paths", "result": "failed"}

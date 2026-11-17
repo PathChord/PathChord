@@ -4,17 +4,12 @@
 
 ### Requirement: Independent service processes and explicit proxy operation
 
-Ingress and Egress SHALL run as separate service invocations, each using a
-dedicated role executable, owning its process, and exposing its local
-management endpoint. Ordinary explicit HTTP/SOCKS proxy operation SHALL NOT
-require packet interception or TUN privileges. Listener protocol behavior
-SHALL follow the [platform contract](../platform-and-dns/spec.md#http-and-socks-listeners).
+Ingress and Egress SHALL run as separate service invocations, each using its dedicated role executable, owning its process, and exposing its local management endpoint. `pathchordctl` SHALL be the management client for both endpoints. Ordinary explicit HTTP/SOCKS proxy operation SHALL NOT require packet interception or TUN privileges. Listener protocol behavior SHALL follow the [platform contract](../../../../specs/platform-and-dns/spec.md#http-and-socks-listeners).
 
 #### Scenario: Dedicated service executable selection
 
 - **WHEN** a packaged Ingress or Egress service starts
-- **THEN** the service invokes its role-specific executable directly and does
-  not select the service role through a shared multi-call service subcommand.
+- **THEN** it invokes `pathchord-ingressd` or `pathchord-egressd` directly and does not select the role through a shared service subcommand.
 
 #### Scenario: Ordinary local proxy setup
 
@@ -24,14 +19,12 @@ SHALL follow the [platform contract](../platform-and-dns/spec.md#http-and-socks-
 #### Scenario: Unix local control endpoint defaults
 
 - **WHEN** a regular Unix account starts Ingress without an explicit control socket
-- **THEN** the endpoint is `$XDG_RUNTIME_DIR/pathchord/ingress.sock` when that runtime directory is available, otherwise `~/.config/pathchord/ingress.sock`; root and packaged service accounts use `/run/pathchord/ingress.sock` with the runtime directory created before startup.
+- **THEN** the endpoint is `$XDG_RUNTIME_DIR/pathchord/ingress.sock` when that runtime directory is available, otherwise `~/.config/pathchord/ingress.sock`; root and packaged service accounts use `/run/pathchord/ingress.sock` with the runtime directory created before startup. Ingress resources default to `~/.config/pathchord/ingress` or `/etc/pathchord/ingress`.
 
 #### Scenario: Explicit enrollment socket selection
 
 - **WHEN** the enrollment client selects a control endpoint
-- **THEN** it defaults to the corresponding local `egress.sock` endpoint and an explicitly supplied socket takes precedence; the endpoint belongs to the Egress service machine.
-
-## ADDED Requirements
+- **THEN** `pathchordctl enroll` defaults to the corresponding local `egress.sock` endpoint and an explicitly supplied socket takes precedence; the endpoint belongs to the Egress service machine. Egress resources default to `~/.config/pathchord/egress` or `/etc/pathchord/egress`.
 
 ### Requirement: Role-specific service artifact boundaries
 
@@ -50,51 +43,35 @@ runtime components.
   store, and admit an explicitly enrolled Ingress Session when ordinary target
   forwarding prerequisites are available.
 
-#### Scenario: Ingress-only platform configuration is isolated
+#### Scenario: Dedicated management client
 
-- **WHEN** an operator inspects or starts the Egress service package
-- **THEN** the package exposes no Egress listener for HTTP, SOCKS, TUN,
-  TPROXY, REDIRECT, or eBPF configuration and does not require the files,
-  devices, or privileges used only by those Ingress modes.
+- **WHEN** an operator invokes `pathchordctl` for status or enrollment
+- **THEN** the client connects to the selected local control endpoint without
+  starting either service executable and preserves the versioned control
+  envelope and generation checks.
 
-### Requirement: Dedicated management client
+## ADDED Requirements
 
-Role service executables SHALL not be the management command dispatcher. A
-dedicated management client SHALL send the existing versioned local control
-envelopes to the selected Ingress or Egress endpoint and SHALL preserve the
-authorization, generation, redaction, and enrollment semantics of the control
-plane.
+### Requirement: Single-role package deployment
 
-#### Scenario: Query an Ingress service
+Each packaged installation SHALL select exactly one service role and install only its daemon, `pathchordctl`, configuration, and service definitions. Unix packages SHALL use the local non-login `pathchord` account. Opposite-role packages SHALL be mutually exclusive. Role replacement SHALL be explicit, and package lifecycle operations SHALL preserve operator-owned configuration, identities, and authorization data.
 
-- **WHEN** an operator invokes the management client for Ingress status
-- **THEN** the client connects to the selected Ingress control endpoint and
-  returns the structured status response without starting an Ingress service.
+#### Scenario: Selected role package payload
 
-#### Scenario: Mutate Egress authorization
+- **WHEN** an operator installs an Ingress or Egress role package
+- **THEN** it supplies the selected daemon, `pathchordctl`, configuration and service, and contains no daemon, default configuration, or service definition for the other role.
 
-- **WHEN** an operator invokes enrollment or authorization management with the
-  Egress control endpoint
-- **THEN** the client sends the request to Egress, preserves the expected
-  authorization generation, and returns the typed response and cleanup result.
+#### Scenario: Opposite role package conflict
 
-### Requirement: Role-specific service state and privilege roots
+- **WHEN** a role package is installed and an operator attempts to install the opposite role
+- **THEN** installation is rejected before changing service registration, configuration, private state, or control endpoints; changing roles requires explicit removal and replacement.
 
-Ingress and Egress SHALL use separate service data, private identity, control
-socket, and credential access roots. A service SHALL have access only to the
-role-owned roots required by its configured runtime and SHALL retain the
-existing prohibition on committing private credentials.
+#### Scenario: Single-role Unix service identity
 
-#### Scenario: Egress service starts with its own state roots
+- **WHEN** a Unix role package prepares its service identity and private paths
+- **THEN** the selected service runs as the local non-login `pathchord` account, only its role directories are created, and private files and control endpoints reject unauthorized local access.
 
-- **WHEN** the Egress service starts from its packaged configuration
-- **THEN** its identity, authorization database, control socket, and runtime
-  state resolve under the Egress-owned paths and it does not create or mutate
-  Ingress listener, subscription, or interception state.
+#### Scenario: Role package lifecycle preserves private state
 
-#### Scenario: Role roots are permission-restricted
-
-- **WHEN** a service package prepares its configuration and state directories
-- **THEN** the directories and private files use ownership and permissions that
-  prevent the other role and unprivileged local actors from reading private
-  identity, authorization, credential, or bearer-token data.
+- **WHEN** the selected role package is upgraded, rolled back, or removed
+- **THEN** operator configuration, identities and authorization data are retained, the other role is not implicitly enabled, and retained identity data is not automatically reused as another role's identity.

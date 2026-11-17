@@ -1,44 +1,37 @@
-; PathChord Windows installer.
-; Build with packaging/windows/build.ps1 so the binary and version are
-; supplied explicitly from the Cargo workspace.
 Unicode True
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
-SetDatablockOptimize on
-
 !include "MUI2.nsh"
-!include "FileFunc.nsh"
-!cd "${__FILEDIR__}"
-
+!ifndef APP_ROLE
+  !error "APP_ROLE must be ingress or egress"
+!endif
+!if "${APP_ROLE}" == "ingress"
+  !define SERVICE_ID "PathChordIngressd"
+  !define CONFIG_TEMPLATE "..\common\default-config.yaml"
+!else if "${APP_ROLE}" == "egress"
+  !define SERVICE_ID "PathChordEgressd"
+  !define CONFIG_TEMPLATE "egress.yaml"
+!else
+  !error "invalid APP_ROLE"
+!endif
+!define DAEMON_NAME "pathchord-${APP_ROLE}d"
 !ifndef APP_VERSION
   !define APP_VERSION "0.1.0"
 !endif
-!ifndef INGRESS_BINARY_PATH
-  !define INGRESS_BINARY_PATH "..\..\target\release\pathchord-ingressd.exe"
-!endif
-!ifndef EGRESS_BINARY_PATH
-  !define EGRESS_BINARY_PATH "..\..\target\release\pathchord-egressd.exe"
+!ifndef DAEMON_BINARY_PATH
+  !error "DAEMON_BINARY_PATH is required"
 !endif
 !ifndef CTL_BINARY_PATH
-  !define CTL_BINARY_PATH "..\..\target\release\pathchordctl.exe"
+  !error "CTL_BINARY_PATH is required"
 !endif
 !ifndef OUTPUT_PATH
-  !define OUTPUT_PATH "PathChord-${APP_VERSION}-windows-x86_64-setup.exe"
+  !define OUTPUT_PATH "${DAEMON_NAME}-${APP_VERSION}-setup.exe"
 !endif
-!define PRODUCT_NAME "PathChord"
-!define PRODUCT_PUBLISHER "PathChord contributors"
-!define PRODUCT_WEB_SITE "https://github.com/KagurazakaNyaa/PathChord"
-!define PRODUCT_DIR "PathChord"
-!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
-
-Name "${PRODUCT_NAME} ${APP_VERSION}"
+!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${DAEMON_NAME}"
+Name "PathChord ${APP_ROLE} ${APP_VERSION}"
 OutFile "${OUTPUT_PATH}"
-InstallDir "$PROGRAMFILES\${PRODUCT_DIR}"
+InstallDir "$PROGRAMFILES64\PathChord"
 InstallDirRegKey HKLM "${UNINSTALL_KEY}" "InstallLocation"
-ShowInstDetails show
-ShowUninstDetails show
-
-!define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "..\..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
@@ -46,79 +39,75 @@ ShowUninstDetails show
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
-
-VIProductVersion "${APP_VERSION}.0"
-VIAddVersionKey /LANG=1033 "ProductName" "${PRODUCT_NAME}"
-VIAddVersionKey /LANG=1033 "CompanyName" "${PRODUCT_PUBLISHER}"
-VIAddVersionKey /LANG=1033 "FileDescription" "PathChord proxy runtime"
-VIAddVersionKey /LANG=1033 "FileVersion" "${APP_VERSION}"
-VIAddVersionKey /LANG=1033 "LegalCopyright" "GPL-3.0-only"
-
-; The packaged service definitions are compatible with WinSW.  WinSW is
-; intentionally not bundled: obtain the audited version used by the operator,
-; place winsw.exe in the installation directory, and run
-; services\install-service.ps1 from an elevated PowerShell prompt.
-Section "PathChord runtime" SecRuntime
+!insertmacro MUI_LANGUAGE "English"
+Function .onInit
+  SetRegView 64
+  SetShellVarContext all
+  ReadRegStr $0 HKLM "Software\PathChord" "Role"
+  StrCmp $0 "" legacy_check
+  StrCmp $0 "${APP_ROLE}" done
+  MessageBox MB_ICONSTOP "Uninstall the other PathChord role before installing ${APP_ROLE}. Private state is preserved."
+  Abort
+  legacy_check:
+  ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\PathChord" "InstallLocation"
+  StrCmp $0 "" done
+  MessageBox MB_ICONSTOP "Uninstall the legacy combined PathChord package before selecting a role."
+  Abort
+  done:
+FunctionEnd
+Section "PathChord ${APP_ROLE}" SecRuntime
   SectionIn RO
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File "install-service.ps1"
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\install-service.ps1" -Action Stop -Role ${APP_ROLE}'
+  Pop $0
+  StrCmp $0 "0" +2
+    Abort "Could not stop the existing service."
   SetOutPath "$INSTDIR"
-  File "${INGRESS_BINARY_PATH}"
-  File "${EGRESS_BINARY_PATH}"
-  File "${CTL_BINARY_PATH}"
+  File /oname=${DAEMON_NAME}.exe "${DAEMON_BINARY_PATH}"
+  File /oname=pathchordctl.exe "${CTL_BINARY_PATH}"
   File "..\..\LICENSE"
   File "..\common\pathchord.1"
-  File "..\common\default-config.yaml"
-
-  SetOutPath "$COMMONAPPDATA\PathChord\config\ingress"
-  IfFileExists "$COMMONAPPDATA\PathChord\config\ingress\ingress.yaml" config_exists
-    File /oname=ingress.yaml "..\common\default-config.yaml"
+  SetOutPath "$APPDATA\PathChord\config\${APP_ROLE}"
+  IfFileExists "$APPDATA\PathChord\config\${APP_ROLE}\${APP_ROLE}.yaml" config_exists
+    File /oname=${APP_ROLE}.yaml "${CONFIG_TEMPLATE}"
   config_exists:
-  CreateDirectory "$COMMONAPPDATA\PathChord\config\egress"
-
-  CreateDirectory "$COMMONAPPDATA\PathChord\data\ingress"
-  CreateDirectory "$COMMONAPPDATA\PathChord\data\egress"
-  CreateDirectory "$COMMONAPPDATA\PathChord\credentials\ingress"
-  CreateDirectory "$COMMONAPPDATA\PathChord\logs"
-
+  CreateDirectory "$APPDATA\PathChord\data\${APP_ROLE}"
+  CreateDirectory "$APPDATA\PathChord\credentials\${APP_ROLE}"
+  CreateDirectory "$APPDATA\PathChord\logs\${APP_ROLE}"
   SetOutPath "$INSTDIR\services"
-  File "pathchord-ingressd.xml"
-  File "pathchord-egressd.xml"
+  File "${DAEMON_NAME}.xml"
   File "install-service.ps1"
-  File "README.md"
-
+  FileOpen $0 "$INSTDIR\services\role.txt" w
+  FileWrite $0 "${APP_ROLE}"
+  FileClose $0
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\services\install-service.ps1" -Action Prepare -Role ${APP_ROLE}'
+  Pop $0
+  StrCmp $0 "0" +2
+    Abort "Could not protect the role's private directories."
   WriteUninstaller "$INSTDIR\uninstall.exe"
-  WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "${PRODUCT_NAME}"
+  WriteRegStr HKLM "Software\PathChord" "Role" "${APP_ROLE}"
+  WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "PathChord ${APP_ROLE}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayVersion" "${APP_VERSION}"
-  WriteRegStr HKLM "${UNINSTALL_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
-  WriteRegStr HKLM "${UNINSTALL_KEY}" "URLInfoAbout" "${PRODUCT_WEB_SITE}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
-  WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoModify" 1
-  WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoRepair" 1
 SectionEnd
-
 Section "Uninstall"
-  ; If WinSW wrappers were installed, let them stop and unregister cleanly.
-  IfFileExists "$INSTDIR\pathchord-ingressd-service.exe" 0 +3
-    ExecWait '"$INSTDIR\pathchord-ingressd-service.exe" stop'
-    ExecWait '"$INSTDIR\pathchord-ingressd-service.exe" uninstall'
-  IfFileExists "$INSTDIR\pathchord-egressd-service.exe" 0 +3
-    ExecWait '"$INSTDIR\pathchord-egressd-service.exe" stop'
-    ExecWait '"$INSTDIR\pathchord-egressd-service.exe" uninstall'
-
-  Delete "$INSTDIR\pathchord-ingressd.exe"
-  Delete "$INSTDIR\pathchord-egressd.exe"
+  SetRegView 64
+  SetShellVarContext all
+  IfFileExists "$INSTDIR\${DAEMON_NAME}-service.exe" 0 +3
+    ExecWait '"$INSTDIR\${DAEMON_NAME}-service.exe" stop'
+    ExecWait '"$INSTDIR\${DAEMON_NAME}-service.exe" uninstall'
+  Delete "$INSTDIR\${DAEMON_NAME}.exe"
   Delete "$INSTDIR\pathchordctl.exe"
   Delete "$INSTDIR\pathchord.1"
-  Delete "$INSTDIR\default-config.yaml"
   Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\${DAEMON_NAME}-service.exe"
+  Delete "$INSTDIR\${DAEMON_NAME}-service.xml"
   Delete "$INSTDIR\uninstall.exe"
-  Delete "$INSTDIR\pathchord-ingressd-service.exe"
-  Delete "$INSTDIR\pathchord-egressd-service.exe"
-  Delete "$INSTDIR\pathchord-ingressd-service.xml"
-  Delete "$INSTDIR\pathchord-egressd-service.xml"
-  Delete "$INSTDIR\pathchord-ingressd.xml"
-  Delete "$INSTDIR\pathchord-egressd.xml"
   RMDir /r "$INSTDIR\services"
   RMDir "$INSTDIR"
   DeleteRegKey HKLM "${UNINSTALL_KEY}"
+  DeleteRegKey HKLM "Software\PathChord"
 SectionEnd

@@ -41,6 +41,13 @@ static __always_inline int mark_transport(struct __sk_buff *skb, __u32 mark)
 		if (bpf_skb_load_bytes(skb, ETH_HLEN + offsetof(struct ipv6hdr, nexthdr),
 					       &transport, sizeof(transport)) < 0)
 			return TC_ACT_OK;
+		/* IPv6 fragments keep the transport protocol in their next-header byte.
+		 * Mark every fragment consistently so kernel reassembly and TPROXY see
+		 * the same policy-routing mark for large UDP datagrams. */
+		if (transport == IPPROTO_FRAGMENT &&
+		    bpf_skb_load_bytes(skb, ETH_HLEN + sizeof(struct ipv6hdr),
+				       &transport, sizeof(transport)) < 0)
+			return TC_ACT_OK;
 	} else {
 		return TC_ACT_OK;
 	}

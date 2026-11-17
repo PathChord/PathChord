@@ -28,8 +28,9 @@ around those contracts.
 - Make Egress configuration role-scoped and independent from the Ingress
   policy graph while preserving common schema validation and source precedence
   rules.
-- Keep the two services separately permissioned and separately packaged while
-  releasing them in one versioned bundle.
+- Install one selected service role per device, using the local non-login
+  `pathchord` account on Unix and only the selected service identity on Windows.
+- Publish mutually exclusive role packages in one versioned release.
 - Remove the unreleased multi-call service entry point completely rather than
   maintaining a compatibility wrapper.
 
@@ -43,6 +44,8 @@ around those contracts.
   protocols.
 - Making Ingress and Egress share private identities, authorization stores,
   runtime databases, listener state, or credential files.
+- Supporting simultaneous packaged Ingress and Egress services on one system or
+  adding separate default Unix identities to isolate such a deployment.
 
 ## Decisions
 
@@ -128,16 +131,25 @@ required logs/state. The Ingress unit owns listener and platform resources and
 receives only the capabilities required by its configured interception mode.
 
 Linux service definitions, Alpine/OpenRC scripts, FreeBSD rc.d scripts, and
-Windows service definitions all start the dedicated executable directly. The
-package installs separate service users or equivalent ACLs where the platform
-supports them; at minimum, the role-owned private roots remain inaccessible to
-the other service.
+Windows service definitions all start the selected executable directly. Each
+device installs one role package containing its daemon, `pathchordctl`, service
+definition, and configuration. Ingress and Egress packages are mutually
+exclusive. Unix uses one local non-login `pathchord` user/group; Windows grants
+the selected service identity access only to its required private paths. Private
+files remain protected against unauthorized local actors. No cross-role runtime
+group, shared sticky directory, or second default account is required.
+
+Changing the installed role requires explicit removal and replacement. Package
+conflict checks run before creating or changing role state. Removal, upgrades,
+and rollback retain operator configuration, private identities and authorization
+data; replacing a package does not implicitly reuse another role's identity.
 
 ### Release both services as one compatibility unit
 
-The release contains `pathchord-ingressd`, `pathchord-egressd`, and
-`pathchordctl` with one version and one protocol revision. Package upgrades
-replace the role binaries and client together. The design does not claim
+The release publishes `pathchord-ingressd`, `pathchord-egressd`, and
+`pathchordctl` with one version and one protocol revision. Each role package
+contains its daemon and the management client; package upgrades replace those
+two executables together. The design does not claim
 zero-downtime or arbitrary cross-version operation: a restarted service still
 invalidates its related Session and Paths, and a protocol revision mismatch
 must fail during normal capability negotiation rather than silently downgrade.
@@ -161,10 +173,12 @@ must fail during normal capability negotiation rather than silently downgrade.
   definitions easier to drift. **Mitigation:** use one package inventory test
   for Debian, Alpine, Arch, FreeBSD, and Windows and verify each service's
   executable, root paths, socket, and privilege settings.
-- **[Risk]** A partial upgrade leaves one role at a different protocol revision.
-  **Mitigation:** publish the binaries as one release bundle, record the shared
-  revision in package metadata, and test clean upgrade and rollback as a
-  bundle.
+- **[Risk]** Devices can run different protocol revisions during an upgrade.
+  **Mitigation:** publish both role packages in one release, record the shared
+  revision, and retain normal negotiation rejection for incompatible peers.
+- **[Risk]** Switching roles overwrites operator data or starts an unexpected
+  service. **Mitigation:** reject opposite-role installation before mutation and
+  test explicit removal/replacement with private-state sentinels.
 - **[Risk]** Removing the unreleased multi-call entry point breaks local scripts
   used during development. **Mitigation:** update repository scripts, examples,
   CI, and package checks in the same change; no production compatibility shim
@@ -181,17 +195,18 @@ must fail during normal capability negotiation rather than silently downgrade.
    local callers and fixtures.
 4. Add role-specific Egress parsing and source validation, split default
    configuration/state roots, and update resource examples.
-5. Update package recipes, service definitions, installers, manpage content,
-   guides, and bilingual design/spec documents. Remove references to the
-   multi-call service executable.
+5. Update mutually exclusive role package recipes, service definitions,
+   installers, manpage content, guides, and bilingual design/spec documents.
+   Remove references to the multi-call service executable and default dual-role
+   installations.
 6. Validate dependency closure, release artifacts, local control operations,
    direct Noise/Path forwarding, platform service definitions, and rollback of
-   the complete release bundle.
+   each role package.
 7. Update `openspec/implementation-status.md` with local build/test evidence
    and clearly separate any native-host or deployed validation that remains.
 
 ## Open Questions
 
 None. Binary names, the absence of a compatibility wrapper, the separate
-management client, role-scoped Egress configuration, and same-bundle release
-policy are fixed by this design and the user's pre-0.1.0 scope.
+management client, role-scoped Egress configuration, single-role package
+installation, unified Unix account, and shared release revision are fixed.

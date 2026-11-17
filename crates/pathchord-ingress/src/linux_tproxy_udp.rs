@@ -198,16 +198,20 @@ impl LinuxTproxyUdpSocket {
 #[async_trait]
 impl TransparentUdpAdapter for LinuxTproxyUdpSocket {
     async fn receive(&self) -> Result<TransparentDatagram, TransparentUdpError> {
-        loop {
-            self.socket
-                .readable()
-                .await
-                .map_err(|error| TransparentUdpError::Io(error.to_string()))?;
-            match self.receive_ready() {
-                Err(TransparentUdpError::WouldBlock) => {}
-                result => return result,
-            }
-        }
+        // recvmsg reads outside Tokio's usual recv_from path. Report EAGAIN
+        // through async_io so stale readiness is cleared instead of spinning
+        // and starving the association/response tasks after the first packet.
+        self.socket
+            .async_io(tokio::io::Interest::READABLE, || {
+                match self.receive_ready() {
+                    Err(TransparentUdpError::WouldBlock) => {
+                        Err(std::io::ErrorKind::WouldBlock.into())
+                    }
+                    result => Ok(result),
+                }
+            })
+            .await
+            .map_err(|error| TransparentUdpError::Io(error.to_string()))?
     }
 
     async fn send(&self, datagram: &TransparentDatagram) -> Result<(), TransparentUdpError> {

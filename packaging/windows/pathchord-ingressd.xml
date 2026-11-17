@@ -6,8 +6,11 @@
   <name>PathChord Ingressd</name>
   <description>PathChord local HTTP and SOCKS ingress listeners.</description>
   <startmode>Manual</startmode>
-  <executable>%ProgramFiles%\PathChord\pathchord-ingressd.exe</executable>
-  <arguments>--config-dir "%ProgramData%\PathChord\config\ingress" --data-dir "%ProgramData%\PathChord\data\ingress" --credentials-dir "%ProgramData%\PathChord\credentials\ingress"</arguments>
+  <serviceaccount>
+    <username>NT SERVICE\PathChordIngressd</username>
+  </serviceaccount>
+  <executable>%BASE%\pathchord-ingressd.exe</executable>
+  <arguments>--socket "\\.\pipe\pathchord-ingress" --config-dir "%ProgramData%\PathChord\config\ingress" --data-dir "%ProgramData%\PathChord\data\ingress" --credentials-dir "%ProgramData%\PathChord\credentials\ingress"</arguments>
   <workingdirectory>%ProgramData%\PathChord</workingdirectory>
   <logpath>%ProgramData%\PathChord\logs\ingress</logpath>
   <log mode="roll" />

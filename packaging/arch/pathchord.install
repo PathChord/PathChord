@@ -1,0 +1,36 @@
+selected_role() {
+    if [ -x /usr/bin/pathchord-ingressd ] && [ ! -e /usr/bin/pathchord-egressd ]; then
+        role=ingress
+    elif [ -x /usr/bin/pathchord-egressd ] && [ ! -e /usr/bin/pathchord-ingressd ]; then
+        role=egress
+    else
+        echo 'PathChord requires exactly one installed service role' >&2
+        return 1
+    fi
+}
+post_install() {
+    selected_role
+    systemd-sysusers /usr/lib/sysusers.d/pathchord.conf
+    /usr/libexec/pathchord-setup-layout "$role"
+}
+pre_upgrade() {
+    selected_role
+    if [ -d /run/systemd/system ] && systemctl is-active --quiet "pathchord-${role}d.service"; then
+        touch /run/pathchord/.restart
+        systemctl stop "pathchord-${role}d.service"
+    fi
+}
+post_upgrade() {
+    post_install
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        if [ -e /run/pathchord/.restart ]; then
+            rm /run/pathchord/.restart
+            systemctl start "pathchord-${role}d.service"
+        fi
+    fi
+}
+pre_remove() {
+    selected_role
+    if [ -d /run/systemd/system ]; then systemctl stop "pathchord-${role}d.service"; fi
+}

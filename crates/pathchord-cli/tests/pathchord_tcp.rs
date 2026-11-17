@@ -58,6 +58,113 @@ async fn direct_transit_establishes_an_ipv6_egress_session() {
 }
 
 #[tokio::test]
+async fn revoked_session_does_not_fail_ingress_shutdown() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let runtime_metrics = tokio::runtime::Handle::current().metrics();
+        let tasks_before = runtime_metrics.num_alive_tasks();
+        let ingress_key = generate_static_keypair().unwrap();
+        let egress_key = Arc::new(generate_static_keypair().unwrap());
+        let store = Arc::new(
+            AuthorizationStore::open(
+                ":memory:",
+                StoreEgressId::new("egress-a"),
+                *egress_key.public(),
+            )
+            .unwrap(),
+        );
+        store
+            .mutate(AuthorizationMutationRequest {
+                actor_id: "test".into(),
+                request_id: "enroll".into(),
+                expected_generation: 0,
+                ingress_id: StoreIngressId::new("ingress-a"),
+                mutation: AuthorizationMutation::Enroll {
+                    public_key: *ingress_key.public(),
+                    administrator_labels: BTreeMap::new(),
+                },
+            })
+            .unwrap();
+        let egress = Arc::new(
+            EgressNode::bind(
+                EgressNodeConfig {
+                    binds: vec!["127.0.0.1:0".parse().unwrap()],
+                    egress_id: "egress-a".into(),
+                    keypair: Arc::clone(&egress_key),
+                    authorizations: Arc::clone(&store),
+                    protocol_limits: ProtocolLimits::default(),
+                    ready_limits: PathReady {
+                        max_frame_payload: 32 * 1024,
+                        max_control_payload: 4 * 1024,
+                        max_session_buffering: 4 * 1024 * 1024,
+                    },
+                    required_capabilities: 1,
+                    supported_capabilities: 1,
+                    max_concurrent_paths: 8,
+                    capacity_bps: 1_000_000_000,
+                    max_inbound_target_connections: 128,
+                    remote_dns_only: false,
+                    quota_remaining: None,
+                    traffic_multiplier_basis_points: 10_000,
+                },
+                TcpTargetConnector::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let (stop, shutdown) = oneshot::channel();
+        let owner = Arc::clone(&egress);
+        let task = tokio::spawn(async move {
+            owner
+                .run_until_shutdown(async {
+                    let _ = shutdown.await;
+                })
+                .await
+        });
+        let plane = IngressDataPlane::new(IngressDataPlaneConfig::new(
+            "ingress-a",
+            ingress_key,
+            policy("default", egress.local_addr(), egress_key.public()),
+        ))
+        .unwrap();
+        plane.warmup().await;
+        assert_eq!(plane.snapshot().await.sessions, 1);
+        store
+            .mutate(AuthorizationMutationRequest {
+                actor_id: "test".into(),
+                request_id: "revoke".into(),
+                expected_generation: 1,
+                ingress_id: StoreIngressId::new("ingress-a"),
+                mutation: AuthorizationMutation::Revoke,
+            })
+            .unwrap();
+        egress
+            .reconcile_authorizations_until(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        while plane.snapshot().await.sessions != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let result = plane.shutdown().await;
+        let _ = stop.send(());
+        task.await.unwrap().unwrap();
+        let snapshot =
+            result.expect("a revoked and already closed Session permits graceful shutdown");
+        assert_eq!(snapshot.sessions, 0);
+        assert_eq!(snapshot.streams, 0);
+        assert_eq!(snapshot.retained_outbound_bytes, 0);
+        for _ in 0..100 {
+            if runtime_metrics.num_alive_tasks() <= tasks_before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime_metrics.num_alive_tasks(), tasks_before);
+    })
+    .await
+    .expect("bounded revoke then shutdown regression");
+}
+
+#[tokio::test]
 async fn retiring_a_replaced_transit_path_prevents_new_streams_from_using_it() {
     use pathchord_policy::{
         SubscriptionConfig, SubscriptionId, SubscriptionSource, SubscriptionSourceType,

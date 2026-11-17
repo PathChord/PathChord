@@ -1767,14 +1767,20 @@ async fn commit_subscription_refresh(
     data_plane: &IngressDataPlane,
     registry: &AdapterRegistry<FileTransitCredentialProvider>,
 ) -> Result<RefreshOutcome, CliError> {
-    // Fence the old adapters before publishing a potentially changed node.
+    // Fence adapters whose admitted identity changes before publishing them.
+    // Unchanged admissions must remain usable while cache I/O and adapter
+    // preparation await; unavailable siblings have no admission to invalidate.
     // A rejected commit restores the previously verified snapshot below.
-    let fenced = candidate.is_ok();
+    let invalidated: Vec<_> = candidate
+        .as_ref()
+        .ok()
+        .map(|candidate| candidate.invalidated_adapters(manager.snapshot()))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| manager.snapshot().validated_admission(id).is_some())
+        .collect();
+    let fenced = !invalidated.is_empty();
     if fenced {
-        let invalidated = candidate
-            .as_ref()
-            .expect("candidate was checked")
-            .invalidated_adapters(manager.snapshot());
         data_plane
             .initialize_subscription_visibility(id.as_str(), false)
             .await;

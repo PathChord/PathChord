@@ -1,118 +1,61 @@
 #!/bin/sh
-# Assemble an Alpine APK from a release or cross-compiled binary.
 set -eu
-
-root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+root_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../common/package-role.sh
+. "$root_dir/packaging/common/package-role.sh"
 output_dir=${1:-"$root_dir/dist"}
 version=${PATHCHORD_VERSION:-$("$root_dir/packaging/version.sh")}
-ingress_binary=${PATHCHORD_INGRESS_BINARY:-"$root_dir/target/release/pathchord-ingressd"}
-egress_binary=${PATHCHORD_EGRESS_BINARY:-"$root_dir/target/release/pathchord-egressd"}
-ctl_binary=${PATHCHORDCTL_BINARY:-"$root_dir/target/release/pathchordctl"}
-for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
-	case "$binary" in
-		/*) ;;
-		*) binary="$root_dir/$binary" ;;
-	esac
-done
-
-case "$version" in
-	''|*[!0-9A-Za-z.+_-]*)
-		echo "invalid PathChord package version: $version" >&2
-		exit 2
-		;;
-esac
-for binary in "$ingress_binary" "$egress_binary" "$ctl_binary"; do
-	if [ ! -f "$binary" ] || [ ! -x "$binary" ]; then
-		echo "PathChord binary is missing or not executable: $binary" >&2
-		exit 1
-	fi
-done
-if ! command -v abuild >/dev/null 2>&1; then
-	echo "abuild is required to build an Alpine package" >&2
-	exit 127
-fi
-
-arch=${PATHCHORD_ALPINE_ARCH:-}
-if [ -z "$arch" ]; then
-	case "$(uname -m)" in
-		x86_64) arch=x86_64 ;;
-		aarch64) arch=aarch64 ;;
-		armv7*) arch=armv7 ;;
-		ppc64le) arch=ppc64le ;;
-		s390x) arch=s390x ;;
-		riscv64) arch=riscv64 ;;
-		*) echo "set PATHCHORD_ALPINE_ARCH for this host" >&2; exit 2 ;;
-	esac
-fi
-case "$arch" in
-	*[!A-Za-z0-9_]*) echo "invalid Alpine architecture: $arch" >&2; exit 2 ;;
-esac
-
+case "$version" in ''|*[!0-9A-Za-z.+_-]*) exit 2 ;; esac
+arch=${PATHCHORD_ALPINE_ARCH:-$(uname -m)}
+command -v abuild >/dev/null
 mkdir -p "$output_dir"
 work=$(mktemp -d "${TMPDIR:-/tmp}/pathchord-alpine.XXXXXX")
-cleanup() { rm -rf "$work"; }
-trap cleanup EXIT HUP INT TERM
-cp "$ingress_binary" "$work/pathchord-ingressd"
-cp "$egress_binary" "$work/pathchord-egressd"
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+cp "$daemon_binary" "$work/$package_name"
 cp "$ctl_binary" "$work/pathchordctl"
 cp "$root_dir/LICENSE" "$work/LICENSE"
 cp "$root_dir/packaging/common/pathchord.1" "$work/pathchord.1"
-cp "$root_dir/packaging/common/default-config.yaml" "$work/default-config.yaml"
-cp "$root_dir/packaging/alpine/pathchord-ingressd.initd" "$work/pathchord-ingressd.initd"
-cp "$root_dir/packaging/alpine/pathchord-egressd.initd" "$work/pathchord-egressd.initd"
-cp "$root_dir/packaging/alpine/pathchord.pre-install" "$work/pathchord.pre-install"
-
-cat >"$work/APKBUILD" <<'EOF'
-pkgname=pathchord
-pkgver=__PATHCHORD_VERSION__
+cp "$root_dir/packaging/common/setup-layout.sh" "$work/setup-layout.sh"
+cp "$root_dir/packaging/alpine/$package_name.initd" "$work/role.initd"
+if [ "$role" = ingress ]; then template=default-config.yaml; else template=default-egress-config.yaml; fi
+cp "$root_dir/packaging/common/$template" "$work/role.yaml"
+for hook in pre-install pre-upgrade post-install post-upgrade pre-deinstall; do
+    cp "$root_dir/packaging/alpine/pathchord.$hook" "$work/$package_name.$hook"
+done
+cat > "$work/APKBUILD" <<'EOF'
+pkgname=__PACKAGE__
+pkgver=__VERSION__
 pkgrel=0
-pkgdesc="Multipath proxy runtime with HTTP, SOCKS, and Egress listeners"
+pkgdesc="PathChord __ROLE__ runtime and local management client"
 url="https://github.com/KagurazakaNyaa/PathChord"
-arch="__PATHCHORD_ARCH__"
+arch="__ARCH__"
 license="GPL-3.0-only"
-depends=""
+depends="__CERTIFICATES__ !__OTHER__ !pathchord"
 makedepends=""
+options="!check !strip"
 pkgusers="pathchord"
 pkggroups="pathchord"
-install="$pkgname.pre-install"
-source="pathchord-ingressd pathchord-egressd pathchordctl LICENSE pathchord.1 default-config.yaml pathchord-ingressd.initd pathchord-egressd.initd"
-sha256sums="
-SKIP
-SKIP
-SKIP
-SKIP
-SKIP
-SKIP
-"
-
-build() {
-	:
-}
-
+install="$pkgname.pre-install $pkgname.pre-upgrade $pkgname.post-install $pkgname.post-upgrade $pkgname.pre-deinstall"
+source="$pkgname pathchordctl LICENSE pathchord.1 setup-layout.sh role.yaml role.initd"
+sha256sums="SKIP"
 package() {
-	install -Dm0755 "$srcdir/pathchord-ingressd" "$pkgdir/usr/bin/pathchord-ingressd"
-	install -Dm0755 "$srcdir/pathchord-egressd" "$pkgdir/usr/bin/pathchord-egressd"
-	install -Dm0755 "$srcdir/pathchordctl" "$pkgdir/usr/bin/pathchordctl"
-	install -Dm0644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/pathchord/LICENSE"
-	install -Dm0644 "$srcdir/pathchord.1" "$pkgdir/usr/share/man/man1/pathchord.1"
-	gzip -n -9 "$pkgdir/usr/share/man/man1/pathchord.1"
-	install -Dm0644 "$srcdir/default-config.yaml" "$pkgdir/etc/pathchord/ingress/ingress.yaml"
-	install -Dm0755 "$srcdir/pathchord-ingressd.initd" "$pkgdir/etc/init.d/pathchord-ingressd"
-	install -Dm0755 "$srcdir/pathchord-egressd.initd" "$pkgdir/etc/init.d/pathchord-egressd"
+    install -Dm0755 "$srcdir/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm0755 "$srcdir/pathchordctl" "$pkgdir/usr/bin/pathchordctl"
+    install -Dm0755 "$srcdir/setup-layout.sh" "$pkgdir/usr/libexec/pathchord-setup-layout"
+    install -Dm0644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm0644 "$srcdir/pathchord.1" "$pkgdir/usr/share/man/man1/pathchord.1"
+    gzip -n -9 "$pkgdir/usr/share/man/man1/pathchord.1"
+    install -Dm0644 "$srcdir/role.yaml" "$pkgdir/etc/pathchord/__ROLE__/__ROLE__.yaml"
+    chmod 0750 "$pkgdir/etc/pathchord/__ROLE__"
+    install -Dm0755 "$srcdir/role.initd" "$pkgdir/etc/init.d/$pkgname"
 }
 EOF
-sed -i \
-	-e "s/__PATHCHORD_VERSION__/$version/g" \
-	-e "s/__PATHCHORD_ARCH__/$arch/g" \
-	"$work/APKBUILD"
-
-(cd "$work" && SRCDEST="$work" abuild checksum && SRCDEST="$work" abuild -r)
-package=$(find "$work" "${HOME:-/nonexistent}/packages" -type f \
-	-name 'pathchord-*.apk' -print 2>/dev/null | sort | tail -n 1)
-if [ -z "$package" ]; then
-	echo "abuild did not produce a package" >&2
-	exit 1
-fi
-destination="$output_dir/$(basename "$package")"
-cp "$package" "$destination"
-printf '%s\n' "$destination"
+if [ "$role" = ingress ]; then certificates=ca-certificates; else certificates=; fi
+sed -i -e "s/__CERTIFICATES__/$certificates/g" -e "s/__PACKAGE__/$package_name/g" -e "s/__OTHER__/$other_package/g" \
+    -e "s/__ROLE__/$role/g" -e "s/__VERSION__/$version/g" -e "s/__ARCH__/$arch/g" "$work/APKBUILD"
+(cd "$work" && SRCDEST="$work" abuild checksum && SRCDEST="$work" abuild -d -r)
+package=$(find "${HOME:-/nonexistent}/packages" -type f -name "$package_name-$version-r0.apk" -print -quit)
+[ -n "$package" ]
+cp "$package" "$output_dir/"
+printf '%s\n' "$output_dir/$(basename "$package")"

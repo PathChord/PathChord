@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+getent group pathchord >/dev/null 2>&1 || addgroup -S pathchord
+getent passwd pathchord >/dev/null 2>&1 || adduser -S -D -H -G pathchord -s /sbin/nologin pathchord
+if [ -d /run/openrc ]; then
+    for role in ingress egress; do
+        if [ -x "/usr/bin/pathchord-${role}d" ] && rc-service "pathchord-${role}d" status >/dev/null 2>&1; then
+            touch /run/pathchord/.restart
+            rc-service "pathchord-${role}d" stop
+        fi
+    done
+fi

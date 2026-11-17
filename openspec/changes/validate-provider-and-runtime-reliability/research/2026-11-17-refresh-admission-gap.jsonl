@@ -1,0 +1,2 @@
+{"diagnostic": "unexpected_provider_traffic_failure", "errors": [{"error": "proxy_connect_status_403", "phase": "provider_recovery"}]}
+{"check": "no_provider_traffic_loss_during_dns_fault", "result": "failed"}

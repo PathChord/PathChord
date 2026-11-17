@@ -1,5 +1,4 @@
 # PathChord 架构
-
 [English](architecture.md) | **简体中文**
 
 ## 1. 范围
@@ -180,6 +179,11 @@ PathChord 在同一个版本化 release bundle 中发布三个可执行文件：
 `pathchord-ingressd` 负责本地监听器、Transit Proxy 适配器、订阅、DNS、策略以及透明/TUN 平台集成；
 `pathchord-egressd` 负责认证的 Path 准入、TCP/UDP 目标转发、授权和全局资源上限；
 `pathchordctl` 是角色无关的本地管理客户端。两个服务以独立进程运行，使用独立的控制 socket、身份、凭据和状态目录。管理客户端不会启动服务。
+
+受支持的软件包部署在每台设备上选择一个角色：客户端运行 Ingress，落地主机运行 Egress。
+互斥的角色软件包只包含所选 daemon 和 `pathchordctl`，以及该角色的服务与配置。
+Unix 使用本机不可登录的 `pathchord` 账号。该部署模式不要求两个默认服务账号，也不要求
+在同一系统同时运行两个服务；切换角色需要显式替换软件包，并保留操作者的私有状态。
 
 Ingress 从 Ingress 配置根读取完整策略资源图。Egress 从 Egress 配置根读取恰好一个
 `EgressService`，不会加载 listener、Transit Proxy、subscription、routing、DNS、fallback 或 geodata 资源。

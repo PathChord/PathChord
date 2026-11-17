@@ -6,8 +6,11 @@
   <name>PathChord Egressd</name>
   <description>PathChord authenticated Egress Path listener.</description>
   <startmode>Manual</startmode>
-  <executable>%ProgramFiles%\PathChord\pathchord-egressd.exe</executable>
-  <arguments>--config-dir "%ProgramData%\PathChord\config\egress" --bind 127.0.0.1:9443 --egress-id exit --identity "%ProgramData%\PathChord\data\egress\egress.key.json" --authorization-db "%ProgramData%\PathChord\data\egress\authorizations.sqlite" --control-socket "\\.\pipe\pathchord-egress"</arguments>
+  <serviceaccount>
+    <username>NT SERVICE\PathChordEgressd</username>
+  </serviceaccount>
+  <executable>%BASE%\pathchord-egressd.exe</executable>
+  <arguments>--config-dir "%ProgramData%\PathChord\config\egress" --control-socket "\\.\pipe\pathchord-egress"</arguments>
   <workingdirectory>%ProgramData%\PathChord</workingdirectory>
   <logpath>%ProgramData%\PathChord\logs\egress</logpath>
   <log mode="roll" />

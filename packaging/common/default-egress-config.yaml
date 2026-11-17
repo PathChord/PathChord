@@ -1,0 +1,11 @@
+# Provision this role's private identity before starting the Egress service.
+apiVersion: pathchord.io/v1
+kind: EgressService
+metadata:
+  name: egress
+spec:
+  binds: ['127.0.0.1:7443']
+  egressId: egress
+  identity: /var/lib/pathchord-egress/egress.key.json
+  authorizationDb: /var/lib/pathchord-egress/authorizations.db
+  controlSocket: /run/pathchord/egress.sock

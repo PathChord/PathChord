@@ -1,11 +1,10 @@
 # PathChord 部署与本地操作
-
 [English](deployment.md) | **简体中文**
 
 本指南介绍本地代理设置、Linux 特权监听器，以及 Ingress/Egress 的显式登记。请先阅读[配置指南](configuration.zh-CN.md)以选择资源和路由。服务行为要求由[部署规范](../../openspec/specs/deployment/spec.zh-CN.md)定义。
 
-`pathchord` 可执行文件提供 Ingress、Egress 服务子命令和本地管理命令。每次服务调用拥有独立
-进程。普通示例使用显式代理监听器，不需要流量拦截或 TUN 权限。Linux 透明代理和 TUN 示例
+发布提供 `pathchord-ingressd`、`pathchord-egressd` 和 `pathchordctl`。每个服务可执行文件
+拥有独立进程。普通示例使用显式代理监听器，不需要流量拦截或 TUN 权限。Linux 透明代理和 TUN 示例
 单独提供，需要下面描述的平台权限和路由设置。
 
 ## 配置目录与覆写
@@ -60,6 +59,30 @@ curl -x socks5h://127.0.0.1:7890 https://example.com
 ```sh
 pathchord-ingressd --config examples/ingress-subscriptions.yaml
 ```
+
+## 软件包服务账号与权限
+
+每台机器只安装一个角色：Ingress 客户端使用 `pathchord-ingressd`，Egress 落地机使用
+`pathchord-egressd`。每个软件包只包含本角色 daemon、`pathchordctl`、配置模板和对应服务。
+安装相反角色时，会在更改现有服务或私有状态之前拒绝操作。更换角色应显式卸载当前包后
+再安装另一角色；升级、回滚和卸载保留用户配置及私钥。
+
+两个 Unix 安装配置都使用本机非登录账号 `pathchord`，只创建所选角色的私有根。
+状态和运行目录权限为 `0700`，配置目录由 `root:pathchord` 拥有、权限为 `0750`，
+控制 socket 及其锁权限为 `0600`。以 root 或 `pathchord` 运行 `pathchordctl`。
+Ingress 凭据位于资源树外的 `/var/lib/pathchord-ingress/credentials`；FreeBSD 使用
+`/var/db/pathchord-ingress/credentials`。
+
+systemd 默认服务无 capability 且限制设备访问。仅在配置透明/TUN listener 时，才把
+`/usr/share/pathchord/systemd/transparent.conf` 安装为
+`/etc/systemd/system/pathchord-ingressd.service.d/transparent.conf` 并重启 Ingress。
+使用 eBPF 时另加相邻的 `ebpf.conf`，预先挂载 bpffs 并准备所需内核与工具。
+[软件包说明](../../packaging/README.md#service-isolation-and-optional-ingress-privileges)
+介绍了 Alpine OpenRC 的 capability 配置。Egress 不需要 TUN 设备或网络管理 capability。
+
+Windows 只安装所选角色服务定义，把本角色配置、数据、凭据和日志权限限制为其虚拟服务
+账号、SYSTEM 和 Administrators。使用 Windows TUN 前，应为所选 Ingress 账号准备原生
+设备权限。普通显式代理 listener 不需要管理员服务账号。
 
 ## Linux 透明代理与 TUN 监听器
 

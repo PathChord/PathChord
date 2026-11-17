@@ -1,30 +1,56 @@
-# FreeBSD package
+# FreeBSD role package
 
-`Makefile` is a ports skeleton for a source build. It uses the standard Cargo
-ports framework and installs `pathchord-ingressd`, `pathchord-egressd`, and
-`pathchordctl`, both rc.d service definitions, `pathchordctl(1)`, and the
-loopback-only default configuration at
-`/usr/local/etc/pathchord/ingress/ingress.yaml`.
+Select `PATHCHORD_ROLE=ingress` or `PATHCHORD_ROLE=egress` when building the
+ports recipe. It installs only that daemon, `pathchordctl`, `pathchord(1)`, the
+matching rc.d script and role configuration under
+`/usr/local/etc/pathchord/<role>`. The two role packages conflict, and both
+use the local non-login `pathchord` account.
 
-For release automation that already has a cross-compiled FreeBSD binary, use
-the artifact assembler from a native FreeBSD host:
+For prebuilt FreeBSD artifacts, run the assembler on a native `pkg(8)` host:
 
 ```sh
-PATHCHORD_INGRESS_BINARY=/path/to/x86_64-unknown-freebsd/pathchord-ingressd \
-PATHCHORD_EGRESS_BINARY=/path/to/x86_64-unknown-freebsd/pathchord-egressd \
+PATHCHORD_ROLE=egress \
+PATHCHORD_DAEMON_BINARY=/path/to/x86_64-unknown-freebsd/pathchord-egressd \
 PATHCHORDCTL_BINARY=/path/to/x86_64-unknown-freebsd/pathchordctl \
-PATHCHORD_VERSION=0.1.0 \
-  packaging/freebsd/build.sh dist
+PATHCHORD_VERSION=0.1.0 packaging/freebsd/build.sh dist
 ```
 
-The assembler calls `pkg create` and therefore must run on a host with
-FreeBSD `pkg(8)`. A Linux cross-build or a successful ELF link does not prove
-that the package installs or that rc.d/service behavior works on FreeBSD.
+The ports recipe uses `@sample`. The prebuilt assembler also ships only a
+`.sample` template and initializes the operator file only when it is absent,
+without requiring a ports keyword tree. Package upgrades and
+rollback retain operator edits, while uninstall preserves private files.
+Changing roles requires explicit removal of the installed package before the
+other is installed. Opposite-role installation must not overwrite existing
+identities or authorization data.
 
-Enable Ingress in `/etc/rc.conf` with `pathchord_ingressd_enable="YES"`. The Egress
-service is separately controlled by `pathchord_egressd_enable` and requires an
-operator-provisioned identity under `/var/db/pathchord-egress`.
+Enable only the selected service in `/etc/rc.conf` with
+`pathchord_ingressd_enable="YES"` or `pathchord_egressd_enable="YES"`.
+For Egress, provision `/var/db/pathchord-egress/egress.key.json` and update its
+loopback bind in `egress.yaml` before service startup. The rc.d wrappers use
+`/var/run/pathchord/<role>.sock`; private state and runtime directories are
+`0700`, and socket endpoints are owner-only. Ingress credential JSON is stored
+in `/var/db/pathchord-ingress/credentials` outside its resource tree.
 
-The rc.d wrappers pass `/var/run/pathchord/ingress.sock` and
-`/var/run/pathchord/egress.sock` explicitly because FreeBSD uses
-`/var/run` for runtime sockets.
+The assembler and ports recipe require native FreeBSD package tools. A Linux
+cross-build can supply the binaries, while package installation, rc.d behavior,
+local control and signal handling are verified on FreeBSD itself.
+
+## Upgrade and rollback
+
+Package replacement stops the selected active service before extracting files.
+FreeBSD `pkg` reaps descendant processes after package scripts finish, so recovery
+runs outside those scripts. After the package operation returns, start the role
+again and query its protected control endpoint:
+
+```sh
+pkg add -f pathchord-egressd-0.1.1.pkg
+service pathchord-egressd onestart
+pathchordctl --socket /var/run/pathchord/egress.sock status
+```
+
+For rollback, replace the package path with the prior tested artifact and repeat
+the service start and status check. Use the matching Ingress service/socket for
+an Ingress profile. Configuration, identity and authorization data are preserved;
+this procedure includes a service interruption. Uninstall stops a running role
+and retains private operator state. Explicit role replacement installs the other
+profile only after removal of the current package.
