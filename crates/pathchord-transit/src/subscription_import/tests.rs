@@ -937,6 +937,29 @@ fn unknown_sing_box_fields_are_kept_for_exact_engine_validation() {
 }
 
 #[test]
+fn sing_box_proxy_chain_options_remain_unavailable_without_a_native_chain_runtime() {
+    let nodes = imports(
+        SubscriptionSourceType::SingBox,
+        r#"{"outbounds":[
+          {"type":"socks","tag":"base","server":"proxy.test","server_port":1080},
+          {"type":"socks","tag":"detoured","server":"proxy.test","server_port":1081,"detour":"base"},
+          {"type":"http","tag":"routed","server":"proxy.test","server_port":8080,"route":{"final":"base"}}
+        ]}"#,
+    );
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(nodes[0].state, DynamicNodeState::Active);
+    for node in &nodes[1..] {
+        assert_eq!(
+            node.state,
+            DynamicNodeState::Unavailable(NodeUnavailableReason::AdapterUnavailable)
+        );
+        assert!(node.credential.field("sing_box_outbound").is_some());
+        assert_eq!(node.config.options, TransitOptions::default());
+        assert!(!format!("{:?}", node.credential).contains("proxy.test"));
+    }
+}
+
+#[test]
 fn simple_sing_box_socks_node_uses_the_native_adapter() {
     let nodes = normalize(
         &config(SubscriptionSourceType::SingBox),

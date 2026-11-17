@@ -539,12 +539,13 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Validation evidence
 
-The current Linux workspace run passed 1,064 tests with 118 external or
-environment-specific tests ignored; `cargo fmt --check`, strict workspace
-Clippy, the standalone Netlink patch test, cargo-deny advisories and strict
-OpenSpec validation also passed. Windows GNU all-target cross-checking passed;
-this is not a native Windows run. Explicit independent-peer results are
-recorded separately below.
+The current Linux workspace run on 2026-11-17 passed 1,084 tests with 118
+external or environment-specific tests ignored. `cargo fmt --check`, strict
+workspace Clippy, strict OpenSpec validation, release role-artifact checks, and
+the role-binary TCP/UDP smoke all passed. The current-head GitHub CI run also
+passed the dependency-advisory and external-core jobs. Native Windows,
+FreeBSD, privileged Linux, and deployed monitoring evidence remain separate
+from these local checks.
 
 The [specification-alignment repair](changes/fix-spec-alignment-findings/) adds
 regressions for connection churn beyond 16,384 completions, shared admission
@@ -558,17 +559,37 @@ credential aliases, failed provider budgets, and independently optional usage
 facts. These are local deterministic or loopback checks; they do not establish
 new native-host, cross-machine, or prolonged-soak evidence.
 
-The repair workspace run passes 671 tests with zero failures and ten existing
+A prior repair workspace run passed 671 tests with zero failures and ten existing
 external-peer tests ignored. A separate CLI-process check completes 16,500
 loopback CONNECT flows while Ingress remains running, then shuts it down
 normally. Workspace Clippy and formatting checks pass. All-target workspace
-checks pass for Windows GNU and FreeBSD x86_64; the FreeBSD check uses the
+checks passed for Windows GNU and FreeBSD x86_64; the FreeBSD check used the
 existing SDK/compiler wrappers described below and does not execute native
-FreeBSD tests. Strict OpenSpec validation passes all sixteen current items,
+FreeBSD tests. The current strict OpenSpec validation passes all 23 items,
 and local documentation links, anchors, and bilingual structural identities
 pass validation.
 
-Recorded passing checks include:
+The 2026-11-17 protocol acceptance rerun passed the applicable independent
+peers and local control paths. sing-box 1.14.4 passed the native AnyTLS,
+Hysteria2, TUIC, Reality/VLESS, VMess, HTTP, HTTPUpgrade, gRPC, WebSocket
+early-data, QUIC, SOCKS5 UDP-over-TCP, Shadowsocks UDP-over-TCP, VLESS
+packetaddr, multiplex, padding, and TLS-fingerprint cases. Mihomo 1.19.34,
+Xray 26.11.9, and V2Fly 5.53.0 passed the external-core cases; Xray Vision and
+gRPC, V2Fly Meek and legacy VMess `alter_id`, and the corresponding TCP/UDP
+flows were exercised. Trojan-Go 0.10.6 passed original/WebSocket, encrypted
+WebSocket, gRPC and HTTPUpgrade cases. v2ray-plugin 1.3.2 passed WebSocket/TLS,
+mux, UDP-over-TCP, wrong-password, and TLS/path rejection cases. Upstream
+simple-obfs HTTP/TLS passed with AES-256-GCM, and an independent sing-box
+AES-192-GCM server passed the custom cipher TCP/UDP obfs case.
+
+Subscription import, provider expansion, cache fencing, prepared-adapter
+selection, credential redaction, Ingress subscription control, CLI observation,
+and restart tests passed. A sing-box `detour`/route reference remains
+unavailable with its private document retained and no direct fallback. This
+is the deliberate proxy-chain boundary for the current change; PathChord does
+not resolve third-party route graphs.
+
+Earlier recorded checks include:
 
 ```text
 cargo fmt --all -- --check

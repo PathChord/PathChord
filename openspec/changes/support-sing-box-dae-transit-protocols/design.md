@@ -38,6 +38,13 @@ parameter is removed before byte-transport validation only when the adapter
 actually implements it. ClientHello fingerprints require the specified wire
 profile; selecting a similar cipher order alone does not satisfy that option.
 
+Imported proxy-chain references such as sing-box `detour` or route selections
+remain unavailable in this change. PathChord preserves the complete private
+outbound document and a sanitized diagnostic, without resolving third-party
+route graphs or silently replacing the chain with a direct connection. This
+keeps the existing non-goal of avoiding imported process and routing semantics
+while still making the rejection behavior testable.
+
 Use independent server fixtures and malformed/fragmented/cancelled I/O
 tests. Third-party executables are supplied by the test environment and are
 never runtime or release dependencies. Local and deployed evidence remain
