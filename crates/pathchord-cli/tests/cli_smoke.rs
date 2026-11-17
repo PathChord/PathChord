@@ -172,7 +172,7 @@ async fn separate_cli_processes_enroll_and_forward_http_and_udp_through_a_transi
 kind: Egress
 metadata: {{name: exit}}
 spec:
-  address: 127.0.0.1
+  host: 127.0.0.1
   port: {egress_port}
   publicKey: {public}
   capabilities: {{tcp: true, udp: true}}
@@ -182,7 +182,7 @@ spec:
 apiVersion: pathchord.io/v1
 kind: TransitProxy
 metadata: {{name: relay}}
-spec: {{protocol: http, address: 127.0.0.1, port: {transit_port}}}
+spec: {{protocol: http, host: 127.0.0.1, port: {transit_port}}}
 ---
 apiVersion: pathchord.io/v1
 kind: TrafficPolicy

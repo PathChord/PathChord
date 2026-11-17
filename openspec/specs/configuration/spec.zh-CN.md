@@ -93,7 +93,7 @@ Ingress 必须（SHALL）先评估有效 Egress 规则，再评估普通 Proxy �
 
 ### Requirement: Session maintenance per Egress
 
-Ingress 必须（SHALL）为每个已配置 Egress 维护一个 Session 槽位，为后续 Stream 和 UDP Association 复用存活的空闲 Session，并在该 Egress 离线或发生硬故障时销毁 Session 及相关业务连接。
+Ingress SHALL 为每个已配置 Egress 维护一个 Session 槽位；即使没有业务连接，也尽力维持其请求的可用 Path 基线；存活的空闲 Session 供后续 Stream 和 UDP Association 复用；当该 Egress 离线或发生硬故障时销毁 Session 及相关业务连接。只要达到公共最小值，基线缺口本身 SHALL NOT 使服务降级或拒绝准入。
 
 #### Scenario: Egress recovers after hard failure
 
@@ -110,18 +110,77 @@ Ingress 必须（SHALL）为每个已配置 Egress 维护一个 Session 槽位�
 - **WHEN** Ingress 启动时 Egress 绑定有效但还没有业务 flow 命中规则
 - **THEN** Ingress 可以直接为该 Egress 建立初始 Path，不得为此构造目标、监听器、flow tag 或 geodata 匹配
 
+#### Scenario: An idle Egress has an unmet usable-Path baseline
+
+- **WHEN** 合格 Egress 没有业务连接，且可用 Path 数低于有效基线
+- **THEN** Ingress 进行有界的后台建连，尽力达到该基线，无需等待路由命中
+
+#### Scenario: The minimum is met while the baseline is short
+
+- **WHEN** 公共最小值为 1，请求基线为 3，且仍有 2 条可用 Path
+- **THEN** Ingress 继续尽力恢复基线，不会只因缺少第三条 Path 而降级或拒绝新业务
+
+#### Detailed contract
+
+Egress 的 `pathPool.minUsablePaths` 是基于数量的公共准入最小值。
+`pathPool.targetUsablePaths` 是请求的稳态可用 Path 基线；省略时解析为 minimum 加一，
+显式目标不再额外增加备用 Path。该基线属于 Ingress 侧 Egress 配置，不是 EgressService
+建议值，也不是路由规则要求。
+
+维护过程独立于监听器、业务规则命中、活动 Stream、UDP Association 和 DNS 流量，按运行时
+上限尽力建立 Path，并遵循现有的退避、资格、授权、容量、增量开销和生命周期守卫。候选不可用
+或建连失败不得导致无界重试、隐式 Direct 路由或切换到其他 Egress。
+
+基线缺口表示期望状态，不得单独改变服务健康、准入许可或公共最小值。现有能力、授权、资源、
+新鲜度和硬故障检查独立生效。低于公共最小值仍会拒绝新业务，但保留剩余 ready Path 上的现有
+工作；最后一条 ready Path 丢失时退休 Session。
+
 ### Requirement: Ingress owns Path target decisions
 
-Ingress SHALL 为每个 Session 根据所选 Egress 最小要求、合规 Transit 关系、聚合方向性 demand、Path 质量和 Egress 硬资源上限计算一个 Path target。路由身份和 flow 匹配不得定义额外 Path target，Egress 不提供或覆盖该决定。
+Ingress SHALL 为每个 Session 根据 Egress 请求的可用 Path 基线和最小值、合规 Transit 关系、聚合方向性 demand、Path 质量及硬资源上限，计算一个有界的 Path target。路由身份和 flow 匹配不得定义额外 Path target，Egress 建议不得覆盖该决定。容量驱动扩张可以超过基线；需求降低后，Path SHALL 逐步排空并收缩至有效基线。
 
 #### Scenario: Egress has no Path recommendation
 
 - **WHEN** Egress 只报告容量和准入状态而不提供 Path 数建议
 - **THEN** Ingress 根据 Egress 配置和运行时观测计算一个有界 Session target
 
+#### Scenario: An omitted baseline preserves the default reserve
+
+- **WHEN** Egress 设置 minimum 为 2 并省略 target
+- **THEN** 应用运行时上限前，请求基线为 3
+
+#### Scenario: An explicit baseline adds no hidden reserve
+
+- **WHEN** Egress 显式设置 minimum 为 1、target 为 3
+- **THEN** 请求基线恰好为 3，而不是 4
+
+#### Scenario: Capacity demand exceeds the baseline
+
+- **WHEN** 新鲜方向性需求需要 5 条可用 Path，请求基线为 3，且运行时上限允许 5
+- **THEN** Ingress 可在现有扩容守卫下向 5 扩张，不把基线当成最大值
+
+#### Scenario: An expanded Session becomes idle
+
+- **WHEN** 扩大的 Session 需求降低，并且剩余容量持续超过稳定窗口
+- **THEN** Ingress 在现有冷却和排空守卫下逐步向有效基线排空富余 Path，不保留历史需求峰值
+
+#### Detailed contract
+
+令 `R` 为 Egress 配置解析出的请求基线，`H` 为当前硬运行时 Path 上限。有效基线为
+`B = min(R, H)`。当前物理 target 覆盖有效基线和上行/下行容量需求中的较大值，并受 `H` 限制。
+target 根据当前观测重新计算，不得变成历史最大负载的单调记录。未知需求仍为 unknown，不得伪造成
+测量零值或无界需求。
+
+硬上限阻止达到请求基线时，必须保留并暴露请求值。运行时限幅不得改写配置或降低公共准入最小值。
+若 `H` 无法满足最小值，沿用现有 minimum 缺口和准入语义。
+
+计划性缩容必须保留有效基线与公共最小值，同时允许独立的硬故障和生命周期转换。缩容应缓慢、
+使用滞回且先排空；不得只为达到空闲基线而中断已接受流量。扩张、排空和恢复共享同一合格 Session
+Path 池及一份不可变 TrafficPolicy。
+
 ### Requirement: Egress Session Path eligibility
 
-同一 Session 中的所有 Stream 和 UDP Association SHALL 共享由 Egress Transit 绑定、Path 认证就绪、健康及生命周期状态定义的 Path 资格。flow 的路由、目标、监听器或业务协议不得缩小 Transit 集合；Egress 协议能力和每个资源的流控仍必须执行。
+同一 Session 中的所有 Stream 和 UDP Association SHALL 共享由 Egress Transit 绑定、Path 认证就绪、健康及生命周期状态定义的 Path 资格。flow 的路由、目标、监听器或业务协议不得缩小 Transit 集合；Egress 协议能力和每个资源的流控仍必须执行。只有合格、已认证、非排空的可用 Path 才计入最小值和基线。
 
 #### Scenario: Warmup finds an ineligible Transit
 
@@ -138,6 +197,21 @@ Ingress SHALL 为每个 Session 根据所选 Egress 最小要求、合规 Transi
 - **WHEN** 一个合规 Transit 关系承载多个独立认证的 Path
 - **THEN** 该关系中非排空的 `ACTIVE` 或 `DEGRADED` Path 可以满足 Egress 最小要求，并共享该关系的配置权重
 
+#### Scenario: A draining Path does not satisfy the baseline
+
+- **WHEN** Session 有两条合格、已认证且可用的 Path，另有一条 Path 正在排空
+- **THEN** 最小值和基线的可用数量为 2，维护不得将排空 Path 用于支持另一条计划性排空
+
+#### Detailed contract
+
+准入、基线维护和计划缩容共用同一数量定义：处于 `ACTIVE` 或 `DEGRADED`、符合资格、已独立
+认证且未排空的 ready Path 数。连接中、关闭、失败、不合格和排空的 Path SHALL NOT 满足任一门槛。
+多条独立认证 Path 即使共享同一个 Transit 关系仍可计数；关系配置权重仍由其全部 Path 共享，不因
+Path 数量而倍增。
+
+旧 `statusRequirements.capabilities` 要求保留为原生配置中的
+`admission.requiredCapabilities`。键名迁移 SHALL NOT 弱化能力检查、身份绑定或授权。
+
 ### Requirement: Resource failure does not fall through silently
 
 当候选 Egress 在准入前以 `RESOURCE_LIMIT` 拒绝打开时，Ingress SHALL 在同一捕获代次中尝试其他合规候选；没有候选成功时返回类型化可重试资源错误，不得静默切换 direct 或无关 Proxy。
@@ -149,7 +223,7 @@ Ingress SHALL 为每个 Session 根据所选 Egress 最小要求、合规 Transi
 
 ### Requirement: Session demand aggregation is bounded
 
-Ingress SHALL 每个 Session 聚合上行和下行 demand，使用有界 counter 和低频窗口。路由身份、policy ID 和业务类别不得划分 Path demand。替换后的 Session 必须从空 counter 和观测开始；不得保留无界 per-flow 历史或将本地策略元数据发送给 Egress。
+Ingress SHALL 每个 Session 聚合上行和下行 demand，使用有界 counter 和低频窗口。路由身份、policy ID 和业务类别不得划分 Path demand。替换后的 Session 必须从空 counter 和观测开始，同时保留配置的 Egress 基线；不得保留无界 per-flow 历史或将本地策略元数据发送给 Egress。
 
 #### Scenario: A Session reconnects
 
@@ -160,6 +234,11 @@ Ingress SHALL 每个 Session 聚合上行和下行 demand，使用有界 counter
 
 - **WHEN** 多条路由规则将流量发送到同一个 Egress
 - **THEN** 这些流量进入同一 Session 的方向性 demand 窗口，不为每条规则分配独立 Path 要求或 demand 历史
+
+#### Scenario: A replacement Session restores its configured baseline
+
+- **WHEN** 请求基线为 3、此前因需求扩张到 6 条 Path 的 Session 被替换
+- **THEN** 新 Session 保留基线 3，应用当前硬上限，并从新 demand 状态开始，不继承旧 target 6
 
 ### Requirement: Geodata predicates participate in ordered routing
 
@@ -220,6 +299,11 @@ Path，不得通过静默更换对端 socket 迁移已建立 Path。
 - **WHEN** 使用一个 endpoint 的 Path 传输失败，而使用另一个 endpoint 的非排空 ready Path 仍存在
 - **THEN** Session 按现有最小值保持可用，只有失败 Path 进入恢复或替换
 
+#### Scenario: A Path endpoint is drained
+
+- **WHEN** 管理员在下一份静态配置中移除 endpoint，或对该 endpoint 发起管理排空
+- **THEN** 新 Path 排除该 endpoint，现有 Path 按正常 Path 排空截止时间再关闭
+
 ### Requirement: Hostname candidates preserve family and port semantics
 
 Egress endpoint 主机名 SHALL 由所选 Transit Adapter 按配置端口解析；同一主机名的 IPv4/IPv6 结果只是
@@ -259,18 +343,21 @@ items:
         region: jp
     spec:
       endpoints:
-        - address: egress-v4.example.net
+        - host: egress-v4.example.net
           port: 7443
-        - address: egress-v6.example.net
+        - host: egress-v6.example.net
           port: 8443
-        - address: egress.example.net
+        - host: egress.example.net
           port: 443
       publicKey: <curve25519-public-key>
       capabilities:
         tcp: true
         udp: true
-      statusRequirements:
+      pathPool:
         minUsablePaths: 2
+        targetUsablePaths: 3
+      admission:
+        requiredCapabilities: [tcp]
       transit:
         require:
           labels:
@@ -308,11 +395,11 @@ metadata:
     role: egress
 spec:
   endpoints:
-    - address: egress-v4.example.net
+    - host: egress-v4.example.net
       port: 7443
-    - address: egress-v6.example.net
+    - host: egress-v6.example.net
       port: 8443
-    - address: egress.example.net
+    - host: egress.example.net
       port: 443
   publicKey: <curve25519-public-key>
   capabilities:
@@ -338,7 +425,7 @@ spec:
     type: clash
     subscriptionRef: provider-a
   protocol: socks5
-  address: proxy.example.net
+  host: proxy.example.net
   port: 443
   tags: [gaming]
   weight: 100
@@ -393,7 +480,7 @@ spec:
 
 `retransmissionReplication: disabled` 即使配置了正预算也请求零 Session 复制上限；`allowed` 请求策略 bit rate 除以 8 后向下取整的 wire bytes/s，Egress 可以接受更低值。零上限会在两个方向禁用可选业务和控制副本，但保留首份数据、必要控制和普通可靠重传。`TrafficPolicy.classes`、`classReplicationBudgetBps` 和规则级 `trafficClassRef` 已退休。
 
-Session 预算在每个发送方向都是硬上限。同一 Session 的所有 Stream 和 UDP Association 共享 Egress 策略及其额度；路由身份不会划分 demand 或复制记账。Ingress 根据 Egress 最小要求、合规 Transit 关系、聚合方向性 demand、Path 观测和 Egress 全局安全上限计算一个有界 Session Path target。Egress 状态不提供或覆盖 Path 数建议。非排空的 `ACTIVE` 或 `DEGRADED` Path 才计入新业务准入；排空 Path 只完成已有工作。
+Session 预算在每个发送方向都是硬上限。同一 Session 的所有 Stream 和 UDP Association 共享 Egress 策略及其额度；路由身份不会划分 demand 或复制记账。Ingress 根据有效配置基线和当前上行/下行容量需求，在硬运行时上限内计算 Session Path target。负载需求可使 target 超过基线；缩容必须渐进并遵循排空守卫。Egress 状态不提供或覆盖 Path 数建议。只有合格且非排空的 `ACTIVE` 或 `DEGRADED` Path 才计入准入和基线；排空 Path 只完成已有工作。只要达到公共准入最小值，基线缺口本身不会使服务降级或拒绝业务。
 
 ### 普通 Proxy 规则与回退
 
@@ -515,7 +602,7 @@ billing.*   optional provider billing metadata
 
 ### 动态更新规则
 
-- 静态 Egress 拓扑、Transit 绑定、公共 Path 要求以及引用的已解析 TrafficPolicy 的规范化值变化需要重启 Ingress。
+- 静态 Egress 拓扑、Path-pool 数量、准入要求、Transit 绑定以及引用的已解析 TrafficPolicy 的规范化值变化需要重启 Ingress。
 - Transit Proxy 订阅更新以原子方式替换动态快照。
 - 订阅刷新失败时保留上一次成功的快照。
 - 已移除的 Transit Proxy 进入排空状态，并从新的选择中排除。
@@ -532,4 +619,6 @@ Ingress 管理员 label/tag 编辑属于控制面动态 mutation，只能更新 
 
 ### Session 维护
 
-Ingress 为每个已配置 Egress 维护一个 Session 槽位，并可以在任何业务 flow 命中规则前根据 Egress 绑定预热该槽位。Session 捕获一个不可变 TrafficPolicy 和协商的复制上限，拥有一个公共 Path 池；空闲时由后续 Stream、UDP Association 以及经 Egress 路由的 DNS 复用。当 Session 低于公共可用 Path 最小值但仍有 ready Path 时，进入 degraded 并拒绝新业务；最后一个 ready Path 丢失或 Egress 发生硬故障时，销毁 Session 和相关业务连接。Egress 再次上线后，Ingress 创建新的 Session 和 Path 集合。
+Ingress 为每个已配置 Egress 维护一个 Session 槽位，可以在任何业务 flow 命中规则前预热或补充其绑定对应的 Path。Session 捕获一个不可变 TrafficPolicy 和协商的复制上限，拥有一个公共 Path 池；空闲时由后续 Stream、UDP Association 以及经 Egress 路由的 DNS 复用。Ingress 尽力维持有效基线（请求目标与硬运行时上限中的较小值）；请求目标默认为公共最小值加一，显式目标不额外增加备用 Path。只要达到公共最小值，基线缺口本身不会使服务降级或拒绝新业务。低于最小值时，若仍有 ready Path，则拒绝新业务；最后一个 ready Path 丢失或 Egress 发生硬故障时，销毁 Session 和相关业务连接。Egress 再次上线后，Ingress 创建新的 Session 和 Path 集合，并恢复配置基线，不继承旧的负载扩张目标。
+
+容量驱动的扩张可以超过基线。需求降低后，Ingress 根据当前方向需求重算目标，并在容量、生命周期和排空守卫下逐步将多余 Path 收缩到有效基线。基线补充有界运行，且不依赖业务路由规则命中。

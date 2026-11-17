@@ -110,10 +110,12 @@ the relationship allocation.
 
 Ingress creates, expands, drains, and closes Paths. Streams and UDP
 Associations are independent of Path identity and may migrate within the
-common Egress Session pool. The Egress `statusRequirements.minUsablePaths` is
-the single configured common minimum; only non-draining ready Paths count for
-new admission. A Session below that minimum is degraded while existing work
-continues; losing the last ready Path closes the Session.
+common Egress Session pool. The Egress `pathPool.minUsablePaths` is the common
+admission minimum; only non-draining ready Paths count for new admission.
+`pathPool.targetUsablePaths` is the best-effort idle baseline, defaulting to
+the minimum plus one when omitted. Missing the baseline does not degrade a
+Session while the minimum remains met. A Session below the minimum is degraded
+while existing work continues; losing the last ready Path closes the Session.
 
 Session control and optional extra replication use the negotiated Session hard
 cap. Each sender shares one outbound allowance across all flows and Paths; the
@@ -139,12 +141,14 @@ per Session without retaining unbounded per-Stream or per-rule history. Health
 sampling and demand windows are low-frequency; the data path only performs
 bounded counter updates.
 
-For each Egress Session, Ingress computes one Path target from the common
-minimum, eligible Transit relationships, aggregate directional demand, Path
-quality, and the Egress hard safety ceiling. The physical Path target covers
-the larger upstream/downstream requirement. Scale-out and scale-in use
-hysteresis, count only usable non-draining Paths after all selected drains,
-and exclude candidates whose incremental capacity is below scheduling overhead.
+For each Egress Session, Ingress computes one Path target from the effective
+idle baseline, eligible Transit relationships, aggregate directional demand,
+Path quality, and the Egress hard safety ceiling. The physical Path target
+covers the larger upstream/downstream requirement and may exceed the baseline.
+When demand falls, scale-in gradually returns toward the baseline. Scale-out
+and scale-in use hysteresis, count only usable non-draining Paths after all
+selected drains, and exclude candidates whose incremental capacity is below
+scheduling overhead.
 
 Egress's effective capacity is a global scheduler/resource estimate. It is
 bounded by the configured wire cap and is derived passively from aggregate

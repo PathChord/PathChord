@@ -95,9 +95,10 @@ Path。Session 管理器可以保留一条 Path 数量为零、正在重连的�
 
 Ingress 创建、扩展、排空和关闭 Path。Stream 和 UDP 会话独立于 Path 标识，
 可以在公共 Egress Session 池的 Path 之间迁移。Egress 的
-`statusRequirements.minUsablePaths` 是唯一的公共最小值；只有非排空的 ready
-Path 计入新业务准入。低于该值时 Session 进入 degraded 但保留已有工作；最后
-一条 ready Path 丢失时关闭 Session。
+`pathPool.minUsablePaths` 是公共准入最小值；只有非排空的 ready Path 计入新业务
+准入。`pathPool.targetUsablePaths` 是尽力维持的空闲基线；省略时默认是最小值
+加一。只要最小值仍满足，未达到基线不会让 Session 降级。低于最小值时 Session
+进入 degraded 但保留已有工作；最后一条 ready Path 丢失时关闭 Session。
 
 Session 控制和可选额外复制使用协商出的 Session 硬上限。每个发送方在所有 flow
 和 Path 之间共享一个 outbound allowance，上下行分别受该标量上限约束。即使
@@ -118,10 +119,11 @@ Ingress 使用有界 counter、ACK、heartbeat、数据速率、丢包、重传�
 不保留无界的 per-Stream 或 per-rule 历史。健康采样和 demand 窗口以低频运行；
 数据路径只更新有界 counter。
 
-对于每个 Egress Session，Ingress 根据公共最小值、合规 Transit 关系、聚合方向性
+对于每个 Egress Session，Ingress 根据有效空闲基线、合规 Transit 关系、聚合方向性
 demand、Path 质量和 Egress 硬安全上限计算一个 Path target。物理 Path target
-覆盖上行和下行中需求较大的方向。扩容和缩容使用迟滞，检查所有选定排空后仍剩余
-的非排空可用 Path，并排除新增容量低于调度开销的候选。
+覆盖上行和下行中需求较大的方向，并且可以超过基线。负载下降后，缩容会逐步回到
+该基线。扩容和缩容使用迟滞，检查所有选定排空后仍剩余的非排空可用 Path，并排除
+新增容量低于调度开销的候选。
 
 Egress 的有效容量是全局 scheduler/resource 估计值，受配置 wire 上限约束，
 并通过 aggregate wire 速率、队列、重传和资源反馈被动计算；空闲吞吐不能伪造

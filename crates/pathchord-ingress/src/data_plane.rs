@@ -47,10 +47,8 @@ const TRUST_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const TRUST_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
 const TRUST_FAILURE_THRESHOLD: usize = 3;
 const AUTOSCALE_DECISION_INTERVAL: Duration = Duration::from_secs(5);
-/// Keep one independently dialed Path ready to take over a transiently
-/// failing business Path. The target is bounded by the Session's max-path
-/// limit and is applied only while Egress admission is healthy.
-const PATH_RESERVE_COUNT: usize = 1;
+const BASELINE_RETRY_BASE: Duration = Duration::from_secs(5);
+const BASELINE_RETRY_MAX: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticReloadOutcome {
@@ -122,9 +120,36 @@ pub struct DataPlaneSessionSnapshot {
     pub path_endpoint: BTreeMap<PathId, usize>,
     pub endpoint_states: Vec<EgressEndpointRuntimeSnapshot>,
     pub minimum_usable_paths: usize,
+    pub requested_target_usable_paths: u64,
+    pub effective_target_usable_paths: usize,
+    pub target_path_count: usize,
+    pub target_shortfall: u64,
+    pub target_shortfall_reason: Option<PathTargetShortfallReason>,
     pub eligible_transit_count: usize,
     pub traffic_policy_id: Option<String>,
     pub replication_cap_bps: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathTargetShortfallReason {
+    RuntimeLimit,
+    AdmissionBlocked,
+    NoEligibleTransit,
+    ConnectFailed,
+    Recovering,
+}
+
+impl PathTargetShortfallReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeLimit => "runtime_limit",
+            Self::AdmissionBlocked => "admission_blocked",
+            Self::NoEligibleTransit => "no_eligible_transit",
+            Self::ConnectFailed => "connect_failed",
+            Self::Recovering => "recovering",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,7 +212,8 @@ struct SessionSlot {
     draining_paths: Mutex<BTreeMap<PathId, (TransitProxyId, Instant)>>,
     autoscaler: Mutex<PathAutoscaler>,
     eligible_transits: Mutex<BTreeMap<TransitProxyId, u32>>,
-    target_path_count: Mutex<usize>,
+    path_target: Mutex<PathTargetState>,
+    baseline_retry: Mutex<BaselineRetryState>,
     replication_budget_bytes: Mutex<Option<u64>>,
     session_policy: Mutex<Option<MultipathConfig>>,
     endpoint_cursor: AtomicUsize,
@@ -200,11 +226,27 @@ struct SessionSlot {
     maintenance_epoch: Instant,
 }
 
+#[derive(Debug)]
+struct PathTargetState {
+    requested: u64,
+    effective: usize,
+    current: usize,
+}
+
+#[derive(Debug)]
+struct BaselineRetryState {
+    failures: u32,
+    next_attempt: Instant,
+}
+
 impl SessionSlot {
     fn new(egress: EgressConfig) -> Self {
-        let min_paths = (egress.status_requirements.min_usable_paths as usize).max(1);
+        let min_paths = configured_minimum_paths(&egress);
         let endpoint_count = egress.endpoints.len();
         let now = Instant::now();
+        let max_paths = 8_usize.max(min_paths);
+        let requested = configured_path_baseline(&egress);
+        let effective = requested.min(max_paths as u64) as usize;
         Self {
             egress,
             session: Mutex::new(None),
@@ -214,13 +256,21 @@ impl SessionSlot {
             autoscaler: Mutex::new(
                 PathAutoscaler::new(PathAutoscalerConfig {
                     min_paths,
-                    max_paths: 8_usize.max(min_paths),
+                    max_paths,
                     ..PathAutoscalerConfig::default()
                 })
                 .expect("static autoscaler configuration"),
             ),
             eligible_transits: Mutex::new(BTreeMap::new()),
-            target_path_count: Mutex::new(reserved_path_target(min_paths, 8_usize.max(min_paths))),
+            path_target: Mutex::new(PathTargetState {
+                requested,
+                effective,
+                current: effective,
+            }),
+            baseline_retry: Mutex::new(BaselineRetryState {
+                failures: 0,
+                next_attempt: now,
+            }),
             replication_budget_bytes: Mutex::new(None),
             session_policy: Mutex::new(None),
             endpoint_cursor: AtomicUsize::new(0),
@@ -241,6 +291,37 @@ impl SessionSlot {
             ),
             maintenance_epoch: now,
         }
+    }
+
+    async fn baseline_attempt_due(&self) -> bool {
+        Instant::now() >= self.baseline_retry.lock().await.next_attempt
+    }
+
+    async fn finish_baseline_attempt(&self, succeeded: bool) {
+        let now = Instant::now();
+        let mut retry = self.baseline_retry.lock().await;
+        if succeeded {
+            retry.failures = 0;
+            retry.next_attempt = now;
+            return;
+        }
+        retry.failures = retry.failures.saturating_add(1);
+        let shift = retry.failures.saturating_sub(1).min(31);
+        let multiplier = 1_u32.checked_shl(shift).unwrap_or(u32::MAX);
+        retry.next_attempt = now
+            + BASELINE_RETRY_BASE
+                .saturating_mul(multiplier)
+                .min(BASELINE_RETRY_MAX);
+    }
+
+    async fn defer_baseline_attempt(&self) {
+        self.finish_baseline_attempt(false).await;
+    }
+
+    async fn reset_baseline_retry(&self) {
+        let mut retry = self.baseline_retry.lock().await;
+        retry.failures = 0;
+        retry.next_attempt = Instant::now();
     }
 
     fn endpoint_candidates(&self) -> Vec<(usize, pathchord_policy::Endpoint)> {
@@ -1268,8 +1349,15 @@ impl IngressDataPlane {
                     session_guard.take();
                     paths.clear();
                     draining.clear();
-                    *slot.target_path_count.lock().await =
-                        (slot.egress.status_requirements.min_usable_paths as usize).max(1);
+                    let requested = configured_path_baseline(&slot.egress);
+                    let max_paths = slot.autoscaler.lock().await.config().max_paths;
+                    let effective = requested.min(max_paths as u64) as usize;
+                    *slot.path_target.lock().await = PathTargetState {
+                        requested,
+                        effective,
+                        current: effective,
+                    };
+                    slot.reset_baseline_retry().await;
                     slot.autoscaler.lock().await.reset();
                 }
                 for path_id in removed_paths {
@@ -1347,35 +1435,52 @@ impl IngressDataPlane {
             }
             let session = slot.session.lock().await.clone();
             let max_paths = slot.autoscaler.lock().await.config().max_paths;
-            let target = reserved_path_target(
-                (slot.egress.status_requirements.min_usable_paths as usize).max(1),
-                max_paths,
-            );
-            if !candidates.is_empty()
-                && session.as_ref().is_none_or(|current| {
-                    current.snapshot().closed || current.snapshot().ready_paths < target
-                })
+            let requested = configured_path_baseline(&slot.egress);
+            let effective = requested.min(max_paths as u64) as usize;
+            let session_snapshot = session.as_ref().map(|current| current.snapshot());
+            let usable_paths = session_snapshot.as_ref().map_or(0, usable_path_count);
+            let admission_blocked = session_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.egress_status.as_ref())
+                .is_some_and(|status| status.fresh && !status.report.admission_allowed);
+            {
+                let mut target = slot.path_target.lock().await;
+                target.requested = requested;
+                target.effective = effective;
+                target.current = effective;
+            }
+            let deficit = effective.saturating_sub(usable_paths);
+            if deficit > 0
+                && !admission_blocked
+                && !candidates.is_empty()
+                && session_snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.closed || snapshot.ready_paths < max_paths)
+                && slot.baseline_attempt_due().await
             {
                 let index = slot
                     .warmup_cursor
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     % candidates.len();
                 let transit = &candidates[index].0;
-                if session
+                let result = if session_snapshot
                     .as_ref()
-                    .is_none_or(|current| current.snapshot().closed)
+                    .is_none_or(|snapshot| snapshot.closed)
                 {
-                    let _ = self
-                        .ensure_session_path(
-                            &egress_id,
-                            transit,
-                            false,
-                            BACKGROUND_PATH_CONNECT_TIMEOUT.min(self.path_connect_timeout),
-                        )
-                        .await;
+                    self.ensure_session_path(
+                        &egress_id,
+                        transit,
+                        false,
+                        BACKGROUND_PATH_CONNECT_TIMEOUT.min(self.path_connect_timeout),
+                    )
+                    .await
+                    .map(|_| ())
                 } else {
-                    let _ = self.add_session_path(&egress_id, transit).await;
-                }
+                    self.add_session_path(&egress_id, transit).await.map(|_| ())
+                };
+                slot.finish_baseline_attempt(result.is_ok()).await;
+            } else if deficit > 0 && candidates.is_empty() {
+                slot.defer_baseline_attempt().await;
             }
         }
         // Existing Sessions still receive their low-frequency aggregate demand
@@ -1413,23 +1518,36 @@ impl IngressDataPlane {
             drop(sample);
             let directional = snapshot.as_ref().and_then(|snapshot| {
                 (!snapshot.path_quality.is_empty()).then(|| {
-                    snapshot.path_quality.values().fold(
-                        (0_u64, 0_u64, 0_u64, 0_u64),
-                        |(up_demand, down_demand, up_capacity, down_capacity), path| {
-                            (
-                                up_demand.saturating_add(path.upstream_throughput_bps),
-                                down_demand.saturating_add(path.downstream_throughput_bps),
-                                up_capacity.saturating_add(
-                                    path.upstream_effective_capacity_bps
-                                        .unwrap_or(path.effective_capacity_bps),
-                                ),
-                                down_capacity.saturating_add(
-                                    path.downstream_effective_capacity_bps
-                                        .unwrap_or(path.effective_capacity_bps),
-                                ),
-                            )
-                        },
-                    )
+                    snapshot
+                        .path_quality
+                        .iter()
+                        .filter(|(path_id, _)| {
+                            snapshot.path_states.get(path_id).is_some_and(|state| {
+                                matches!(
+                                    state,
+                                    pathchord_core::PathState::Active
+                                        | pathchord_core::PathState::Degraded
+                                )
+                            })
+                        })
+                        .map(|(_, quality)| quality)
+                        .fold(
+                            (0_u64, 0_u64, 0_u64, 0_u64),
+                            |(up_demand, down_demand, up_capacity, down_capacity), path| {
+                                (
+                                    up_demand.saturating_add(path.upstream_throughput_bps),
+                                    down_demand.saturating_add(path.downstream_throughput_bps),
+                                    up_capacity.saturating_add(
+                                        path.upstream_effective_capacity_bps
+                                            .unwrap_or(path.effective_capacity_bps),
+                                    ),
+                                    down_capacity.saturating_add(
+                                        path.downstream_effective_capacity_bps
+                                            .unwrap_or(path.effective_capacity_bps),
+                                    ),
+                                )
+                            },
+                        )
                 })
             });
             let input = AutoscaleInput {
@@ -1564,13 +1682,19 @@ impl IngressDataPlane {
                 .await
                 .retain(|path_id, _| known_paths.contains(path_id));
             let snapshot = session.snapshot();
-            input.ready_paths = snapshot.ready_paths;
+            let usable_paths = usable_path_count(&snapshot);
+            input.ready_paths = usable_paths;
             let max_paths = slot.autoscaler.lock().await.config().max_paths;
-            let minimum = (slot.egress.status_requirements.min_usable_paths as usize).max(1);
-            let target = (*slot.target_path_count.lock().await)
-                .max(reserved_path_target(minimum, max_paths));
-            *slot.target_path_count.lock().await = target;
+            let requested = configured_path_baseline(&slot.egress);
+            let effective = requested.min(max_paths as u64) as usize;
+            let demand_target = demand_required_path_count(input, usable_paths, max_paths);
+            let target = effective.max(demand_target).min(max_paths);
             input.target_path_count = Some(target);
+            let mut target_state = slot.path_target.lock().await;
+            target_state.requested = requested;
+            target_state.effective = effective;
+            target_state.current = target;
+            drop(target_state);
             let paths = slot.transit_paths.lock().await.clone();
             let runtime = self.runtime.read().await;
             let economics: BTreeMap<_, _> = paths
@@ -1632,19 +1756,17 @@ impl IngressDataPlane {
         // surviving Path while a fresh connection is established.
         let current = slot.transit_paths.lock().await.clone();
         let max_paths = slot.autoscaler.lock().await.config().max_paths;
-        let target = input.target_path_count.unwrap_or_else(|| {
-            reserved_path_target(
-                (slot.egress.status_requirements.min_usable_paths as usize).max(1),
-                max_paths,
-            )
-        });
+        let minimum = configured_minimum_paths(&slot.egress);
+        let requested = configured_path_baseline(&slot.egress);
+        let effective = requested.min(max_paths as u64) as usize;
+        let target = input.target_path_count.unwrap_or(effective).max(effective);
         if session.is_some()
             && input.hard_available
             && input.admission_allowed
-            && input.ready_paths < max_paths
-            && input.ready_paths < target
+            && input.ready_paths < effective
+            && slot.baseline_attempt_due().await
         {
-            let deficit = target.saturating_sub(input.ready_paths);
+            let deficit = effective.saturating_sub(input.ready_paths);
             let eligible = slot.eligible_transits.lock().await.clone();
             let available: BTreeMap<_, _> = self
                 .transit_adapters
@@ -1657,9 +1779,10 @@ impl IngressDataPlane {
             let start = slot
                 .warmup_cursor
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let attempts = 1;
             let mut added = 0_usize;
-            for transit_id in plan_transit_candidates(&available, &current, attempts, start) {
+            let candidates = plan_transit_candidates(&available, &current, 1, start);
+            let attempted = !candidates.is_empty();
+            for transit_id in candidates {
                 if self.add_session_path(egress_id, &transit_id).await.is_ok() {
                     added = added.saturating_add(1);
                     if added >= deficit {
@@ -1668,6 +1791,7 @@ impl IngressDataPlane {
                 }
             }
             if added > 0 {
+                slot.finish_baseline_attempt(true).await;
                 self.mark_egress(
                     egress_id,
                     RuntimeNodeState::Ready,
@@ -1677,6 +1801,10 @@ impl IngressDataPlane {
                 )
                 .await;
                 return Ok(AutoscaleDecision::Add { count: added });
+            } else if attempted {
+                slot.finish_baseline_attempt(false).await;
+            } else {
+                slot.defer_baseline_attempt().await;
             }
         }
         {
@@ -1702,13 +1830,17 @@ impl IngressDataPlane {
                 let start = slot
                     .warmup_cursor
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let attempts = count.min(1);
-                let mut added = 0;
-                for transit_id in plan_transit_candidates(&available, &current, attempts, start) {
-                    if self.add_session_path(egress_id, &transit_id).await.is_ok() {
-                        added += 1;
-                        if added >= count {
-                            break;
+                let mut added = 0_usize;
+                let slots_used = session
+                    .as_ref()
+                    .map_or(0, |current| current.snapshot().ready_paths);
+                if slots_used < max_paths {
+                    for transit_id in plan_transit_candidates(&available, &current, 1, start) {
+                        if self.add_session_path(egress_id, &transit_id).await.is_ok() {
+                            added = added.saturating_add(1);
+                            if added >= count {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1717,10 +1849,24 @@ impl IngressDataPlane {
                 if let Some(session) = session {
                     let transit_paths = slot.transit_paths.lock().await.clone();
                     let draining_paths = slot.draining_paths.lock().await.clone();
-                    let ready_paths: BTreeSet<_> =
-                        session.snapshot().ready_path_ids.into_iter().collect();
-                    let minimum =
-                        (slot.egress.status_requirements.min_usable_paths as usize).max(1);
+                    let ready_paths: BTreeSet<_> = session
+                        .snapshot()
+                        .path_states
+                        .into_iter()
+                        .filter_map(|(path_id, state)| {
+                            matches!(
+                                state,
+                                pathchord_core::PathState::Active
+                                    | pathchord_core::PathState::Degraded
+                            )
+                            .then_some(path_id)
+                        })
+                        .collect();
+                    let minimum = if input.hard_available {
+                        minimum.max(effective).max(target)
+                    } else {
+                        0
+                    };
                     let mut selected = 0_usize;
                     let candidates: Vec<_> = transit_paths
                         .iter()
@@ -1830,8 +1976,8 @@ impl IngressDataPlane {
             Some(policy_id) => self.multipath_config_for(policy_id).await,
             None => MultipathConfig::default(),
         };
-        config.minimum_usable_paths =
-            (slot.egress.status_requirements.min_usable_paths as usize).max(1);
+        config.minimum_usable_paths = configured_minimum_paths(&slot.egress);
+        config.max_paths = slot.autoscaler.lock().await.config().max_paths;
         config.demand_key = None;
         *slot.session_policy.lock().await = Some(config.clone());
         config
@@ -2127,12 +2273,38 @@ impl IngressDataPlane {
         let mut snapshots = Vec::new();
         for (egress_id, slot) in &self.sessions {
             if let Some(session) = slot.session.lock().await.clone() {
+                let session_snapshot = session.snapshot();
+                if session_snapshot.closed {
+                    continue;
+                }
+                let usable_paths = usable_path_count(&session_snapshot);
+                let (requested, effective, current) = {
+                    let target = slot.path_target.lock().await;
+                    (target.requested, target.effective, target.current)
+                };
+                let shortfall = requested.saturating_sub(usable_paths as u64);
+                let admission_blocked = session_snapshot
+                    .egress_status
+                    .as_ref()
+                    .is_some_and(|status| status.fresh && !status.report.admission_allowed);
+                let no_eligible_transit = slot.eligible_transits.lock().await.is_empty();
+                let connect_failed = slot.baseline_retry.lock().await.failures > 0;
                 snapshots.push(DataPlaneSessionSnapshot {
                     egress_id: egress_id.as_str().to_owned(),
-                    session: session.snapshot(),
-                    minimum_usable_paths: (slot.egress.status_requirements.min_usable_paths
-                        as usize)
-                        .max(1),
+                    session: session_snapshot,
+                    minimum_usable_paths: configured_minimum_paths(&slot.egress),
+                    requested_target_usable_paths: requested,
+                    effective_target_usable_paths: effective,
+                    target_path_count: current,
+                    target_shortfall: shortfall,
+                    target_shortfall_reason: baseline_shortfall_reason(
+                        requested,
+                        effective,
+                        usable_paths,
+                        admission_blocked,
+                        no_eligible_transit,
+                        connect_failed,
+                    ),
                     eligible_transit_count: slot.eligible_transits.lock().await.len(),
                     traffic_policy_id: slot
                         .egress
@@ -2453,10 +2625,15 @@ impl IngressDataPlane {
         slot.transit_paths.lock().await.clear();
         slot.draining_paths.lock().await.clear();
         slot.path_endpoints.lock().await.clear();
-        *slot.target_path_count.lock().await = reserved_path_target(
-            (slot.egress.status_requirements.min_usable_paths as usize).max(1),
-            slot.autoscaler.lock().await.config().max_paths,
-        );
+        let requested = configured_path_baseline(&slot.egress);
+        let max_paths = slot.autoscaler.lock().await.config().max_paths;
+        let effective = requested.min(max_paths as u64) as usize;
+        *slot.path_target.lock().await = PathTargetState {
+            requested,
+            effective,
+            current: effective,
+        };
+        slot.reset_baseline_retry().await;
         *slot.replication_budget_bytes.lock().await = None;
         *slot.session_policy.lock().await = None;
         let _ = self.session_multipath_config(slot).await;
@@ -2927,11 +3104,84 @@ fn retryable_pre_admission_stream_error(error: &OpenStreamError) -> bool {
     }
 }
 
-fn reserved_path_target(required: usize, max_paths: usize) -> usize {
-    required
-        .max(1)
-        .saturating_add(PATH_RESERVE_COUNT)
-        .min(max_paths.max(1))
+fn configured_minimum_paths(egress: &EgressConfig) -> usize {
+    egress.path_pool.min_usable_paths.max(1) as usize
+}
+
+fn configured_path_baseline(egress: &EgressConfig) -> u64 {
+    egress.path_pool.requested_target_usable_paths()
+}
+
+fn usable_path_count(snapshot: &SessionSnapshot) -> usize {
+    snapshot
+        .path_states
+        .values()
+        .filter(|state| {
+            matches!(
+                state,
+                pathchord_core::PathState::Active | pathchord_core::PathState::Degraded
+            )
+        })
+        .count()
+}
+
+fn demand_required_path_count(
+    input: AutoscaleInput,
+    usable_paths: usize,
+    max_paths: usize,
+) -> usize {
+    let required_for = |demand: u64, capacity: u64| {
+        if demand == 0 {
+            return 0;
+        }
+        if capacity == 0 {
+            return max_paths;
+        }
+        let capacity_per_path = capacity
+            .checked_div(usable_paths.max(1) as u64)
+            .unwrap_or(0)
+            .max(1);
+        demand.div_ceil(capacity_per_path).min(max_paths as u64) as usize
+    };
+    let directional = input
+        .upstream_demand_bps
+        .zip(input.downstream_demand_bps)
+        .zip(
+            input
+                .upstream_capacity_bps
+                .zip(input.downstream_capacity_bps),
+        );
+    let required = directional.map_or_else(
+        || required_for(input.demand_bps, input.effective_capacity_bps),
+        |((up_demand, down_demand), (up_capacity, down_capacity))| {
+            required_for(up_demand, up_capacity).max(required_for(down_demand, down_capacity))
+        },
+    );
+    required.min(max_paths)
+}
+
+fn baseline_shortfall_reason(
+    requested: u64,
+    effective: usize,
+    usable_paths: usize,
+    admission_blocked: bool,
+    no_eligible_transit: bool,
+    connect_failed: bool,
+) -> Option<PathTargetShortfallReason> {
+    if requested <= usable_paths as u64 {
+        return None;
+    }
+    if (effective as u64) < requested {
+        Some(PathTargetShortfallReason::RuntimeLimit)
+    } else if admission_blocked {
+        Some(PathTargetShortfallReason::AdmissionBlocked)
+    } else if no_eligible_transit {
+        Some(PathTargetShortfallReason::NoEligibleTransit)
+    } else if connect_failed {
+        Some(PathTargetShortfallReason::ConnectFailed)
+    } else {
+        Some(PathTargetShortfallReason::Recovering)
+    }
 }
 
 fn plan_transit_candidates(
@@ -3140,7 +3390,8 @@ mod tests {
                 tcp: true,
                 udp: true,
             },
-            status_requirements: Default::default(),
+            path_pool: pathchord_policy::EgressPathPoolConfig::default(),
+            admission: pathchord_policy::EgressAdmission::default(),
             transit: pathchord_policy::EgressTransitBinding::default(),
             traffic_policy: None,
         });
@@ -3189,7 +3440,8 @@ mod tests {
                 tcp: true,
                 udp: true,
             },
-            status_requirements: pathchord_policy::EgressStatusRequirements::default(),
+            path_pool: pathchord_policy::EgressPathPoolConfig::default(),
+            admission: pathchord_policy::EgressAdmission::default(),
             transit: pathchord_policy::EgressTransitBinding::default(),
             traffic_policy: None,
         });
@@ -3225,11 +3477,80 @@ mod tests {
     }
 
     #[test]
-    fn reserved_path_target_keeps_one_spare_without_exceeding_session_limit() {
-        assert_eq!(reserved_path_target(1, 4), 2);
-        assert_eq!(reserved_path_target(3, 4), 4);
-        assert_eq!(reserved_path_target(4, 4), 4);
-        assert_eq!(reserved_path_target(0, 0), 1);
+    fn requested_path_baseline_defaults_to_one_spare_but_explicit_target_does_not_add_one() {
+        let mut egress = EgressConfig {
+            id: EgressId::new("edge"),
+            endpoints: vec![],
+            public_key: "key".into(),
+            labels: BTreeMap::new(),
+            capabilities: pathchord_policy::Capabilities {
+                tcp: true,
+                udp: true,
+            },
+            path_pool: pathchord_policy::EgressPathPoolConfig::default(),
+            admission: pathchord_policy::EgressAdmission::default(),
+            transit: pathchord_policy::EgressTransitBinding::default(),
+            traffic_policy: None,
+        };
+        assert_eq!(configured_path_baseline(&egress), 2);
+        egress.path_pool.min_usable_paths = 3;
+        assert_eq!(configured_path_baseline(&egress), 4);
+        egress.path_pool.target_usable_paths = Some(3);
+        assert_eq!(configured_path_baseline(&egress), 3);
+    }
+
+    #[test]
+    fn current_path_target_uses_the_larger_direction_and_stays_bounded() {
+        let mut input = AutoscaleInput {
+            demand_bps: 0,
+            effective_capacity_bps: 0,
+            upstream_demand_bps: Some(100),
+            downstream_demand_bps: Some(250),
+            upstream_capacity_bps: Some(200),
+            downstream_capacity_bps: Some(200),
+            ready_paths: 2,
+            degraded_paths: 0,
+            target_path_count: None,
+            hard_available: true,
+            admission_allowed: true,
+            quota_remaining: None,
+            traffic_multiplier_basis_points: 10_000,
+            incremental_capacity_bps: None,
+            scheduling_overhead_bps: 0,
+        };
+        assert_eq!(demand_required_path_count(input, 2, 8), 3);
+        input.downstream_demand_bps = Some(10);
+        assert_eq!(demand_required_path_count(input, 2, 8), 1);
+        input.upstream_demand_bps = Some(10_000);
+        assert_eq!(demand_required_path_count(input, 2, 4), 4);
+    }
+
+    #[test]
+    fn baseline_shortfall_reasons_follow_the_registered_precedence() {
+        assert_eq!(
+            baseline_shortfall_reason(6, 4, 4, true, true, true),
+            Some(PathTargetShortfallReason::RuntimeLimit)
+        );
+        assert_eq!(
+            baseline_shortfall_reason(3, 3, 2, true, true, true),
+            Some(PathTargetShortfallReason::AdmissionBlocked)
+        );
+        assert_eq!(
+            baseline_shortfall_reason(3, 3, 2, false, true, true),
+            Some(PathTargetShortfallReason::NoEligibleTransit)
+        );
+        assert_eq!(
+            baseline_shortfall_reason(3, 3, 2, false, false, true),
+            Some(PathTargetShortfallReason::ConnectFailed)
+        );
+        assert_eq!(
+            baseline_shortfall_reason(3, 3, 2, false, false, false),
+            Some(PathTargetShortfallReason::Recovering)
+        );
+        assert_eq!(
+            baseline_shortfall_reason(3, 3, 3, false, false, false),
+            None
+        );
     }
 
     #[test]
@@ -3300,7 +3621,8 @@ mod tests {
                     tcp: true,
                     udp: true,
                 },
-                status_requirements: Default::default(),
+                path_pool: pathchord_policy::EgressPathPoolConfig::default(),
+                admission: pathchord_policy::EgressAdmission::default(),
                 transit: pathchord_policy::EgressTransitBinding::default(),
                 traffic_policy: None,
             });

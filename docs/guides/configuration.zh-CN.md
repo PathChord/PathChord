@@ -145,7 +145,7 @@ Gecko 包，但其 2048 字节设置无法完成握手；独立 sing-quic relay 
 路径 MTU 可能要求更低的设置。本地 2048 字节 relay 测试使用回环接口，不能证明该设置适用于
 1500 字节的路径。
 
-SOCKS5 或 Shadowsocks UDP-over-TCP 可将 `spec.options.udpOverTcp` 设为 `1` 或 `2`；省略时
+SOCKS5 或 Shadowsocks UDP-over-TCP 可将 `spec.options.udpOverTcpVersion` 设为 `1` 或 `2`；省略时
 使用适配器的普通 UDP 传输。导入的 Clash 节点启用 UDP-over-TCP 但省略版本时使用 v1，
 导入的 sing-box 节点使用 v2；还要确保节点启用了 UDP。VMess 的 `spec.options.vmess.globalPadding` 和 `authenticatedLength` 用于启用
 对应的 AEAD 帧选项。Meek 节点使用 `spec.options.transport.type: meek`，完整 URL 放在凭据
@@ -154,7 +154,7 @@ JSON 的私有 `meek_url` 字段中。HTTP CONNECT 请求路径同样放在私�
 
 Shadowsocks、VLESS、VMess 或 Trojan 节点可以将 `spec.options.multiplex.enabled` 设为
 `true`，并在 `spec.options.multiplex.protocol` 中选择 `h2mux`、`yamux` 或 `smux`；省略协议时使用
-`h2mux`。Multiplex 不能与显式 `packetEncoding` 或 `udpOverTcp` 同时使用；对端要求 sing-mux
+`h2mux`。Multiplex 不能与显式 `packetEncoding` 或 `udpOverTcpVersion` 同时使用；对端要求 sing-mux
 padding 时，将 `spec.options.multiplex.padding` 设为 `true`。
 不可用的组合会在节点诊断中说明。导入的 Clash/Mihomo 和 sing-box VLESS 节点通常默认使用 XUDP，
 启用 multiplex 后使用其 UDP 帧。手写的 VLESS 节点不启用 multiplex 且省略 `packetEncoding` 时，
@@ -189,17 +189,62 @@ Brutal 会补偿丢包，正常经过 pacing 的 QUIC 发包速率最高可达�
 
 Egress 来源必须包含恰好一个 `EgressService`，不能包含 Ingress listener、Transit Proxy、subscription、routing、DNS、fallback 或 geodata 资源。可以从 [egress-service.yaml](../../examples/egress-service.yaml) 开始。`EgressService` authored 配置只提供全局资源上限
 `maxWireBandwidthBps` 和 `maxInboundTargetConnections`。Egress 运行时结合这些上限和本地
-profile 计算 Path 安全上限及 pending reservation。不要再配置
-`recommendedPathCount`、`maxConcurrentPaths` 或 `maxStreamsPerIngress`；Path target 属于
-Ingress 规则和运行时观测。STATUS_REPORT 提供配置/有效/当前容量、容量可信度、准入状态和当前复制
-allowance；公共 Path 最小值位于 Ingress 侧 Egress 的 `statusRequirements.minUsablePaths`，
-target 由 Session 运行时决定，不携带规则或 TrafficClass 元数据。
+profile 计算 Path 安全上限及 pending reservation。Path 池配置属于 Ingress 侧的 `Egress` 资源：
+`pathPool.minUsablePaths` 控制新业务准入，`pathPool.targetUsablePaths` 是空闲时尽力维持的基线，
+没有业务连接时也会尝试维持。省略目标时，默认值为最小值加一；显式目标表示总数，不再额外加
+备用 Path。只要最小值满足，暂时低于目标不会导致服务降级或仅因此拒绝新 flow。容量需求可以
+扩容到目标以上，负载下降后再逐步缩回基线。`admission.requiredCapabilities` 配置 Egress 的
+公共能力要求。`EgressService` 不接受 Ingress Path 目标。
+
+如需启用 Egress Web Gateway，其配置归组在 `web` 下：
+
+```yaml
+web:
+  bind: 127.0.0.1:9090
+  tokenFile: ../secrets/web.token
+  allowedOrigins: [https://admin.example.net]
+  protectedTransport: true
+```
+
+省略 `web` 时，Web Gateway 保持关闭。Token 文件应保存在配置目录之外。现有
+`--web-token-file` 等 CLI 参数仍会覆盖相应的嵌套配置项。
+
+STATUS_REPORT 提供配置/有效/当前容量、容量可信度、准入状态和当前复制 allowance；它不提供
+Ingress Path 目标，也不携带规则或 TrafficClass 元数据。
 
 `EgressService` 可以使用 `binds` 配置多个公共 Path listener，包括在不同端口上的 IPv4 和 IPv6
 地址。旧的单数 `bind` 仍然是一个 listener 的简写。Ingress 侧在同一个 Egress ID 有多个可达域名或
-端口时使用 `endpoints`；每项包含 `address` 和 `port`。旧的 `address`/`port` 仍然是单个 endpoint
-的简写。所有 bind 和 endpoint 必须使用相同的 Egress ID、identity、公钥和授权数据库。endpoint
-拓扑属于启动配置，变化后需要重启。
+端口时使用 `endpoints`；每项包含 `host` 和 `port`。单个 Egress endpoint 也使用相同的
+`host`/`port` 字段。所有 bind 和 endpoint 必须使用相同的 Egress ID、identity、公钥和授权数据库。
+endpoint 拓扑属于启动配置，变化后需要重启。
+
+### 迁移已废弃的原生配置键
+
+当前原生 schema 不读取旧键，也不提供兼容别名。使用新版本启动或重载前，必须先迁移自己编写的
+资源；即使旧键与新键同时出现，整个候选配置仍会被拒绝。完整路径、限制和诊断格式见
+[configuration schema](../../openspec/specs/configuration-schema/spec.zh-CN.md)
+以及 [Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)。
+
+| 旧原生字段 | 新字段 |
+| --- | --- |
+| Egress `statusRequirements.minUsablePaths` | `pathPool.minUsablePaths` |
+| Egress `statusRequirements.capabilities` | `admission.requiredCapabilities` |
+| Egress `address` | `host` |
+| Egress `endpoints[].address` | `endpoints[].host` |
+| TransitProxy `address` | `host` |
+| EgressService `webBind` | `web.bind` |
+| EgressService `webTokenFile` | `web.tokenFile` |
+| EgressService `webOrigins` | `web.allowedOrigins` |
+| EgressService `webProtectedTransport` | `web.protectedTransport` |
+| TransitProxy `options.transport.host` | `options.transport.hosts` |
+| TransitProxy `options.transport.maxEarlyData` | `options.transport.maxEarlyDataBytes` |
+| TransitProxy `options.tls.certificate` | `options.tls.certificates` |
+| TransitProxy `options.tls.clientCertificate` | `options.tls.clientCertificates` |
+| TransitProxy `options.tls.fingerprint` | `options.tls.clientHelloFingerprint` |
+| TransitProxy `options.udpOverTcp` | `options.udpOverTcpVersion` |
+
+只迁移 PathChord 原生资源字段。Clash、sing-box 和分享链接继续使用各自格式，由导入器归一化；
+私有凭据 JSON、HTTP header 名称、Listener 接口地址、CLI 参数和协议标识遵循各自契约。
 
 支持 TLS 的 Transit 节点默认使用系统根证书。需要自定义根时，将有序 `truststore` 列表设置为
 `system` 和/或本地 PEM/DER 文件。相对路径从选定的配置来源解析。空列表表示明确不加载信任锚点，
@@ -210,6 +255,6 @@ target 由 Session 运行时决定，不携带规则或 TrafficClass 元数据�
 
 服务会监听选定资源目录中的新增、编辑、移除和重命名，并在发布前验证完整候选配置。支持原子替换文件。解析、资源图验证、规则编译、持久化或缓存写入失败时，最近一次成功配置继续生效；通过结构化 status 查看失败，修正候选后等待重新加载。
 
-订阅节点、编译后的动态规则、管理员 label/tag 和 DNS 运行时健康可以动态更新。静态 Egress 拓扑、Transit 绑定、公共 Path 要求、已解析 TrafficPolicy、本地私钥、监听器绑定设置或平台路由设置发生变化时，需要重启服务。将未改变的资源移到其他文件不会改变其身份，也不需要重启。新 flow 在完整路由决策中使用同一已发布代次；现有资源遵循准入时的契约及正常排空/失败规则。
+订阅节点、编译后的动态规则、管理员 label/tag 和 DNS 运行时健康可以动态更新。静态 Egress 拓扑、Transit 绑定、Path 池数量、准入能力要求、已解析 TrafficPolicy、本地私钥、监听器绑定设置或平台路由设置发生变化时，需要重启服务。将未改变的资源移到其他文件不会改变其身份，也不需要重启。新 flow 在完整路由决策中使用同一已发布代次；现有资源遵循准入时的契约及正常排空/失败规则。
 
 声明式订阅通过管理操作发生的变更，在其声明未改变时会跨重载和重启继续生效。编辑或移除声明时，应用对应的新期望状态。精确的发布和所有权规则见[重载契约](../../openspec/specs/configuration-schema/spec.zh-CN.md#快照发布和重载)。

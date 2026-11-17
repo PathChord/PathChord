@@ -458,7 +458,11 @@ pub struct SessionObservation {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub minimum_usable_paths: usize,
+    pub requested_target_usable_paths: u64,
+    pub effective_target_usable_paths: usize,
     pub target_path_count: usize,
+    pub target_shortfall: u64,
+    pub target_shortfall_reason: Option<String>,
     pub usable_paths: usize,
     pub eligible_transit_count: usize,
     pub traffic_policy_id: Option<String>,
@@ -771,7 +775,7 @@ impl IngressObservationHandle {
         let mut changes = Vec::new();
         for (id, session) in &sessions {
             if state.sessions.get(id) != Some(session) {
-                changes.push((ControlEventKind::SessionChanged, id.to_string(), json!({"session_id": id.to_string(), "egress_id": session.egress_id, "state": format!("{:?}", session.state).to_ascii_lowercase(), "admission_generation": session.admission_generation, "created_at_ms": session.created_at_ms, "last_change_at_ms": session.last_change_at_ms, "close_reason": session.close_reason, "ready_path_count": session.ready_paths, "usable_path_count": session.usable_paths, "minimum_usable_paths": session.minimum_usable_paths, "target_path_count": session.target_path_count, "eligible_transit_count": session.eligible_transit_count, "traffic_policy_id": session.traffic_policy_id, "traffic_policy_generation": session.traffic_policy_generation, "active_streams": session.active_streams, "active_udp_associations": session.active_udp_associations, "pending_session_controls": session.pending_session_controls})));
+                changes.push((ControlEventKind::SessionChanged, id.to_string(), json!({"session_id": id.to_string(), "egress_id": session.egress_id, "state": format!("{:?}", session.state).to_ascii_lowercase(), "admission_generation": session.admission_generation, "created_at_ms": session.created_at_ms, "last_change_at_ms": session.last_change_at_ms, "close_reason": session.close_reason, "ready_path_count": session.ready_paths, "usable_path_count": session.usable_paths, "minimum_usable_paths": session.minimum_usable_paths, "requested_target_usable_paths": session.requested_target_usable_paths, "effective_target_usable_paths": session.effective_target_usable_paths, "target_path_count": session.target_path_count, "target_shortfall": session.target_shortfall, "target_shortfall_reason": session.target_shortfall_reason, "eligible_transit_count": session.eligible_transit_count, "traffic_policy_id": session.traffic_policy_id, "traffic_policy_generation": session.traffic_policy_generation, "active_streams": session.active_streams, "active_udp_associations": session.active_udp_associations, "pending_session_controls": session.pending_session_controls})));
             }
         }
         for id in state
@@ -3329,7 +3333,11 @@ mod tests {
                     bytes_sent: 4,
                     bytes_received: 5,
                     minimum_usable_paths: 1,
+                    requested_target_usable_paths: 1,
+                    effective_target_usable_paths: 1,
                     target_path_count: 1,
+                    target_shortfall: 0,
+                    target_shortfall_reason: None,
                     usable_paths: 1,
                     eligible_transit_count: 0,
                     traffic_policy_id: None,

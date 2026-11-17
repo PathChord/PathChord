@@ -79,17 +79,27 @@ The system-proxy owner SHALL validate the Windows listener, preserve exact previ
 
 ### Requirement: Bounded scheduling and autoscaling guards
 
-Scheduling SHALL preserve one immutable Egress Session policy snapshot, bounded fair service, relationship and directional quality weighting, and per-sender shared replication accounting. Autoscaling SHALL apply one Session Path target with the documented hysteresis, common-minimum retention, drain action, incremental-capacity exclusion, and counter resets.
+Scheduling SHALL preserve one immutable Egress Session policy snapshot, bounded fair service, relationship and directional quality weighting, and per-sender shared replication accounting. Capacity autoscaling SHALL use hysteresis, incremental-capacity exclusion, and counter resets. Planned capacity scale-in SHALL preserve the effective baseline and common minimum after all selected drains; every Path removed by planned capacity scale-in SHALL enter `DRAINING` first.
 
 #### Scenario: Autoscaler scales a Path in
 
-- **WHEN** surplus persists for the configured non-zero scale-in window and removing every selected drain candidate leaves another compliant usable Path and the Egress minimum
+- **WHEN** surplus persists for the configured non-zero scale-in window and removing every selected drain candidate preserves sufficient capacity, another compliant usable Path, the effective baseline, and the Egress minimum
 - **THEN** the selected Path enters `DRAINING` before removal, preserving the documented hysteresis and budget guards
 
 #### Scenario: A draining Path cannot justify another drain
 
 - **WHEN** the common minimum is two, two Paths are usable, and one additional Path is already draining
 - **THEN** the owner rejects a planned drain of either usable Path and subtracts concurrently selected drain candidates when checking the minimum
+
+#### Scenario: Spare capacity still belongs to the baseline
+
+- **WHEN** the minimum is one, the effective baseline is three, three usable Paths remain, and business demand is zero
+- **THEN** capacity scale-in retains all three Paths rather than shrinking to the admission minimum
+
+#### Scenario: Several drains would cross the baseline
+
+- **WHEN** the effective baseline is three and four usable Paths plus one draining Path exist
+- **THEN** at most one additional usable Path may be selected for capacity scale-in and the already draining Path cannot justify a second selection
 
 ### Requirement: One owner validates lifecycle transitions
 
@@ -111,16 +121,21 @@ The Egress service state SHALL express lifecycle and health, while a separate ad
 
 ### Requirement: Reconnected Sessions start fresh
 
-When a Session closes because of Egress failure, Path loss, authorization failure, or protocol trust failure, the replacement Session SHALL use a new SessionID, capture the configured Egress policy, and reset aggregate demand, Path targets, replication usage, and lifecycle observations.
+When a Session closes because of Egress failure, Path loss, authorization failure, or protocol trust failure, its replacement SHALL use a new SessionID and capture the configured Egress policy. It SHALL recompute the requested and effective Path baselines from configuration and current ceilings while resetting demand targets, replication usage, retry/hysteresis state as allowed by trust guards, and Session lifecycle observations.
 
 #### Scenario: Egress recovers after Session closure
 
 - **WHEN** Ingress reconnects to the same configured Egress after the old Session was retired
-- **THEN** the new Session starts from its Egress minimum and fresh observations and does not reuse old Session state
+- **THEN** the new Session uses its configured minimum and requested baseline with fresh demand observations, does not inherit the old load-expanded target, and does not reuse old Session state
+
+#### Scenario: A busy Session reconnects while idle
+
+- **WHEN** a Session previously expanded to six Paths with a configured baseline of three closes and its replacement starts without business demand
+- **THEN** the replacement attempts to maintain the bounded baseline of three rather than inheriting six or falling back to one
 
 ### Requirement: Egress Session Path pool lifecycle
 
-The Ingress Session owner SHALL maintain one authenticated Path pool for an Egress relationship, independently of matched routing rules. Planned expansion and draining SHALL preserve common eligibility and hard safety ceilings. Falling below the common minimum SHALL deny new business admission without closing existing work solely for that shortfall; losing the last ready Path SHALL retire the Session.
+The Ingress owner SHALL maintain one authenticated Path pool per Egress relationship, independently of routing matches or business connections. Planned maintenance SHALL preserve eligibility and hard ceilings. A shortfall below the requested baseline SHALL not alone degrade service or deny admission while the minimum is met. Falling below the minimum SHALL deny new work without closing existing work solely for that shortfall; loss of the last ready Path SHALL retire the Session.
 
 #### Scenario: Ready Paths fall below the configured minimum
 
@@ -136,6 +151,16 @@ The Ingress Session owner SHALL maintain one authenticated Path pool for an Egre
 
 - **WHEN** the last ready Path in the common pool fails
 - **THEN** all related business resources close and the retired SessionID is not reused
+
+#### Scenario: A baseline Path fails above the minimum
+
+- **WHEN** the minimum is one, the requested baseline is three, and a failure leaves two otherwise healthy usable Paths
+- **THEN** existing and new business work remain permitted by the count guard while bounded maintenance attempts to replenish the third Path
+
+#### Scenario: No business resources are open
+
+- **WHEN** a configured Egress has an eligible candidate and permits new Path attachment but no Stream or UDP Association exists
+- **THEN** the owner establishes or refills the bounded baseline without waiting for a business open or synthesizing a target connection
 
 ### Requirement: Endpoint failure preserves shared lifecycle ownership
 
@@ -153,21 +178,41 @@ Endpoint-specific Path failure SHALL be processed by the existing Session/Path l
 
 ### Requirement: Directional Path capacity drives scaling
 
-Ingress SHALL maintain upstream and downstream Path observations separately. A bidirectional Session target SHALL cover the larger of the direction-specific Path requirements, while each direction SHALL use its own scheduler inputs.
+Ingress SHALL maintain upstream and downstream Path observations separately. The current Session target SHALL cover the effective baseline and the larger direction-specific Path requirement, bounded by hard resource ceilings. Each direction SHALL retain its own scheduler inputs, and demand changes SHALL recompute the target without making a past expansion the new baseline.
 
 #### Scenario: Downstream is the bottleneck
 
 - **WHEN** upstream demand fits one Path but downstream demand requires three
-- **THEN** the physical Path target is at least three and the upstream and downstream schedulers use their respective observations
+- **THEN** the physical Path target is at least three within hard ceilings and the upstream and downstream schedulers use their respective observations
+
+#### Scenario: Capacity demand exceeds the baseline
+
+- **WHEN** the effective baseline is three, fresh downstream capacity observations require five Paths, and the hard ceiling permits five
+- **THEN** sustained demand can expand the pool to five without changing the configured baseline of three
+
+#### Scenario: Demand falls after expansion
+
+- **WHEN** a five-Path pool has a baseline of three and fresh directional observations show sustained spare capacity
+- **THEN** the computed demand target can fall to three and the owner gradually drains surplus Paths subject to the scale-in guards
 
 ### Requirement: Autoscaling remains bounded and low-frequency
 
-Path health sampling and Session demand aggregation SHALL use bounded counters and low-frequency windows. Autoscaling SHALL use independent hysteresis for scale-out and scale-in, preserve the common Egress minimum during planned scale-in, and exclude a candidate whose incremental capacity is below its scheduling overhead.
+Path sampling, Session demand aggregation, and baseline maintenance SHALL use bounded counters and low-frequency work. Capacity expansion and contraction SHALL use independent hysteresis, and planned contraction SHALL preserve the effective baseline and common minimum. A known candidate capacity below scheduling overhead SHALL remain excluded; unknown capacity SHALL not prevent bounded baseline maintenance by being treated as zero.
 
 #### Scenario: Unknown capacity at startup
 
 - **WHEN** a Session has not collected enough fresh measurements for effective capacity
 - **THEN** Ingress uses the configured Egress cap as a provisional scheduling ceiling, marks the observation provisional, and does not create unbounded extra Paths
+
+#### Scenario: Idle startup has no measured Path capacity
+
+- **WHEN** business demand is zero and Path capacity is unknown at startup
+- **THEN** Ingress can establish the bounded configured baseline without fabricating a zero-capacity or measured-capacity sample and without repeatedly expanding beyond it
+
+#### Scenario: No candidate can satisfy the target
+
+- **WHEN** a requested baseline cannot be reached because every eligible attachment attempt fails
+- **THEN** maintenance retains surviving Paths, exposes the shortfall, and uses bounded retries with backoff rather than a busy loop or repeated target connections
 
 ## Detailed contract
 
@@ -220,7 +265,7 @@ derived as follows:
 | Service state | Guard |
 |---|---|
 | `up` | `connected=true`, not draining, and all current admission requirements are met |
-| `degraded` | `connected=true`, not draining, but capacity, Path count, or capability requirements are not met |
+| `degraded` | `connected=true`, not draining, but capacity, the common admission minimum, or capability requirements are not met |
 | `draining` | administrative drain is active; new flows are rejected while existing work finishes |
 | `down` | no ready Path or administrative shutdown/authorization failure is active |
 
@@ -273,7 +318,8 @@ ACTIVE/DEGRADED/DRAINING → CLOSED
 
 `ACTIVE` requires at least one `ACTIVE` or `DEGRADED` Path and permits new
 business operations. `DEGRADED` has at least one ready Path but fails a current
-capacity, Path-count, or capability requirement. `DRAINING` rejects new
+capacity, common-minimum, or capability requirement. Falling below the
+requested baseline alone does not make the Session degraded. `DRAINING` rejects new
 Streams and associations and waits for existing work; it MAY contain ready
 draining Paths. Losing the last ready Path closes the protocol Session
 permanently, closes all business resources, retires the SessionID, and permits
@@ -428,16 +474,40 @@ business replication. Each sender's optional copies MUST NOT consume more than
 the remaining outbound Session allowance; upstream and downstream are bounded
 independently by the accepted scalar cap.
 
-The autoscaler MUST use hysteresis: it MAY add a Path only after aggregate
-capacity is below demand or the Session target exceeds active count for a
-configured consecutive sample window; it MAY remove a Path only after surplus
-persists for a separate non-zero window and the remaining non-draining usable
-Paths still meet the common Egress minimum after all selected drain candidates
-are removed. Scale-in MUST enter `DRAINING` first. A Path MUST be excluded when
-incremental capacity is below scheduling overhead, with the reason exposed in
-observations. Opposite-direction counters MUST reset after a state change or
-failed probe. Thresholds and windows MAY be configured, but these guards,
-hysteresis, drain action, and budget accounting are normative.
+Let `R` be the configured requested baseline (the explicit target, or the
+common minimum plus one when omitted), `H` the current hard runtime/negotiated
+Path ceiling, and `B = min(R, H)` the effective baseline. The current
+demand-derived target is `min(H, max(B, directional capacity need))`; it is
+recomputed from current observations rather than retained as a historical
+peak. A runtime ceiling that prevents reaching `R` is observable and does
+not rewrite the configuration or lower the common minimum. A ceiling below
+the common minimum retains the existing admission-shortfall behavior.
+
+The autoscaler MUST use hysteresis: capacity scale-out MAY add a Path after
+aggregate capacity is below demand or the current target exceeds the usable
+count for a configured consecutive sample window. Baseline refill and failed
+Path recovery MAY start without the capacity shortfall window, independently
+of business connections, but MUST respect bounded attempts/backoff,
+authorization, admission, eligibility, candidate exclusions, in-flight
+attachments, and hard ceilings. Zero idle demand alone is not a reason to
+exclude an eligible baseline Path or invent a capacity measurement.
+
+Capacity scale-in MAY remove a Path only after surplus persists for a
+separate non-zero low-utilization window, stabilized recovery, and cooldown.
+It MUST remove at most one Path per decision, enter `DRAINING` first, and
+verify that all selected capacity drains leave the effective baseline, common
+admission minimum, and enough usable Path capacity for current directional
+demand. Draining Paths do not count toward these thresholds. Mandatory hard
+failure, authorization, trust, administrative, or resource-limit transitions
+retain their existing priority and may reduce the pool below its requested
+baseline.
+
+A Path MUST be excluded when its known incremental capacity is below
+scheduling overhead, with a bounded reason exposed in observations. Unknown
+capacity MUST NOT be represented as measured zero or prevent bounded baseline
+maintenance. Opposite-direction counters MUST reset after a scaling
+transition or failed probe. Thresholds and windows MAY be configured, but
+these guards, hysteresis, drain action, and budget accounting are normative.
 
 ### Transition effects and failure reasons
 

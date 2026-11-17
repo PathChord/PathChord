@@ -164,7 +164,7 @@ do not fit. Such Gecko fragments can be dropped and appear as a handshake
 timeout. Tunnels or smaller path MTUs can require lower settings. The local
 2048-byte relay test used loopback and does not verify a 1500-byte path.
 
-For SOCKS5 or Shadowsocks UDP-over-TCP, set `spec.options.udpOverTcp` to `1` or
+For SOCKS5 or Shadowsocks UDP-over-TCP, set `spec.options.udpOverTcpVersion` to `1` or
 `2`; omit it for the adapter's ordinary UDP transport. When an imported Clash
 node enables UDP-over-TCP without a version it uses v1; an imported sing-box
 node uses v2. Ensure UDP is enabled on the node. For VMess, `spec.options.vmess.globalPadding` and
@@ -177,7 +177,7 @@ resource documents.
 To use native multiplexing for a Shadowsocks, VLESS, VMess, or Trojan node,
 set `spec.options.multiplex.enabled: true` and select `h2mux`, `yamux`, or `smux` in
 `spec.options.multiplex.protocol`; omission selects `h2mux`. Multiplex cannot
-be combined with explicit `packetEncoding` or `udpOverTcp`; set
+be combined with explicit `packetEncoding` or `udpOverTcpVersion`; set
 `spec.options.multiplex.padding: true` when the peer requires sing-mux padding.
 An unavailable combination is reported in the node diagnostic. Imported
 Clash/Mihomo and sing-box VLESS nodes normally default to XUDP, but when they
@@ -233,21 +233,75 @@ fallback, or geodata resources. Use [egress-service.yaml](../../examples/egress-
 as the starting point. An `EgressService` authors only the global resource limits
 `maxWireBandwidthBps` and `maxInboundTargetConnections`. The Egress runtime
 computes its Path safety ceiling and pending reservations from these limits and
-the local profile. Do not add `recommendedPathCount`, `maxConcurrentPaths`, or
-`maxStreamsPerIngress`; the common Path minimum belongs on the Ingress-side
-Egress `statusRequirements.minUsablePaths`, while the target remains a Session
-runtime decision. STATUS_REPORT exposes configured/effective/current capacity,
-capacity confidence, admission state, and the current replication allowance;
-it does not expose rule or TrafficClass metadata.
+the local profile. A Path pool belongs to the Ingress-side `Egress` resource:
+`pathPool.minUsablePaths` controls new-business admission, while
+`pathPool.targetUsablePaths` is the best-effort baseline to maintain even when
+no business connection is open. If the target is omitted, it defaults to the
+minimum plus one. Set it explicitly to the total idle Path count you want; an
+explicit value does not add another spare. Missing the target alone does not
+degrade service or deny new flows while the minimum is met. Capacity demand may
+expand above the target, and gradual scale-in returns to the baseline after
+load falls. `admission.requiredCapabilities` carries common Egress capability
+requirements. `EgressService` does not accept an Ingress Path target.
+
+`EgressService` Web Gateway settings, when needed, are grouped under `web`:
+
+```yaml
+web:
+  bind: 127.0.0.1:9090
+  tokenFile: ../secrets/web.token
+  allowedOrigins: [https://admin.example.net]
+  protectedTransport: true
+```
+
+The Web Gateway remains disabled when `web` is omitted. Keep its token file
+outside the configuration tree. Existing CLI options such as
+`--web-token-file` continue to override the matching nested setting.
+
+STATUS_REPORT exposes configured/effective/current capacity, capacity
+confidence, admission state, and the current replication allowance; it does
+not expose Ingress Path targets or rule/TrafficClass metadata.
 
 An EgressService may use `binds` for multiple public Path listeners, including
 IPv4 and IPv6 addresses on different ports. The older singular `bind` remains
 valid as a one-listener shorthand. On the Ingress side, use `endpoints` when
-one Egress ID has several reachable names or ports; each entry contains an
-`address` and `port`. The older `address`/`port` pair remains a one-endpoint
-shorthand. Keep the Egress ID, identity, public key, and authorization database
-the same across every bind and endpoint. Endpoint topology is startup
-configuration and changes require a restart.
+one Egress ID has several reachable names or ports; each entry contains a
+`host` and `port`. A single Egress endpoint uses the same `host`/`port` fields.
+Keep the Egress ID, identity, public key, and authorization database the same
+across every bind and endpoint. Endpoint topology is startup configuration
+and changes require a restart.
+
+### Migrate retired native keys
+
+The canonical native schema has no compatibility reader. Rename authored
+resources before starting or reloading with the new version; any retired key
+rejects the complete candidate, including when paired with its replacement.
+The exact paths, bounds, and replacement diagnostics are defined in the
+[configuration schema](../../openspec/specs/configuration-schema/spec.md)
+and [Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md).
+
+| Old native field | Canonical field |
+| --- | --- |
+| Egress `statusRequirements.minUsablePaths` | `pathPool.minUsablePaths` |
+| Egress `statusRequirements.capabilities` | `admission.requiredCapabilities` |
+| Egress `address` | `host` |
+| Egress `endpoints[].address` | `endpoints[].host` |
+| TransitProxy `address` | `host` |
+| EgressService `webBind` | `web.bind` |
+| EgressService `webTokenFile` | `web.tokenFile` |
+| EgressService `webOrigins` | `web.allowedOrigins` |
+| EgressService `webProtectedTransport` | `web.protectedTransport` |
+| TransitProxy `options.transport.host` | `options.transport.hosts` |
+| TransitProxy `options.transport.maxEarlyData` | `options.transport.maxEarlyDataBytes` |
+| TransitProxy `options.tls.certificate` | `options.tls.certificates` |
+| TransitProxy `options.tls.clientCertificate` | `options.tls.clientCertificates` |
+| TransitProxy `options.tls.fingerprint` | `options.tls.clientHelloFingerprint` |
+| TransitProxy `options.udpOverTcp` | `options.udpOverTcpVersion` |
+
+Update only PathChord-authored resource keys. Clash, sing-box, and share-link
+documents keep their source spellings and are normalized by the importer;
+private credential JSON, HTTP header names, Listener interface addresses,
+CLI flags, and protocol identifiers have separate contracts.
 
 TLS-capable Transit nodes use system roots by default. Set the ordered
 `truststore` list to `system` and/or local PEM/DER files when custom roots are
@@ -260,6 +314,6 @@ symlink sources reject the node instead of downgrading its transport.
 
 The service watches additions, edits, removals, and renames in a selected resource directory and validates the entire candidate before publishing it. Atomic file replacement is supported. If parsing, graph validation, rule compilation, persistence, or cache writing fails, the last successful configuration remains active; inspect structured status for the failure, fix the candidate, and let it reload.
 
-Subscription nodes, compiled dynamic rules, administrator labels/tags, and DNS runtime health can update dynamically. Changes to static Egress topology, its Transit binding, common Path requirements, resolved TrafficPolicy, local private keys, listener bind settings, or platform routing settings require a service restart. Moving unchanged resources between files does not change their identity or require restart. New flows use a single published generation for their complete route decision; existing resources follow their admission and normal drain/failure rules.
+Subscription nodes, compiled dynamic rules, administrator labels/tags, and DNS runtime health can update dynamically. Changes to static Egress topology, its Transit binding, Path-pool counts, admission capabilities, resolved TrafficPolicy, local private keys, listener bind settings, or platform routing settings require a service restart. Moving unchanged resources between files does not change their identity or require restart. New flows use a single published generation for their complete route decision; existing resources follow their admission and normal drain/failure rules.
 
 Management changes to a declared subscription remain effective across reload and restart while its declaration is unchanged. Editing or removing the declaration applies the corresponding new desired state. The [reload contract](../../openspec/specs/configuration-schema/spec.md#snapshot-publication-and-reload) provides the exact publication and ownership rules.

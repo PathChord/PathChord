@@ -27,6 +27,8 @@ pub use usage::{SubscriptionDocument, SubscriptionUsage};
 pub const MAX_SUBSCRIPTION_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SUBSCRIPTION_NODES: usize = 10_000;
 const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const CACHE_ENVELOPE_VERSION: u8 = 3;
+const CACHE_INCOMPATIBLE_CODE: &str = "cache_incompatible";
 const MAX_BACKOFF_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -694,6 +696,7 @@ pub enum RefreshOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheLoadOutcome {
     Loaded { diff: SnapshotDiff },
+    Incompatible { code: &'static str },
     NotConfigured,
     Missing,
     Expired,
@@ -1158,14 +1161,31 @@ impl SubscriptionManager {
         let encoded = tokio::fs::read(&path)
             .await
             .map_err(|_| SubscriptionError::CacheIo)?;
-        let cached: CacheEnvelope =
+        let envelope: serde_json::Value =
             serde_json::from_slice(&encoded).map_err(|_| SubscriptionError::InvalidCache)?;
-        if cached.version == 1 {
-            return Ok(CacheLoadOutcome::UnverifiedSource);
-        }
-        if cached.version != 2 || cached.subscription_id != config.id {
+        let version = envelope
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(SubscriptionError::InvalidCache)?;
+        let subscription_id = envelope
+            .get("subscription_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(SubscriptionError::InvalidCache)?;
+        if subscription_id != config.id.as_str() {
             return Err(SubscriptionError::InvalidCache);
         }
+        if version == 1 {
+            return Ok(CacheLoadOutcome::UnverifiedSource);
+        }
+        if version != u64::from(CACHE_ENVELOPE_VERSION)
+            || has_retired_native_option_fields(&envelope)
+        {
+            return Ok(CacheLoadOutcome::Incompatible {
+                code: CACHE_INCOMPATIBLE_CODE,
+            });
+        }
+        let cached: CacheEnvelope =
+            serde_json::from_value(envelope).map_err(|_| SubscriptionError::InvalidCache)?;
         match cached.source_fingerprint.as_deref() {
             None => return Ok(CacheLoadOutcome::UnverifiedSource),
             Some(fingerprint) if fingerprint != source_fingerprint => {
@@ -1511,7 +1531,7 @@ impl SubscriptionManager {
             })
             .collect();
         let envelope = CacheEnvelope {
-            version: 2,
+            version: CACHE_ENVELOPE_VERSION,
             published_at_unix_seconds: unix_seconds()?,
             subscription_id: config.id.clone(),
             source_fingerprint: Some(subscription_source_fingerprint(config)),
@@ -1548,6 +1568,25 @@ struct CacheEnvelope {
     #[serde(default)]
     source_fingerprint: Option<String>,
     nodes: Vec<CachedNode>,
+}
+
+fn has_retired_native_option_fields(envelope: &serde_json::Value) -> bool {
+    envelope
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                let Some(options) = node.pointer("/config/options") else {
+                    return false;
+                };
+                options.get("udpOverTcp").is_some()
+                    || options.pointer("/tls/certificate").is_some()
+                    || options.pointer("/tls/clientCertificate").is_some()
+                    || options.pointer("/tls/fingerprint").is_some()
+                    || options.pointer("/transport/host").is_some()
+                    || options.pointer("/transport/maxEarlyData").is_some()
+            })
+        })
 }
 
 fn subscription_source_fingerprint(config: &SubscriptionConfig) -> String {
@@ -2409,6 +2448,9 @@ proxies:
         ));
         let cache_path = directory.join(&cache.path);
         assert!(cache_path.is_file());
+        let envelope: CacheEnvelope =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(envelope.version, CACHE_ENVELOPE_VERSION);
         let entries: Vec<_> = std::fs::read_dir(cache_path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -2450,6 +2492,48 @@ proxies:
             expired.load_cache(&subscription).await.unwrap(),
             CacheLoadOutcome::Expired
         );
+    }
+
+    #[tokio::test]
+    async fn incompatible_normalized_cache_is_not_decoded_or_published() {
+        let directory = temp_directory("incompatible-cache");
+        let cache = SubscriptionCache {
+            path: "provider.snapshot".into(),
+            max_age_seconds: 86_400,
+        };
+        let subscription = config(SubscriptionSourceType::Clash, Some(cache.clone()));
+        let cache_path = directory.join(&cache.path);
+        for version in [2, CACHE_ENVELOPE_VERSION] {
+            let old_envelope = serde_json::json!({
+                "version": version,
+                "subscription_id": subscription.id.as_str(),
+                "nodes": [{
+                    "config": {
+                        "options": {
+                            "udpOverTcp": 2,
+                            "tls": {"fingerprint": "chrome"},
+                            "transport": {"type": "ws", "maxEarlyData": 4096}
+                        }
+                    }
+                }]
+            });
+            atomic_write(&cache_path, &serde_json::to_vec(&old_envelope).unwrap())
+                .await
+                .unwrap();
+
+            let mut manager = SubscriptionManager::new(
+                Arc::new(ScriptedFetcher::new([])),
+                &directory,
+                BTreeSet::from(["vless".into()]),
+            );
+            assert_eq!(
+                manager.load_cache(&subscription).await.unwrap(),
+                CacheLoadOutcome::Incompatible {
+                    code: CACHE_INCOMPATIBLE_CODE,
+                }
+            );
+            assert!(manager.snapshot().nodes.is_empty());
+        }
     }
 
     #[tokio::test]

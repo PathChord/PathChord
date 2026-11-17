@@ -79,17 +79,27 @@
 
 ### Requirement: Bounded scheduling and autoscaling guards
 
-调度 SHALL 保留一个不可变的 Egress Session 策略快照、有界公平服务、关系及方向性质量权重和按发送方共享的复制记账。自动扩缩容 SHALL 使用一个 Session Path target，并执行规定的滞回、公共最小值保留、排空动作、新增容量排除及计数器重置规则。
+调度 SHALL 保留一个不可变的 Egress Session 策略快照、有界公平服务、关系及方向性质量权重和按发送方共享的复制记账。容量自动扩缩容 SHALL 使用滞回、新增容量排除和计数器重置。计划性容量缩容必须在所有选中排空后保留有效基线和公共最小值；计划性容量缩容移除的每条 Path SHALL 先进入 `DRAINING`。
 
 #### Scenario: Autoscaler scales a Path in
 
-- **WHEN** 容量富余持续达到配置的非零缩容窗口，移除所有选中的排空候选后仍保留合规可用 Path 且满足 Egress 最小值
+- **WHEN** 容量富余持续达到配置的非零缩容窗口，且移除所有选中的排空候选后仍保留足够容量、另一条合规可用 Path、有效基线和 Egress 最小值
 - **THEN** 选中的 Path 在移除前进入 `DRAINING`，并保留规定的滞回和预算守卫
 
 #### Scenario: A draining Path cannot justify another drain
 
 - **WHEN** 公共最小值为 2、已有 2 条可用 Path，且另有 1 条 Path 正在排空
 - **THEN** owner 拒绝排空任一可用 Path，并在检查最小值时扣除并发选中的排空候选
+
+#### Scenario: Spare capacity still belongs to the baseline
+
+- **WHEN** 最小值为 1，有效基线为 3，仍有 3 条可用 Path，且业务需求为零
+- **THEN** 容量缩容保留 3 条 Path，不得缩减到准入最小值
+
+#### Scenario: Several drains would cross the baseline
+
+- **WHEN** 有效基线为 3，有 4 条可用 Path，另有 1 条正在排空
+- **THEN** 最多再选 1 条可用 Path 进行容量缩容，且已有排空 Path 不得成为再选第二条的理由
 
 ### Requirement: One owner validates lifecycle transitions
 
@@ -111,16 +121,21 @@ Egress service state SHALL 表示生命周期和健康；独立的 admission sta
 
 ### Requirement: Reconnected Sessions start fresh
 
-Session 因 Egress 故障、Path 丢失、授权失败或协议信任失败关闭时，替代 Session SHALL 使用新的 SessionID，捕获配置的 Egress 策略，并重置聚合 demand、Path target、复制用量和生命周期观测。
+Session 因 Egress 故障、Path 丢失、授权失败或协议信任失败关闭时，替代 Session SHALL 使用新的 SessionID 并捕获配置的 Egress 策略。替代 Session SHALL 根据配置和当前上限重新计算请求基线及有效基线，同时重置 demand target、复制用量、重试/滞回状态（受信任失败守卫约束）和 Session 生命周期观测。
 
 #### Scenario: Egress recovers after Session closure
 
 - **WHEN** Ingress 重新连接同一配置 Egress
-- **THEN** 新 Session 从 Egress 最小值和新鲜观测开始，不复用旧 Session 状态
+- **THEN** 新 Session 使用配置的最小值和请求基线以及新鲜 demand 观测，不继承旧的负载扩张 target，也不复用旧 Session 状态
+
+#### Scenario: A busy Session reconnects while idle
+
+- **WHEN** 一个曾因需求扩张到 6 条 Path、配置基线为 3 的 Session 关闭，替代 Session 启动时无业务需求
+- **THEN** 替代 Session 尝试维持受限基线 3，不继承 6 条，也不退回到 1 条
 
 ### Requirement: Egress Session Path pool lifecycle
 
-Ingress Session owner SHALL 为一个 Egress 关系维护一个认证的公共 Path 池，不依赖命中的路由规则。扩展和排空必须保持公共资格及硬安全上限。低于公共最小值时拒绝新业务但不能仅因短缺关闭已有工作；最后一条 ready Path 丢失时废弃 Session。
+Ingress owner SHALL 为每个 Egress 关系维护一个认证 Path 池，不依赖路由命中或业务连接。计划维护 SHALL 保留 Path 资格和硬上限。低于请求基线本身不得在达到最小值时降级或拒绝准入。低于最小值时 SHALL 拒绝新业务，但不得仅因数量不足关闭已有工作；最后一条 ready Path 丢失时退休 Session。
 
 #### Scenario: Ready Paths fall below the configured minimum
 
@@ -136,6 +151,16 @@ Ingress Session owner SHALL 为一个 Egress 关系维护一个认证的公共 P
 
 - **WHEN** 公共池最后一条 ready Path 失败
 - **THEN** 关闭所有相关业务资源，废弃的 SessionID 不得复用
+
+#### Scenario: A baseline Path fails above the minimum
+
+- **WHEN** 最小值为 1、请求基线为 3，故障后仍有 2 条健康可用 Path
+- **THEN** 数量守卫允许已有和新业务继续，且维护会有界地补回第三条 Path
+
+#### Scenario: No business resources are open
+
+- **WHEN** 配置的 Egress 有合格候选且允许建立 Path，但没有 Stream 或 UDP Association
+- **THEN** owner 无需等待业务打开或构造目标连接，即建立或补充有界基线
 
 ### Requirement: Endpoint failure preserves shared lifecycle ownership
 
@@ -153,21 +178,41 @@ endpoint 级 Path 故障 SHALL 由现有 Session/Path lifecycle owner 处理。e
 
 ### Requirement: Directional Path capacity drives scaling
 
-Ingress SHALL 分别维护上行和下行 Path 观测。双向 Session target SHALL 覆盖两个方向需求中较大的一个，各方向调度使用自身输入。
+Ingress SHALL 分别维护上行和下行 Path 观测。Session 当前 target SHALL 覆盖有效基线和较大的方向 Path 需求，并受硬资源上限约束。每个方向保留自身调度输入，且需求变化 SHALL 重新计算 target，不得把过去扩张值当成新基线。
 
 #### Scenario: Downstream is the bottleneck
 
 - **WHEN** 上行需求适合一条 Path 而下行需求需要三条
-- **THEN** 物理 Path target 至少为三，且上下行调度分别使用各自观测
+- **THEN** 物理 Path target 在硬上限内至少为三，且上下行调度分别使用各自观测
+
+#### Scenario: Capacity demand exceeds the baseline
+
+- **WHEN** 有效基线为 3，新鲜下行容量观测要求 5 条 Path，且硬上限允许 5
+- **THEN** 持续需求可使连接池扩张到 5，同时配置基线仍为 3
+
+#### Scenario: Demand falls after expansion
+
+- **WHEN** 基线为 3 的 5-Path 池获得新鲜方向性观测且容量持续富余
+- **THEN** 计算出的需求 target 可降回 3，并在缩容守卫下逐步排空多余 Path
 
 ### Requirement: Autoscaling remains bounded and low-frequency
 
-Path 健康采样和 Session demand 聚合 SHALL 使用有界 counter 和低频窗口。自动扩缩容 SHALL 对扩容和缩容使用独立滞回，计划缩容保留 Egress 公共最小值，并排除新增容量低于调度开销的候选。
+Path 采样、Session demand 聚合和基线维护 SHALL 使用有界 counter 与低频操作。容量扩张和缩容 SHALL 使用独立滞回，计划缩容 SHALL 保留有效基线和公共最小值。已知新增容量低于调度开销的候选 SHALL 继续排除；容量未知不得通过将其视作零来阻止有界基线维护。
 
 #### Scenario: Unknown capacity at startup
 
 - **WHEN** Session 尚未收集足够新鲜的有效容量测量
 - **THEN** Ingress 使用配置 Egress 上限作为临时调度上限，标记 provisional，不创建无界额外 Path
+
+#### Scenario: Idle startup has no measured Path capacity
+
+- **WHEN** 启动时业务需求为零，Path 容量尚未知
+- **THEN** Ingress 可以建立有界配置基线，不伪造零容量或实测容量，也不因未知容量反复扩张超过基线
+
+#### Scenario: No candidate can satisfy the target
+
+- **WHEN** 所有合格建连尝试均失败，导致请求基线无法达到
+- **THEN** 维护保留现存 Path，暴露基线缺口，并使用有界退避重试，避免忙循环或反复打开目标连接
 
 ## Detailed contract
 

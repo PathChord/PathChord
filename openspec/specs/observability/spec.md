@@ -143,7 +143,7 @@ Ingress SHALL publish bounded upstream and downstream Path observations and SHAL
 
 ### Requirement: Session Path-pool observations
 
-Session observations SHALL identify the owning Egress, common minimum, current target, eligible Transit count, immutable policy snapshot, aggregate directional demand, and negotiated per-sender replication allowance. These fields SHALL follow existing authorization, generation, cardinality, and unknown-value rules without allocating per-rule or per-business-class observations.
+Session observations SHALL identify the owning Egress, common minimum, requested baseline, effective bounded baseline, current demand-derived target, actual ready and usable counts, typed target shortfall, eligible Transit count, immutable policy, directional demand, and replication allowance. These fields SHALL preserve authorization, generation, cardinality, and unknown-value rules without per-rule or per-class observations. Baseline shortfall alone SHALL NOT change health or admission.
 
 #### Scenario: Different routing rules use one Egress
 
@@ -159,6 +159,36 @@ Session observations SHALL identify the owning Egress, common minimum, current t
 
 - **WHEN** a Session has no accepted replication negotiation or an aggregate demand window has no authoritative sample
 - **THEN** the corresponding field is null or explicitly unknown rather than a fabricated measured zero
+
+#### Scenario: Runtime ceiling clamps the baseline
+
+- **WHEN** the requested baseline is six, the hard runtime ceiling is four, and four Paths are usable
+- **THEN** the requested baseline remains six, the effective baseline is four, target shortfall is two, and its reason is `runtime_limit` without baseline shortfall independently degrading health or denying admission
+
+#### Scenario: Partial baseline recovery remains healthy
+
+- **WHEN** the minimum is one, the requested baseline is three, two Paths are usable, and a bounded background recovery is in progress
+- **THEN** observations retain the minimum, requested baseline, effective baseline, and actual counts, report a shortfall of one with the dominant typed reason, and do not derive degraded health or denied admission from that shortfall alone
+
+#### Scenario: Load expansion does not change the configured baseline
+
+- **WHEN** requested and effective baselines are three and current directional demand requires five Paths within the runtime ceiling
+- **THEN** observations retain both baselines at three while `target_path_count` reflects the current bounded demand target of five
+
+#### Scenario: A Session exceeds its idle baseline
+
+- **WHEN** five Paths are usable for a requested baseline of three
+- **THEN** `target_shortfall` is zero and `target_shortfall_reason` is null even while demand or gradual draining keeps the actual count above the baseline
+
+#### Scenario: Several shortfall causes apply
+
+- **WHEN** a baseline shortfall has more than one applicable registered cause
+- **THEN** observations select the deterministic dominant reason in the documented precedence rather than varying by producer or adapter
+
+#### Scenario: Prometheus reads live Path-planning totals
+
+- **WHEN** an authorized client reads `/metrics`
+- **THEN** the four registered Path-planning gauges sum the same live Session snapshot without new labels, report zero for an empty live set, and do not include retired Session history or represent lifetime counters
 
 ## Detailed contract
 
@@ -293,10 +323,48 @@ ready_path_count, active_streams, active_udp_associations
 control_pending, control_acked, control_retransmissions
 close_reason, reconnect_attempts
 minimum_usable_paths, target_path_count, usable_path_count
+requested_target_usable_paths, effective_target_usable_paths
+target_shortfall, target_shortfall_reason
 eligible_transit_count, traffic_policy_id, traffic_policy_generation
 demand_upstream_bps, demand_downstream_bps
 replication_cap_bps, replication_upstream_used_bps, replication_downstream_used_bps
 ```
+
+`requested_target_usable_paths` is the resolved explicit target or the
+minimum-plus-one default before runtime clamping. It uses an unsigned 64-bit
+value to preserve the maximum 32-bit minimum plus one. The effective target
+is bounded by the hard runtime Path ceiling, and `target_path_count` is
+recomputed from the effective target and current directional demand rather
+than retaining a past peak. A live Session's baseline shortfall is
+`max(requested_target_usable_paths - usable_path_count, 0)`; it does not
+measure demand-target shortfall and does not independently affect health or
+admission. Configured Egress resources without a live Session do not create
+fabricated authenticated Session rows.
+
+For a positive baseline shortfall, the dominant reason is the first
+applicable item in this order: `runtime_limit`, `admission_blocked`,
+`no_eligible_transit`, `connect_failed`, then `recovering`. The reason is
+null exactly when shortfall is zero. Reasons are bounded identifiers and
+never include raw transport errors.
+
+| Field | Type and meaning |
+| --- | --- |
+| `minimum_usable_paths` | configured admission minimum |
+| `requested_target_usable_paths` | unsigned 64-bit resolved baseline in `1..=4294967296`, before runtime clamping |
+| `effective_target_usable_paths` | requested baseline bounded by the current hard runtime ceiling |
+| `target_path_count` | current demand-derived physical target, bounded by the hard ceiling and recomputed instead of retaining a past peak |
+| `ready_path_count` | authenticated ready Paths under lifecycle semantics |
+| `usable_path_count` | eligible authenticated non-draining `ACTIVE` or `DEGRADED` Paths |
+| `target_shortfall` | `max(requested_target_usable_paths - usable_path_count, 0)` without unsigned underflow |
+| `target_shortfall_reason` | null at zero shortfall; otherwise the dominant reason below |
+
+| Precedence | Reason | Applicability |
+| --- | --- | --- |
+| 1 | `runtime_limit` | a current hard Path ceiling is below the requested baseline |
+| 2 | `admission_blocked` | an independent Egress admission constraint prevents Path establishment |
+| 3 | `no_eligible_transit` | the Egress binding has no eligible Transit candidate |
+| 4 | `connect_failed` | the latest bounded establishment attempt failed, including its retry backoff |
+| 5 | `recovering` | shortfall remains and no preceding reason applies |
 
 Stream views expose:
 
@@ -323,9 +391,13 @@ publish a recommended Path count or per-Ingress quota. Ingress Path observations
 MUST include separate upstream/downstream RTT, jitter, loss, reordering,
 throughput, effective capacity, and connection-establishment quality.
 
-The observation provider MUST also expose one Session pool minimum, bounded
-target, ready/usable counts, eligible relationships, captured policy identity
-and generation, aggregate upstream/downstream demand, and negotiated cap.
+The observation provider MUST also expose one Session pool minimum, requested
+and effective baseline, current bounded demand target, ready/usable counts,
+baseline shortfall and its dominant reason, eligible relationships, captured
+policy identity and generation, aggregate upstream/downstream demand, and
+negotiated cap. Baseline shortfall alone MUST NOT change service health,
+Session state, or admission permission. The shortfall compares the requested
+baseline with usable Paths and is independent of an enlarged load target.
 Upstream usage is authoritative local sender accounting; downstream usage is
 null unless an authoritative Session-scoped producer exists. The global Egress
 replication allowance is not a substitute. The scheduler uses the typed fields, not human-readable log text. A stale report
@@ -352,6 +424,10 @@ pathchord_target_connections
 pathchord_observed_nodes
 pathchord_observed_connections
 pathchord_observation_generation
+pathchord_session_requested_target_usable_paths
+pathchord_session_effective_target_usable_paths
+pathchord_session_target_paths
+pathchord_session_target_shortfall
 ```
 
 These values describe current snapshot state. They MUST NOT be presented as
@@ -379,9 +455,15 @@ pathchord_path_capacity_bps
 pathchord_egress_load_ratio
 pathchord_egress_connection_utilization_ratio
 pathchord_egress_bandwidth_utilization_ratio
-pathchord_egress_recommended_paths
 pathchord_stream_reorder_bytes
 ```
+
+The four Path-planning gauges are sums over the same current live Session
+snapshot, exclude closed and retired Session history, and are zero when that
+live set is empty. They are gauges, not lifetime counters, and add no labels.
+Egress does not recommend a Path count; Ingress owns its requested baseline
+and demand target. These values are local observations and are not added to
+the authenticated Egress `STATUS_REPORT`.
 
 Histograms MUST define units and bucket boundaries in their adapter schema. A
 metric family MUST declare whether it is a counter, gauge, or histogram.

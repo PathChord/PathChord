@@ -16,7 +16,7 @@ pub mod geodata;
 mod resource;
 mod service_config;
 mod transit_options;
-pub use service_config::{EgressServiceSpec, NodeProbePolicySpec};
+pub use service_config::{EgressServiceSpec, EgressWebSettings, NodeProbePolicySpec};
 
 pub use transit_options::{
     TransitMultiplex, TransitOptions, TransitReality, TransitTls, TransitTransport,
@@ -179,7 +179,8 @@ pub struct EgressConfig {
     pub public_key: String,
     pub labels: BTreeMap<String, String>,
     pub capabilities: Capabilities,
-    pub status_requirements: EgressStatusRequirements,
+    pub path_pool: EgressPathPoolConfig,
+    pub admission: EgressAdmission,
     /// One Transit binding is shared by every Session for this Egress.
     #[serde(default)]
     pub transit: EgressTransitBinding,
@@ -188,10 +189,42 @@ pub struct EgressConfig {
     pub traffic_policy: Option<TrafficPolicyId>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EgressStatusRequirements {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EgressPathPoolConfig {
     pub min_usable_paths: u32,
-    pub capabilities: BTreeSet<FlowProtocol>,
+    pub target_usable_paths: Option<u32>,
+}
+
+impl Default for EgressPathPoolConfig {
+    fn default() -> Self {
+        Self {
+            min_usable_paths: 1,
+            target_usable_paths: None,
+        }
+    }
+}
+
+impl EgressPathPoolConfig {
+    #[must_use]
+    pub fn requested_target_usable_paths(&self) -> u64 {
+        self.target_usable_paths
+            .map(u64::from)
+            .unwrap_or_else(|| u64::from(self.min_usable_paths).saturating_add(1))
+    }
+}
+
+impl PartialEq for EgressPathPoolConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.min_usable_paths == other.min_usable_paths
+            && self.requested_target_usable_paths() == other.requested_target_usable_paths()
+    }
+}
+
+impl Eq for EgressPathPoolConfig {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressAdmission {
+    pub required_capabilities: BTreeSet<FlowProtocol>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,6 +628,11 @@ pub enum PolicyDecision {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ValidationError {
+    #[error("Egress {egress_id} has an invalid Path-pool field {field}")]
+    InvalidEgressPathPool {
+        egress_id: String,
+        field: &'static str,
+    },
     #[error("rule {rule_id} references unknown traffic class {class}")]
     UnknownTrafficClass { rule_id: String, class: String },
 
@@ -698,6 +736,22 @@ fn validate(config: &PolicyConfig) -> Result<(), ValidationError> {
         "egress",
         config.egresses.iter().map(|item| item.id.as_str()),
     )?;
+    for egress in &config.egresses {
+        if egress.path_pool.min_usable_paths == 0 {
+            return Err(ValidationError::InvalidEgressPathPool {
+                egress_id: egress.id.as_str().to_owned(),
+                field: "pathPool.minUsablePaths",
+            });
+        }
+        if let Some(target) = egress.path_pool.target_usable_paths
+            && (target == 0 || target < egress.path_pool.min_usable_paths)
+        {
+            return Err(ValidationError::InvalidEgressPathPool {
+                egress_id: egress.id.as_str().to_owned(),
+                field: "pathPool.targetUsablePaths",
+            });
+        }
+    }
     validate_unique(
         "Transit Proxy",
         config.transit_proxies.iter().map(|item| item.id.as_str()),
@@ -1227,7 +1281,8 @@ mod tests {
                     tcp: true,
                     udp: true,
                 },
-                status_requirements: EgressStatusRequirements::default(),
+                path_pool: EgressPathPoolConfig::default(),
+                admission: EgressAdmission::default(),
                 transit: EgressTransitBinding::default(),
                 traffic_policy: None,
             }],
@@ -1307,6 +1362,32 @@ mod tests {
         assert!(matches!(
             ValidatedPolicySnapshot::new(Generation::new(1), invalid_port),
             Err(ValidationError::InvalidPort { kind: "egress", .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_programmatic_egress_path_pools() {
+        let mut config = base_config();
+        config.egresses[0].path_pool.min_usable_paths = 0;
+        assert!(matches!(
+            ValidatedPolicySnapshot::new(Generation::new(1), config),
+            Err(ValidationError::InvalidEgressPathPool {
+                field: "pathPool.minUsablePaths",
+                ..
+            })
+        ));
+
+        let mut config = base_config();
+        config.egresses[0].path_pool = EgressPathPoolConfig {
+            min_usable_paths: 2,
+            target_usable_paths: Some(1),
+        };
+        assert!(matches!(
+            ValidatedPolicySnapshot::new(Generation::new(1), config),
+            Err(ValidationError::InvalidEgressPathPool {
+                field: "pathPool.targetUsablePaths",
+                ..
+            })
         ));
     }
 

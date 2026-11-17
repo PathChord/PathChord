@@ -17,6 +17,36 @@ Transit 适配器和订阅处理 SHALL 遵循下文完整详细契约，包括�
 - **WHEN** 导入 `socks4` 或 `socks4a` 出站节点
 - **THEN** 即使本地监听器支持这些协议，该节点仍保持不可用并带类型化诊断。
 
+#### Scenario: Canonical native option names are authored
+
+- **WHEN** 原生 TransitProxy 在其选项对象中使用 `hosts`、`maxEarlyDataBytes`、`certificates`、`clientCertificates`、`clientHelloFingerprint` 或 `udpOverTcpVersion`
+- **THEN** 解析会保留各字段的文档化类型、值和列表顺序，并将其交给选定适配器，连接语义保持不变
+
+#### Scenario: A retired native option name is authored
+
+- **WHEN** 原生 TransitProxy 使用迁移表中的任意退役选项路径，包括空值或默认值字段
+- **THEN** 完整配置校验会拒绝该候选，并返回有界的 `CONFIG_RETIRED_FIELD` 诊断，指出资源、准确的已输入字段路径和规范替代路径，且不暴露字段值
+
+#### Scenario: Retired and canonical native names are combined
+
+- **WHEN** 一个原生 TransitProxy 同时包含退役选项名及其规范替代名
+- **THEN** 校验会拒绝完整候选，不合并值、不择一使用，也不把退役名当作别名
+
+#### Scenario: Certificate pins and ClientHello profiles are configured together
+
+- **WHEN** 原生 TLS 配置同时包含 `certificateSha256` 和 `clientHelloFingerprint`
+- **THEN** 证书 pin 仍必须匹配，ClientHello profile 独立选择受支持的模拟行为
+
+#### Scenario: A supported foreign node uses its original option names
+
+- **WHEN** Clash、sing-box 或分享链接节点使用其来源文档规定的名称提供受支持的 TLS、HTTP Host、early-data 或 UDP-over-TCP 参数
+- **THEN** 导入器接受并将这些字段规范化为原生模型，不要求外部文档改用 PathChord 原生字段名
+
+#### Scenario: Foreign or private data contains a matching field name
+
+- **WHEN** HTTP 头、私有凭据字段或保留的完整外部文档包含与某个退役原生选项同名的键
+- **THEN** 原生键校验不会仅因键名匹配而重写或拒绝该数据
+
 ### Requirement: Bounded smux sessions
 
 smux 会话 SHALL 执行详细契约中的每会话和每流资源限制，隔离接收超限的流，并保持规定的
@@ -105,6 +135,31 @@ SHALL 使用 Brutal 发包控制和丢包补偿。
 
 - **WHEN** 订阅的来源类型、URL、凭据引用或有效 User-Agent 改变
 - **THEN** 旧来源的节点进入排空，不得被新 flow 选择。
+
+#### Scenario: Canonical native options survive a source-bound cache roundtrip
+
+- **WHEN** 写入并加载包含规范原生选项的已验证来源绑定缓存
+- **THEN** 选项值、凭据、诊断、来源身份和重新执行适配器准备的要求均得到保留
+
+#### Scenario: A cache uses an incompatible normalized option schema
+
+- **WHEN** 缓存使用较旧的规范化选项 schema 版本，或包含退役的规范化原生选项字段
+- **THEN** 加载会返回有界且脱敏的 `cache_incompatible` 诊断，不发布该缓存中的节点，并且只允许针对当前配置来源执行有界认证刷新
+
+#### Scenario: An incompatible cache is found while valid nodes are active
+
+- **WHEN** 发现不兼容缓存，且当前来源与生命周期决策下仍有独立有效的活动快照
+- **THEN** 有界刷新期间可以保留该活动快照，但不得把不兼容缓存当作有效校验或复活已退役节点
+
+#### Scenario: A cold start has an incompatible cache and no source connection
+
+- **WHEN** 不存在独立有效的活动快照、缓存不兼容且配置来源无法刷新
+- **THEN** 不发布该缓存中的节点，订阅保持不可用，并提供类型化的缓存与刷新诊断
+
+#### Scenario: A cache conflicts with subscription lifecycle decisions
+
+- **WHEN** 加载缓存或发布刷新结果之前，订阅已禁用、删除、替换来源或命中持久化节点 tombstone
+- **THEN** 当前生命周期决策会抑制相关发布，不兼容缓存、过期刷新或保留快照均不得复活已退役节点
 
 ### Requirement: Node probe revocation follows source visibility
 
@@ -207,16 +262,16 @@ VLESS 在明文 TCP、TLS 或不带 Vision 的 REALITY 上也支持 IP 目标的
 与任一 Vision flow 同时配置 `packetaddr` 时会在适配器准备阶段拒绝。显式 packet encoding
 也不能与 multiplex 同时配置；受支持的 multiplex 使用自身的数据报帧。
 
-对于 REALITY，`fingerprint: chrome` 选择 dae 2.1.2 的 Chrome 133 profile。它初次尝试
+对于 REALITY，`clientHelloFingerprint: chrome` 选择 dae 2.1.2 的 Chrome 133 profile。它初次尝试
 传统 X25519 形式并记住成功的形式，仅在完整 TLS 握手验证了可信的伪装站点证书后才重试另一种形式，绝不向
 伪装站点发送 VLESS 数据。此 profile 不支持 TLS 1.2、HelloRetryRequest、恢复握手、真实 ECH
 和服务端 ALPS 响应。
-`fingerprint: ios`、`safari`、`edge` 和 `qq` 分别选择 dae 的 iOS 14、Safari 16、
-Edge 85 和 QQ 11.1 profile，使用原有 X25519 key share。`fingerprint: firefox` 选择 dae 的
+`clientHelloFingerprint: ios`、`safari`、`edge` 和 `qq` 分别选择 dae 的 iOS 14、Safari 16、
+Edge 85 和 QQ 11.1 profile，使用原有 X25519 key share。`clientHelloFingerprint: firefox` 选择 dae 的
 Firefox 120 profile，使用独立的 X25519 和 P-256 key share。对端的 `record_size_limit`
 独立于客户端公告的接收限制约束出站 TLS 记录，且不会放宽更严格的本地限制。QQ 服务端的
 ALPS 响应会被明确拒绝。普通 TLS 也支持这些 profile，并应用配置的证书校验。
-`fingerprint: android` 为不使用 ALPN 的普通 TLS 1.2 选择 dae/uTLS Android 11 OkHttp；
+`clientHelloFingerprint: android` 为不使用 ALPN 的普通 TLS 1.2 选择 dae/uTLS Android 11 OkHttp；
 此 profile 不支持 REALITY、Vision 以及要求 ALPN 的传输。360 profile 所声明的密码套件
 均未被当前 TLS 后端实现，因此不可用，不得用其他 profile 替代。
 
@@ -266,11 +321,11 @@ TLS、Host、path、经过验证的头、配置的证书及 pin 校验，以及�
 
 | 字段 | 默认值与含义 |
 | --- | --- |
-| `tls` | 缺省；TLS 对象，字段为 `enabled`、`serverName`、`insecure`、有序 `truststore`、`alpn`、`certificate`、`certificateSha256`、`clientCertificate`、`clientKeyField`、`fingerprint`、`reality` |
-| `transport` | 缺省；对象，字段为 `type`、`path`、`host`、`headers`、`serviceName`、`maxEarlyData`、`earlyDataHeaderName` |
+| `tls` | 缺省；TLS 对象，字段为 `enabled`、`serverName`、`insecure`、有序 `truststore`、`alpn`、`certificates`、`certificateSha256`、`clientCertificates`、`clientKeyField`、`clientHelloFingerprint`、`reality` |
+| `transport` | 缺省；对象，字段为 `type`、`path`、`hosts`、`headers`、`serviceName`、`maxEarlyDataBytes`、`earlyDataHeaderName` |
 | `headers` | `{}`；非秘密 HTTP CONNECT 头 |
 | `udp` | 缺省；使用适配器能力；`false` 禁用普通 UDP 转发 |
-| `udpOverTcp` | 缺省；SOCKS5 或 Shadowsocks UDP-over-TCP 版本 `1` 或 `2`；与 `udp: false` 不兼容 |
+| `udpOverTcpVersion` | 缺省；SOCKS5 或 Shadowsocks UDP-over-TCP 版本 `1` 或 `2`；与 `udp: false` 不兼容 |
 | `vmess` | 缺省；`globalPadding` 和 `authenticatedLength` 布尔值，均默认 `false` |
 | `multiplex` | 缺省；对象，字段为 `enabled`、`protocol`、`maxConnections`、`minStreams`、`maxStreams`、`padding` |
 | `tcpFastOpen` | 缺省；可选布尔值 |
@@ -278,16 +333,32 @@ TLS、Host、path、经过验证的头、配置的证书及 pin 校验，以及�
 | `routingMark` | 缺省；可选的无符号 32 位路由标记 |
 | `packetEncoding` | 缺省；`xudp` 或 `packetaddr` |
 
-TLS 布尔值默认 `false`；truststore 默认 `["system"]`，证书和 ALPN 列表默认空列表。每个 truststore
+PathChord 原生选项键名唯一且没有兼容别名。适配器 MUST 拒绝不支持的组合或列表元素数量，不能丢弃字段。
+退役键 MUST 通过有界的 `CONFIG_RETIRED_FIELD` 诊断指出替代字段；未知键仍然无效，字段名不得递归改写。
+
+| 退役原生字段 | 规范字段 |
+| --- | --- |
+| `transport.host` | `transport.hosts` |
+| `transport.maxEarlyData` | `transport.maxEarlyDataBytes` |
+| `tls.certificate` | `tls.certificates` |
+| `tls.clientCertificate` | `tls.clientCertificates` |
+| `tls.fingerprint` | `tls.clientHelloFingerprint` |
+| `udpOverTcp` | `udpOverTcpVersion` |
+
+`hosts` 是有序列表，最多 16 个非空 HTTP Host 覆盖值，每个最多 255 字节；适配器可以支持更少元素，且必须拒绝不支持的数量。
+`certificates` 和 `clientCertificates` 均为有序内联 PEM 列表，最多 16 个值，每个最多 65,536 字节。前者向信任库添加信任锚，后者组成客户端认证链。
+`maxEarlyDataBytes` 是范围为 `0..=65536` 的整数字节数；`udpOverTcpVersion` 是可选整数版本 `1` 或 `2`，不是启用开关。
+
+TLS 布尔值默认 `false`；truststore 默认 `["system"]`，`certificates`、`clientCertificates` 和 `alpn` 列表默认空列表。每个 truststore
 来源必须是 `system` 或本地 PEM/DER 文件；相对路径从选定配置来源解析，允许绝对路径，符号链接目标
 必须是普通文件，空列表表示没有信任锚点。任一无效、超大或格式错误来源都必须原子拒绝适配器。
 `https` 隐含启用 TLS。Clash HTTP
 节点的 `tls: true` 必须规范化为 HTTPS CONNECT。`serverName` 独立于连接地址覆盖证书/SNI
-身份。原生 HTTPS CONNECT 允许 HTTP/1.1 ALPN。证书值是内联 PEM；客户端私钥只能从
+身份。原生 HTTPS CONNECT 允许 HTTP/1.1 ALPN。`certificates` 是添加到当前 truststore 的内联 PEM 信任锚；`clientCertificates` 是客户端认证证书链。客户端私钥只能从
 `clientKeyField` 指定的 opaque credential 文档字段读取。除整个对象均为默认值外，禁用 TLS
 时指定 TLS 设置无效。`certificateSha256` 是 DER 证书的十六进制 SHA-256；匹配叶证书时认证该
 证书，匹配中间证书时以该证书为信任锚验证证书链、名称和有效期。即使设置 `insecure: true`，
-pin 仍必须匹配。Reality 使用 `publicKey` 和 `shortId`；fingerprint 需要实现所请求
+pin 仍必须匹配。Reality 使用 `publicKey` 和 `shortId`；`clientHelloFingerprint` 需要实现所请求
 ClientHello profile 的适配器。`insecure` 是显式证书验证选项，不得在验证失败后自动采用。
 
 传输 `type` 为 `tcp`、`ws`、`grpc`、`http`、`httpupgrade`、`quic`、`meek` 或 `xhttp`；模型接受该值
@@ -301,7 +372,7 @@ REALITY、Vision、ClientHello 指纹和其他未消费的传输参数会被拒�
 Meek 用于通过 HTTPS 的 VLESS 和 VMess。包含 query 的完整 URL 存储在私有 `meek_url` 凭据中；
 公开的 path、Host 和 header 传输选项会被拒绝。Meek 的本地写端关闭不会向远端发出流结束信号。
 HTTPUpgrade 支持在 TCP
-或 TLS 上使用 path、Host 和经过验证的头。WebSocket early data 将首次写入的最多 `maxEarlyData` 字节
+或 TLS 上使用 path、Host 和经过验证的头。WebSocket early data 将首次写入的最多 `maxEarlyDataBytes` 字节
 以无填充 Base64URL 放入路径或指定的 `earlyDataHeaderName`，其余字节通过二进制帧发送。
 路径 early data 与其他 query 组合时不可用。WebSocket Host 覆盖映射为传输的
 `Host` 头。冲突的别名或 Host 值必须拒绝。Multiplex 布尔值默认 `false`。原生 `h2mux`、
@@ -360,6 +431,12 @@ SS 适配器原生实现 simple-obfs 的 `obfs`、`obfs-local` 和 `simple-obfs`
 v2ray-plugin WebSocket 模式；UDP 使用普通 Shadowsocks 数据报，显式启用 UDP-over-TCP 时除外。
 其他插件与不支持的选项保持不可用，PathChord 不执行插件进程。
 
+外部文档语法及私有凭据 JSON 保持来源格式。受支持的 Clash `client-fingerprint` 和 sing-box
+`tls.utls.fingerprint` 规范化为原生 `tls.clientHelloFingerprint`；Clash 证书
+`fingerprint` 则映射为不同的 `tls.certificateSha256`。外部 Host、early-data 和 UDP-over-TCP
+字段继续由来源适配器规范化。原生键校验不得仅因某个名称与退役原生路径相同，就重写 HTTP 头、
+协议标识、私有凭据字段或完整导入文档。
+
 ### 订阅文档类型
 
 | `source.type` | 接受的文档类型 |
@@ -393,6 +470,10 @@ Vision 与显式空值的组合不可用。手写原生 VLESS 节点不启用 mu
 发生变化时，旧来源的节点进入排空，不得被新 flow 选择。缓存的来源标识不得暴露来源 URL 或
 凭据值。根请求与所有引用的 HTTP provider 使用同一有效 User-Agent，未配置时默认为
 `clash.meta`。旧版本中未绑定 User-Agent 的缓存无法证明其来源身份，不得发布。
+
+来源绑定的规范化节点缓存使用 envelope 版本 `3` 和规范原生选项名。版本 2 的规范化缓存或包含任一退役原生选项路径的缓存都不兼容：必须返回有界、脱敏的 `cache_incompatible` 诊断，且不得从该缓存发布节点。加载器不得安装原生别名、丢弃字段、替换为默认值、部分解码节点或猜测私有凭据内容来继续使用不兼容缓存。版本 1 缓存仍属于无法验证来源的缓存，MUST NOT 发布。
+
+拒绝不兼容缓存后，如果当前来源及生命周期下存在独立有效的活动快照，可以在有界认证刷新期间继续使用该快照。冷启动时若无该快照且来源离线，订阅保持不可用。刷新必须保留凭据 origin 和获取预算边界，并经过常规规范化、校验与适配器准备后才能发布。缓存加载、保留快照和过期刷新工作均不得复活已禁用、已删除、已替换来源或命中 tombstone 的节点。
 
 ### HTTP provider 展开
 

@@ -78,7 +78,7 @@ struct ResourceList {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressSpec {
-    address: Option<String>,
+    host: Option<String>,
     port: Option<u16>,
     #[serde(default)]
     endpoints: Option<Vec<EgressEndpointSpec>>,
@@ -86,7 +86,9 @@ pub struct EgressSpec {
     #[serde(default)]
     capabilities: Capabilities,
     #[serde(default)]
-    status_requirements: RequirementsSpec,
+    path_pool: EgressPathPoolSpec,
+    #[serde(default)]
+    admission: EgressAdmissionSpec,
     transit: Option<EgressTransitSpec>,
     traffic_policy_ref: Option<String>,
 }
@@ -94,8 +96,40 @@ pub struct EgressSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EgressEndpointSpec {
-    address: String,
+    host: String,
     port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EgressPathPoolSpec {
+    #[serde(default = "default_min_paths")]
+    min_usable_paths: u32,
+    #[serde(default, deserialize_with = "deserialize_non_null_optional_u32")]
+    target_usable_paths: Option<u32>,
+}
+
+impl Default for EgressPathPoolSpec {
+    fn default() -> Self {
+        Self {
+            min_usable_paths: 1,
+            target_usable_paths: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EgressAdmissionSpec {
+    #[serde(default)]
+    required_capabilities: BTreeSet<FlowProtocol>,
+}
+
+fn deserialize_non_null_optional_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u32::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -127,7 +161,7 @@ pub struct TransitSourceSpec {
 pub struct TransitProxySpec {
     source: Option<TransitSourceSpec>,
     protocol: String,
-    address: Option<String>,
+    host: Option<String>,
     port: Option<u16>,
     #[serde(default)]
     tags: BTreeSet<String>,
@@ -298,15 +332,6 @@ impl Default for RequirementsSpec {
         Self {
             min_usable_paths: 1,
             capabilities: BTreeSet::new(),
-        }
-    }
-}
-
-impl From<RequirementsSpec> for crate::EgressStatusRequirements {
-    fn from(value: RequirementsSpec) -> Self {
-        Self {
-            min_usable_paths: value.min_usable_paths,
-            capabilities: value.capabilities,
         }
     }
 }
@@ -685,6 +710,13 @@ pub enum ConfigError {
         name: String,
         reason: String,
     },
+    #[error("resource {kind}/{name} uses retired field {field_path}; use {replacement}")]
+    RetiredField {
+        kind: String,
+        name: String,
+        field_path: String,
+        replacement: String,
+    },
     #[error("resource validation failed: {0}")]
     Validation(#[from] crate::ValidationError),
 }
@@ -792,7 +824,13 @@ impl KubeConfig {
                         public_key: value.spec.public_key,
                         labels: value.metadata.labels,
                         capabilities: value.spec.capabilities,
-                        status_requirements: value.spec.status_requirements.into(),
+                        path_pool: crate::EgressPathPoolConfig {
+                            min_usable_paths: value.spec.path_pool.min_usable_paths,
+                            target_usable_paths: value.spec.path_pool.target_usable_paths,
+                        },
+                        admission: crate::EgressAdmission {
+                            required_capabilities: value.spec.admission.required_capabilities,
+                        },
                         transit: {
                             let transit = value.spec.transit.ok_or_else(|| {
                                 invalid_spec(
@@ -830,7 +868,7 @@ impl KubeConfig {
                         source,
                         protocol: value.spec.protocol,
                         endpoint: Endpoint {
-                            host: value.spec.address.unwrap_or_default(),
+                            host: value.spec.host.unwrap_or_default(),
                             port,
                         },
                         credentials_ref: value.spec.credentials_ref,
@@ -1283,6 +1321,8 @@ fn kind_of(value: &Value) -> Result<String, ConfigError> {
 
 fn parse_resource(value: Value) -> Result<KubeResource, ConfigError> {
     let kind = kind_of(&value)?;
+    reject_retired_native_fields(&value, &kind)?;
+    validate_path_pool_values(&value, &kind)?;
     macro_rules! parse {
         ($ty:ty, $variant:ident) => {{
             let resource: Resource<$ty> = serde_yaml::from_value(value)?;
@@ -1310,6 +1350,194 @@ fn parse_resource(value: Value) -> Result<KubeResource, ConfigError> {
         "FallbackPolicy" => parse!(FallbackPolicySpec, FallbackPolicy),
         other => Err(ConfigError::UnsupportedKind(other.to_owned())),
     }
+}
+
+fn map_field<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+    let Value::Mapping(mapping) = value else {
+        return None;
+    };
+    mapping.get(field)
+}
+
+fn nested_field<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(value, |current, field| map_field(current, field))
+}
+
+fn retired_field(
+    kind: &str,
+    name: &str,
+    field_path: impl Into<String>,
+    replacement: impl Into<String>,
+) -> ConfigError {
+    ConfigError::RetiredField {
+        kind: kind.to_owned(),
+        name: name.to_owned(),
+        field_path: field_path.into(),
+        replacement: replacement.into(),
+    }
+}
+
+fn reject_retired_native_fields(value: &Value, kind: &str) -> Result<(), ConfigError> {
+    let name = map_field(value, "metadata")
+        .and_then(|metadata| map_field(metadata, "name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(spec) = map_field(value, "spec") else {
+        return Ok(());
+    };
+
+    let retired: &[(&str, &str)] = match kind {
+        "Egress" => &[("address", "spec.host")],
+        "TransitProxy" => &[("address", "spec.host")],
+        "EgressService" => &[
+            ("webBind", "spec.web.bind"),
+            ("webTokenFile", "spec.web.tokenFile"),
+            ("webOrigins", "spec.web.allowedOrigins"),
+            ("webProtectedTransport", "spec.web.protectedTransport"),
+        ],
+        _ => &[],
+    };
+    if kind == "Egress"
+        && let Some(requirements) = map_field(spec, "statusRequirements")
+    {
+        for (field, replacement) in [
+            ("minUsablePaths", "spec.pathPool.minUsablePaths"),
+            ("capabilities", "spec.admission.requiredCapabilities"),
+        ] {
+            if map_field(requirements, field).is_some() {
+                return Err(retired_field(
+                    kind,
+                    name,
+                    format!("spec.statusRequirements.{field}"),
+                    replacement,
+                ));
+            }
+        }
+        return Err(retired_field(
+            kind,
+            name,
+            "spec.statusRequirements",
+            "spec.pathPool and spec.admission",
+        ));
+    }
+    for (field, replacement) in retired {
+        if map_field(spec, field).is_some() {
+            return Err(retired_field(
+                kind,
+                name,
+                format!("spec.{field}"),
+                *replacement,
+            ));
+        }
+    }
+
+    if kind == "Egress"
+        && let Some(endpoints) = map_field(spec, "endpoints").and_then(Value::as_sequence)
+        && endpoints
+            .iter()
+            .any(|endpoint| map_field(endpoint, "address").is_some())
+    {
+        return Err(retired_field(
+            kind,
+            name,
+            "spec.endpoints[].address",
+            "spec.endpoints[].host",
+        ));
+    }
+
+    if kind == "TransitProxy" {
+        for (path, replacement) in [
+            (
+                &["options", "transport", "host"][..],
+                "spec.options.transport.hosts",
+            ),
+            (
+                &["options", "transport", "maxEarlyData"][..],
+                "spec.options.transport.maxEarlyDataBytes",
+            ),
+            (
+                &["options", "tls", "certificate"][..],
+                "spec.options.tls.certificates",
+            ),
+            (
+                &["options", "tls", "clientCertificate"][..],
+                "spec.options.tls.clientCertificates",
+            ),
+            (
+                &["options", "tls", "fingerprint"][..],
+                "spec.options.tls.clientHelloFingerprint",
+            ),
+            (
+                &["options", "udpOverTcp"][..],
+                "spec.options.udpOverTcpVersion",
+            ),
+        ] {
+            if nested_field(spec, path).is_some() {
+                return Err(retired_field(
+                    kind,
+                    name,
+                    format!("spec.{}", path.join(".")),
+                    replacement,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_path_pool_values(value: &Value, kind: &str) -> Result<(), ConfigError> {
+    if kind != "Egress" {
+        return Ok(());
+    }
+    let name = map_field(value, "metadata")
+        .and_then(|metadata| map_field(metadata, "name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(spec) = map_field(value, "spec") else {
+        return Ok(());
+    };
+    let Some(path_pool) = map_field(spec, "pathPool") else {
+        return Ok(());
+    };
+    if !matches!(path_pool, Value::Mapping(_)) {
+        return Err(invalid_spec(kind, name, "pathPool must be an object"));
+    }
+    let minimum = match map_field(path_pool, "minUsablePaths") {
+        Some(raw) => parse_positive_u32(raw).ok_or_else(|| {
+            invalid_spec(
+                kind,
+                name,
+                "pathPool.minUsablePaths must be a positive unsigned 32-bit integer",
+            )
+        })?,
+        None => 1,
+    };
+    if let Some(raw) = map_field(path_pool, "targetUsablePaths") {
+        let target = parse_positive_u32(raw).ok_or_else(|| {
+            invalid_spec(
+                kind,
+                name,
+                "pathPool.targetUsablePaths must be a positive unsigned 32-bit integer",
+            )
+        })?;
+        if target < minimum {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "pathPool.targetUsablePaths must be at least pathPool.minUsablePaths",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_positive_u32(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .filter(|value| (1..=u64::from(u32::MAX)).contains(value))
+        .and_then(|value| u32::try_from(value).ok())
 }
 
 fn validate_resource_set(
@@ -1680,6 +1908,30 @@ fn validate_egress_spec(value: &Resource<EgressSpec>) -> Result<(), ConfigError>
     let kind = value.kind.as_str();
     let name = value.metadata.name.as_str();
     normalize_egress_endpoints(&value.spec, kind, name)?;
+    let minimum = value.spec.path_pool.min_usable_paths;
+    if minimum == 0 {
+        return Err(invalid_spec(
+            kind,
+            name,
+            "pathPool.minUsablePaths must be positive",
+        ));
+    }
+    if let Some(target) = value.spec.path_pool.target_usable_paths {
+        if target == 0 {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "pathPool.targetUsablePaths must be positive",
+            ));
+        }
+        if target < minimum {
+            return Err(invalid_spec(
+                kind,
+                name,
+                "pathPool.targetUsablePaths must be at least pathPool.minUsablePaths",
+            ));
+        }
+    }
     validate_public_key(&value.spec.public_key)
         .map_err(|reason| invalid_spec(kind, name, reason))?;
     if !value.spec.capabilities.tcp && !value.spec.capabilities.udp {
@@ -1697,12 +1949,12 @@ fn normalize_egress_endpoints(
     kind: &str,
     name: &str,
 ) -> Result<Vec<Endpoint>, ConfigError> {
-    let legacy_present = spec.address.is_some() || spec.port.is_some();
-    if legacy_present && spec.endpoints.is_some() {
+    let shorthand_present = spec.host.is_some() || spec.port.is_some();
+    if shorthand_present && spec.endpoints.is_some() {
         return Err(invalid_spec(
             kind,
             name,
-            "address/port and endpoints are mutually exclusive",
+            "host/port and endpoints are mutually exclusive",
         ));
     }
 
@@ -1716,23 +1968,23 @@ fn normalize_egress_endpoints(
         }
         endpoints
             .iter()
-            .map(|endpoint| (&endpoint.address, endpoint.port))
+            .map(|endpoint| (&endpoint.host, endpoint.port))
             .collect::<Vec<_>>()
     } else {
-        match (&spec.address, spec.port) {
-            (Some(address), Some(port)) => vec![(address, port)],
+        match (&spec.host, spec.port) {
+            (Some(host), Some(port)) => vec![(host, port)],
             (None, None) => {
                 return Err(invalid_spec(
                     kind,
                     name,
-                    "address/port or endpoints is required",
+                    "host/port or endpoints is required",
                 ));
             }
             _ => {
                 return Err(invalid_spec(
                     kind,
                     name,
-                    "address and port must be supplied together",
+                    "host and port must be supplied together",
                 ));
             }
         }
@@ -1740,20 +1992,30 @@ fn normalize_egress_endpoints(
 
     let mut seen = BTreeSet::new();
     let mut normalized = Vec::with_capacity(raw.len());
-    for (address, port) in raw {
-        validate_host("address", address).map_err(|reason| invalid_spec(kind, name, reason))?;
+    for (host, port) in raw {
+        validate_host("host", host).map_err(|reason| {
+            let reason = if spec.endpoints.is_some() {
+                format!("endpoints[].{reason}")
+            } else {
+                reason
+            };
+            invalid_spec(kind, name, reason)
+        })?;
         if port == 0 {
             return Err(invalid_spec(kind, name, "endpoint port must be non-zero"));
         }
-        let host = normalize_endpoint_host(address);
-        if !seen.insert((host.clone(), port)) {
+        let normalized_host = normalize_endpoint_host(host);
+        if !seen.insert((normalized_host.clone(), port)) {
             return Err(invalid_spec(
                 kind,
                 name,
-                "endpoints contain a duplicate address and port",
+                "endpoints contain a duplicate host and port",
             ));
         }
-        normalized.push(Endpoint { host, port });
+        normalized.push(Endpoint {
+            host: normalized_host,
+            port,
+        });
     }
     Ok(normalized)
 }
@@ -1840,8 +2102,8 @@ fn validate_transit_proxy_spec(value: &Resource<TransitProxySpec>) -> Result<(),
         }
     }
     if value.spec.protocol != "direct" {
-        let address = value.spec.address.as_deref().unwrap_or_default();
-        validate_host("address", address).map_err(|reason| invalid_spec(kind, name, reason))?;
+        let host = value.spec.host.as_deref().unwrap_or_default();
+        validate_host("host", host).map_err(|reason| invalid_spec(kind, name, reason))?;
         if value.spec.port.is_none_or(|port| port == 0) {
             return Err(invalid_spec(
                 kind,
@@ -2496,7 +2758,7 @@ items:
     metadata:
       name: jp-1
     spec:
-      address: egress.example.net
+      host: egress.example.net
       port: 443
       publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
       capabilities: {tcp: true, udp: true}
@@ -2574,10 +2836,315 @@ items:
     }
 
     #[test]
+    fn resolves_omitted_and_explicit_path_pool_targets_without_an_extra_spare() {
+        let default = KubeConfig::from_yaml(VALID)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        let default_pool = &default.egresses[0].path_pool;
+        assert_eq!(default_pool.min_usable_paths, 1);
+        assert_eq!(default_pool.target_usable_paths, None);
+        assert_eq!(default_pool.requested_target_usable_paths(), 2);
+
+        let empty_pool = VALID.replace(
+            "      host: egress.example.net",
+            "      pathPool: {}\n      host: egress.example.net",
+        );
+        let empty_pool = KubeConfig::from_yaml(&empty_pool)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(
+            empty_pool.egresses[0]
+                .path_pool
+                .requested_target_usable_paths(),
+            2
+        );
+
+        let larger_minimum = VALID.replace(
+            "      host: egress.example.net",
+            "      pathPool: {minUsablePaths: 3}\n      host: egress.example.net",
+        );
+        let larger_minimum = KubeConfig::from_yaml(&larger_minimum)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(
+            larger_minimum.egresses[0]
+                .path_pool
+                .requested_target_usable_paths(),
+            4
+        );
+
+        let explicit = VALID.replace(
+            "      host: egress.example.net",
+            "      pathPool: {minUsablePaths: 1, targetUsablePaths: 3}\n      host: egress.example.net",
+        );
+        let explicit = KubeConfig::from_yaml(&explicit)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(
+            explicit.egresses[0]
+                .path_pool
+                .requested_target_usable_paths(),
+            3
+        );
+
+        let explicit_equal = VALID.replace(
+            "      host: egress.example.net",
+            "      pathPool: {minUsablePaths: 2, targetUsablePaths: 2}\n      host: egress.example.net",
+        );
+        let explicit_equal = KubeConfig::from_yaml(&explicit_equal)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(
+            explicit_equal.egresses[0]
+                .path_pool
+                .requested_target_usable_paths(),
+            2
+        );
+
+        let maximum_minimum = VALID.replace(
+            "      host: egress.example.net",
+            "      pathPool: {minUsablePaths: 4294967295}\n      host: egress.example.net",
+        );
+        let maximum_minimum = KubeConfig::from_yaml(&maximum_minimum)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(
+            maximum_minimum.egresses[0]
+                .path_pool
+                .requested_target_usable_paths(),
+            4_294_967_296
+        );
+
+        let equivalent = VALID.replace(
+            "      host: egress.example.net",
+            "      pathPool: {minUsablePaths: 1, targetUsablePaths: 2}\n      host: egress.example.net",
+        );
+        let equivalent = KubeConfig::from_yaml(&equivalent)
+            .unwrap()
+            .into_policy_config()
+            .unwrap();
+        assert_eq!(
+            default.egresses[0].path_pool,
+            equivalent.egresses[0].path_pool
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_path_pool_counts_at_their_field_paths() {
+        for (path_pool, expected) in [
+            ("{minUsablePaths: 0}", "pathPool.minUsablePaths"),
+            (
+                "{minUsablePaths: 1, targetUsablePaths: 0}",
+                "pathPool.targetUsablePaths",
+            ),
+            ("{minUsablePaths: null}", "pathPool.minUsablePaths"),
+            ("{minUsablePaths: 4294967296}", "pathPool.minUsablePaths"),
+            (
+                "{minUsablePaths: 2, targetUsablePaths: 1}",
+                "pathPool.targetUsablePaths",
+            ),
+            ("{targetUsablePaths: null}", "pathPool.targetUsablePaths"),
+        ] {
+            let input = VALID.replace(
+                "      host: egress.example.net",
+                &format!("      pathPool: {path_pool}\n      host: egress.example.net"),
+            );
+            let error = KubeConfig::from_yaml(&input).unwrap_err();
+            match error {
+                ConfigError::InvalidSpec { reason, .. } => {
+                    assert!(reason.contains(expected), "{reason}");
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reports_retired_native_egress_and_transit_fields_with_replacements() {
+        let cases = [
+            (
+                VALID.replace(
+                    "      host: egress.example.net",
+                    "      statusRequirements: {}\n      host: egress.example.net",
+                ),
+                "spec.statusRequirements",
+                "spec.pathPool and spec.admission",
+            ),
+            (
+                VALID.replace(
+                    "      host: egress.example.net",
+                    "      address: egress.example.net",
+                ),
+                "spec.address",
+                "spec.host",
+            ),
+            (
+                format!(
+                    "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: legacy}}\nspec: {{protocol: direct, address: proxy.example, options: {{}}}}\n"
+                ),
+                "spec.address",
+                "spec.host",
+            ),
+            (
+                format!(
+                    "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: legacy}}\nspec: {{protocol: socks5, host: proxy.example, options: {{udpOverTcp: 1}}}}\n"
+                ),
+                "spec.options.udpOverTcp",
+                "spec.options.udpOverTcpVersion",
+            ),
+        ];
+        for (input, expected_path, expected_replacement) in cases {
+            let error = KubeConfig::from_yaml(&input).unwrap_err();
+            match error {
+                ConfigError::RetiredField {
+                    field_path,
+                    replacement,
+                    ..
+                } => {
+                    assert_eq!(field_path, expected_path);
+                    assert_eq!(replacement, expected_replacement);
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+        }
+
+        let nested = VALID.replace(
+            "      host: egress.example.net",
+            "      statusRequirements: {minUsablePaths: 2}\n      host: egress.example.net",
+        );
+        assert!(matches!(
+            KubeConfig::from_yaml(&nested),
+            Err(ConfigError::RetiredField {
+                field_path,
+                replacement,
+                ..
+            }) if field_path == "spec.statusRequirements.minUsablePaths"
+                && replacement == "spec.pathPool.minUsablePaths"
+        ));
+    }
+
+    #[test]
+    fn reports_retired_endpoint_and_nested_service_fields_with_replacements() {
+        let endpoint = VALID.replace(
+            "      host: egress.example.net",
+            "      endpoints: [{address: egress.example.net, port: 443}]",
+        );
+        assert!(matches!(
+            KubeConfig::from_yaml(&endpoint),
+            Err(ConfigError::RetiredField {
+                field_path,
+                replacement,
+                ..
+            }) if field_path == "spec.endpoints[].address"
+                && replacement == "spec.endpoints[].host"
+        ));
+
+        let service = "apiVersion: pathchord.io/v1\nkind: EgressService\nmetadata: {name: edge}\nspec: {identity: egress.key.json, webBind: 127.0.0.1:9090}\n";
+        assert!(matches!(
+            KubeConfig::from_service_documents([service]),
+            Err(ConfigError::RetiredField {
+                field_path,
+                replacement,
+                ..
+            }) if field_path == "spec.webBind" && replacement == "spec.web.bind"
+        ));
+    }
+
+    #[test]
+    fn reports_every_retired_native_transit_option_path() {
+        let cases = [
+            (
+                "transport: {host: [ws.example.test]}",
+                "spec.options.transport.host",
+                "spec.options.transport.hosts",
+            ),
+            (
+                "transport: {maxEarlyData: 16}",
+                "spec.options.transport.maxEarlyData",
+                "spec.options.transport.maxEarlyDataBytes",
+            ),
+            (
+                "tls: {certificate: [pem]}",
+                "spec.options.tls.certificate",
+                "spec.options.tls.certificates",
+            ),
+            (
+                "tls: {clientCertificate: [pem]}",
+                "spec.options.tls.clientCertificate",
+                "spec.options.tls.clientCertificates",
+            ),
+            (
+                "tls: {fingerprint: chrome}",
+                "spec.options.tls.fingerprint",
+                "spec.options.tls.clientHelloFingerprint",
+            ),
+            (
+                "udpOverTcp: 1",
+                "spec.options.udpOverTcp",
+                "spec.options.udpOverTcpVersion",
+            ),
+        ];
+        for (option, expected_path, expected_replacement) in cases {
+            let input = format!(
+                "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: legacy}}\nspec:\n  protocol: direct\n  options: {{{option}}}\n"
+            );
+            assert!(matches!(
+                KubeConfig::from_yaml(&input),
+                Err(ConfigError::RetiredField {
+                    field_path,
+                    replacement,
+                    ..
+                }) if field_path == expected_path && replacement == expected_replacement
+            ));
+        }
+    }
+
+    #[test]
+    fn reports_each_retired_egress_service_web_path() {
+        let cases = [
+            ("webBind: 127.0.0.1:9090", "spec.webBind", "spec.web.bind"),
+            (
+                "webTokenFile: secrets/token",
+                "spec.webTokenFile",
+                "spec.web.tokenFile",
+            ),
+            (
+                "webOrigins: [https://admin.example]",
+                "spec.webOrigins",
+                "spec.web.allowedOrigins",
+            ),
+            (
+                "webProtectedTransport: true",
+                "spec.webProtectedTransport",
+                "spec.web.protectedTransport",
+            ),
+        ];
+        for (field, expected_path, expected_replacement) in cases {
+            let input = format!(
+                "apiVersion: pathchord.io/v1\nkind: EgressService\nmetadata: {{name: edge}}\nspec: {{identity: egress.key.json, {field}}}\n"
+            );
+            assert!(matches!(
+                KubeConfig::from_service_documents([input.as_str()]),
+                Err(ConfigError::RetiredField {
+                    field_path,
+                    replacement,
+                    ..
+                }) if field_path == expected_path && replacement == expected_replacement
+            ));
+        }
+    }
+
+    #[test]
     fn normalizes_multiple_egress_endpoints_and_preserves_order() {
         let input = VALID.replace(
-            "      address: egress.example.net\n      port: 443",
-            "      endpoints:\n        - address: Egress-V4.Example.net.\n          port: 7443\n        - address: 2001:0db8::10\n          port: 8443\n        - address: egress.example.net\n          port: 443",
+            "      host: egress.example.net\n      port: 443",
+            "      endpoints:\n        - host: Egress-V4.Example.net.\n          port: 7443\n        - host: 2001:0db8::10\n          port: 8443\n        - host: egress.example.net\n          port: 443",
         );
         let policy = KubeConfig::from_yaml(&input)
             .expect("multiple endpoints parse")
@@ -2606,26 +3173,26 @@ items:
     fn rejects_ambiguous_or_invalid_egress_endpoint_forms() {
         let cases = [
             (
-                "      address: egress.example.net\n      port: 443\n      endpoints: [{address: other.example.net, port: 443}]",
+                "      host: egress.example.net\n      port: 443\n      endpoints: [{host: other.example.net, port: 443}]",
                 "mutually exclusive",
             ),
-            ("      address: egress.example.net", "supplied together"),
+            ("      host: egress.example.net", "supplied together"),
             (
-                "      endpoints: [{address: egress.example.net, port: 443}, {address: EGRESS.EXAMPLE.NET., port: 443}]",
+                "      endpoints: [{host: egress.example.net, port: 443}, {host: EGRESS.EXAMPLE.NET., port: 443}]",
                 "duplicate",
             ),
             (
-                "      endpoints: [{address: '[2001:db8::10]', port: 443}]",
+                "      endpoints: [{host: '[2001:db8::10]', port: 443}]",
                 "valid DNS hostname",
             ),
             (
-                "      endpoints: [{address: egress.example.net, port: 0}]",
+                "      endpoints: [{host: egress.example.net, port: 0}]",
                 "non-zero",
             ),
         ];
         for (replacement, expected) in cases {
             let input = VALID.replace(
-                "      address: egress.example.net\n      port: 443",
+                "      host: egress.example.net\n      port: 443",
                 replacement,
             );
             let error = KubeConfig::from_yaml(&input).expect_err("invalid endpoint form");
@@ -2638,14 +3205,14 @@ items:
         let endpoints = (0..33)
             .map(|index| {
                 format!(
-                    "        - address: egress-{index}.example.net\n          port: {}",
+                    "        - host: egress-{index}.example.net\n          port: {}",
                     7000 + index
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
         let input = VALID.replace(
-            "      address: egress.example.net\n      port: 443",
+            "      host: egress.example.net\n      port: 443",
             &format!("      endpoints:\n{endpoints}"),
         );
         let error = KubeConfig::from_yaml(&input).expect_err("endpoint bound");
@@ -2796,7 +3363,7 @@ spec: {path: ../geodata/another.dat}
     #[test]
     fn typed_tls_and_transport_options_are_preserved_and_unknown_fields_rejected() {
         let source = format!(
-            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: tls-node}}\nspec:\n  protocol: vless\n  address: proxy.example\n  port: 443\n  credentialsRef: node-secret\n  options:\n    tls: {{enabled: true, serverName: verified.example, alpn: [http/1.1], reality: {{publicKey: public-example, shortId: abcd}}}}\n    transport: {{type: ws, path: /proxy, headers: {{Host: ws.example}}}}\n    udp: false\n"
+            "{VALID}\n---\napiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: tls-node}}\nspec:\n  protocol: vless\n  host: proxy.example\n  port: 443\n  credentialsRef: node-secret\n  options:\n    tls: {{enabled: true, serverName: verified.example, alpn: [http/1.1], reality: {{publicKey: public-example, shortId: abcd}}}}\n    transport: {{type: ws, path: /proxy, headers: {{Host: ws.example}}}}\n    udp: false\n"
         );
         let policy = KubeConfig::from_yaml(&source)
             .unwrap()
@@ -2980,7 +3547,7 @@ metadata:
   name: private-socks
 spec:
   protocol: socks5
-  address: proxy.example.test
+  host: proxy.example.test
   port: 1080
   credentialsRef: local-socks-secret
 "#
@@ -3005,11 +3572,11 @@ spec:
     #[test]
     fn rejects_unknown_fields_and_duplicate_names() {
         let unknown = VALID.replace(
-            "spec:\n      address",
-            "spec:\n      unknown: true\n      address",
+            "spec:\n      host",
+            "spec:\n      unknown: true\n      host",
         );
         assert!(KubeConfig::from_yaml(&unknown).is_err());
-        let duplicate = VALID.replace("  - apiVersion: pathchord.io/v1\n    kind: DNSPolicy", "  - apiVersion: pathchord.io/v1\n    kind: Egress\n    metadata:\n      name: jp-1\n    spec:\n      address: egress2.example.net\n      port: 443\n      publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n      capabilities: {tcp: true, udp: true}\n  - apiVersion: pathchord.io/v1\n    kind: DNSPolicy");
+        let duplicate = VALID.replace("  - apiVersion: pathchord.io/v1\n    kind: DNSPolicy", "  - apiVersion: pathchord.io/v1\n    kind: Egress\n    metadata:\n      name: jp-1\n    spec:\n      host: egress2.example.net\n      port: 443\n      publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n      capabilities: {tcp: true, udp: true}\n  - apiVersion: pathchord.io/v1\n    kind: DNSPolicy");
         assert!(KubeConfig::from_yaml(&duplicate).is_err());
     }
 
@@ -3062,7 +3629,7 @@ kind: Egress
 metadata:
   name: jp-1
 spec:
-  address: egress.example.net
+  host: egress.example.net
   port: 443
   publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
   capabilities: {tcp: true, udp: true}
@@ -3222,7 +3789,7 @@ spec:
 apiVersion: pathchord.io/v1
 kind: Egress
 metadata: {{name: edge, namespace: {namespace}, labels: {{region: jp}}}}
-spec: {{address: 127.0.0.1, port: 7443, publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, capabilities: {{tcp: true}}, transit: {{}}, trafficPolicyRef: traffic}}
+spec: {{host: 127.0.0.1, port: 7443, publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA, capabilities: {{tcp: true}}, transit: {{}}, trafficPolicyRef: traffic}}
 ---
 apiVersion: pathchord.io/v1
 kind: Listener

@@ -810,7 +810,15 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     );
     subscription_manager.reconcile(&effective_subscriptions);
     for subscription in &effective_subscriptions {
-        let _ = subscription_manager.load_cache(subscription).await;
+        if let Ok(pathchord_transit::CacheLoadOutcome::Incompatible { code }) =
+            subscription_manager.load_cache(subscription).await
+        {
+            let id = ControlSubscriptionId::new(subscription.id.as_str())?;
+            control_service.set_subscription_cache_metadata(
+                &id,
+                BTreeMap::from([("cache_diagnostic".to_owned(), code.to_owned())]),
+            )?;
+        }
     }
     let prepared = subscription_manager
         .snapshot()
@@ -999,10 +1007,16 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                             SessionState::Active
                         };
                         let fingerprint = format!(
-                            "{state:?}:{}:{}:{}",
+                            "{state:?}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}",
                             entry.session.ready_paths,
                             entry.session.active_streams,
-                            entry.session.active_udp_associations
+                            entry.session.active_udp_associations,
+                            entry.minimum_usable_paths,
+                            entry.requested_target_usable_paths,
+                            entry.effective_target_usable_paths,
+                            entry.target_path_count,
+                            entry.target_shortfall,
+                            entry.target_shortfall_reason
                         );
                         let timing = session_timing
                             .entry(entry.session.session_id)
@@ -1027,18 +1041,18 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
                             bytes_sent: entry.session.bytes_sent,
                             bytes_received: entry.session.bytes_received,
                             minimum_usable_paths: entry.minimum_usable_paths,
-                            target_path_count: entry.session.target_path_count as usize,
+                            requested_target_usable_paths: entry.requested_target_usable_paths,
+                            effective_target_usable_paths: entry.effective_target_usable_paths,
+                            target_path_count: entry.target_path_count,
+                            target_shortfall: entry.target_shortfall,
+                            target_shortfall_reason: entry
+                                .target_shortfall_reason
+                                .map(|reason| reason.as_str().to_owned()),
                             usable_paths: entry
                                 .session
                                 .path_states
                                 .values()
-                                .filter(|state| {
-                                    matches!(
-                                        state,
-                                        pathchord_core::PathState::Active
-                                            | pathchord_core::PathState::Degraded
-                                    )
-                                })
+                                .filter(|state| matches!(state, pathchord_core::PathState::Active | pathchord_core::PathState::Degraded))
                                 .count(),
                             eligible_transit_count: entry.eligible_transit_count,
                             traffic_policy_id: entry.traffic_policy_id.clone(),
@@ -1519,10 +1533,29 @@ impl SubscriptionWorker {
                             observations.remove_subscription_runtime(&ControlSubscriptionId::new(id.as_str())?)?;
                         }
                         for config in &latest {
-                            if changed_ids.contains(&config.id)
-                                && matches!(manager.load_cache(config).await, Ok(pathchord_transit::CacheLoadOutcome::Loaded { .. }))
-                            {
-                                releasable.insert(config.id.clone());
+                            if changed_ids.contains(&config.id) {
+                                match manager.load_cache(config).await {
+                                    Ok(pathchord_transit::CacheLoadOutcome::Loaded { .. }) => {
+                                        releasable.insert(config.id.clone());
+                                        let control_id = ControlSubscriptionId::new(config.id.as_str())?;
+                                        let mut dispatcher = control.lock().await;
+                                        dispatcher.service_mut().set_subscription_cache_metadata(
+                                            &control_id,
+                                            BTreeMap::new(),
+                                        )?;
+                                        observed_generation = dispatcher.service().snapshot().generation;
+                                    }
+                                    Ok(pathchord_transit::CacheLoadOutcome::Incompatible { code }) => {
+                                        let control_id = ControlSubscriptionId::new(config.id.as_str())?;
+                                        let mut dispatcher = control.lock().await;
+                                        dispatcher.service_mut().set_subscription_cache_metadata(
+                                            &control_id,
+                                            BTreeMap::from([("cache_diagnostic".to_owned(), code.to_owned())]),
+                                        )?;
+                                        observed_generation = dispatcher.service().snapshot().generation;
+                                    }
+                                    Ok(_) | Err(_) => {}
+                                }
                             }
                         }
                         configs = latest;
@@ -1782,6 +1815,11 @@ async fn commit_subscription_refresh(
     }
     if let Some(error) = control_error {
         return Err(error.into());
+    }
+    if matches!(&outcome, RefreshOutcome::Published { .. }) {
+        dispatcher
+            .service_mut()
+            .set_subscription_cache_metadata(id, BTreeMap::new())?;
     }
     if let RefreshOutcome::Retained { error, .. } = &outcome {
         // Stale candidates never alter either the control state or cache.

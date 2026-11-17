@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use pathchord_policy::{
-    Capabilities, EgressConfig, EgressStatusRequirements, EgressTransitBinding, Endpoint,
-    FallbackAction, FlowMatch, Generation, PolicyConfig, ProxyRule, ProxySelection,
+    Capabilities, EgressAdmission, EgressConfig, EgressPathPoolConfig, EgressTransitBinding,
+    Endpoint, FallbackAction, FlowMatch, Generation, PolicyConfig, ProxyRule, ProxySelection,
     RetransmissionReplication, RuleId, Scheduler, TrafficPolicy, TrafficPolicyId,
 };
 use pathchord_transit::{
@@ -77,7 +77,8 @@ fn egress_policy(generation: u64, budget_bps: u64) -> ValidatedPolicySnapshot {
                     tcp: true,
                     udp: true,
                 },
-                status_requirements: EgressStatusRequirements::default(),
+                path_pool: EgressPathPoolConfig::default(),
+                admission: EgressAdmission::default(),
                 transit: EgressTransitBinding::default(),
                 traffic_policy: Some(TrafficPolicyId::new("edge-policy")),
             }],
