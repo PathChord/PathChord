@@ -274,6 +274,20 @@ endpoint。选择必须是确定且有界的，不得为每个 endpoint 创建�
 - **WHEN** Path 建立从有序 endpoint 列表开始
 - **THEN** cursor 和有界回绕保留配置顺序，不会无限重试单个候选
 
+### Requirement: Endpoint attempts use one static bounded sequence
+
+每次 Egress Path 建立 SHALL 从该 Egress 的 endpoint 选择 cursor 开始，使用一个共享截止时间，按顺序循环访问规范化候选且每个候选最多一次。成功准入或候选耗尽后 SHALL 前移 cursor；endpoint failover 仅适用于 Path 准入前。
+
+#### Scenario: A Path sequence reaches a successful candidate
+
+- **WHEN** 一个候选连接成功且 Noise 准入达到 ready
+- **THEN** Path 记录该候选并前移 cursor，后续 Stream 或 UDP 重试不会更改 Path 的传输连接
+
+#### Scenario: A Path sequence is exhausted
+
+- **WHEN** 所有候选均在 ready 前失败或超时
+- **THEN** 操作返回现有类型化 Path 连接失败，不延长截止时间，也不绕过 Egress Transit binding 和 TrafficPolicy
+
 ### Requirement: Endpoint failure uses bounded pre-admission failover
 
 Path 达到认证 ready 前，Ingress SHALL 在 Path 连接截止时间和有限尝试次数内尝试合规 Egress endpoint。

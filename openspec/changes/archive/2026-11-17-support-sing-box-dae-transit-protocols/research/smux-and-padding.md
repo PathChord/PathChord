@@ -9,7 +9,7 @@ investigation, unpadded h2mux had been independently tested, yamux integration
 was being handled separately, and smux and padding were unimplemented. No
 dependency was added and no new external-peer test was run for this note.
 Subsequent h2mux/yamux/smux and padding implementation and test evidence is
-recorded in the [implementation status](../../../implementation-status.md).
+recorded in the [implementation status](../../../../implementation-status.md).
 The implementation follow-up below distinguishes completed local evidence
 from the original investigation and its proposed validation plan.
 

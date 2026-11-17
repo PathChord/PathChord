@@ -47,6 +47,34 @@ Transit 适配器和订阅处理 SHALL 遵循下文完整详细契约，包括�
 - **WHEN** HTTP 头、私有凭据字段或保留的完整外部文档包含与某个退役原生选项同名的键
 - **THEN** 原生键校验不会仅因键名匹配而重写或拒绝该数据
 
+### Requirement: Native compatibility for existing proxy protocols
+
+Transit SHALL 仅为下方详细适配器矩阵标记为支持的协议与选项组合提供原生支持。受支持的 provider 节点 SHALL 保留认证、传输、安全和数据报语义；不支持或不完整的组合保持不可用并附类型化诊断。
+
+#### Scenario: A supported provider node uses a native adapter
+
+- **WHEN** provider 提供的节点使用矩阵列出的受支持协议与选项组合
+- **THEN** Transit 规范化并准备对应的原生适配器，不启动外部代理 core，且保留文档定义的连接语义
+
+#### Scenario: A combination cannot be represented safely
+
+- **WHEN** 节点包含不支持或不完整的连接选项组合
+- **THEN** 节点保持不可用并附脱敏诊断，且不得降级后继续路由
+
+### Requirement: VLESS Vision flow and datagrams
+
+VLESS Vision SHALL 在直连 TLS 1.3 或 REALITY 上保留每个方向的 framing 状态转换；不启用 multiplex 时使用 XUDP，启用时使用所选 multiplex 的数据报 framing。`-udp443` flow 还 SHALL 允许目标 UDP 443 端口。
+
+#### Scenario: Vision datagrams to port 443
+
+- **WHEN** Vision 节点向 UDP 443 端口打开数据报
+- **THEN** 仅 `xtls-rprx-vision-udp443` 请求成功，且线上携带基础 Vision flow 名称
+
+#### Scenario: Peer switches a Vision direction to direct copy
+
+- **WHEN** 对端在 framing 内容后发送有效的 Vision DIRECT 转换
+- **THEN** 接收端按顺序交付已缓冲明文和之后的原始字节，且不暴露外层 TLS 记录流
+
 ### Requirement: Bounded smux sessions
 
 smux 会话 SHALL 执行详细契约中的每会话和每流资源限制，隔离接收超限的流，并保持规定的

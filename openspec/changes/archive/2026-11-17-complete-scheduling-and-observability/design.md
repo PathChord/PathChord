@@ -2,7 +2,7 @@
 
 ## Context
 
-The [status snapshot](../../implementation-status.md#shared-implementation-gaps) records Session-wide strictest-seen budgets, suppressed Egress extra copies, optional measurements without default producers, and null management detail fields. The [state-machine contract](../../specs/state-machines/spec.md#scheduler-and-autoscaling-guards) and [observability contract](../../specs/observability/spec.md) define the intended behavior.
+The [status snapshot](../../../implementation-status.md#shared-implementation-gaps) records Session-wide strictest-seen budgets, suppressed Egress extra copies, optional measurements without default producers, and null management detail fields. The [state-machine contract](../../../specs/state-machines/spec.md#scheduler-and-autoscaling-guards) and [observability contract](../../../specs/observability/spec.md) define the intended behavior.
 
 ## Goals / non-goals
 

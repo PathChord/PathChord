@@ -53,7 +53,7 @@
   changes report restart required and never partially replace an active Egress
   runtime; verify invalid, unreadable, and startup-only candidates leave the
   running listener and authorization database unchanged.
-- [x] 3.3 Apply role-specific service users/ACLs and capability/device
+- [ ] 3.3 Apply role-specific service users/ACLs and capability/device
   restrictions in the runtime model and package metadata; verify Egress has no
   TUN device access or network-administration capability requirements while
   Ingress retains the documented privileges for transparent/TUN modes.
