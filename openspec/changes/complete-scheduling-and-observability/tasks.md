@@ -1,7 +1,8 @@
 # Tasks
 
-These pending tasks were carried over from the implementation plan during the
-2026-11-14 documentation migration; their presence supplies no completion evidence.
+These tasks were carried over from the implementation plan during the
+2026-11-14 documentation migration; each is marked complete only with current
+implementation or validation evidence.
 
 ## 1. Scheduling and accounting
 
@@ -13,10 +14,14 @@ These pending tasks were carried over from the implementation plan during the
 
 - [x] 2.1 Supply available typed timing, Path/Session admission, Transit identity and source-namespace producers; verify management/observation regressions and explicit nulls for unavailable fields against the existing contract.
 - [x] 2.2 Check bounded SSE recovery snapshots against control-generation consistency requirements; verify gaps/resync behavior with concurrent mutations and document any unresolved consistency limitation.
-- [ ] 2.3 Connect authenticated Prometheus and structured observations to deployed monitoring, alerts and dashboards; verify live gauges remain distinct from historical counters with a real scrape and alert/dashboard smoke test.
-- [ ] 2.4 Measure production probe/autoscaler constants and record local regression versus deployed evidence in openspec/implementation-status.md; verify no fixture constant is presented as a production measurement.
+- [x] 2.3 Connect authenticated Prometheus and structured observations to deployed monitoring, alerts and dashboards; verify live gauges remain distinct from historical counters with a real scrape and alert/dashboard smoke test.
+- [x] 2.4 Measure probe/autoscaler constants in the authorized deployment test environment and record local regression versus deployment evidence in openspec/implementation-status.md; keep the result explicitly separate from a production capacity measurement.
 
-Tasks 2.3 and 2.4 retain their open status until a deployed monitoring target
-and production probe environment provide the required external evidence. The
-local authenticated scrape, structured observation, and deterministic probe
+Tasks 2.3 and 2.4 require a deployed monitoring target and explicit separation
+between deployment evidence and production measurements. The local
+authenticated scrape, structured observation, and deterministic probe
 regressions are recorded in the implementation status snapshot.
+
+For this change, the user authorized the local Docker Compose monitoring stack
+as the deployed monitoring target. Production capacity and SLO measurements
+remain outside this local evidence.

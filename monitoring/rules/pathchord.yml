@@ -1,0 +1,56 @@
+groups:
+  - name: pathchord-recordings
+    interval: 5s
+    rules:
+      - record: pathchord:egress_wire_utilization_ratio
+        expr: |
+          pathchord_egress_current_wire_rate_bps
+            / clamp_min(pathchord_egress_effective_capacity_bps, 1)
+
+  - name: pathchord-alerts
+    interval: 5s
+    rules:
+      - alert: PathChordMetricsMissing
+        expr: absent(up{job="pathchord-ingress"}) or up{job="pathchord-ingress"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: PathChord metrics target is unavailable
+          description: Prometheus cannot scrape the authenticated PathChord metrics endpoint.
+
+      - alert: PathChordNoReadyPaths
+        expr: pathchord_active_sessions > 0 and pathchord_ready_paths == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: PathChord has sessions without ready Paths
+          description: Existing Sessions are present while the current snapshot has no ready Paths.
+
+      - alert: PathChordAdmissionDenied
+        expr: pathchord_egress_admission_denied > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: PathChord Egress admission is denied
+          description: At least one Egress observation currently denies new admission.
+
+      - alert: PathChordStaleEgressReports
+        expr: pathchord_egress_stale_reports > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: PathChord has stale Egress reports
+          description: At least one Egress status report exceeded its freshness threshold.
+
+      - alert: PathChordTransitNodesDown
+        expr: pathchord_nodes_down > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: PathChord has unavailable Transit nodes
+          description: At least one prepared Transit node is currently down.

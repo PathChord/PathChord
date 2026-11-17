@@ -1,0 +1,49 @@
+apiVersion: pathchord.io/v1
+kind: TransitProxy
+metadata:
+  name: monitoring-direct
+spec:
+  protocol: direct
+  address: 127.0.0.1
+  port: 18081
+---
+apiVersion: pathchord.io/v1
+kind: NodeProbePolicy
+metadata:
+  name: monitoring-probes
+spec:
+  target:
+    host: 127.0.0.1
+    port: 18081
+  intervalSeconds: 1
+  timeoutSeconds: 1
+  maxConcurrency: 1
+  windowSize: 4
+  maxNodesPerBatch: 1
+---
+apiVersion: pathchord.io/v1
+kind: Listener
+metadata:
+  name: monitoring-mixed
+spec:
+  type: mixed
+  platform: any
+  bind: 127.0.0.1:17890
+  protocols: [tcp, udp]
+  authentication: disabled
+---
+apiVersion: pathchord.io/v1
+kind: DNSPolicy
+metadata:
+  name: monitoring-dns
+spec:
+  defaultRoute: local
+  local:
+    servers: [9.9.9.9:53]
+---
+apiVersion: pathchord.io/v1
+kind: FallbackPolicy
+metadata:
+  name: monitoring-fallback
+spec:
+  action: direct

@@ -105,8 +105,8 @@ Local validation for this change includes policy/configuration unit tests,
 Path runtime alignment tests, Ingress reload and Session tests, the CLI
 multi-process HTTP/UDP smoke test, the complete locked workspace test suite,
 formatting, Clippy, strict OpenSpec validation, and documentation diff/link
-checks. Native-platform, external-peer, deployed monitoring, and production
-probe evidence remain separate and are not inferred from these local checks.
+checks. Native-platform, external-peer, and production probe calibration
+evidence remain separate and are not inferred from these local checks.
 
 Earlier local validation of the v1 contract, before the current uncommitted
 proxy-compatibility work:
@@ -505,19 +505,29 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   a source with an in-use node may wait for that node before promoting the new
   adapter. SSE recovery snapshots are assembled from bounded resource queries
   rather than a single atomic cross-resource transaction.
-- Native Windows/FreeBSD runtime matrices, provider soak tests, external
-  monitoring deployment, and a broad real-provider protocol/parameter matrix
-  remain validation work. SSR, SOCKS4/4a outbound and other unregistered protocols stay explicitly
-  unavailable. Cross-machine Reality and long-running protocol soak evidence
-  remain validation work.
-- The authenticated Prometheus endpoint now exports aggregate Egress configured,
+- Native Windows/FreeBSD runtime matrices, provider soak tests, production
+  monitoring rollout and probe/autoscaler calibration, and a broad real-provider
+  protocol/parameter matrix remain validation work. SSR, SOCKS4/4a outbound and
+  other unregistered protocols stay explicitly unavailable. Cross-machine
+  Reality and long-running protocol soak evidence remain validation work.
+- The authenticated Prometheus endpoint exports aggregate Egress configured,
   effective, current-wire-rate, replication-allowance, denied-admission, and
-  stale-report gauges from the same observation snapshot. A deployed Prometheus
-  scrape, alert rules, and dashboard smoke test still require an external
-  monitoring environment.
-- Production probe/autoscaler constant measurements are not available from this
-  local checkout. Local deterministic tests remain regression evidence only;
-  no fixture values are recorded as production measurements.
+  stale-report gauges from the same observation snapshot. The local Docker
+  deployment under `monitoring/` now runs Prometheus and Grafana with a bearer
+  token scrape, recording rule, alert rules, provisioned datasource, and
+  dashboard. `scripts/monitoring-smoke.sh` performs a real scrape and checks
+  the Prometheus and Grafana APIs; snapshot byte totals remain declared gauges,
+  not lifetime counters.
+- The local Docker deployment baseline records the default Path autoscaler
+  values (`min=1`, `max=4`, scale-out 8000 bp, scale-in 3500 bp, samples
+  3/3/6, cooldown 30 s) and NodeProbePolicy defaults (30 s interval, 5 s
+  timeout, concurrency 8, window 32, batch 128). The smoke uses a smaller
+  one-second probe policy, observes a real `up` RTT sample, and verifies the
+  authenticated observation snapshot. These are deployment regression values,
+  explicitly not production capacity or SLO measurements.
+  The loopback probe reported `0 ms` after integer-millisecond rounding; this
+  confirms probe publication and has no WAN latency meaning. All seven
+  deterministic autoscaler tests pass.
   Third-party policy groups, rules, and scripts are not imported as PathChord
   policy.
 
@@ -543,9 +553,9 @@ The current Linux workspace run on 2026-11-17 passed 1,084 tests with 118
 external or environment-specific tests ignored. `cargo fmt --check`, strict
 workspace Clippy, strict OpenSpec validation, release role-artifact checks, and
 the role-binary TCP/UDP smoke all passed. The current-head GitHub CI run also
-passed the dependency-advisory and external-core jobs. Native Windows,
-FreeBSD, privileged Linux, and deployed monitoring evidence remain separate
-from these local checks.
+passed the dependency-advisory and external-core jobs. The local Docker
+monitoring deployment is recorded separately below. Native Windows, FreeBSD,
+privileged Linux, and production monitoring/probe calibration remain pending.
 
 The [specification-alignment repair](changes/fix-spec-alignment-findings/) adds
 regressions for connection churn beyond 16,384 completions, shared admission
