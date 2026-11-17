@@ -4,7 +4,7 @@
 
 ### Requirement: Independent service processes and explicit proxy operation
 
-Ingress and Egress SHALL run as separate service invocations, each using its dedicated role executable, owning its process, and exposing its local management endpoint. `pathchordctl` SHALL be the management client for both endpoints. Ordinary explicit HTTP/SOCKS proxy operation SHALL NOT require packet interception or TUN privileges. Listener protocol behavior SHALL follow the [platform contract](../../../../specs/platform-and-dns/spec.md#http-and-socks-listeners).
+Ingress and Egress SHALL run as separate service invocations, each using its dedicated role executable, owning its process, and exposing its local management endpoint. `pathchordctl` SHALL be the management client for both endpoints. Ordinary explicit HTTP/SOCKS proxy operation SHALL NOT require packet interception or TUN privileges. Listener protocol behavior SHALL follow the [platform contract](../../../../../specs/platform-and-dns/spec.md#http-and-socks-listeners).
 
 #### Scenario: Dedicated service executable selection
 
