@@ -1,0 +1,95 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Runtime gauges",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "pathchord_active_sessions", "legendFormat": "active sessions"},
+        {"expr": "pathchord_ready_paths", "legendFormat": "ready paths"},
+        {"expr": "pathchord_active_streams", "legendFormat": "active streams"},
+        {"expr": "pathchord_target_connections", "legendFormat": "target connections"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Egress capacity and wire rate",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {"expr": "pathchord_egress_effective_capacity_bps", "legendFormat": "effective capacity"},
+        {"expr": "pathchord_egress_current_wire_rate_bps", "legendFormat": "current wire rate"},
+        {"expr": "pathchord:egress_wire_utilization_ratio", "legendFormat": "wire utilization ratio"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "bps"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "type": "stat",
+      "title": "Admission denied",
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 8},
+      "targets": [{"expr": "pathchord_egress_admission_denied", "legendFormat": "denied"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
+    },
+    {
+      "type": "stat",
+      "title": "Stale Egress reports",
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 8},
+      "targets": [{"expr": "pathchord_egress_stale_reports", "legendFormat": "stale"}],
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Transit node health",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 20},
+      "targets": [
+        {"expr": "pathchord_nodes_up", "legendFormat": "up"},
+        {"expr": "pathchord_nodes_degraded", "legendFormat": "degraded"},
+        {"expr": "pathchord_nodes_down", "legendFormat": "down"},
+        {"expr": "pathchord_nodes_unknown", "legendFormat": "unknown"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Stream byte totals (snapshot gauges)",
+      "description": "These values come from the bounded current observation snapshot. They are not lifetime counters.",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {"expr": "pathchord_stream_bytes_sent", "legendFormat": "bytes sent snapshot"},
+        {"expr": "pathchord_stream_bytes_received", "legendFormat": "bytes received snapshot"},
+        {"expr": "pathchord_stream_bytes_acked", "legendFormat": "bytes acked snapshot"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Stream retransmissions (snapshot gauge)",
+      "description": "This value comes from the bounded current observation snapshot. It is not a lifetime counter.",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 13},
+      "targets": [{"expr": "pathchord_stream_retransmissions", "legendFormat": "retransmissions snapshot"}],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}}
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["pathchord", "proxy"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "PathChord Overview",
+  "uid": "pathchord-overview",
+  "version": 1
+}

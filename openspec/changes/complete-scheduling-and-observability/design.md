@@ -14,6 +14,11 @@ Implement independently accounted policy/class budgets and lifecycle release, in
 
 Add typed producers for listener-independent timing, Path/Session admission timestamps, Transit identity and compiled source namespace where the runtime can supply them. Review recovery snapshot consistency at the same service boundary. Export through the existing authenticated observation/Prometheus surface, then connect deployed monitoring, alerts and dashboards. Measure probe/autoscaler constants on the deployment rather than promoting local fixture values.
 
+For this validation run, the user-authorized local Docker Compose monitoring
+stack is the deployed target. Its scrape, alert, dashboard, and probe results
+are recorded as deployment evidence and remain explicitly separate from a
+production capacity or SLO claim.
+
 ## Risks / trade-offs
 
 - Relaxing Session-wide limits too early can exceed a policy → retain conservative replication until both directions enforce the agreed limit.
