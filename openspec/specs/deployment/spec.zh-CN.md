@@ -48,6 +48,30 @@ Ingress 服务可执行文件 SHALL 包含其声明的本地监听器、Transit 
 - **WHEN** 操作者使用 `pathchordctl` 查询状态或执行登记
 - **THEN** 客户端连接选定的本地控制端点而不启动任一服务，并保留版本化 control envelope 和代次检查。
 
+### Requirement: Single-role package deployment
+
+每次软件包安装 SHALL 选择且仅选择一个服务角色，只安装该角色的 daemon、`pathchordctl`、配置和服务定义。Unix 软件包 SHALL 使用本机不可登录的 `pathchord` 账号。相反角色的软件包 SHALL 互斥。角色替换 SHALL 显式执行，软件包生命周期操作 SHALL 保留操作者的配置、身份和授权数据。
+
+#### Scenario: Selected role package payload
+
+- **WHEN** 操作者安装 Ingress 或 Egress 角色软件包
+- **THEN** 软件包提供所选 daemon、`pathchordctl`、配置和服务，且不包含另一个角色的 daemon、默认配置或服务定义。
+
+#### Scenario: Opposite role package conflict
+
+- **WHEN** 一个角色的软件包已经安装，操作者尝试安装相反角色
+- **THEN** 安装在修改服务注册、配置、私有状态或控制端点前被拒绝；切换角色需要显式移除并替换。
+
+#### Scenario: Single-role Unix service identity
+
+- **WHEN** Unix 角色软件包准备服务身份和私有路径
+- **THEN** 所选服务以本机不可登录的 `pathchord` 账号运行，只创建其角色目录，私有文件和控制端点拒绝未授权本地访问。
+
+#### Scenario: Role package lifecycle preserves private state
+
+- **WHEN** 所选角色软件包升级、回滚或移除
+- **THEN** 保留操作者配置、身份和授权数据，不隐式启用另一个角色，也不把保留的身份数据自动用作另一个角色的身份。
+
 ### Requirement: Explicit configuration-source precedence
 
 Ingress SHALL 遵循[配置来源契约](../configuration-schema/spec.zh-CN.md#配置来源)，优先选择命令行，其次环境变量，最后账号默认值。递归载入的 YAML/YML/JSON 文件 SHALL 组成一张资源图统一验证；重载 SHALL 原子替换完整有效资源图，并在失败时保留旧图。私有凭据、密钥 JSON 和服务数据 SHALL 保持在该资源树之外。

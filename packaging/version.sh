@@ -2,7 +2,7 @@
 # Print the workspace version used by every native package recipe.
 set -eu
 
-root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 awk '
   /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
   /^\[/ { in_workspace_package = 0 }

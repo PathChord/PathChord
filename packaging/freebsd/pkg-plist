@@ -1,14 +1,10 @@
-bin/pathchord-ingressd
-bin/pathchord-egressd
+bin/%%DAEMON%%
 bin/pathchordctl
-etc/pathchord/ingress/ingress.yaml
-etc/rc.d/pathchord-ingressd
-etc/rc.d/pathchord-egressd
-share/licenses/pathchord/LICENSE
+libexec/pathchord-setup-layout
+@sample etc/pathchord/%%ROLE%%/%%ROLE%%.yaml.sample
+etc/rc.d/%%DAEMON%%
+share/licenses/%%DAEMON%%/LICENSE
 share/man/man1/pathchord.1
-share/pathchord/pkg-message
-@dir(0750,pathchord,pathchord) etc/pathchord
-@dir(0750,pathchord,pathchord) etc/pathchord/ingress
-@dir(0750,pathchord,pathchord) etc/pathchord/egress
-@dir(0750,pathchord,pathchord) var/db/pathchord-ingress
-@dir(0750,pathchord,pathchord) var/db/pathchord-egress
+@dir(root,wheel,0755) etc/pathchord
+@dir(root,pathchord,0750) etc/pathchord/%%ROLE%%
+@dir(pathchord,pathchord,0700) /var/db/pathchord-%%ROLE%%

@@ -3,9 +3,12 @@
 name="pathchord-ingressd"
 description="PathChord Ingress proxy runtime"
 command="/usr/bin/pathchord-ingressd"
-command_args="--socket /run/pathchord/ingress.sock --config-dir /etc/pathchord/ingress --data-dir /var/lib/pathchord-ingress --credentials-dir /etc/pathchord/ingress/secrets"
+command_args="--socket /run/pathchord/ingress.sock --config-dir /etc/pathchord/ingress --data-dir /var/lib/pathchord-ingress --credentials-dir /var/lib/pathchord-ingress/credentials"
 command_user="pathchord:pathchord"
+output_log="/var/lib/pathchord-ingress/service.log"
+error_log="/var/lib/pathchord-ingress/service.log"
 command_background="yes"
+umask="0077"
 pidfile="/run/${RC_SVCNAME}.pid"
 retry="TERM/30/KILL/5"
 
@@ -15,7 +18,7 @@ depend() {
 }
 
 start_pre() {
-	checkpath --directory --owner pathchord:pathchord --mode 0750 /var/lib/pathchord-ingress
-	checkpath --directory --owner pathchord:pathchord --mode 0750 /run/pathchord
-	checkpath --directory --owner root:pathchord --mode 0750 /etc/pathchord/ingress/secrets
+	checkpath --directory --owner pathchord:pathchord --mode 0700 /var/lib/pathchord-ingress
+	checkpath --directory --owner pathchord:pathchord --mode 0700 /run/pathchord
+	checkpath --directory --owner pathchord:pathchord --mode 0700 /var/lib/pathchord-ingress/credentials
 }

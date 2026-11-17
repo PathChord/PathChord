@@ -435,6 +435,11 @@ impl ConfigHotReloader {
             watcher
                 .watch(source.path(), RecursiveMode::Recursive)
                 .map_err(|_| ReloadError::Notify)?;
+        } else {
+            // kqueue directory watches report entry changes, not writes to
+            // an existing child inode. Keep a file watch as well as its parent
+            // so both in-place writes and atomic replacements are observed.
+            watch_existing_file(&mut watcher, source.path())?;
         }
         let loaded = source.load().await?;
         // Establish external parent watches before reading dataset bytes.
@@ -466,6 +471,11 @@ impl ConfigHotReloader {
             watcher
                 .watch(directory, RecursiveMode::NonRecursive)
                 .map_err(|_| ReloadError::Notify)?;
+        }
+        for path in &geodata_paths {
+            if !source.is_directory() || !path.starts_with(source.path()) {
+                watch_existing_file(&mut watcher, path)?;
+            }
         }
         let handle = ConfigReloadHandle::from_documents_with_source(
             loaded.documents.iter().map(String::as_str),
@@ -527,7 +537,7 @@ impl ConfigHotReloader {
                     for _ in 0..MAX_WATCH_EVENTS {
                         if self.events.try_recv().is_err() { break; }
                     }
-                    if self.rearm_directory_watch().is_err() {
+                    if self.rearm_source_watch().is_err() {
                         self.handle.replace_status(ReloadStatus {
                             state: ReloadState::Rejected,
                             active_generation: self.handle.status().active_generation,
@@ -600,7 +610,7 @@ impl ConfigHotReloader {
         }
     }
 
-    fn rearm_directory_watch(&mut self) -> Result<(), ReloadError> {
+    fn rearm_source_watch(&mut self) -> Result<(), ReloadError> {
         if self.source.is_directory() {
             let _ = self.watcher.unwatch(self.source.path());
             if self
@@ -613,6 +623,9 @@ impl ConfigHotReloader {
                     .watch(self.source.path(), RecursiveMode::Recursive)
                     .map_err(|_| ReloadError::Notify)?;
             }
+        } else {
+            let _ = self.watcher.unwatch(self.source.path());
+            watch_existing_file(&mut self.watcher, self.source.path())?;
         }
         Ok(())
     }
@@ -649,6 +662,14 @@ impl ConfigHotReloader {
         for path in self.geodata_watch_dirs.difference(&desired) {
             let _ = self.watcher.unwatch(path);
         }
+        for path in self.geodata_paths.union(&paths) {
+            if !self.source.is_directory() || !path.starts_with(self.source.path()) {
+                let _ = self.watcher.unwatch(path);
+                if paths.contains(path) {
+                    watch_existing_file(&mut self.watcher, path)?;
+                }
+            }
+        }
         self.geodata_watch_dirs = desired;
         self.geodata_paths = paths;
         Ok(())
@@ -668,7 +689,23 @@ impl ConfigHotReloader {
             if self.geodata_paths.contains(path) {
                 return true;
             }
+            // kqueue may identify only a directory entry change. Rescan the
+            // bounded source graph when an external parent reports activity.
+            if cfg!(target_os = "freebsd")
+                && self.geodata_watch_dirs.iter().any(|directory| {
+                    path == directory || path.parent() == Some(directory.as_path())
+                })
+            {
+                return true;
+            }
             if path == self.source.path() {
+                return true;
+            }
+            if cfg!(target_os = "freebsd")
+                && !self.source.is_directory()
+                && (Some(path.as_path()) == self.source.path().parent()
+                    || path.parent() == self.source.path().parent())
+            {
                 return true;
             }
             if !self.source.is_directory() || !self.source.visible_descendant(path) {
@@ -681,6 +718,21 @@ impl ConfigHotReloader {
                     .is_ok_and(|metadata| metadata.is_dir() || metadata.file_type().is_symlink())
         })
     }
+}
+
+fn watch_existing_file(
+    watcher: &mut RecommendedWatcher,
+    path: &std::path::Path,
+) -> Result<(), ReloadError> {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.is_file())
+    {
+        watcher
+            .watch(path, RecursiveMode::NonRecursive)
+            .map_err(|_| ReloadError::Notify)?;
+    }
+    Ok(())
 }
 
 fn compile_candidate_documents<'a>(
@@ -1565,9 +1617,13 @@ spec: {scheduler: effectiveCapacityWeighted}
         wait_until(&handle, 2, ReloadState::Applied).await;
         std::fs::write(&path, VALID).unwrap();
         wait_until(&handle, 3, ReloadState::Applied).await;
+        std::fs::remove_file(&path).unwrap();
+        wait_until(&handle, 3, ReloadState::Rejected).await;
+        std::fs::write(&path, VALID.replace("action: reject", "action: direct")).unwrap();
+        wait_until(&handle, 4, ReloadState::Applied).await;
         std::fs::write(root.0.join("other.yaml"), "invalid").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(handle.snapshot().unwrap().generation, 3);
+        assert_eq!(handle.snapshot().unwrap().generation, 4);
         assert_eq!(handle.status().state, ReloadState::Applied);
         stop(shutdown, task).await;
     }
@@ -1653,6 +1709,9 @@ spec: {scheduler: effectiveCapacityWeighted}
         std::fs::rename(&replacement, &db).unwrap();
         wait_until(&handle, 3, ReloadState::Applied).await;
         assert!(matched(&handle.snapshot().unwrap(), "third.test"));
+        std::fs::write(&db, database("fourth.test")).unwrap();
+        wait_until(&handle, 4, ReloadState::Applied).await;
+        assert!(matched(&handle.snapshot().unwrap(), "fourth.test"));
         stop(shutdown, task).await;
     }
 

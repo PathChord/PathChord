@@ -53,10 +53,11 @@
   changes report restart required and never partially replace an active Egress
   runtime; verify invalid, unreadable, and startup-only candidates leave the
   running listener and authorization database unchanged.
-- [ ] 3.3 Apply role-specific service users/ACLs and capability/device
-  restrictions in the runtime model and package metadata; verify Egress has no
-  TUN device access or network-administration capability requirements while
-  Ingress retains the documented privileges for transparent/TUN modes.
+- [x] 3.3 Apply single-role package selection, the local non-login `pathchord`
+  Unix account, selected Windows service ACLs, and role-appropriate privileges;
+  verify opposite-role installation is rejected before state mutation, Egress
+  needs no TUN or network-administration capabilities, and Ingress retains its
+  documented transparent/TUN prerequisites.
 - [x] 3.4 Update configuration examples and fixtures to use separate role
   sources, preserve explicit enrollment and independent private identities, and
   remove shared-bundle Egress examples; verify every example parses with the
@@ -65,14 +66,13 @@
 ## 4. Update packaging and documentation
 
 - [x] 4.1 Update Debian, Alpine, Arch, FreeBSD, and Windows package recipes to
-  install `pathchord-ingressd`, `pathchord-egressd`, and `pathchordctl`, and
-  start each service executable directly with role-specific roots and sockets;
-  verify package inventory and service-definition checks cover every named
-  target.
-- [x] 4.2 Update installer/uninstaller behavior, system users, runtime/state
-  directories, manpage content, and service restart/rollback procedures for the
-  three artifacts; verify shell syntax, Windows script/XML validation, and
-  generated package file lists pass where host tooling is available.
+  install only the selected role daemon plus `pathchordctl`, its configuration,
+  and its service; verify every named target rejects opposite-role coexistence
+  and has no unselected daemon, service, or default configuration in its payload.
+- [x] 4.2 Update installer/uninstaller behavior, the single Unix service account,
+  private runtime/state directories, manpage, and selected-role restart/rollback;
+  verify shell/Windows syntax, inventory, and preservation of operator state
+  across upgrade, rollback, uninstall, and explicit role replacement.
 - [x] 4.3 Update `docs/design/architecture.md` and its Chinese counterpart,
   deployment/configuration guides, README command examples, and the affected
   OpenSpec main-spec wording to describe dedicated binaries, role-scoped

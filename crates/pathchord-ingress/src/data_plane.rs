@@ -3272,8 +3272,14 @@ async fn shutdown_session(session: Arc<IngressSessionHandle>) -> Result<(), Data
     loop {
         match Arc::try_unwrap(session) {
             Ok(owner) => {
-                owner.shutdown().await?;
-                return Ok(());
+                // A peer restart or authorization revoke may already have
+                // closed the actor and its command channel. That terminal
+                // Path is normal during service shutdown; other failures
+                // still need to reach the caller.
+                return match owner.shutdown().await {
+                    Ok(_) | Err(SessionRuntimeError::PathClosed) => Ok(()),
+                    Err(error) => Err(error.into()),
+                };
             }
             Err(shared) if Instant::now() < deadline => {
                 session = shared;

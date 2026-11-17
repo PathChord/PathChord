@@ -1,5 +1,4 @@
 # PathChord architecture
-
 **English** | [简体中文](architecture.zh-CN.md)
 
 ## 1. Scope
@@ -231,6 +230,14 @@ forwarding, authorization, and global resource limits; `pathchordctl` is the
 role-neutral local management client. The service binaries run as separate
 processes and use separate control sockets, identities, credentials, and state
 roots. The management client never starts a service.
+
+The supported packaged deployment selects one role per device: Ingress on the
+client or Egress on the exit host. Each mutually exclusive role package contains
+its selected daemon and `pathchordctl`, with only that role's service and
+configuration. Unix uses the local non-login `pathchord` account. The deployment
+does not require two default service accounts or simultaneous services on one
+system; selecting another role requires explicit package replacement while
+retaining operator-owned private state.
 
 Ingress reads its complete policy resource graph from the Ingress source root.
 Egress reads exactly one `EgressService` from its Egress source root and does

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+if [ -d /run/openrc ]; then
+    for role in ingress egress; do
+        service="pathchord-${role}d"
+        if [ -x "/usr/bin/$service" ] && rc-service "$service" status >/dev/null 2>&1; then
+            rc-service "$service" stop
+        fi
+    done
+fi

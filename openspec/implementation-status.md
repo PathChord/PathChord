@@ -22,7 +22,7 @@ unverified.
 
 ## Current focus
 
-The [geosite and geoip routing change](changes/support-geosite-geoip-routing/)
+The [geosite and geoip routing change](changes/archive/2026-11-17-support-geosite-geoip-routing/)
 adds local V2Fly geodata databases, named-set rule matching and atomic dataset
 reload. Deterministic tests cover domain types, attributes, IPv4/IPv6, invalid
 inputs and retained generations. Official domain-list-community release
@@ -82,17 +82,18 @@ checklist.
 The evidence below remains local Linux build/test evidence unless a section
 explicitly names a native host, external peer, cross-machine run, or soak.
 
-The pre-0.1.0 service artifact split is implemented in the local worktree.
+The role service artifacts remain separate in source:
 `pathchord-ingressd`, `pathchord-egressd`, and `pathchordctl` build as separate
 targets. The shared configuration and control crates are independent of the
 Ingress runtime; Egress configuration accepts exactly one EgressService and
-Egress dependency inspection excludes Ingress and Transit runtime crates.
-Local smoke checks started Ingress on `127.0.0.1:7890`, started an unprivileged
-Egress with a private identity and authorization database, and queried both
-control sockets through `pathchordctl`. Native package assembly remains
-host-dependent: Debian `dpkg-deb`, Alpine `abuild`, Arch `makepkg`, FreeBSD
-`pkg(8)`, Windows PowerShell/NSIS, and native service-control checks were not
-available on this Linux host.
+Egress dependency inspection excludes Ingress and Transit runtime crates. The
+supported packaged deployment selects one role per device and uses one local
+Unix `pathchord` service account. Mutually exclusive role packages and native
+service lifecycles have passed on Debian, Alpine, Arch Linux and FreeBSD; each
+payload contains only its selected daemon and `pathchordctl`, and an opposite-role
+install is rejected before state changes. Package evidence and the remaining
+Windows-only validation gap are in the
+[single-role package report](changes/validate-native-packages/research/2026-11-17-single-role-packages.md).
 
 The scheduling slice now has deterministic coverage for independent mixed-flow
 replication budgets, reserved control/retransmission priority, directional
@@ -147,16 +148,17 @@ proxy-compatibility work:
   external binaries are supplied.
 - `openspec validate --all --strict --no-interactive`, `git diff --check`, and
   the repository heading/bilingual documentation audit passed.
-- Native Windows/FreeBSD execution, privileged Linux interception, and
-  prolonged soak remain unverified; external-peer and cross-machine evidence
-  is limited to the separately identified runs below.
+- Native Windows execution and prolonged soak were unverified at this earlier
+  validation point. Privileged Linux, native FreeBSD and the later provider soak
+  are now documented in the dated evidence below; external-peer and cross-machine
+  claims remain limited to their separately identified runs.
 
-Active work prioritizes HTTP forwarding/CONNECT, SOCKS4/4a/5 CONNECT, SOCKS5
-UDP ASSOCIATE, and same-port Mixed listeners on Linux, Windows, and FreeBSD.
-FreeBSD explicit-listener configuration, native process metadata, platform
-identity, and Unix local control are integrated. FreeBSD x86_64 target
-compilation and CLI linking pass; native host tests remain outstanding.
-Portable listener regressions run in the existing Rust CI job.
+The explicit-listener runtime prioritizes HTTP forwarding/CONNECT,
+SOCKS4/4a/5 CONNECT, SOCKS5 UDP ASSOCIATE, and same-port Mixed listeners.
+FreeBSD configuration, native process metadata, platform identity and Unix
+local control have passed their FreeBSD 15.1 native QEMU test run below. Native
+Windows coverage remains outstanding. Portable listener regressions run in the
+existing Rust CI job.
 
 TPROXY, REDIRECT, transparent UDP interception, and TUN integration are wired
 into the Ingress platform runtime with configuration, rollback, protected
@@ -187,12 +189,12 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   builds on Linux, and cross-checks for Windows GNU and FreeBSD x86_64.
   Core frame/message codecs, state machines, bounded reliability buffers,
   wire vectors, and UDP/Path lifecycle payloads are implemented.
-- Native package recipes cover Debian, Alpine, Arch Linux, FreeBSD, and
-  Windows NSIS. They share the `pathchord(1)` manual and loopback-only default
-  configuration template; Linux and Alpine service definitions use
-  `/etc/pathchord`, the FreeBSD port uses `/usr/local/etc/pathchord`, and
-  packaged Windows services use `%ProgramData%\PathChord\config`. Package
-  assembly remains host-tool and native-service validation work.
+- Native single-role package recipes cover Debian, Alpine, Arch Linux, FreeBSD,
+  and Windows NSIS. Linux packages use `/etc/pathchord`, FreeBSD uses
+  `/usr/local/etc/pathchord`, and Windows uses `%ProgramData%\PathChord\config`.
+  Debian/Alpine/Arch/FreeBSD role payloads and lifecycle tests pass; Windows
+  static NSIS checks pass, but Windows native package/service execution remains
+  unverified.
 - Noise IK uses Clatter zeroizing key and cipher containers with an Orion
   SHA-256/HMAC adapter. Static, ephemeral, chaining, and traffic-key owners
   have explicit cleanup paths. Frozen vectors preserve the previous wire bytes.
@@ -375,7 +377,7 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   value and the local rate. An absent or zero `up_mbps` retains BBR. Brutal
   compensates for loss; PTO probes and ACK-only packets may bypass pacing, so
   the target is not a strict physical bandwidth cap. The
-  [Brutal pacing investigation](changes/support-sing-box-dae-transit-protocols/research/2026-11-16-hysteria2-brutal-pacing.md)
+  [Brutal pacing investigation](changes/archive/2026-11-17-support-sing-box-dae-transit-protocols/research/2026-11-16-hysteria2-brutal-pacing.md)
   records the narrowly patched Quinn hooks, validation and limits.
   Native TUIC covers QUIC/TLS-exporter TCP CONNECT, UDP DATAGRAM and
   QUIC-stream relay or UDP-over-stream, cubic/NewReno/BBR congestion control and heartbeat with a
@@ -481,32 +483,32 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 - The deployment guide and example configurations cover direct,
   subscription, and authenticated Egress use. Separate CLI-process smoke
   validation covers key generation, enrollment, HTTP Transit, Mixed HTTP, and
-  Session UDP forwarding. Cross-machine and long-running deployment evidence
-  remains to be gathered.
-- Linux, Windows, and FreeBSD HTTP/SOCKS5 need end-to-end and long-running
-  validation of authentication, source restrictions, TCP/UDP forwarding, DNS, bounded
-  resources, shutdown, reload, and local control. Existing automated loopback
-  tests are recorded below; they do not establish native Windows or FreeBSD
-  coverage.
-- Linux transparent TCP/UDP and TUN need privileged host smoke validation of
-  `ip` rule/table ownership, IPv4/IPv6 interception, real `/dev/net/tun`
-  operation, host routes, and cleanup after restart. Fake route/device tests
-  cover rollback and packet semantics but do not establish that host evidence.
+  Session UDP forwarding. A 300-second explicit-listener failure/restart soak
+  and the selected cross-machine protocol matrix both passed; neither represents
+  production WAN performance or deployment evidence.
+- Native Windows HTTP/SOCKS5 still needs end-to-end and long-running validation
+  of authentication, source restrictions, TCP/UDP forwarding, DNS, bounded
+  resources, shutdown, reload, and local control. The FreeBSD 15.1 native QEMU
+  suite passed below; portable loopback tests do not establish Windows coverage.
+- Linux TPROXY/REDIRECT/TUN and optional TC/eBPF ownership, IPv4/IPv6 forwarding,
+  rollback, crash recovery, foreign-object preservation and fallback passed a
+  disposable native-kernel QEMU matrix; see the evidence below. The development
+  host kernel could not run the full matrix because its nft TPROXY module does
+  not match the running kernel.
 - Windows registry, WinINet refresh, Named Pipe ACL, and system-proxy crash
   recovery still need validation on a real Windows host. Cross-compiling and
   fake adapters are not equivalent to host evidence.
-- FreeBSD native dependencies, configuration watching, SQLite,
-  credential/socket permissions, and signal behavior need native-host
-  validation. A cross-compiled target check is distinct from executing the
-  workspace tests on FreeBSD; native FreeBSD execution remains a separate host
-  validation item.
+- The FreeBSD 15.1 QEMU guest completed the native listener/control workspace
+  suite and selected-role Egress permission/signal checks. Both FreeBSD role
+  packages also passed native `pkg` creation, service, upgrade, rollback,
+  uninstall and explicit replacement checks; see the single-role package report.
 - Process metadata is best-effort: Linux uses bounded procfs reads and Windows
   and FreeBSD use the safe `netsock` native IP Helper/libprocstat provider.
   Process IDs and executable names are returned where permissions allow;
   user/group identifiers remain unknown when the platform API does not expose
   them.
-- Long-running failure/restart tests and real subscription refresh soak tests
-  remain to be exercised through the explicit listeners.
+- A 300-second explicit-listener Path/provider failure and restart soak passed;
+  the exact matrix and resource peaks are recorded below.
 
 ## Shared implementation gaps
 
@@ -532,11 +534,12 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   a source with an in-use node may wait for that node before promoting the new
   adapter. SSE recovery snapshots are assembled from bounded resource queries
   rather than a single atomic cross-resource transaction.
-- Native Windows/FreeBSD runtime matrices, provider soak tests, production
-  monitoring rollout and probe/autoscaler calibration, and a broad real-provider
-  protocol/parameter matrix remain validation work. SSR, SOCKS4/4a outbound and
-  other unregistered protocols stay explicitly unavailable. Cross-machine
-  Reality and long-running protocol soak evidence remain validation work.
+- Native Windows runtime matrices, production monitoring rollout and
+  probe/autoscaler calibration, and provenance-backed real-provider samples for
+  every document family remain validation work. SSR, SOCKS4/4a outbound and
+  other unregistered protocols stay explicitly unavailable. The QEMU
+  cross-machine adapter matrix is complete for its selected peer, protocol and
+  network conditions; it is not WAN or production deployment evidence.
 - The authenticated Prometheus endpoint exports aggregate Egress configured,
   effective, current-wire-rate, replication-allowance, denied-admission, and
   stale-report gauges from the same observation snapshot. The local Docker
@@ -560,42 +563,121 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Deferred work
 
-- Linux TPROXY mark/routing behavior, IPv4/IPv6 transparent UDP, and TUN
-  integration are implemented, but privileged host validation remains
-  deferred. Route ownership journals are designed to fail closed and never
-  remove foreign rules. Wintun packaging and native Windows TUN validation are
-  also deferred.
-- An optional Linux eBPF interception backend is implemented as an explicit,
-  interface-bound TC classifier switch. The ordinary TPROXY backend remains
-  the supported fallback; root-level kernel/privilege smoke and failure
-  recovery validation remain outstanding. The staged decision and prerequisites
-  are recorded in [the dae/eBPF research note](changes/validate-native-platforms/research/dae-ebpf-transparent-proxy.md).
+- Linux transparent and TUN forwarding, TC/eBPF interception, route ownership,
+  foreign mark/filter preservation, crash recovery and ordinary TPROXY fallback
+  have passed the disposable QEMU kernel matrix. Route cleanup remains journal
+  owned. Wintun packaging and native Windows TUN validation are deferred.
 - Protocols outside the registered native set remain
   unavailable with node diagnostics. Further native implementations need
   protocol-specific interoperability fixtures.
 
 ## Validation evidence
 
-The current Linux workspace run on 2026-11-17 passed 1,097 tests with 118
-external or environment-specific tests ignored. `cargo fmt --all -- --check`,
+Privileged Linux platform validation completed on 2026-11-17 in Alpine 3.24.4,
+x86_64 QEMU/KVM with Linux `6.18.63-0-virt`, iproute2/TC 7.0.0, nftables 1.1.6
+and bpftool 7.8.0. The final run passed 21/21 result groups, including TPROXY
+IPv4/IPv6 TCP and 4096-byte UDP, REDIRECT IPv4/IPv6 TCP with explicit UDP
+rejection, real TUN IPv4/IPv6 TCP half-close and fragmented UDP, route journal
+rollback/recovery, eBPF IPv4/IPv6 forwarding, foreign-mark preservation, pin
+ownership, crash/restart cleanup, occupied-priority rejection and explicit
+TPROXY fallback. Guest namespaces were removed after the run. The development
+host kernel is `7.2.15-zen1-1-zen` and lacks a matching `nft_tproxy` module, so
+the full privileged matrix ran against the guest kernel and did not modify host
+routes or firewall state.
+
+Reproduction: `cargo build --locked --release --target x86_64-unknown-linux-musl --bin pathchord-ingressd --bin pathchordctl`, then
+`python3 scripts/test-qemu-linux-platforms.py --cache /data/pathchord-qemu/linux-rootfs --output /data/pathchord-qemu/runs/linux-platforms --apk-address 146.75.114.132`.
+The source revision was `9caf37278a61e28c6c5c1669eb793eb2b5ba33df` with a
+dirty worktree. The Ingress binary SHA-256 was
+`186a5dd8c8f47336ed72a6d7ce30b2f622bd50e627b66d3f42d8ab90ae9db647`. Exact
+guest/tool versions, all result groups and source/APK/log/pcap hashes are in
+[the machine-readable manifest](changes/validate-native-platforms/research/2026-11-17-linux-kernel-validation.json);
+full behavior and implementation findings are in the adjacent Markdown record.
+
+The explicit-listener reliability soak ran for 300.24 seconds over 12 cycles,
+with eight injected failure classes repeated 12 times each. It completed 3,122
+Path and 5,877 provider 8192-byte echo exchanges. All 577 Path and 122 provider
+interruptions occurred during intentionally destructive churn/restart/revoke
+or node-drain windows; retained-provider, parse/DNS/reload and stable windows
+had no extra failures. Peak file descriptors were 17/20/18 and RSS was
+17.1/50.1/52.0 MiB for Egress/Path-Ingress/provider processes. Detailed
+per-cycle evidence and its limits are in the
+[runtime reliability report](changes/validate-provider-and-runtime-reliability/research/2026-11-17-runtime-reliability.md).
+
+Native FreeBSD validation completed on 2026-11-17 in FreeBSD 15.1-RELEASE,
+amd64, under QEMU/KVM. The 51 native test executables passed 1,083 tests with
+zero failures and 118 external-peer tests ignored. The suite includes native
+dependencies, SQLite, HTTP/CONNECT, SOCKS4/4a/5, Mixed, UDP, authentication,
+IPv4/IPv6, configuration watching, process metadata, control and shutdown. It
+ran as the selected non-login `pathchord` account. A separate live Egress check
+verified `0600` identity, SQLite database and control socket ownership/modes,
+normal SIGTERM exit and socket removal. Source revision:
+`9caf37278a61e28c6c5c1669eb793eb2b5ba33df`. The full per-executable, binary,
+SDK, image and toolchain evidence is recorded in the
+[FreeBSD validation manifest](changes/validate-native-platforms/research/2026-11-17-freebsd-native-validation.json).
+The cached image for this run came from the official FreeBSD mirror and its
+published SHA-256; `scripts/qemu_freebsd.py` now defaults future downloads to
+the user-recommended CERNET mirror.
+
+The FreeBSD run exposed and fixed a Kqueue watcher gap: writes made in place
+were not observed when only the parent directory was monitored. The Ingress
+watcher now observes source files and rearms file watches after atomic
+replacement. Native tests cover in-place configuration/geodata changes and
+file deletion/recreation.
+
+Cross-machine Transit interoperability completed on 2026-11-17 between two
+independent Alpine 3.24.4 QEMU guests, each running Linux `6.18.63-0-virt` on
+the private socket-backed Ethernet network. The PathChord musl client talked to
+the independent sing-box 1.14.4 server. Twenty positive cases covered VLESS
+REALITY Vision, Hysteria2, TUIC, AnyTLS and VMess with IPv4/IPv6 peer endpoints,
+IPv4/IPv6 targets, and baseline plus 10 ms one-way `netem` delay. Each case
+verified 262,142 TCP echo bytes and 18,892 UDP echo bytes. Two negative cases
+verified that unsupported VLESS gRPC parameters remain unavailable and retired
+SSR does not register. The command, guest boot IDs, peer/client hashes,
+source hashes and raw result hash are in the
+[cross-machine protocol manifest](changes/validate-provider-and-runtime-reliability/research/2026-11-17-cross-kernel-protocol-validation.json).
+This is isolated virtual-network evidence, not a real WAN or deployed-peer
+result. The provider/import format matrix still lacks retained, anonymized
+source-provenance examples for every document family; see the provider
+[acceptance matrix](changes/validate-provider-and-runtime-reliability/research/2026-11-17-acceptance-matrix.md).
+
+Single-role package and service lifecycle acceptance passed on Debian 12,
+Alpine 3.24.4, Arch Linux and FreeBSD 15.1 for both Ingress and Egress
+profiles. Each package contains only the selected daemon and `pathchordctl`,
+uses one local non-login Unix `pathchord` account, and rejects the opposite role
+without stopping or changing the installed service. Native lifecycle tests
+covered service start/control, active upgrade, rollback, uninstall, explicit
+role replacement, and sentinel configuration/identity/authorization retention.
+FreeBSD Egress also verified a real enrollment record across restart and
+preserved the actual identity/SQLite hashes on removal. Windows NSIS/PowerShell
+static checks passed, but no Windows VM/native service run is claimed. The
+[single-role package report](changes/validate-native-packages/research/2026-11-17-single-role-packages.md)
+links per-profile evidence under `/data/pathchord-qemu/runs/native-packages/`.
+The package fixture versions 0.1.0/0.1.1 use identical tested binaries and do
+not establish cross-protocol-version or database-schema migration.
+
+The current Linux workspace quality run on 2026-11-17 passed
+`cargo fmt --all -- --check`,
 `cargo clippy --locked --workspace --all-targets -- -D warnings`,
-`cargo build --locked --workspace --bins`, the role-binary TCP/UDP smoke, all
-main-spec strict validation (11/11), and strict validation of the active
-configuration/path-target change passed. Clippy reports the existing unused
-`netsock` manifest dependency warning.
+`cargo build --locked --workspace --bins`, and
+`cargo test --locked --workspace --all-targets`. Standard workspace runs keep
+external peer cases ignored unless their pinned server binaries are provided;
+the native peer matrices above were run separately. Clippy reports the existing
+unused `netsock` manifest dependency warning.
 
-After archiving the completed changes, strict all-change OpenSpec validation
-passes all 15 remaining items. Four changes remain active:
-native platform validation, native package validation, provider/runtime
-reliability evidence, and the role-binary change. The role-binary task for
-cross-role private-file isolation is reopened because the packaged Ingress and
-Egress services still share a service UID on Arch and Debian. The current-head
-GitHub CI run also passed the dependency-advisory and external-core jobs. The
-local Docker monitoring deployment is recorded separately below. Native
-Windows, FreeBSD, privileged Linux, and production monitoring/probe calibration
-remain pending.
+Strict all-change OpenSpec validation passes all 15 items. Four changes remain
+listed: the role-binary change has all 21 tasks complete, while native platform
+validation is 5/8, native package validation is 6/7, and provider/runtime
+reliability is 5/6. The remaining gaps are Windows-native listener/control and
+NSIS lifecycle evidence, plus provenance-backed provider samples for every
+document family. The mutually exclusive single-role package model uses one
+Unix service account; prior dual-role tests are not counted for it. The
+current-head GitHub CI run also passed the dependency-advisory and external-core
+jobs. The local Docker monitoring deployment is recorded separately below.
+Production monitoring/probe calibration remains pending; privileged Linux and
+FreeBSD execution are recorded above.
 
-The [specification-alignment repair](changes/fix-spec-alignment-findings/) adds
+The [specification-alignment repair](changes/archive/2026-11-17-fix-spec-alignment-findings/) adds
 regressions for connection churn beyond 16,384 completions, shared admission
 across HTTP/SOCKS/Mixed runtimes, typed history limits, SSE authorization and
 failed gap recovery, namespace-isolated configuration/selection/cache/control,
@@ -711,7 +793,7 @@ certificate and key, a valid 513-byte record completes the handshake and Vision
 round trip. The ordinary fixture uses a longer test certificate, and a separate
 boundary regression preserves this peer limitation. Whether a given real
 server's decoy produces the affected record layout is not established; see the
-[decoy record investigation](changes/support-sing-box-dae-transit-protocols/research/reality-decoy-record-boundary.md).
+[decoy record investigation](changes/archive/2026-11-17-support-sing-box-dae-transit-protocols/research/reality-decoy-record-boundary.md).
 Android 11's TLS 1.2 ClientHello was compared with dae/uTLS and exercised
 against sing-box and Xray over VLESS TCP/UDP. TLS 1.3-only peers and selections
 of advertised but unsupported legacy ciphers fail explicitly.
@@ -735,7 +817,7 @@ are local measurements, not WAN or deployed performance evidence. A separate
 copy of the patched Quinn crate passed 305 upstream library tests and two
 additional delayed ACK/loss switch tests; the sing-box TUIC fixture also
 passed with cubic, NewReno and BBR. See the
-[Brutal pacing investigation](changes/support-sing-box-dae-transit-protocols/research/2026-11-16-hysteria2-brutal-pacing.md)
+[Brutal pacing investigation](changes/archive/2026-11-17-support-sing-box-dae-transit-protocols/research/2026-11-16-hysteria2-brutal-pacing.md)
 for the setup and its limits. A controller switch without a later application
 write and live QUIC path migration/reset have not been independently verified.
 The sing-box HTTP transport fixture covers VLESS and VMess over HTTP/1.1 and
@@ -941,26 +1023,12 @@ unchanged resources moved between files. The CLI process smoke test uses a
 directory bundle while conflicting environment sources are present, proving
 the command-line override is effective.
 
-The FreeBSD target check and CLI build use Zig 0.17.1 C/C++ compiler and archiver
-wrappers with the official FreeBSD 15.1 SDK, including the bundled SQLite and
-crypto dependencies. Both pass with Rust 1.100.0. The resulting x86_64 ELF
-uses `/libexec/ld-elf.so.1` and links against `libprocstat.so.1`, `libthr.so.3`,
-`libc.so.7`, and `libutil.so.10`. This validates target compilation and
-linking; it does not execute FreeBSD tests. Native FreeBSD validation remains
-pending a host run.
-
-The default Linux environment does not select the SDK wrappers. A plain
-FreeBSD workspace check invokes the host GCC for `aws-lc-sys` and fails with
-`unknown type name 'pthread_rwlock_t'`. A minimal Rust binary also fails to
-link with the host linker because it cannot find `-lexecinfo`. The Rust target
-standard library alone does not supply a FreeBSD C compiler, headers, startup
-objects, or system libraries.
-
-The local Zig and FreeBSD SDK are already present; the missing setup is
-target-specific compiler, archiver, and linker selection. Cross builds need
-`CC_x86_64_unknown_freebsd`, `CXX_x86_64_unknown_freebsd`,
-`AR_x86_64_unknown_freebsd`, and
-`CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER` to select wrappers that use the
-same FreeBSD sysroot. The linker wrapper must preserve host build-library
-search directories passed by Cargo rather than resolving them inside the
-sysroot, and must not bind those directories to one checkout or target folder.
+The current FreeBSD cross build exported headers and libraries from the native
+FreeBSD 15.1 guest to `/data/pathchord-qemu/freebsd-build/sysroot`, then used
+Clang/Clang++ and LLD 23 with Rust 1.100.0 to build all workspace targets and
+test executables. The resulting executables were uploaded back to that FreeBSD
+guest and ran as `pathchord`; native results and artifact hashes are in the
+[FreeBSD validation manifest](changes/validate-native-platforms/research/2026-11-17-freebsd-native-validation.json).
+The plain host GCC/LLD target failure described in older validation notes still
+applies when target-specific SDK wrappers are not selected; Rust's target
+standard library alone does not supply system headers or libraries.

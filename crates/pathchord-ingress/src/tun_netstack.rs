@@ -229,10 +229,10 @@ struct QueueDevice {
 }
 
 impl QueueDevice {
-    fn new(mtu: usize, queue_limit: usize) -> Self {
+    fn new(queue_limit: usize) -> Self {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
-        capabilities.max_transmission_unit = mtu;
+        capabilities.max_transmission_unit = crate::tun_fragmentation::MAX_PACKET_BYTES;
         Self {
             inbound: VecDeque::new(),
             outbound: VecDeque::new(),
@@ -356,6 +356,8 @@ struct Reactor {
     started: StdInstant,
     next_flow_id: u64,
     report: TunFlowRuntimeReport,
+    reassembler: crate::tun_fragmentation::Reassembler,
+    next_fragment_id: u32,
 }
 
 impl Reactor {
@@ -366,7 +368,7 @@ impl Reactor {
         protected: ProtectedEndpointSet,
     ) -> Result<Self, TunFlowRuntimeError> {
         let started = StdInstant::now();
-        let mut device = QueueDevice::new(config.mtu, config.packet_queue);
+        let mut device = QueueDevice::new(config.packet_queue);
         let interface_config = InterfaceConfig::new(HardwareAddress::Ip);
         let mut interface =
             Interface::new(interface_config, &mut device, SmolInstant::from_millis(0));
@@ -379,6 +381,7 @@ impl Reactor {
         let (command_sender, commands) = mpsc::channel(config.packet_queue);
         let notify = Arc::new(Notify::new());
         let waker = Waker::from(Arc::new(ReactorWake(Arc::clone(&notify))));
+        let reassembler = crate::tun_fragmentation::Reassembler::new(config.packet_queue.min(16));
         Ok(Self {
             config,
             tcp_opener,
@@ -399,6 +402,8 @@ impl Reactor {
             started,
             next_flow_id: 0,
             report: TunFlowRuntimeReport::default(),
+            reassembler,
+            next_fragment_id: 1,
         })
     }
 
@@ -417,6 +422,20 @@ impl Reactor {
 
     fn receive_packet(&mut self, packet: Vec<u8>) {
         self.report.packets_received = self.report.packets_received.saturating_add(1);
+        if crate::tun_fragmentation::source(&packet)
+            .is_none_or(|source| !crate::source_allowed(&self.config.allowed_sources, source))
+        {
+            self.report.packets_rejected = self.report.packets_rejected.saturating_add(1);
+            return;
+        }
+        let packet = match self.reassembler.receive(packet, StdInstant::now()) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => return,
+            Err(()) => {
+                self.report.packets_rejected = self.report.packets_rejected.saturating_add(1);
+                return;
+            }
+        };
         let Some(tuple) = packet_tuple(&packet) else {
             self.report.packets_rejected = self.report.packets_rejected.saturating_add(1);
             return;
@@ -526,7 +545,7 @@ impl Reactor {
                 continue;
             }
             self.tcp_listeners.remove(&port);
-            if state != tcp::State::Established {
+            if !matches!(state, tcp::State::Established | tcp::State::CloseWait) {
                 self.sockets.remove(handle);
                 self.ensure_tcp_listener(port);
                 continue;
@@ -788,11 +807,10 @@ impl Reactor {
         joined: Option<Result<TcpTaskResult, tokio::task::JoinError>>,
     ) -> Result<(), TunFlowRuntimeError> {
         match joined {
-            Some(Ok((id, Ok(_)))) => {
-                if let Some(flow) = self.tcp_flows.get_mut(&id) {
-                    self.sockets.get_mut::<tcp::Socket>(flow.socket).close();
-                }
-            }
+            // Successful completion can leave response bytes in the duplex
+            // buffer. pump_tcp_flows drains them before observing EOF and
+            // sending FIN; closing here would discard that accepted response.
+            Some(Ok((_, Ok(_)))) => {}
             Some(Ok((id, Err(_)))) => {
                 if let Some(flow) = self.tcp_flows.get_mut(&id) {
                     self.sockets.get_mut::<tcp::Socket>(flow.socket).abort();
@@ -829,11 +847,19 @@ impl Reactor {
         packet_device: &dyn PacketDevice,
     ) -> Result<(), TunFlowRuntimeError> {
         while let Some(packet) = self.device.outbound.pop_front() {
-            packet_device
-                .send_packet(&packet)
-                .await
-                .map_err(|error| TunFlowRuntimeError::Device(error.to_string()))?;
-            self.report.packets_sent = self.report.packets_sent.saturating_add(1);
+            let fragments =
+                crate::tun_fragmentation::split(&packet, self.config.mtu, self.next_fragment_id)
+                    .map_err(|()| {
+                        TunFlowRuntimeError::Device("cannot fragment outgoing IP packet".to_owned())
+                    })?;
+            self.next_fragment_id = self.next_fragment_id.wrapping_add(1);
+            for fragment in fragments {
+                packet_device
+                    .send_packet(&fragment)
+                    .await
+                    .map_err(|error| TunFlowRuntimeError::Device(error.to_string()))?;
+                self.report.packets_sent = self.report.packets_sent.saturating_add(1);
+            }
         }
         Ok(())
     }

@@ -1,0 +1,332 @@
+{
+  "topology": {
+    "image": "alpine:3.24",
+    "image_id": "sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf",
+    "packages": [
+      "linux-virt",
+      "openssh",
+      "python3",
+      "curl",
+      "iproute2",
+      "iproute2-tc",
+      "openssl",
+      "cpio",
+      "ca-certificates",
+      "openrc",
+      "apk-tools",
+      "shadow"
+    ],
+    "alpine": "3.24.4",
+    "kernel_sha256": "d2edb145c22bc89e745bebbe130ad34ecd0445c26a88f8b41ac457fdc607f45e",
+    "topology": "client QEMU eth1 <-> private socket Ethernet <-> server QEMU eth1",
+    "client": [
+      "Linux 6.18.63-0-virt x86_64 Linux",
+      "aedbc01b-4873-48c9-a680-56aa1a13eafe"
+    ],
+    "server": [
+      "Linux 6.18.63-0-virt x86_64 Linux",
+      "7802f5e2-a666-4895-9dd9-dc3e6fa499e8"
+    ],
+    "management": "loopback-only SSH via independent QEMU user networks",
+    "revision": "9caf37278a61e28c6c5c1669eb793eb2b5ba33df"
+  },
+  "peer_version": "sing-box version 1.14.4",
+  "peer_sha256": "1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a",
+  "probe_sha256": "0fb2689c453979c25efd10f928558ce8f416bd49d51eb4d08301bcc8c9ab2dba",
+  "peer_private_libraries_sha256": {
+    "ld-linux-x86-64.so.2": "0460a979877b7d7c1524d800b38205b70a7b27b294f933f05cbc92a77890b3ff",
+    "libc.so.6": "5884f2c5fdfcfca450fe536c1fba8c36d89d84fb0f851522078343b402bbccd9",
+    "libdl.so.2": "0db210326a6e4dc324a4f0ab408c04d79911d939db992fbed926157fb7ade3f2",
+    "libpthread.so.0": "839b91403f89fa4c6888d50deb2b59cd0612f8cfe3d57dd9d6314832b4cb31ab"
+  },
+  "delay_ms_per_direction": 10,
+  "guest_probe_tmpdir": "/tmp/pathchord-probe-tmp",
+  "cases": [
+    {
+      "ok": true,
+      "protocol": "vless",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "reality",
+      "phase": "baseline",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "vless",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "reality",
+      "phase": "baseline",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "ok": true,
+      "protocol": "hysteria2",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "hysteria2",
+      "phase": "baseline",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "hysteria2",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "hysteria2",
+      "phase": "baseline",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "ok": true,
+      "protocol": "tuic",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "tuic",
+      "phase": "baseline",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "tuic",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "tuic",
+      "phase": "baseline",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "ok": true,
+      "protocol": "anytls",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "anytls",
+      "phase": "baseline",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "anytls",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "anytls",
+      "phase": "baseline",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "ok": true,
+      "protocol": "vmess",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "vmess",
+      "phase": "baseline",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "vmess",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "vmess",
+      "phase": "baseline",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "ok": true,
+      "protocol": "vless",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "reality",
+      "phase": "delayed",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "vless",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "reality",
+      "phase": "delayed",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "ok": true,
+      "protocol": "hysteria2",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "hysteria2",
+      "phase": "delayed",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "hysteria2",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "hysteria2",
+      "phase": "delayed",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "ok": true,
+      "protocol": "tuic",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "tuic",
+      "phase": "delayed",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "tuic",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "tuic",
+      "phase": "delayed",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "ok": true,
+      "protocol": "anytls",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "anytls",
+      "phase": "delayed",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "anytls",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "anytls",
+      "phase": "delayed",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "ok": true,
+      "protocol": "vmess",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "vmess",
+      "phase": "delayed",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "vmess",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "vmess",
+      "phase": "delayed",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "protocol": "vless",
+      "unavailable": true
+    },
+    {
+      "protocol": "ssr",
+      "unavailable": true
+    }
+  ],
+  "ok": true,
+  "validation_run_directory": "/data/pathchord-qemu/runs/transit-final-fixed-20261117-1702",
+  "raw_results_sha256": "523543a715e71a62d6fbabc97aaac59ca293fb5359d9dc73889f55aa6ed525df",
+  "command": "env TMPDIR=/data/pathchord-qemu/probe-build/tmp python3 -B scripts/test-qemu-transit.py --sing-box /tmp/pathchord-outbound-20261117/sing-box --probe /data/pathchord-qemu/probe-build/cross_machine_probe --cache /data/pathchord-qemu/linux-rootfs --output /data/pathchord-qemu/runs/transit-final-fixed-20261117-1702",
+  "source_sha256": {
+    "scripts/test-qemu-transit.py": "2c3a75ee136512cd7df35291522439fdc279533c29b144f1d5080d342044207b",
+    "scripts/qemu_lab.py": "1186ac49079ae0f391d24f64a3be7f571e40921eb0fe81f626e26dc4419f3de8",
+    "crates/pathchord-transit/examples/cross_machine_probe.rs": "df351254cafeb50a2e25b8c4d674090713269ffa99b0d177d0b0a8bfe4b7bf4f",
+    "crates/pathchord-transit/src/vmess.rs": "a6748e47eaaa23516358e9d09ff84f94f80fce8f996cc8ec6a3e23f0b094e2e3",
+    "crates/pathchord-transit/src/anytls_adapter.rs": "31971a8da6840af8fe699c9ea0426d47be38a58a62f5466a5137e0c54e528230",
+    "crates/pathchord-transit/src/native_transport.rs": "40e8d6532de9b8137a4cbb0362fbf2ecaf4e287473ef72ecb3a70cabbe5090e0",
+    "Cargo.lock": "1ca8727114bc904749dde58e72916dfbfdb905d16e67a838ac00ada0a32b515f"
+  },
+  "network_log_sha256": {
+    "client-network.txt": "dc4c7746a0b457b8bb926e481648cbb7eb7317f824f4b696d34aaded162a39ce",
+    "server-network.txt": "ecb9a19fb0e519e6dd8fae37b0d593fffc56c0676a14391a059cf670c855fff2",
+    "peer.log": "76cc9e59b95eb1ce25c1807ceff9f2d05e8753aee1e9f62bf9737cd7c8ba2814"
+  }
+}

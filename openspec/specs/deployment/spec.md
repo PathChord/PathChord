@@ -58,6 +58,30 @@ runtime components.
   starting either service executable and preserves the versioned control
   envelope and generation checks.
 
+### Requirement: Single-role package deployment
+
+Each packaged installation SHALL select exactly one service role and install only its daemon, `pathchordctl`, configuration, and service definitions. Unix packages SHALL use the local non-login `pathchord` account. Opposite-role packages SHALL be mutually exclusive. Role replacement SHALL be explicit, and package lifecycle operations SHALL preserve operator-owned configuration, identities, and authorization data.
+
+#### Scenario: Selected role package payload
+
+- **WHEN** an operator installs an Ingress or Egress role package
+- **THEN** it supplies the selected daemon, `pathchordctl`, configuration and service, and contains no daemon, default configuration, or service definition for the other role.
+
+#### Scenario: Opposite role package conflict
+
+- **WHEN** a role package is installed and an operator attempts to install the opposite role
+- **THEN** installation is rejected before changing service registration, configuration, private state, or control endpoints; changing roles requires explicit removal and replacement.
+
+#### Scenario: Single-role Unix service identity
+
+- **WHEN** a Unix role package prepares its service identity and private paths
+- **THEN** the selected service runs as the local non-login `pathchord` account, only its role directories are created, and private files and control endpoints reject unauthorized local access.
+
+#### Scenario: Role package lifecycle preserves private state
+
+- **WHEN** the selected role package is upgraded, rolled back, or removed
+- **THEN** operator configuration, identities and authorization data are retained, the other role is not implicitly enabled, and retained identity data is not automatically reused as another role's identity.
+
 ### Requirement: Explicit configuration-source precedence
 
 Ingress SHALL follow the [configuration source contract](../configuration-schema/spec.md#configuration-sources), selecting command line before environment variables and account defaults. Recursive YAML/YML/JSON files SHALL form one validated resource graph; reload SHALL replace the complete valid graph atomically and retain the old graph on failure. Private credentials, key JSON, and service data SHALL remain outside that resource tree.

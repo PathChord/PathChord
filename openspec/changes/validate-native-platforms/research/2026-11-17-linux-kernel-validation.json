@@ -1,0 +1,482 @@
+{
+  "change": "validate-native-platforms",
+  "tasks": [
+    "3.1",
+    "3.2"
+  ],
+  "date": "2026-11-17",
+  "run_directory": "/data/pathchord-qemu/runs/linux-platforms/20261117-161035",
+  "evidence_class": "native Linux kernel execution in disposable QEMU guest with isolated network namespaces",
+  "manifest": {
+    "revision": "9caf37278a61e28c6c5c1669eb793eb2b5ba33df",
+    "dirty_worktree": true,
+    "command": "PATHCHORD_TEST_UDP_BYTES=4096 python3 /tmp/test-linux-platforms.py --ingress /tmp/pathchord-ingressd --output /tmp/platform-evidence --revision 9caf37278a61e28c6c5c1669eb793eb2b5ba33df",
+    "guest": {
+      "kernel": "6.18.63-0-virt",
+      "architecture": "x86_64",
+      "boot_id": "961134d7-d4a8-4c45-bb20-38498193ae5a"
+    },
+    "binaries": {
+      "pathchord-ingressd": "186a5dd8c8f47336ed72a6d7ce30b2f622bd50e627b66d3f42d8ab90ae9db647",
+      "pathchordctl": "623fe709f3a023ef3be9a336a57b79615c59052163da6da2503e742a9c13f67c"
+    },
+    "apk_sha256": {
+      "bpftool-7.1.5-r0.apk": "2347861587913bdd87143bfe3cb6065da03a21feeb49d4653a7cb69fe861cfad",
+      "brotli-libs-1.2.1-r0.apk": "62a7e37e43bbfc1f8525a00ad2125fd5897135dc93b849733884cb78ffd8e26c",
+      "busybox-1.37.0-r31.apk": "0e626fa97cf937fda7bba4ed4dde8e2f2dbb5083ac34e02180cec0c4eba9351b",
+      "busybox-binsh-1.37.0-r31.apk": "93f803ae5db6b729c0f66f4afba6e907ccc17d7d5f8b8c3d25bdb4636de2c48a",
+      "c-ares-1.34.9-r0.apk": "3539a3e11c1ef1516117d8179a546ac882086e94e0d78ad51d687b3fa2b3b5f2",
+      "ca-certificates-bundle-20261020-r0.apk": "bb008f6d214b6af7576324659856fb63dc8dcb4373f8345ff706388696f1254d",
+      "cpupower-7.1.5-r0.apk": "2838ac49a8e710e935f58a1ba9d7e5ab595d41a97ee29323a2a8a4a7c3afc0bd",
+      "gdbm-1.26-r0.apk": "3278ccba30b241168ca4ab93c919be805411b918fdc062f06d3684d12dc33ae3",
+      "gmp-6.3.0-r4.apk": "85323ef5bce8ff234736dc2d6592ea37aebdc6348a531e27430bdfe38364d256",
+      "jansson-2.15.0-r0.apk": "7681b41486e1f2b2efce11875c839533464ae8857d30fc49130f0039c6585fdb",
+      "json-c-0.18-r1.apk": "22dc7a8fe3eda0d22635615cca682b2a575ef25e8c2f401445e12be4cbf77302",
+      "libbz2-1.0.8-r6.apk": "2737e2b23ed08d4911ee62cd0163b5f4bf0379cacf4dc35b23a00209584c98fd",
+      "libcap2-2.78-r0.apk": "42886a7b4bcde26347c712925c8dc7db202b6029ef9b8c7ee81577ab7bdd8fad",
+      "libcrypto3-3.5.9-r0.apk": "6632d758d8f5e9ea3b650fe966f23bbf9a202f8b8dceecac93da135dec5e3689",
+      "libcurl-8.23.0-r0.apk": "1f70ca404818805a6465b615bbfe84ef861488a963d7e630108ebd7fbaa51665",
+      "libdebuginfod-0.195-r0.apk": "6b125f8dc651d204a496c55d549e04388c9ea464e5cb9579fc454039fdfd3cc0",
+      "libdw-0.195-r0.apk": "e1cc3b757cf44a38f6b160cb714bf570bc28eca11cd1ba8e8b0b54eab4837ffb",
+      "libelf-0.195-r0.apk": "78c5a1993342ab1bdcdce30639fd0937e8000f6d0d85cea171f573d31decd036",
+      "libexpat-2.10.0-r0.apk": "e7e7408ea787ed06d00159b0ff1f9b65a63cf634f36d9e0fa7512ce2c489a503",
+      "libffi-3.5.2-r1.apk": "6da1a19313a40c56cac756fb11e2c4d5267831e1c22fc8323f24c943c94da6e0",
+      "libgcc-15.2.0-r5.apk": "393dcd32629f06d7d85409c272d142d0c082772d10b87ef55ee82f47de3be637",
+      "libidn2-2.3.8-r0.apk": "7d038ac558dde464964b033ce5126dd2eaf84cc414dc15e77c5424a321d0ebee",
+      "libintl-1.0-r0.apk": "cb03919cba5624b5e8759d04f3b31913b02585355988b914bc31de4746ff5ef6",
+      "libmnl-1.0.5-r2.apk": "3693162ff7c27998dbbb2da1c4bd9072079cd55af1fa3d6d2ade51d276e20157",
+      "libncursesw-6.6_p20260516-r0.apk": "cf8caa8a88bc4ce9d9e395567fefaf9ef7fbd55c50ae6155b35c1b58f3755023",
+      "libnftnl-1.3.1-r0.apk": "2f4cf35959fde00fdba0dd35ef12a6739739b504e8319c97e30bd4834f98d924",
+      "libnl3-3.11.0-r0.apk": "b8c9b0a045b1615027b58618103f3dabeca69aacb80b527ac7b96ba354aba4a4",
+      "libpanelw-6.6_p20260516-r0.apk": "057be8b1b788580f4cb72c382a6dcc03467d15bd69700f32192bd709e7a57a12",
+      "libpcap-1.10.7-r0.apk": "1883aff264d8b5901f6bbc3575929ad01855e24d06557b7d0ad9762241b7e3cf",
+      "libpsl-0.21.5-r3.apk": "ec665a344b6e887f00f0a47015cc732c3a281b69e84641dc8662ea234fde6cdb",
+      "libssl3-3.5.9-r0.apk": "05e3393fb95aa5751ca2f9d242f659f6cff82c1cc7767cc2df4a086f7ad01877",
+      "libstdc++-15.2.0-r5.apk": "14c987b556f5385a5db18376e788c75f37d85321b8dc1920d926ea7daac1d6f6",
+      "libtraceevent-1.9.0-r0.apk": "6613479c044e7d131b833b74b855a207b3bd80d16f4a17b834fbbb989ee607b4",
+      "libtraceevent-plugins-1.9.0-r0.apk": "602be484973da8ebb96e8369797354b94831b77daf9ac05045e198a9adab34ca",
+      "libunistring-1.4.2-r0.apk": "3aa6030e603e34d96192742f327c0509f409c6769ce2e7b1463685dede38d714",
+      "libxml2-2.13.9-r2.apk": "4b2f986159c659f014b942fe8a5d70c67af475153ca826c3dd53389eea46a300",
+      "linux-tools-gpio-7.1.5-r0.apk": "c7f983bd812756b15e65087d19939e68ce0472a3b1c3f668c142a19f851da27e",
+      "linux-tools-iio-7.1.5-r0.apk": "5cd32d5ae77dfe4e4ade3dc1ac0faafc33d84a4993907f55c624afe58e0f1e09",
+      "llvm22-libs-22.1.3-r1.apk": "dec15bdd29b6ec7fc22aee43bac153a22e6b132c599e5e5d9ccd0d159eae764f",
+      "mpdecimal-4.0.1-r0.apk": "1278f374bbc8b4aad674244458cca5fc63e0780a921138eef400d5db64381a31",
+      "musl-1.2.6-r3.apk": "e142255d0fa397f14318996bc10378093dcc069dc3dd1b6818c8f28a789c21da",
+      "musl-fts-1.2.7-r7.apk": "10563dc485f24f7cd987e0f3c68552e2c6417b61f5c8cb6b39cbf9af46ea09a7",
+      "ncurses-terminfo-base-6.6_p20260516-r0.apk": "ce83be6d0bd10584a53c3a5868cc1595ce5f0f8e0b621f8f7f70b6144e521fc9",
+      "nftables-1.1.6-r1.apk": "edca96e6160479bd734bb6cdb8412f84f689c6a771fdec75ce2c1c18f3e7cf42",
+      "nghttp2-libs-1.70.0-r0.apk": "f0c4014eb2f10308dcdfd84cd49c121673c7b78cb8182b6e7a1388d8ae112a3b",
+      "numactl-2.0.19-r0.apk": "4a78670a16d9ae7377906e2084be7430197d4b4c24877d65712dd1d4597b59db",
+      "pciutils-libs-3.15.0-r0.apk": "2905bb60e9bc41d208d62c7f6b238140117dde44254b0acc6e42834ede8e815c",
+      "perf-7.1.5-r0.apk": "a14590d90c566dc5bf8235c3a6315248a84f3ee9fb1b11bbd156f11c3a6beaf9",
+      "pyc-3.14.10-r1.apk": "8b1678559e6c29db978a923b611cd21a8bfda26d4814edefbb2d62a903bf7df8",
+      "python3-3.14.10-r1.apk": "32ae9c446a79f965f942ae704c5121fa4744c5fee76ec86955fe0fc9a6e6c412",
+      "python3-pyc-3.14.10-r1.apk": "bc63349707d5658ee2d852e415846246b8d71ece5007120b1d2aee85b4a2ad0a",
+      "python3-pycache-pyc0-3.14.10-r1.apk": "19a814d76898adbf90ec0f33ff1fd85fb8454be8615f4993fba0b69b7b978926",
+      "readline-8.3.3-r1.apk": "766911ecb986a6c5cf0841a6b556cd1e9dbbf22b3559726de32416486cd15c81",
+      "slang-2.3.3-r3.apk": "96daf8e02cbcc0d4fd7163d087ae2a71a1aea279a0ac8d2a00a1612ccdccf644",
+      "sqlite-libs-3.53.4-r0.apk": "a8a216e53d22faa3f04d2e3650c1991af66f8d0b42fadff5afcdb9afb60b19e5",
+      "ssl_client-1.37.0-r31.apk": "e578a140670e4cf9816117b0c2063632bf3754ecbe8fa593a7fd2b4039372bf0",
+      "tcpdump-4.99.6-r1.apk": "14626b75407d65fece45f2e9c66fe127ab0e6fbfe9cdd94d6a093342c20af7d6",
+      "xz-libs-5.8.4-r0.apk": "ab362dd515ead04c31a6c302163248da7aa4813e283c971e6dd3f789b453a1d9",
+      "zlib-1.4-r0.apk": "7b05bc778b8b25cd880835b40114182bd4d1581717504d0129c810c0a14291cb",
+      "zstd-libs-1.5.7-r2.apk": "23c6065b0049b2406441564bcf0032515a43f78e80d76fcb85535a3803ef5d4e"
+    },
+    "returncode": 0
+  },
+  "guest_versions": "Linux pathchord-server 6.18.63-0-virt #1-Alpine SMP PREEMPT_DYNAMIC 2026-11-11 03:02:54 x86_64 Linux\n3.24.4\nip utility, iproute2-v7.0.0\ntc utility, iproute2-v7.0.0\nnftables v1.1.6 (Commodore Bullmoose #7)\nbpftool v7.8.0\nusing libbpf v1.8\nfeatures: llvm, crypto, skeletons\n",
+  "report": {
+    "kernel": "6.18.63-0-virt",
+    "architecture": "x86_64",
+    "revision": "9caf37278a61e28c6c5c1669eb793eb2b5ba33df",
+    "outcome": "passed",
+    "results": [
+      {
+        "name": "isolated topology",
+        "outcome": "passed",
+        "namespaces": [
+          "pcplat-867-c",
+          "pcplat-867-p",
+          "pcplat-867-t"
+        ]
+      },
+      {
+        "name": "tproxy-ipv4",
+        "outcome": "passed",
+        "exchanges": [
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19080,
+            "bytes": 16384,
+            "expected": "10.251.12.1"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "udp",
+            "port": 19081,
+            "bytes": 4096,
+            "expected": "10.251.12.1"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19082,
+            "bytes": 16384,
+            "expected": "blocked"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "udp",
+            "port": 19082,
+            "bytes": 4096,
+            "expected": "blocked"
+          }
+        ],
+        "tcp_roundtrips": 1,
+        "cleanup": true
+      },
+      {
+        "name": "tproxy-ipv6",
+        "outcome": "passed",
+        "exchanges": [
+          {
+            "address": "fd25:12::2",
+            "protocol": "tcp",
+            "port": 19080,
+            "bytes": 16384,
+            "expected": "fd25:12::1"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "udp",
+            "port": 19081,
+            "bytes": 4096,
+            "expected": "fd25:12::1"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "tcp",
+            "port": 19082,
+            "bytes": 16384,
+            "expected": "blocked"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "udp",
+            "port": 19082,
+            "bytes": 4096,
+            "expected": "blocked"
+          }
+        ],
+        "tcp_roundtrips": 1,
+        "cleanup": true
+      },
+      {
+        "name": "redirect-ipv4",
+        "outcome": "passed",
+        "exchanges": [
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19080,
+            "bytes": 16384,
+            "expected": "10.251.12.1"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19082,
+            "bytes": 16384,
+            "expected": "blocked"
+          }
+        ],
+        "tcp_roundtrips": 1,
+        "cleanup": true
+      },
+      {
+        "name": "redirect-ipv6",
+        "outcome": "passed",
+        "exchanges": [
+          {
+            "address": "fd25:12::2",
+            "protocol": "tcp",
+            "port": 19080,
+            "bytes": 16384,
+            "expected": "fd25:12::1"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "tcp",
+            "port": 19082,
+            "bytes": 16384,
+            "expected": "blocked"
+          }
+        ],
+        "tcp_roundtrips": 1,
+        "cleanup": true
+      },
+      {
+        "name": "tun-ipv4",
+        "outcome": "passed",
+        "exchanges": [
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19080,
+            "bytes": 16384,
+            "expected": "10.251.12.1"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "udp",
+            "port": 19081,
+            "bytes": 4096,
+            "expected": "10.251.12.1"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19082,
+            "bytes": 16384,
+            "expected": "blocked"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "udp",
+            "port": 19082,
+            "bytes": 4096,
+            "expected": "blocked"
+          }
+        ],
+        "tcp_roundtrips": 17,
+        "cleanup": true
+      },
+      {
+        "name": "tun-ipv6",
+        "outcome": "passed",
+        "exchanges": [
+          {
+            "address": "fd25:12::2",
+            "protocol": "tcp",
+            "port": 19080,
+            "bytes": 16384,
+            "expected": "fd25:12::1"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "udp",
+            "port": 19081,
+            "bytes": 4096,
+            "expected": "fd25:12::1"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "tcp",
+            "port": 19082,
+            "bytes": 16384,
+            "expected": "blocked"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "udp",
+            "port": 19082,
+            "bytes": 4096,
+            "expected": "blocked"
+          }
+        ],
+        "tcp_roundtrips": 17,
+        "cleanup": true
+      },
+      {
+        "name": "REDIRECT UDP configuration rejected explicitly",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "route journal crash/restart recovery",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "changed foreign route survives recovery conflict",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "changed foreign rule mask survives recovery conflict",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "kernel route apply failure rolls back previous mutations",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "foreign rule rejected without mutation",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "ebpf-ipv4",
+        "outcome": "passed",
+        "exchanges": [
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19080,
+            "bytes": 16384,
+            "expected": "10.251.12.1"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "udp",
+            "port": 19081,
+            "bytes": 4096,
+            "expected": "10.251.12.1"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19082,
+            "bytes": 16384,
+            "expected": "blocked"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "udp",
+            "port": 19082,
+            "bytes": 4096,
+            "expected": "blocked"
+          }
+        ],
+        "tcp_roundtrips": 1,
+        "cleanup": true
+      },
+      {
+        "name": "ebpf-ipv6",
+        "outcome": "passed",
+        "exchanges": [
+          {
+            "address": "fd25:12::2",
+            "protocol": "tcp",
+            "port": 19080,
+            "bytes": 16384,
+            "expected": "fd25:12::1"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "udp",
+            "port": 19081,
+            "bytes": 4096,
+            "expected": "fd25:12::1"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "tcp",
+            "port": 19082,
+            "bytes": 16384,
+            "expected": "blocked"
+          },
+          {
+            "address": "fd25:12::2",
+            "protocol": "udp",
+            "port": 19082,
+            "bytes": 4096,
+            "expected": "blocked"
+          }
+        ],
+        "tcp_roundtrips": 1,
+        "cleanup": true
+      },
+      {
+        "name": "eBPF preserves foreign packet marks and shared TC filter",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "eBPF crash journal recovers pins and preserves later foreign filter",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "eBPF replacement filter survives shutdown and restart ownership conflict",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "eBPF rejects occupied TC priority without deleting administrator filter",
+        "outcome": "passed",
+        "cleanup": true
+      },
+      {
+        "name": "ordinary-tproxy-after-ebpf-failure",
+        "outcome": "passed",
+        "exchanges": [
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19080,
+            "bytes": 16384,
+            "expected": "10.251.12.1"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "udp",
+            "port": 19081,
+            "bytes": 4096,
+            "expected": "10.251.12.1"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "tcp",
+            "port": 19082,
+            "bytes": 16384,
+            "expected": "blocked"
+          },
+          {
+            "address": "10.251.12.2",
+            "protocol": "udp",
+            "port": 19082,
+            "bytes": 4096,
+            "expected": "blocked"
+          }
+        ],
+        "tcp_roundtrips": 1,
+        "cleanup": true
+      },
+      {
+        "name": "explicit ordinary TPROXY fallback after unavailable eBPF",
+        "outcome": "passed",
+        "cleanup": true
+      }
+    ],
+    "namespaces_removed": true
+  },
+  "artifact_sha256": {
+    "matrix.log": "c1760a561fdf9342e67941a8616a4f278cc9c2776de78644b2f2f78c0d4a27fa",
+    "guest-evidence.tar.gz": "45c8ab0586641bec32023d22a1299ba9453b5bb4b050034762e7fbfa02726607",
+    "evidence/report.json": "7657fa5c7ab242da77e18d6cf03751e53e6cb63a83a906d6591db3a90b153dc3",
+    "evidence/network.pcap": "30384f8eff3295ff7e0e6777599ea2c930d194d4da1761a037367cd19f8dc1c2"
+  },
+  "source_sha256": {
+    "crates/pathchord-ingress/src/linux_ebpf.rs": "0e5f13d0c3a09885509a49956e179a3b8010270f9eb0efe8e13449356b0589b2",
+    "crates/pathchord-ingress/src/linux_routing.rs": "99967c2c49997318f4da11f8dd5029bfdef2880014b41c494118f579cd66ac69",
+    "crates/pathchord-ingress/src/linux_tproxy_udp.rs": "993184b7f493f5bd8e610777d2f58350721b62ec5ccb218237982aa8c86a95e0",
+    "crates/pathchord-ingress/src/tun_netstack.rs": "720b0bad54a16c14789b3f0ce7f1ddfdbc3b4e2f64e1919a2a5f3df73baf1f15",
+    "crates/pathchord-ingress/src/tun_fragmentation.rs": "cab5949ea5265fa656e8f477ed029708bc01daa568d443fba89b22253e9a72a2",
+    "crates/pathchord-ingress/src/ebpf/pathchord_tproxy.c": "b185b2482d1c1e3f82b92827d6f0e202f4b059cb30d7f95d919fb5142edaf33e",
+    "scripts/test-linux-platforms.py": "b8d39ed636206f1292b4cb47b48ba17817b4e8e8f5901ae365bf142efcece513",
+    "scripts/test-qemu-linux-platforms.py": "50854ce2d3c065bafe569281805e687050696185f6bb6e07cd2d670ddd830bf7",
+    "scripts/qemu_lab.py": "52387c6ddc6733a83e5855e67ec1f0bbc299c146364d9f37670802d7877be5e1",
+    "crates/pathchord-ingress/src/lib.rs": "096d7d3ce3f98a77f4d47e94894350f85c826187d2c8810b0ec5c319422b9986"
+  },
+  "validation": [
+    "cargo test --locked -p pathchord-ingress --all-targets (234 library tests and listener integrations passed before final TC ownership additions)",
+    "cargo test --locked -p pathchord-ingress linux_ebpf --lib (final TC inventory test passed)",
+    "cargo fmt --all -- --check (passed)",
+    "python3 -m py_compile scripts/test-linux-platforms.py scripts/test-qemu-linux-platforms.py (passed)",
+    "python3 scripts/test-qemu-linux-platforms.py --cache /data/pathchord-qemu/linux-rootfs --output /data/pathchord-qemu/runs/linux-platforms --apk-address 146.75.114.132 (all 21 result groups passed)"
+  ]
+}

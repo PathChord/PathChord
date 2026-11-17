@@ -101,6 +101,9 @@ openspec validate --all --strict --no-interactive
 
 ## 命令界面
 
+软件包部署在每台设备上选择一个角色：客户端使用 `pathchord-ingressd`，落地主机使用
+`pathchord-egressd`。各角色包都包含 `pathchordctl`，Unix 上使用本机的 `pathchord` 服务账号。
+
 `pathchord-ingressd` 为普通用户默认加载 `~/.config/pathchord/ingress`，为软件包服务账号默认加载
 `/etc/pathchord/ingress`。Egress 使用独立的 `~/.config/pathchord/egress` 或
 `/etc/pathchord/egress`。`--config-dir` 将目录中的 YAML/YML/JSON 资源递归载入并统一验证。
@@ -124,9 +127,10 @@ target bridge。
 
 [`packaging/`](packaging/README.md) 下提供 Debian（`.deb`）、Alpine（`.apk`）、
 Arch Linux（`.pkg.tar.*`）、FreeBSD（`.pkg`）和 Windows NSIS（`.exe`）的原生
-打包配方。每个软件包都包含 `pathchordctl(1)` 手册页、服务定义和仅监听回环地址的
-配置模板以及 `pathchord-ingressd`、`pathchord-egressd` 和 `pathchordctl`。先构建 release 二进制，再使用 `make -C packaging` 选择软件包目标；
-软件包指南说明所需的原生构建工具以及交叉编译产物覆盖方式。
+打包配方。每台机器只安装一个角色包；每个包只包含所选 daemon、`pathchordctl`、对应
+服务定义和角色配置。两种角色包互斥，切换角色前需显式移除现有包。构建所选 daemon 和
+`pathchordctl`，并在 `make -C packaging` 中选择 `ROLE=ingress` 或 `ROLE=egress`；
+软件包指南说明所需的原生构建工具以及预编译产物覆盖方式。
 
 ## 开发
 

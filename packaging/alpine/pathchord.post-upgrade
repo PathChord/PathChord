@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+if [ -x /usr/bin/pathchord-ingressd ] && [ ! -e /usr/bin/pathchord-egressd ]; then role=ingress
+elif [ -x /usr/bin/pathchord-egressd ] && [ ! -e /usr/bin/pathchord-ingressd ]; then role=egress
+else echo 'PathChord requires exactly one installed service role' >&2; exit 1; fi
+/usr/libexec/pathchord-setup-layout "$role"
+if [ -d /run/openrc ] && [ -e /run/pathchord/.restart ]; then
+    rm /run/pathchord/.restart
+    rc-service "pathchord-${role}d" start
+fi

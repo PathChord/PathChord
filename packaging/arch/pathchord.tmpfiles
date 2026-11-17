@@ -1,2 +1,0 @@
-d /var/lib/pathchord-ingress 0750 pathchord pathchord - -
-d /var/lib/pathchord-egress 0750 pathchord pathchord - -

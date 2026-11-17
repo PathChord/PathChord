@@ -491,6 +491,56 @@ pub type SystemProcessMetadataProvider = NativeProcessMetadataProvider;
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "freebsd")]
+    #[tokio::test]
+    async fn native_lookup_reports_the_socket_owner_or_unknown_without_inventing_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        let _client = client.unwrap();
+        let (stream, source) = accepted.unwrap();
+        let request = ProcessMetadataRequest {
+            executable: true,
+            user: true,
+            group: true,
+        };
+        let provider = SystemProcessMetadataProvider::default();
+        let metadata = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            provider.lookup(
+                ProcessSocketTuple {
+                    local: stream.local_addr().unwrap(),
+                    source,
+                },
+                request,
+            ),
+        )
+        .await
+        .expect("native socket ownership lookup is bounded");
+        if let Some(metadata) = metadata {
+            assert_eq!(metadata.process_id, Some(std::process::id()));
+            assert!(
+                metadata
+                    .executable
+                    .as_ref()
+                    .is_some_and(|name| !name.is_empty() && name.len() <= 4096)
+            );
+            assert_eq!(metadata.user_id, None);
+            assert_eq!(metadata.group_id, None);
+        }
+        let absent = provider
+            .lookup(
+                ProcessSocketTuple {
+                    local: "127.0.0.1:0".parse().unwrap(),
+                    source: "127.0.0.1:0".parse().unwrap(),
+                },
+                request,
+            )
+            .await;
+        assert_eq!(absent, None);
+    }
+
     #[tokio::test]
     async fn noop_provider_always_returns_unknown() {
         let provider = NoopProcessMetadataProvider;

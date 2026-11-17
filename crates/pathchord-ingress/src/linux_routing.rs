@@ -326,6 +326,7 @@ impl IpCommandRouteAdapter {
 
     fn query(&self, arguments: &[String]) -> Result<Vec<Value>, LinuxRoutingError> {
         let output = Command::new(&self.program)
+            .arg("-N")
             .args(arguments)
             .output()
             .map_err(|error| LinuxRoutingError::Command(error.to_string()))?;
@@ -500,6 +501,22 @@ fn classify_rule(values: &[Value], config: LinuxTransparentRouteConfig) -> Route
             && value_u64(value, "table") == Some(u64::from(config.table))
             && value_u64(value, "protocol") == Some(u64::from(config.protocol))
             && value_mark(value.get("fwmark")) == Some(config.mark)
+            && value
+                .get("fwmask")
+                .is_none_or(|mask| value_mark(Some(mask)) == Some(u32::MAX))
+            && ["src", "dst"].iter().all(|field| {
+                value
+                    .get(*field)
+                    .is_none_or(|field| field.as_str() == Some("all"))
+            })
+            && value.as_object().is_some_and(|fields| {
+                fields.keys().all(|field| {
+                    matches!(
+                        field.as_str(),
+                        "priority" | "src" | "dst" | "fwmark" | "fwmask" | "table" | "protocol"
+                    )
+                })
+            })
     });
     if exact {
         RouteObjectState::Exact
@@ -518,10 +535,44 @@ fn classify_route(
     }
     let exact = values.iter().all(|value| {
         let destination = value.get("dst").and_then(Value::as_str);
-        value.get("type").and_then(Value::as_str) == Some("local")
+        (matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("local" | "2")
+        ) || value_u64(value, "type") == Some(2))
             && value.get("dev").and_then(Value::as_str) == Some("lo")
             && value_u64(value, "protocol") == Some(u64::from(config.protocol))
             && (destination == Some("default") || destination == Some(family.default_route()))
+            && value
+                .get("flags")
+                .is_none_or(|flags| flags.as_array().is_some_and(Vec::is_empty))
+            && value.get("scope").is_none_or(|scope| {
+                matches!(scope.as_str(), Some("host" | "254")) || scope.as_u64() == Some(254)
+            })
+            && value.get("metric").is_none_or(|_| {
+                family == IpFamily::Ipv6 && value_u64(value, "metric") == Some(1024)
+            })
+            && value
+                .get("pref")
+                .is_none_or(|pref| pref.as_str() == Some("medium"))
+            && value
+                .get("table")
+                .is_none_or(|_| value_u64(value, "table") == Some(u64::from(config.table)))
+            && value.as_object().is_some_and(|fields| {
+                fields.keys().all(|field| {
+                    matches!(
+                        field.as_str(),
+                        "type"
+                            | "dst"
+                            | "dev"
+                            | "protocol"
+                            | "scope"
+                            | "flags"
+                            | "metric"
+                            | "pref"
+                            | "table"
+                    )
+                })
+            })
     });
     if exact {
         RouteObjectState::Exact
@@ -826,6 +877,33 @@ mod tests {
         assert_eq!(
             classify_route(route.as_array().unwrap(), IpFamily::Ipv4, config()),
             RouteObjectState::Exact
+        );
+    }
+
+    #[test]
+    fn numeric_ip_inventory_matches_ownership_but_changed_selectors_do_not() {
+        let mut rule = serde_json::json!({"priority":30100,"src":"all","fwmark":"0x1","table":"100","protocol":"186"});
+        assert_eq!(
+            classify_rule(&[rule.clone()], config()),
+            RouteObjectState::Exact
+        );
+        rule["fwmask"] = serde_json::json!("0xff");
+        assert_eq!(
+            classify_rule(&[rule.clone()], config()),
+            RouteObjectState::Conflict
+        );
+        rule.as_object_mut().unwrap().remove("fwmask");
+        rule["src"] = serde_json::json!("192.0.2.0/24");
+        assert_eq!(classify_rule(&[rule], config()), RouteObjectState::Conflict);
+        let mut route = serde_json::json!({"type":"2","dst":"default","dev":"lo","protocol":"186","metric":1024,"flags":[],"pref":"medium"});
+        assert_eq!(
+            classify_route(&[route.clone()], IpFamily::Ipv6, config()),
+            RouteObjectState::Exact
+        );
+        route["metric"] = serde_json::json!(1025);
+        assert_eq!(
+            classify_route(&[route], IpFamily::Ipv6, config()),
+            RouteObjectState::Conflict
         );
     }
 

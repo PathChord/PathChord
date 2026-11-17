@@ -1882,6 +1882,9 @@ mod tests {
         path: u128,
     ) -> pathchord_path::PathAdmissionOutcome<pathchord_path::IngressAdmittedPath<TcpStream>> {
         let stream = TcpStream::connect(address).await.expect("connect Egress");
+        stream
+            .set_nodelay(true)
+            .expect("disable test handshake Nagle delay");
         dial_path(
             stream,
             ingress.private(),
@@ -2424,6 +2427,7 @@ mod tests {
 
         for stage in 0..5 {
             let mut peer = TcpStream::connect(node.local_addr()).await.unwrap();
+            peer.set_nodelay(true).unwrap();
             match stage {
                 0 => {}                                          // No prefix.
                 1 => peer.write_all(&[0]).await.unwrap(),        // Incomplete prefix.
@@ -2488,7 +2492,11 @@ mod tests {
             })
             .await
             .expect("admission must expire and release the permit");
-            assert_eq!(peer.read(&mut [0_u8; 1]).await.unwrap(), 0);
+            match peer.read(&mut [0_u8; 1]).await {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                outcome => panic!("expired admission must close its socket: {outcome:?}"),
+            }
         }
         let PathAdmissionOutcome::Ready(path) =
             dial_ingress(&node, &ingress_key, &egress_key, 100, 101).await

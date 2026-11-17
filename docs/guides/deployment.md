@@ -1,5 +1,4 @@
 # PathChord deployment and local operation
-
 **English** | [简体中文](deployment.zh-CN.md)
 
 This guide walks through local proxy setup, privileged Linux listeners, and explicit Ingress/Egress enrollment. Start with the [configuration guide](configuration.md) to choose resources and routing. Required service behavior is defined by the [deployment specification](../../openspec/specs/deployment/spec.md).
@@ -71,6 +70,37 @@ usable matching node. Its provider URL MUST be replaced before use:
 ```sh
 pathchord-ingressd --config examples/ingress-subscriptions.yaml
 ```
+
+## Packaged service identities and privileges
+
+Install one role per machine: `pathchord-ingressd` on an Ingress client or
+`pathchord-egressd` on an Egress host. Each package contains its daemon,
+`pathchordctl`, its configuration template and matching service. Installing the
+opposite role is rejected before changing the installed service or private
+state. To change roles, remove the existing package explicitly and install the
+other; upgrade, rollback and removal preserve operator configuration and keys.
+
+Both Unix profiles use the local non-login `pathchord` account. Only the selected
+role's private roots are created. State and runtime directories are `0700`,
+configuration directories are `root:pathchord` with mode `0750`, and control
+sockets and locks are `0600`. Run `pathchordctl` as root or `pathchord`.
+Ingress credentials live in `/var/lib/pathchord-ingress/credentials`, or
+`/var/db/pathchord-ingress/credentials` on FreeBSD, outside the resource tree.
+
+Default systemd services have no capabilities and restrict device access.
+Only when configuring transparent/TUN listeners, install
+`/usr/share/pathchord/systemd/transparent.conf` as
+`/etc/systemd/system/pathchord-ingressd.service.d/transparent.conf` and restart
+Ingress. Add the adjacent `ebpf.conf` for eBPF after mounting bpffs and preparing
+the required kernel and tools. The [package instructions](../../packaging/README.md#service-isolation-and-optional-ingress-privileges)
+describe Alpine OpenRC capability setup. Egress needs no TUN device or
+network-administration capability.
+
+Windows installs only the selected service definition and restricts that role's
+config, data, credentials and logs to its virtual service account, SYSTEM and
+Administrators. Provision native device permissions for the selected Ingress
+account before using Windows TUN. Ordinary explicit proxy listeners require no
+administrator service account.
 
 ## Linux transparent and TUN listeners
 

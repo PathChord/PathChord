@@ -1,16 +1,13 @@
-PathChord installs a loopback-only default Ingress configuration at
-%%PREFIX%%/etc/pathchord/ingress/ingress.yaml and creates a pathchord service account.
+Install exactly one role package on this machine: pathchord-ingressd for an
+Ingress client or pathchord-egressd for an Egress host. The packages conflict;
+remove the installed profile explicitly before replacing it. Private operator
+configuration, identities and authorization state are preserved.
 
-Enable the local listener in /etc/rc.conf:
+The selected role uses the local non-login pathchord account. Its configuration
+is under %%PREFIX%%/etc/pathchord/<role> and private state under
+/var/db/pathchord-<role>. Enable only its matching rc.d service in /etc/rc.conf.
+Before starting Egress, provision /var/db/pathchord-egress/egress.key.json and
+set its intended bind in egress.yaml. The packaged default remains loopback.
 
-  pathchord_ingressd_enable="YES"
-
-The Egress service is disabled by default. Provision an identity and enable
-it only after replacing the example values in /etc/rc.conf:
-
-  pathchord_egressd_enable="YES"
-  pathchord_egressd_id="exit"
-  pathchord_egressd_bind="0.0.0.0:7443"
-  pathchord_egressd_identity="/var/db/pathchord-egress/egress.key.json"
-
-The package includes the pathchordctl(1) manual and rc.d service definitions.
+The selected daemon, pathchordctl, pathchord(1) and matching rc.d definition are
+installed; the other role's daemon, service and default configuration are absent.

@@ -135,6 +135,10 @@ specs, and affected design/user documents. Completed change history belongs in
 
 ## Command surface
 
+Packaged deployments select one role per device: `pathchord-ingressd` on a
+client or `pathchord-egressd` on an exit host. Each role package includes
+`pathchordctl` and uses the local `pathchord` service account on Unix.
+
 `pathchord-ingressd` defaults to `~/.config/pathchord/ingress` for regular users
 and `/etc/pathchord/ingress` for packaged services. `--config-dir` loads
 YAML/YML/JSON resources recursively as one validated bundle. Egress uses a
@@ -161,12 +165,13 @@ Egress/Transit route.
 
 Native package recipes are kept under [`packaging/`](packaging/README.md) for
 Debian (`.deb`), Alpine (`.apk`), Arch Linux (`.pkg.tar.*`), FreeBSD (`.pkg`),
-and Windows NSIS (`.exe`). Each package carries `pathchord-ingressd`,
-`pathchord-egressd`, `pathchordctl`, service definitions, and a loopback-only
-configuration template. Build the three release binaries and select a package
-target with `make -C packaging`; the
-package guide documents the required native host tools and cross-compiled
-artifact override.
+and Windows NSIS (`.exe`). A machine installs one role package: each carries
+only its selected daemon, `pathchordctl`, matching service definition and
+role-specific configuration. Role packages are mutually exclusive; remove the
+installed role explicitly before switching. Build the selected daemon together
+with `pathchordctl` and select `ROLE=ingress` or `ROLE=egress` with
+`make -C packaging`; the package guide documents native host tools and
+precompiled artifact overrides.
 
 ## Development
 

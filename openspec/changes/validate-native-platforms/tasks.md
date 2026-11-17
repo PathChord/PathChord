@@ -11,11 +11,11 @@ These pending tasks were carried over from the implementation plan during the
 
 ## 2. FreeBSD hosts
 
-- [ ] 2.1 Build and run native listener/control tests on FreeBSD, covering HTTP/CONNECT, SOCKS4/4a/5, Mixed, UDP, DNS, authentication, source restrictions and IPv4/IPv6; record execution evidence separately from target linking.
-- [ ] 2.2 Verify native dependencies, SQLite and credential/socket permissions, process-metadata fallback, configuration watching, signals, bounded resources and shutdown under the intended service account; retain host results.
+- [x] 2.1 Build and run native listener/control tests on FreeBSD, covering HTTP/CONNECT, SOCKS4/4a/5, Mixed, UDP, DNS, authentication, source restrictions and IPv4/IPv6; record execution evidence separately from target linking.
+- [x] 2.2 Verify native dependencies, SQLite and credential/socket permissions, process-metadata fallback, configuration watching, signals, bounded resources and shutdown under the selected role service account; retain host results.
 
 ## 3. Privileged Linux and evidence
 
-- [ ] 3.1 Run root-level TPROXY/REDIRECT TCP/UDP and real /dev/net/tun IPv4/IPv6 smoke tests; verify protected destinations, owned rules/tables, rollback, restart cleanup and route-journal recovery.
-- [ ] 3.2 Run the optional eBPF TC backend checks from the research note on a supported kernel/interface; verify mark ownership, TCP/UDP IPv4/IPv6 forwarding and cleanup while preserving ordinary TPROXY fallback and the TUN contract.
-- [ ] 3.3 Record host versions, architectures, repository revisions, commands, outcomes and unresolved failures in openspec/implementation-status.md; verify no target-build or fake-device result is presented as native runtime evidence.
+- [x] 3.1 Run root-level TPROXY TCP/UDP, REDIRECT TCP with explicit UDP rejection, and real /dev/net/tun IPv4/IPv6 smoke tests; verify protected destinations, owned rules/tables, rollback, restart cleanup and route-journal recovery.
+- [x] 3.2 Run the optional eBPF TC backend checks from the research note on a supported kernel/interface; verify mark ownership, TCP/UDP IPv4/IPv6 forwarding and cleanup while preserving ordinary TPROXY fallback and the TUN contract.
+- [x] 3.3 Record guest kernel/tool versions, architecture, repository revision, commands, outcomes and unresolved host failures in openspec/implementation-status.md; verify no target-build or fake-device result is presented as native runtime evidence.

@@ -51,6 +51,7 @@ mod socks5;
 mod socks5_udp;
 mod store;
 mod tun_device;
+mod tun_fragmentation;
 mod tun_netstack;
 mod udp_flow;
 

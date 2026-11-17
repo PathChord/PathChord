@@ -1021,6 +1021,7 @@ fn spawn_duplex(
                         .write_all(&cfb_record(&mut cipher, &buffer[..size]))
                         .await
                         .is_err()
+                    || upstream_write.flush().await.is_err()
                 {
                     break;
                 }
@@ -1044,7 +1045,9 @@ fn spawn_duplex(
             let Ok(encoded) = codec.encode(&buf[..size]) else {
                 break;
             };
-            if upstream_write.write_all(&encoded).await.is_err() {
+            if upstream_write.write_all(&encoded).await.is_err()
+                || upstream_write.flush().await.is_err()
+            {
                 break;
             }
         }
@@ -1854,6 +1857,73 @@ mod tests {
             decode_legacy_response_header(&[0, 1], &key, &iv, 0x42),
             Err(TransitError::Protocol(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn buffered_tcp_upload_flushes_partial_final_records() {
+        for kind in [BodyCipherKind::Aes128Gcm, BodyCipherKind::Aes128Cfb] {
+            let sealed = Sealed {
+                bytes: Vec::new(),
+                req_key: [0x21; 16],
+                req_iv: [0x37; 16],
+                resp_v: 0x42,
+                command: 1,
+                legacy: false,
+            };
+            let framing = VmessFramingOptions::default();
+            let mut codec = (kind != BodyCipherKind::Aes128Cfb).then(|| {
+                RecordCodec::new(
+                    kind,
+                    &sealed.req_key,
+                    &sealed.req_iv,
+                    &sealed.req_key,
+                    &sealed.req_iv,
+                    framing,
+                )
+            });
+            let mut cfb = CfbStream::new(&sealed.req_key, &sealed.req_iv);
+            let (upstream, mut peer) = tokio::io::duplex(8192);
+            let buffered = tokio::io::BufWriter::with_capacity(8192, upstream);
+            let mut stream = spawn_duplex(Box::new(buffered), sealed, kind, framing);
+            let payload: Vec<_> = (0..131_071).map(|index| (index % 251) as u8).collect();
+            let expected_len = payload.len();
+            let mut peer_task = tokio::spawn(async move {
+                let mut received = Vec::new();
+                while received.len() < expected_len {
+                    let mut length = [0; 2];
+                    peer.read_exact(&mut length).await.unwrap();
+                    if kind == BodyCipherKind::Aes128Cfb {
+                        cfb.apply(&mut length, true);
+                        let mut body = vec![0; u16::from_be_bytes(length) as usize];
+                        peer.read_exact(&mut body).await.unwrap();
+                        cfb.apply(&mut body, true);
+                        received.extend(cfb_payload(&body).unwrap());
+                    } else {
+                        let codec = codec.as_mut().unwrap();
+                        let header = codec.decode_header(&length).unwrap();
+                        let mut body = vec![0; header.ciphertext_len + header.padding_len];
+                        peer.read_exact(&mut body).await.unwrap();
+                        received.extend(codec.decode_body(header, &body).unwrap());
+                    }
+                }
+                received
+            });
+            let result = timeout(Duration::from_secs(2), async {
+                stream.write_all(&payload).await.unwrap();
+                stream.flush().await.unwrap();
+                (&mut peer_task).await.unwrap()
+            })
+            .await;
+            drop(stream);
+            if result.is_err() {
+                peer_task.abort();
+                let _ = peer_task.await;
+            }
+            assert_eq!(
+                result.expect("a partial VMess record must be flushed before application shutdown"),
+                payload
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,80 @@
+{
+  "topology": {
+    "image": "alpine:3.24",
+    "image_id": "sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf",
+    "packages": [
+      "linux-virt",
+      "openssh",
+      "python3",
+      "curl",
+      "iproute2",
+      "iproute2-tc",
+      "openssl",
+      "cpio",
+      "ca-certificates",
+      "openrc",
+      "apk-tools",
+      "shadow"
+    ],
+    "alpine": "3.24.4",
+    "kernel_sha256": "d2edb145c22bc89e745bebbe130ad34ecd0445c26a88f8b41ac457fdc607f45e",
+    "topology": "client QEMU eth1 <-> private socket Ethernet <-> server QEMU eth1",
+    "client": [
+      "Linux 6.18.63-0-virt x86_64 Linux",
+      "becd9cc2-d2d6-43cf-9c77-df179bcbc952"
+    ],
+    "server": [
+      "Linux 6.18.63-0-virt x86_64 Linux",
+      "bffc04a5-68ad-4f2f-a25e-13219d450ad5"
+    ],
+    "management": "loopback-only SSH via independent QEMU user networks",
+    "revision": "9caf37278a61e28c6c5c1669eb793eb2b5ba33df"
+  },
+  "peer_version": "sing-box version 1.14.4",
+  "peer_sha256": "1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a",
+  "probe_sha256": "f854409dc4ce01747c4269e4ccd05ea5a780ce52a7bca07ce24ee4e4434575b9",
+  "peer_private_libraries_sha256": {
+    "ld-linux-x86-64.so.2": "0460a979877b7d7c1524d800b38205b70a7b27b294f933f05cbc92a77890b3ff",
+    "libc.so.6": "5884f2c5fdfcfca450fe536c1fba8c36d89d84fb0f851522078343b402bbccd9",
+    "libdl.so.2": "0db210326a6e4dc324a4f0ab408c04d79911d939db992fbed926157fb7ade3f2",
+    "libpthread.so.0": "839b91403f89fa4c6888d50deb2b59cd0612f8cfe3d57dd9d6314832b4cb31ab"
+  },
+  "delay_ms_per_direction": 10,
+  "cases": [
+    {
+      "ok": true,
+      "protocol": "anytls",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "anytls",
+      "phase": "baseline",
+      "peer_address": "192.0.2.11"
+    },
+    {
+      "ok": true,
+      "protocol": "anytls",
+      "targets": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "tcp_bytes": 262142,
+      "udp_bytes": 18892,
+      "case": "anytls",
+      "phase": "baseline",
+      "peer_address": "fd00:7063::11"
+    },
+    {
+      "protocol": "vless",
+      "unavailable": true
+    },
+    {
+      "protocol": "ssr",
+      "unavailable": true
+    }
+  ],
+  "ok": true
+}

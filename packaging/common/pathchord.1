@@ -1,4 +1,4 @@
-.TH PATHCHORDCTL 1 "November 2026" "PathChord" "PathChord manual"
+.TH PATHCHORD 1 "November 2026" "PathChord" "PathChord manual"
 .SH NAME
 pathchordctl \- PathChord local management client
 .SH SYNOPSIS
@@ -18,7 +18,10 @@ pathchordctl \- PathChord local management client
 PathChord provides local HTTP forwarding, HTTP CONNECT, SOCKS4/4a/5, and
 same-port mixed listeners through the Ingress service.  The Egress service
 accepts authenticated Path connections and forwards TCP and UDP targets.
-Each service has a dedicated executable and process.  The
+Native packages install exactly one service role on a machine.  Each role
+package includes only its dedicated daemon and the management client, and
+conflicts with the opposite role package.  Both Unix profiles use the local
+non-login pathchord account.  The
 .B pathchordctl
 client queries and mutates their local control endpoints.
 .PP
@@ -135,7 +138,12 @@ Do not place private keys, bearer tokens, or credential values in a published
 configuration template.  Restrict service data and control endpoints to the
 service account and administrators.  Replace the loopback default before
 exposing a listener to another network.
+.SH PACKAGE LIFECYCLE
+Upgrade and rollback preserve operator configuration, identities, credentials
+and authorization data.  Uninstall the selected role explicitly before
+installing another role; uninstall retains private state and the service
+account.  Opposite-role installation is rejected before modifying the
+installed service or private files.
 .SH SEE ALSO
-.BR pathchordctl (1),
 .BR systemd.service (5),
 .BR rc.conf (5)

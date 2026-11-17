@@ -307,11 +307,13 @@ fn spawn_stream_relay(stream: BoxedTransitConnection) -> BoxedTransitConnection 
                     if size == 0 { break; }
                     let mut frame = BytesMut::new();
                     if (AnyTlsFrame { command: AnyTlsCommand::Push, stream_id: STREAM_ID, payload: bytes::Bytes::copy_from_slice(&data[..size]) }).encode(&mut frame).is_err() { break; }
-                    if upstream_write.write_all(&frame).await.is_err() { break; }
+                    if upstream_write.write_all(&frame).await.is_err()
+                        || upstream_write.flush().await.is_err() { break; }
                 }
                 control = control_rx.recv() => {
                     let Some(control) = control else { break; };
-                    if upstream_write.write_all(&control).await.is_err() { break; }
+                    if upstream_write.write_all(&control).await.is_err()
+                        || upstream_write.flush().await.is_err() { break; }
                 }
             }
         }
@@ -451,9 +453,14 @@ mod tests {
         let target_address = target.local_addr().unwrap();
         let target_task = tokio::spawn(async move {
             let (mut stream, _) = target.accept().await.unwrap();
-            let mut payload = [0_u8; 7];
-            stream.read_exact(&mut payload).await.unwrap();
-            stream.write_all(&payload).await.unwrap();
+            let mut payload = [0_u8; 8192];
+            loop {
+                let length = stream.read(&mut payload).await.unwrap();
+                if length == 0 {
+                    break;
+                }
+                stream.write_all(&payload[..length]).await.unwrap();
+            }
         });
         let config = pathchord_policy::TransitProxyConfig {
             id: TransitProxyId::new("anytls-test"),
@@ -495,12 +502,29 @@ mod tests {
             })
             .await
             .unwrap();
-        stream.write_all(b"anytls!").await.unwrap();
-        stream.flush().await.unwrap();
-        let mut echoed = [0_u8; 7];
-        stream.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"anytls!");
-        target_task.await.unwrap();
+        for length in [7, 65_535, 65_536, 131_070, 131_071, 262_145] {
+            let payload: Vec<_> = (0..length).map(|index| (index % 251) as u8).collect();
+            let mut echoed = vec![0; length];
+            let (mut read, mut write) = tokio::io::split(&mut stream);
+            timeout(Duration::from_secs(5), async {
+                tokio::try_join!(
+                    async {
+                        write.write_all(&payload).await?;
+                        write.flush().await
+                    },
+                    read.read_exact(&mut echoed)
+                )
+            })
+            .await
+            .unwrap_or_else(|_| panic!("AnyTLS TCP echo timed out at {length} bytes"))
+            .unwrap();
+            assert_eq!(echoed, payload);
+        }
+        stream.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), target_task)
+            .await
+            .unwrap()
+            .unwrap();
         let udp_target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_address = udp_target.local_addr().unwrap();
         let udp_task = tokio::spawn(async move {
@@ -523,6 +547,56 @@ mod tests {
         udp_task.await.unwrap();
         peer.kill().await.unwrap();
         peer.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_relay_flushes_the_tail_after_two_maximum_frames() {
+        let (upstream, mut peer) = tokio::io::duplex(16 * 1024);
+        let buffered = tokio::io::BufWriter::with_capacity(16 * 1024, upstream);
+        let stream = spawn_stream_relay(Box::new(buffered));
+        let peer_task = tokio::spawn(async move {
+            let mut input = BytesMut::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                while let Some(frame) = AnyTlsFrame::decode(&mut input).unwrap() {
+                    if frame.command == AnyTlsCommand::Fin {
+                        return;
+                    }
+                    assert_eq!(frame.command, AnyTlsCommand::Push);
+                    let mut response = BytesMut::new();
+                    frame.encode(&mut response).unwrap();
+                    peer.write_all(&response).await.unwrap();
+                }
+                let count = peer.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                input.extend_from_slice(&buffer[..count]);
+            }
+        });
+        let payload: Vec<_> = (0..MAX_FRAME_PAYLOAD * 2 + 1)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut echoed = vec![0; payload.len()];
+        let (mut read, mut write) = tokio::io::split(stream);
+        let result = timeout(Duration::from_secs(2), async {
+            tokio::try_join!(
+                async {
+                    write.write_all(&payload).await?;
+                    write.flush().await
+                },
+                read.read_exact(&mut echoed)
+            )
+        })
+        .await;
+        drop(read);
+        drop(write);
+        peer_task.abort();
+        let _ = peer_task.await;
+        result
+            .expect("the final one-byte PUSH must reach a buffered peer without client shutdown")
+            .unwrap();
+        assert_eq!(echoed, payload);
     }
 
     #[tokio::test]

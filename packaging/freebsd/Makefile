@@ -1,45 +1,40 @@
-PORTNAME=       pathchord
+.if !defined(PATHCHORD_ROLE) || (${PATHCHORD_ROLE} != "ingress" && ${PATHCHORD_ROLE} != "egress")
+.error Set PATHCHORD_ROLE=ingress or PATHCHORD_ROLE=egress
+.endif
+PORTNAME=       pathchord-${PATHCHORD_ROLE}d
 DISTVERSION?=   0.1.0
 CATEGORIES=     net security
 USE_GITHUB=     yes
 GH_ACCOUNT=     KagurazakaNyaa
 GH_PROJECT=     PathChord
 GH_TAGNAME=     v${DISTVERSION}
-
 MAINTAINER=     PathChord contributors <pathchord@example.invalid>
-COMMENT=        Adaptive multipath proxy runtime with HTTP and SOCKS listeners
+COMMENT=        PathChord ${PATHCHORD_ROLE} runtime and management client
 WWW=            https://github.com/KagurazakaNyaa/PathChord
-
 LICENSE=        GPLv3
 LICENSE_FILE=   ${WRKSRC}/LICENSE
-
 USES=           cargo
-USERS=          pathchord
-GROUPS=         pathchord
-
-CARGO_BUILD_ARGS= --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
-
+PKGINSTALL=     ${WRKSRC}/packaging/freebsd/pkg-install
+PKGDEINSTALL=   ${WRKSRC}/packaging/freebsd/pkg-deinstall
+CARGO_BUILD_ARGS= --bin ${PORTNAME} --bin pathchordctl
+CARGO_INSTALL_PATH= crates/${PORTNAME} crates/pathchordctl
+PLIST_SUB=      ROLE=${PATHCHORD_ROLE} DAEMON=${PORTNAME}
+.if ${PATHCHORD_ROLE} == "ingress"
+CONFLICTS_INSTALL= pathchord-egressd pathchord
+ROLE_TEMPLATE=  default-config.yaml
+.else
+CONFLICTS_INSTALL= pathchord-ingressd pathchord
+ROLE_TEMPLATE=  default-egress-config.yaml
+.endif
 post-install:
-	${MKDIR} ${STAGEDIR}${PREFIX}/etc/pathchord/ingress \
-		${STAGEDIR}${PREFIX}/etc/pathchord/egress \
-		${STAGEDIR}/var/db/pathchord-ingress \
-		${STAGEDIR}/var/db/pathchord-egress \
-		${STAGEDIR}${PREFIX}/etc/rc.d \
-		${STAGEDIR}${PREFIX}/share/licenses/pathchord \
-		${STAGEDIR}${PREFIX}/share/man/man1 \
-		${STAGEDIR}${PREFIX}/share/pathchord
-	${INSTALL_DATA} ${WRKSRC}/LICENSE \
-		${STAGEDIR}${PREFIX}/share/licenses/pathchord/LICENSE
-	${INSTALL_DATA} ${WRKSRC}/packaging/common/default-config.yaml \
-		${STAGEDIR}${PREFIX}/etc/pathchord/ingress/ingress.yaml
-	${INSTALL_DATA} ${WRKSRC}/packaging/common/pathchord.1 \
-		${STAGEDIR}${PREFIX}/share/man/man1/pathchord.1
-	${INSTALL_SCRIPT} ${WRKSRC}/packaging/freebsd/pathchord-ingressd.in \
-		${STAGEDIR}${PREFIX}/etc/rc.d/pathchord-ingressd
-	${INSTALL_SCRIPT} ${WRKSRC}/packaging/freebsd/pathchord-egressd.in \
-		${STAGEDIR}${PREFIX}/etc/rc.d/pathchord-egressd
-	${SED} 's,%%PREFIX%%,${PREFIX},g' \
-		${WRKSRC}/packaging/freebsd/pkg-message > \
-		${STAGEDIR}${PREFIX}/share/pathchord/pkg-message
-
+	${MKDIR} ${STAGEDIR}${PREFIX}/etc/pathchord/${PATHCHORD_ROLE} \
+		${STAGEDIR}${PREFIX}/etc/rc.d ${STAGEDIR}${PREFIX}/libexec \
+		${STAGEDIR}${PREFIX}/share/licenses/${PORTNAME} ${STAGEDIR}${PREFIX}/share/man/man1
+	${INSTALL_DATA} ${WRKSRC}/LICENSE ${STAGEDIR}${PREFIX}/share/licenses/${PORTNAME}/LICENSE
+	${SED} -e 's@/var/lib/pathchord-@/var/db/pathchord-@g' -e 's@/run/pathchord/@/var/run/pathchord/@g' \
+		${WRKSRC}/packaging/common/${ROLE_TEMPLATE} > \
+		${STAGEDIR}${PREFIX}/etc/pathchord/${PATHCHORD_ROLE}/${PATHCHORD_ROLE}.yaml.sample
+	${INSTALL_DATA} ${WRKSRC}/packaging/common/pathchord.1 ${STAGEDIR}${PREFIX}/share/man/man1/pathchord.1
+	${INSTALL_SCRIPT} ${WRKSRC}/packaging/common/setup-layout.sh ${STAGEDIR}${PREFIX}/libexec/pathchord-setup-layout
+	${INSTALL_SCRIPT} ${WRKSRC}/packaging/freebsd/${PORTNAME}.in ${STAGEDIR}${PREFIX}/etc/rc.d/${PORTNAME}
 .include <bsd.port.mk>
