@@ -10,7 +10,7 @@
 
 ### Requirement: Versioned schema conformance
 
-v1 schema SHALL 暴露 Egress aggregate wire capacity 和全局入站目标连接限制，同时将 desired Path 数量、per-Ingress stream 配额和 Path 安全上限排除在 authored Egress policy 之外。每个 Ingress 侧 Egress 必须声明一个 Transit 绑定和一个用于 Session Path 池的 TrafficPolicy 引用。
+v1 schema SHALL 暴露 Egress aggregate wire capacity 和全局入站目标连接限制，同时将 per-Ingress stream 配额和 Path 安全上限保留为运行时字段。每个 Ingress 侧 Egress SHALL 声明一个 Transit 绑定、一个 TrafficPolicy 引用、公共 Path 准入最小值和尽力维持的 Path 基线。原生资源键 SHALL 遵循本契约中的规范名称和旧键处理规则。
 
 #### Scenario: Removed desired-Path fields are authored
 
@@ -21,6 +21,56 @@ v1 schema SHALL 暴露 Egress aggregate wire capacity 和全局入站目标连�
 
 - **WHEN** 管理员提交了包含用户编写 `status` 字段的资源
 - **THEN** 验证拒绝该资源，上一份已发布快照继续生效
+
+#### Detailed contract
+
+##### 原生配置名称和字段迁移
+
+PathChord 自有资源键 MUST 使用 lower camelCase。资源引用 MUST 使用 `Ref` 后缀并保留
+namespace 解析；`egressId` 表示协议身份，不表示资源引用。时间、速率和字节上限必须标明单位。
+集合名应表达集合含义，同时保留 `alpn` 等既定协议术语。远端单个 endpoint 主机 MUST 使用
+`host`；HTTP Host 覆写列表 MUST 使用 `hosts`。用户 label 键、HTTP header 名、外部来源文档、
+枚举值、私有凭据字段、环境变量和 CLI flag 不属于此原生键命名规则。
+
+下表列出本次变更中全部退休的原生字段路径。路径相对于对应资源的 `spec`。
+
+| 资源 | 退休的原生路径 | 规范路径 | 保留的含义 |
+|---|---|---|---|
+| Egress | `statusRequirements.minUsablePaths` | `pathPool.minUsablePaths` | 公共可用 Path 准入最小值 |
+| Egress | `statusRequirements.capabilities` | `admission.requiredCapabilities` | Egress 公共能力要求 |
+| Egress | `address` | `host` | 单 endpoint 简写主机 |
+| Egress | `endpoints[].address` | `endpoints[].host` | 有序 endpoint 候选主机 |
+| TransitProxy | `address` | `host` | 远端代理 endpoint 主机 |
+| EgressService | `webBind` | `web.bind` | 可选管理服务 bind |
+| EgressService | `webTokenFile` | `web.tokenFile` | 私有 bearer token 文件路径 |
+| EgressService | `webOrigins` | `web.allowedOrigins` | 允许的 Web 来源 |
+| EgressService | `webProtectedTransport` | `web.protectedTransport` | 现有受保护传输断言 |
+| TransitProxy | `options.transport.host` | `options.transport.hosts` | 有序 HTTP Host 覆写列表 |
+| TransitProxy | `options.transport.maxEarlyData` | `options.transport.maxEarlyDataBytes` | 保留原上限的字节数 |
+| TransitProxy | `options.tls.certificate` | `options.tls.certificates` | 内联额外信任锚点 |
+| TransitProxy | `options.tls.clientCertificate` | `options.tls.clientCertificates` | 内联客户端证书链 |
+| TransitProxy | `options.tls.fingerprint` | `options.tls.clientHelloFingerprint` | ClientHello 模拟 profile |
+| TransitProxy | `options.udpOverTcp` | `options.udpOverTcpVersion` | 明确的支持版本 |
+
+资源 API 版本仍为 `pathchord.io/v1`。整个 `statusRequirements` 对象均已退休，包括空对象。
+每个旧原生键都 MUST 导致完整候选配置验证失败，包括空/默认值，以及新旧键同时出现的文档。
+旧键 MUST NOT 作为别名、回退值或合并输入。有限的 `CONFIG_RETIRED_FIELD` 诊断 MUST 标明资源、
+确切的旧字段路径和一个或多个新字段路径，且不得返回字段值。未知字段仍然无效；不得递归转换
+任意数据中的键名。
+
+Egress 的 `host`/`port` 简写与 `endpoints: [{host, port}]` 互斥。主机名/IP、IPv6、顺序、重复
+检测、namespace、公钥以及 1..=32 endpoint 限制保持不变。TransitProxy `host`/`port` 保留
+`direct` 适配器的现有例外。NodeProbe target 和对象形式的 Listener bind 已使用 `host`/`port`。
+Listener interface 的 `address`、CIDR、socket address 字符串和字面 HTTP `Host` header 含义不同，
+不得作为远端 endpoint 主机来重命名。
+
+EgressService 的 `web` 可选，只接受 `bind`、`tokenFile`、`allowedOrigins` 和
+`protectedTransport`。省略后仍保持 Web Gateway 默认禁用；子字段默认值、校验限制、origin/token
+检查和受保护传输要求不变。相对的 `web.tokenFile` 路径按现有私有路径规则相对于选定配置来源解析。
+已有 CLI flag 按现有来源优先级覆写对应嵌套资源字段；分组不改变密钥存储，也不启用 TLS 终止。
+
+规范 MUST 说明 EgressRule 和 ProxyRule 的 `catchAll`，以及 ProxyRule 的 `require`，并保持现有验证和
+选择语义。本次名称整理不改变路由动作模型，也不扩展 `transit.reject` 当前仅支持 tag 的条件。
 
 ### Requirement: Whole-bundle identities and references
 
@@ -42,7 +92,7 @@ Ingress 必须（SHALL）先选择命令行配置，再选择环境配置和账�
 
 ### Requirement: Atomic publication and resilient watching
 
-完整候选必须（SHALL）通过解析、验证、规范化、编译及必要的持久化后，才能发布一个不可变代次。无效候选必须（SHALL）保留上一份有效配置集合；单文件和根目录的原子替换必须（SHALL）保留监听能力。Egress endpoint 集合、EgressService bind 集合、公共准入最小值、引用的策略或已解析策略内容发生变化时，必须报告需要重启并保留当前配置。
+完整候选必须（SHALL）通过解析、验证、规范化、编译及必要的持久化后，才能发布一个不可变代次。无效候选必须（SHALL）保留上一份有效配置集合；单文件和根目录的原子替换必须（SHALL）保留监听能力。Egress endpoints、准入要求、任一规范化 Path-pool 数量、引用的策略、已解析策略内容或 EgressService 启动设置发生变化时，必须报告需要重启并保留当前配置。
 
 #### Scenario: Atomic replacement contains an invalid candidate
 
@@ -73,6 +123,16 @@ Ingress 必须（SHALL）先选择命令行配置，再选择环境配置和账�
 
 - **WHEN** 重载改变了没有任何配置 Egress 引用的 TrafficPolicy
 - **THEN** 该变化单独不触发 Egress 启动边界，也不改变存活 Session 的策略
+
+#### Scenario: Only the configured Path baseline changes
+
+- **WHEN** 有效候选将 `pathPool.targetUsablePaths` 改为另一已解析请求基线
+- **THEN** 重载报告需要重启，并保留完整活动配置，包括其他有效动态变更
+
+#### Scenario: An omitted target becomes an equivalent explicit value
+
+- **WHEN** minimum 为 1，候选将省略 target 改为 `targetUsablePaths: 2`，且其他规范化值不变
+- **THEN** 已解析 Path-pool fingerprint 不变，该字段变化本身不要求重启
 
 ### Requirement: Deterministic bounded rule compilation
 
@@ -177,18 +237,87 @@ Ingress 侧 Egress SHALL 包含有界、非空、有序的 endpoint 列表。每
 
 ### Requirement: Ingress Egress endpoint forms normalize without changing identity
 
-Egress schema SHALL 接受现有 `address` 和 `port` 组合作为单 endpoint 简写，也接受 `endpoints` 列表。
-同时提供两种形式 SHALL 被拒绝；endpoint 规范化不得改变 Egress 资源名、Egress ID 或公钥绑定。
+Egress schema SHALL 接受 `host` 和 `port` 作为单 endpoint 简写，并接受每个候选包含 `host` 和
+`port` 的 `endpoints` 列表。两种形式同时提供 SHALL 被拒绝；endpoint 规范化不得改变 Egress 资源名、
+Egress ID 或公钥绑定。退休的原生 `address` 字段 SHALL 返回规范替换字段诊断。
 
 #### Scenario: Existing address and port are loaded
 
-- **WHEN** Egress 只提供 `address` 和 `port`
-- **THEN** 验证生成等价单项 endpoint 列表并保留原路由身份
+- **WHEN** Egress 只提供已退休的 `address` 和 `port` 简写
+- **THEN** 验证拒绝完整候选并指出 `host` 是 `address` 的替换字段
 
 #### Scenario: Singular and plural endpoint forms conflict
 
-- **WHEN** Egress 同时提供 `address`/`port` 和 `endpoints`
+- **WHEN** Egress 同时提供 `host`/`port` 和 `endpoints`
 - **THEN** 验证拒绝资源，不静默合并或选择一种形式
+
+#### Scenario: Canonical single-endpoint shorthand is loaded
+
+- **WHEN** Egress 仅提供有效 `host` 和 `port`
+- **THEN** 验证生成等价的单项规范化 endpoint 列表并保留路由身份
+
+### Requirement: Egress Path-pool configuration
+
+Ingress 侧 Egress SHALL 接受可选的 `pathPool.minUsablePaths` 和 `pathPool.targetUsablePaths`。
+minimum 默认 1；省略 target 时请求 minimum 加一；显式 target 不额外增加备用 Path。数值范围、
+准入和上限契约见下文详细契约。
+
+#### Scenario: Path-pool configuration is omitted
+
+- **WHEN** Egress 省略 `pathPool`
+- **THEN** minimum 为 1，请求的可用 Path 基线为 2，并受运行时上限约束
+
+#### Scenario: A larger minimum has no explicit target
+
+- **WHEN** Egress 设置 `minUsablePaths: 3` 并省略 target
+- **THEN** 应用运行时上限前，请求基线为 4
+
+#### Scenario: An explicit target equals the minimum
+
+- **WHEN** Egress 将两个数量都设为 2
+- **THEN** 请求基线恰好为 2，不隐含增加备用 Path
+
+#### Scenario: A Path-pool count is invalid
+
+- **WHEN** 数值为零、负数、非整数、null、超出无符号 32 位范围，或显式 target 小于 minimum
+- **THEN** 完整配置验证以资源和错误字段路径拒绝候选
+
+#### Scenario: A target exceeds the current runtime ceiling
+
+- **WHEN** 有效请求基线超过较低的运行时或协商 Path 上限
+- **THEN** 配置保留请求值，运行时规划使用受限的有效基线，并暴露上限缺口，但不拒绝原本有效的配置
+
+#### Scenario: The default target requires wider arithmetic
+
+- **WHEN** minimum 是最大无符号 32 位整数且省略 target
+- **THEN** 默认值解析使用更宽的无符号数表示 minimum 加一，不溢出或回绕为零
+
+#### Scenario: Capability requirements move with their meaning intact
+
+- **WHEN** Egress 声明 `admission.requiredCapabilities: [tcp, udp]`
+- **THEN** 保留旧 capability requirement 的公共 Egress 能力检查，不增加按流或原生 UDP Transit 限制
+
+#### Detailed contract
+
+| Egress `spec` 下的字段 | 类型 | 默认值和含义 |
+|---|---|---|
+| `pathPool` | 对象 | 省略或 `{}` 时使用子字段默认值 |
+| `pathPool.minUsablePaths` | 整数 `1..=4294967295` | `1`；新业务准入所需的已认证、可用、非排空 Path 最小值 |
+| `pathPool.targetUsablePaths` | 整数 `1..=4294967295`，且不小于 minimum | 省略时请求 `minUsablePaths + 1`；显式值为请求基线 |
+| `admission` | 对象 | 省略或 `{}` 时不添加能力要求 |
+| `admission.requiredCapabilities` | 有界且唯一的 `tcp`/`udp` 集合 | `[]`；公共 Egress 能力资格要求 |
+
+Null 不等同于省略数量。未知子字段无效；现有字符串、集合、身份、namespace 和 schema 数值限制继续生效。
+默认值计算 MUST 使用足以容纳 `4294967296` 的无符号类型。规范化相等性 MUST 比较解析后的请求基线，
+不能只比较 target 是否显式填写，也不得依赖运行时上限或当前合格 Transit 数量。
+
+只有已认证、符合资格、处于 `ACTIVE` 或 `DEGRADED` 且未排空的 Path 才计入数量。连接中、失败、关闭、
+排空或策略排除的 Path MUST NOT 满足任一数量。单个合格 Transit 可承载多条独立 Path，并遵循既有关系权重。
+target 是维护基线，不是副本数、新的准入门槛、精确连接池大小或公开最大值。状态机契约定义按容量扩张
+和逐步收缩行为。
+
+两个 Path-pool 数量和 `admission.requiredCapabilities` 都是 Egress 启动配置。EgressService MUST NOT
+接收这些 Ingress 侧字段，也不得获得 Path recommendation。原生路由规则不得覆写这些字段。
 
 ### Requirement: Endpoint collections have bounded canonical values
 
@@ -294,7 +423,7 @@ items:
       labels:
         region: jp
     spec:
-      address: egress.example.net
+      host: egress.example.net
       port: 443
       publicKey: <curve25519-public-key>
       capabilities:
@@ -366,28 +495,36 @@ mutation 写入。导入的 source、observed、quota 和 billing 值均由运�
 | 字段 | 必填 | 类型和语义 |
 |---|---|---|
 | `metadata.name` | 是 | namespace 内唯一的资源名 |
-| `spec.address` | 条件 | 旧的主机名或 IP 字面量；没有 `endpoints` 时必须与 `port` 一起提供 |
-| `spec.port` | 条件 | 旧的 endpoint 端口；没有 `endpoints` 时必须与 `address` 一起提供 |
-| `spec.endpoints` | 条件 | 1..=32 个有序 `{address, port}` 候选；与 `address`/`port` 互斥 |
+| `spec.host` | 条件 | 主机名或 IP 字面量；没有 `endpoints` 时必须与 `port` 一起提供 |
+| `spec.port` | 条件 | endpoint 端口；没有 `endpoints` 时必须与 `host` 一起提供 |
+| `spec.endpoints` | 条件 | 1..=32 个有序 `{host, port}` 候选；与 `host`/`port` 互斥 |
 | `spec.publicKey` | 是 | 32 字节无填充 base64url Curve25519 公钥 |
 | `spec.capabilities` | 否 | `tcp`/`udp` 布尔映射，默认均为 false |
-| `spec.statusRequirements` | 否 | `minUsablePaths` 和可选能力集合，默认 1 |
+| `spec.pathPool` | 否 | `minUsablePaths` 和 `targetUsablePaths`；默认 minimum 为 1，请求基线为 2 |
+| `spec.admission` | 否 | `requiredCapabilities`；默认没有额外公共能力要求 |
 | `spec.transit` | 是 | 同一 namespace 的公共 Transit 绑定，可选 `require` 和 `reject` 选择器 |
 | `spec.trafficPolicyRef` | 是 | 每个使用该 Egress 的 Session 所用的同 namespace TrafficPolicy |
 
+单数 `host`/`port` 简写与 `endpoints` 互斥。target 默认请求公共 minimum 加一；显式 target
+不额外增加备用 Path。`pathPool.minUsablePaths` 控制基于数量的准入；
+`pathPool.targetUsablePaths` 是尽力维持的空闲基线，本身不改变健康状态或新业务准入。数量范围、
+默认值宽算术、运行时限幅以及请求值与有效值的区别见上方 Path-pool 规范。
 `capabilities.tcp` 或 `capabilities.udp` 至少一个必须为 true。所有 Egress 引用必须解析到 Egress
 对象。`transit: {}` 明确允许同 namespace 中其他条件合格的 Transit 节点；`require` 使用 label、tag
 和 capability，`reject.tags` 排除匹配节点。绑定不能包含 flow match、order、第二个 weight、Path 子集
-或 desired Path 数量。Egress 拓扑、绑定和已解析 TrafficPolicy 属于启动配置，不能热重载。
+或 desired Path 数量。Egress 拓扑、Path-pool 数量、admission 要求、绑定和已解析 TrafficPolicy
+属于启动配置，不能热重载。
 
 ### EgressService 和 NodeProbePolicy
 
 `EgressService.spec` 接受 `bind` 或 `binds`、`egressId`、`identity`、`authorizationDb`、
 `controlSocket`、`maxWireBandwidthBps`、`maxInboundTargetConnections`、
 `quotaRemaining`、`trafficMultiplierBasisPoints`、
-`remoteDnsOnly`、`webBind`、`webTokenFile`、`webOrigins` 和 `webProtectedTransport`。`bind` 是单项简写，
+`remoteDnsOnly` 和可选的 `web` 设置。`web` 接受 `bind`、`tokenFile`、`allowedOrigins` 和
+`protectedTransport`。`bind` 是单项简写，
 `binds` 是 1..=32 个唯一 SocketAddr 的有序列表，两种形式互斥。
-desired Path 数量、per-Ingress stream 配额和 Path 安全上限由运行时拥有，不得在资源中配置。
+Ingress Path-pool 数量、per-Ingress stream 配额和 Path 安全上限不属于 EgressService 字段，不得写入
+该资源。
 资源中的相对路径相对于所选配置来源解析。一个 Egress 进程最多选择一个此类资源。
 应用命令行覆写后必须提供 `identity` 和 Egress ID；缺少 `egressId` 时使用资源名。
 `remoteDnsOnly` 默认 false。设为 true 且存在原始主机名时，Egress 对 TCP 和 UDP 使用自身系统
@@ -396,7 +533,8 @@ desired Path 数量、per-Ingress stream 配额和 Path 安全上限由运行时
 
 Egress 来源不得包含 Listener、TransitProxy、Subscription、EgressRule、ProxyRule、TrafficPolicy、
 DNSPolicy、FallbackPolicy、GeoSiteDatabase、GeoIpDatabase 或 NodeProbePolicy。私有身份、授权库、
-控制 socket 和 bearer token 路径相对于 Egress 来源根解析，并保留在用户资源文档之外。
+控制 socket 和 bearer token 密钥内容位于用户资源文档之外。相对 `web.tokenFile` 路径从所选 Egress
+配置来源根解析。
 EgressService 字段属于启动配置；来源变化时报告需要重启，活动 Egress 运行时保留原值。
 
 `NodeProbePolicy.spec.target` 是包含 `host` 和 `port` 的对象。`intervalSeconds` 默认 30、
@@ -418,19 +556,19 @@ spec:
     type: clash
     subscriptionRef: provider-a
   protocol: socks5
-  address: proxy.example.net
+  host: proxy.example.net
   port: 443
   tags: [gaming]
   weight: 100
 ```
 
 节点 protocol 遵循[适配器契约](../transit-proxies/spec.zh-CN.md#适配器选择与失败)，可执行支持必须单独验证。
-`options` 默认 `{}`，包含类型化 TLS、transport、header、UDP、SOCKS5/SS `udpOverTcp`、
+`options` 默认 `{}`，包含类型化 TLS、transport、header、UDP、SOCKS5/SS `udpOverTcpVersion`、
 VMess 帧、multiplex 和拨号选项。
 `source.type` 遵循[订阅文档类型](../transit-proxies/spec.zh-CN.md#订阅文档类型)，包括 `static`、`auto`、
 `clash`、`sip008`、`uri`、`sing_box`、`surge`、`quantumult` 和 `loon`；非 static 来源必须引用现有 Subscription。
 导入的 source、observed 和 quota 属性由运行时拥有，不能写入 Proxy spec。`direct` 没有第三方端点，
-忽略 address 和 port。
+忽略 host 和 port。
 
 [Transit Proxy 契约](../transit-proxies/spec.zh-CN.md)定义全部类型化选项、按协议区分的凭据处理、完整
 引擎节点文档、单节点诊断、有界 HTTP provider 展开、用量元数据，以及原生和 Egress 承载的 UDP。
@@ -501,7 +639,7 @@ namespace 中。归一化后重复的引用无效。同一字段中的值为 OR�
 `targetGeoIps` 和 `targetPorts`。
 
 EgressRule 的 spec 在 `egressRef`、`egressSelector` 或 `mode: none` 中选择一个。selector 至少一个条件；
-mode none 是普通 Proxy 模式，不得创建 Session。EgressRule 不接受 requirements、Transit selector、策略覆盖或业务类别字段；选定 Egress 的绑定提供公共 Transit 候选、Path 最小值和 TrafficPolicy。绑定没有准入 Transit 时继续下一条 EgressRule，不得隐式选择任意 Proxy。ProxyRule 的 select 默认 any，也可以使用 `proxy: direct`；proxy 与 select 互斥。
+mode none 是普通 Proxy 模式，不得创建 Session。EgressRule 不接受 requirements、Transit selector、策略覆盖或业务类别字段；选定 Egress 的绑定提供公共 Transit 候选、Path-pool minimum 和基线，以及 TrafficPolicy。绑定没有准入 Transit 时继续下一条 EgressRule，不得隐式选择任意 Proxy。ProxyRule 的 `require` 使用相同 label/tag/capability 选择器语义过滤普通 Proxy；select 默认 any，也可以使用 `proxy: direct`；proxy 与 select 互斥。EgressRule 和 ProxyRule 均可用 `catchAll` 显式标记全匹配规则；全匹配规则不得同时提供 `match`。
 规则求值必须确定、有界且无 I/O，编译器必须拒绝未知字段、无界表达式和无效引用，编译失败保留上一快照。
 
 ### TrafficPolicy
@@ -581,8 +719,8 @@ Ingress 接受一个资源文件或一棵目录树；Egress 接受包含一个 E
 ### 快照发布和重载
 
 加载器必须先解析、验证、规范化并编译完整对象图，再发布不可变代次。连接在 Egress/Proxy 求值前捕获一个
-代次并使用到完整决策结束。运行时观测不能覆盖期望 spec。静态 Egress 拓扑、Transit 绑定、公共 Path 要求、
-引用的 TrafficPolicy 内容、本地密钥、监听器绑定和平台路由需要重启；订阅、导入 Proxy、管理员 label、DNS
+代次并使用到完整决策结束。运行时观测不能覆盖期望 spec。静态 Egress 拓扑、Path-pool 数量、准入要求、
+Transit 绑定、引用的 TrafficPolicy 内容、本地密钥、EgressService 启动设置、监听器绑定和平台路由需要重启；订阅、导入 Proxy、管理员 label、DNS
 健康和编译后的动态规则可以热重载。替换必须原子化；
 解析、验证、编译、持久化或缓存失败时，上一成功代次保持生效并通过类型化 status 暴露错误。
 

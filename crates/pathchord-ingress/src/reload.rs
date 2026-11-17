@@ -49,7 +49,7 @@ pub struct ReloadStatus {
 pub struct ReloadDiagnostic {
     pub code: &'static str,
     pub field_path: String,
-    pub message: &'static str,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,7 +321,7 @@ impl ConfigReloadHandle {
                     state: ReloadState::Rejected,
                     active_generation,
                     observed_at_ms: now_ms(),
-                    reason: Some(diagnostic.message.to_owned()),
+                    reason: Some(diagnostic.message.clone()),
                     diagnostic: Some(diagnostic),
                 };
                 return ReloadOutcome::Rejected { active_generation };
@@ -706,12 +706,12 @@ fn compile_candidate_documents<'a>(
 fn reload_diagnostic(
     code: &'static str,
     field_path: String,
-    message: &'static str,
+    message: impl Into<String>,
 ) -> ReloadDiagnostic {
     ReloadDiagnostic {
         code,
         field_path,
-        message,
+        message: message.into(),
     }
 }
 
@@ -742,6 +742,16 @@ fn config_diagnostic(error: ConfigError) -> ReloadDiagnostic {
             resource_field(&kind, &name, "metadata.name"),
             "configuration resource identity is duplicated",
         ),
+        ConfigError::RetiredField {
+            kind,
+            name,
+            field_path,
+            replacement,
+        } => reload_diagnostic(
+            "CONFIG_RETIRED_FIELD",
+            resource_field(&kind, &name, &field_path),
+            format!("configuration field is retired; use {replacement}"),
+        ),
         ConfigError::InvalidSpec { kind, name, reason } => reload_diagnostic(
             "CONFIG_INVALID_FIELD",
             resource_field(&kind, &name, spec_error_field(&kind, &reason)),
@@ -753,6 +763,10 @@ fn config_diagnostic(error: ConfigError) -> ReloadDiagnostic {
 
 fn validation_diagnostic(error: ValidationError) -> ReloadDiagnostic {
     let (code, field_path) = match error {
+        ValidationError::InvalidEgressPathPool { egress_id, field } => (
+            "CONFIG_INVALID_FIELD",
+            resource_field("Egress", &egress_id, field),
+        ),
         ValidationError::MissingFallback => ("CONFIG_MISSING_RESOURCE", "$.FallbackPolicy".into()),
         ValidationError::EmptyId { .. } => {
             ("CONFIG_INVALID_FIELD", "$.resources[].metadata.name".into())
@@ -837,7 +851,7 @@ fn compile_diagnostic(error: CompileError) -> ReloadDiagnostic {
             field.push_str(" set=");
             field.push_str(set);
         }
-        return reload_diagnostic("CONFIG_GEODATA_INVALID", field, reason);
+        return reload_diagnostic("CONFIG_GEODATA_INVALID", field, *reason);
     }
     let (rule_id, field) = match error {
         CompileError::InvalidSourceNetwork { rule_id, .. } => {
@@ -853,7 +867,7 @@ fn compile_diagnostic(error: CompileError) -> ReloadDiagnostic {
     )
 }
 
-fn resource_field(kind: &str, name: &str, field: &'static str) -> String {
+fn resource_field(kind: &str, name: &str, field: &str) -> String {
     let kind = match kind {
         "Egress" | "egress" => "Egress",
         "TransitProxy" | "Transit Proxy" => "TransitProxy",
@@ -887,7 +901,49 @@ fn resource_field(kind: &str, name: &str, field: &'static str) -> String {
 }
 
 fn spec_error_field(kind: &str, reason: &str) -> &'static str {
+    if kind == "Egress" && reason.contains("endpoints[].host") {
+        return "spec.endpoints[].host";
+    }
+    if kind == "TransitProxy" {
+        for (needle, field) in [
+            ("options.transport.hosts", "spec.options.transport.hosts"),
+            (
+                "options.transport.maxEarlyDataBytes",
+                "spec.options.transport.maxEarlyDataBytes",
+            ),
+            ("options.tls.certificates", "spec.options.tls.certificates"),
+            (
+                "options.tls.clientCertificates",
+                "spec.options.tls.clientCertificates",
+            ),
+            (
+                "options.tls.clientHelloFingerprint",
+                "spec.options.tls.clientHelloFingerprint",
+            ),
+            (
+                "options.udpOverTcpVersion",
+                "spec.options.udpOverTcpVersion",
+            ),
+        ] {
+            if reason.contains(needle) {
+                return field;
+            }
+        }
+        if reason.contains("options.") {
+            return "spec.options";
+        }
+    }
     for (needle, field) in [
+        ("pathPool.minUsablePaths", "spec.pathPool.minUsablePaths"),
+        (
+            "pathPool.targetUsablePaths",
+            "spec.pathPool.targetUsablePaths",
+        ),
+        (
+            "requiredCapabilities",
+            "spec.admission.requiredCapabilities",
+        ),
+        ("endpoints[].host", "spec.endpoints[].host"),
         ("metadata.labels", "metadata.labels"),
         ("metadata.annotations", "metadata.annotations"),
         ("trafficPolicyRef", "spec.trafficPolicyRef"),
@@ -917,6 +973,8 @@ fn spec_error_field(kind: &str, reason: &str) -> &'static str {
         ("port is", "spec.port"),
         ("port must", "spec.port"),
         ("address", "spec.address"),
+        ("pathPool", "spec.pathPool"),
+        ("host", "spec.host"),
         ("bind", "spec.bind"),
         ("match", "spec.match"),
     ] {
@@ -975,7 +1033,7 @@ items:
     metadata:
       name: jp-1
     spec:
-      address: egress.example.net
+      host: egress.example.net
       port: 443
       publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
       capabilities: {tcp: true, udp: true}
@@ -1210,6 +1268,31 @@ items:
     }
 
     #[test]
+    fn retired_native_fields_report_the_canonical_replacement_without_values() {
+        let handle = ConfigReloadHandle::from_yaml(VALID, 7).unwrap();
+        let retired = VALID.replace(
+            "      host: egress.example.net",
+            "      address: sensitive-endpoint.example.net",
+        );
+        assert_eq!(
+            handle.reload_text(&retired),
+            ReloadOutcome::Rejected {
+                active_generation: 7
+            }
+        );
+        let status = handle.status();
+        let diagnostic = status.diagnostic.as_ref().unwrap();
+        assert_eq!(diagnostic.code, "CONFIG_RETIRED_FIELD");
+        assert_eq!(
+            diagnostic.field_path,
+            "$.resources.Egress[jp-1].spec.address"
+        );
+        assert!(diagnostic.message.contains("spec.host"));
+        assert!(!format!("{status:?}").contains("sensitive-endpoint.example.net"));
+        assert_eq!(handle.snapshot().unwrap().generation, 7);
+    }
+
+    #[test]
     fn unknown_reference_and_runtime_failure_have_stable_redacted_diagnostics() {
         let handle = ConfigReloadHandle::from_yaml(VALID, 1).unwrap();
         let candidate = VALID.replace(
@@ -1338,7 +1421,7 @@ items:
 
     fn proxy(name: &str, port: u16) -> String {
         format!(
-            "apiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: {name}}}\nspec: {{protocol: socks5, address: 127.0.0.1, port: {port}}}\n"
+            "apiVersion: pathchord.io/v1\nkind: TransitProxy\nmetadata: {{name: {name}}}\nspec: {{protocol: socks5, host: 127.0.0.1, port: {port}}}\n"
         )
     }
 
@@ -1386,7 +1469,7 @@ spec: {scheduler: effectiveCapacityWeighted}
 "#,
         )
         .unwrap();
-        std::fs::write(root.0.join("proxy.JSON"),r#"{"apiVersion":"pathchord.io/v1","kind":"TransitProxy","metadata":{"name":"relay"},"spec":{"protocol":"socks5","address":"127.0.0.1","port":1080}}"#).unwrap();
+        std::fs::write(root.0.join("proxy.JSON"),r#"{"apiVersion":"pathchord.io/v1","kind":"TransitProxy","metadata":{"name":"relay"},"spec":{"protocol":"socks5","host":"127.0.0.1","port":1080}}"#).unwrap();
         let reloader = ConfigHotReloader::bind(root.0.clone(), 1).await.unwrap();
         let snapshot = reloader.handle().snapshot().unwrap();
         assert_eq!(

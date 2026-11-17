@@ -154,6 +154,8 @@ Unix socket 的所有权/权限和 Windows Named Pipe ACL 保护本地管理接�
 所在机器。Windows 对应控制端点使用 Named Pipe 名称。Web Gateway 通过 `--web-bind` 显式
 启用，并共用本地 dispatcher；配置的 `--web-token-file` 提供 bearer token。Prometheus 在
 `/metrics` 抓取，使用相同的认证、Origin 检查和 `metrics:read` 能力。
+Path pool gauge 汇总 live Session 的请求/有效空闲基线、当前需求目标和基线缺口。具体字段和
+指标语义见[可观测性契约](../../openspec/specs/observability/spec.zh-CN.md)。
 
 每个服务接受 Ctrl-C 关停，在 Unix 上也接受 SIGTERM，并拥有任务和连接清理责任。持久配置变更遵循重载契约；身份、
 监听器拓扑和其他只在启动时加载的设置，在重载响应明确要求时需要重启服务。

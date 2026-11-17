@@ -873,13 +873,13 @@ fn egress_is_usable(
     status: &EgressRuntimeStatus,
     protocol: FlowProtocol,
 ) -> bool {
-    let min_paths = egress.status_requirements.min_usable_paths;
+    let min_paths = egress.path_pool.min_usable_paths;
     status.state.admits_new_work()
         && status.usable_paths >= min_paths
         && egress_supports(&egress.capabilities, protocol)
         && egress
-            .status_requirements
-            .capabilities
+            .admission
+            .required_capabilities
             .iter()
             .all(|capability| egress_supports(&egress.capabilities, *capability))
 }
@@ -1076,9 +1076,12 @@ mod tests {
                 .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
                 .collect(),
             capabilities: Capabilities { tcp, udp },
-            status_requirements: crate::EgressStatusRequirements {
+            path_pool: crate::EgressPathPoolConfig {
                 min_usable_paths: 1,
-                capabilities: BTreeSet::new(),
+                target_usable_paths: None,
+            },
+            admission: crate::EgressAdmission {
+                required_capabilities: BTreeSet::new(),
             },
             transit: crate::EgressTransitBinding::default(),
             traffic_policy: None,
@@ -1351,7 +1354,7 @@ apiVersion: pathchord.io/v1
 kind: Egress
 metadata: {name: edge}
 spec:
-  address: edge.example.test
+  host: edge.example.test
   port: 443
   publicKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
   capabilities: {tcp: true, udp: true}

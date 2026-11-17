@@ -21,7 +21,7 @@ use pathchord_egress::{
     TcpTargetConnector,
 };
 use pathchord_noise::StaticKeypair;
-use pathchord_policy::EgressServiceSpec;
+use pathchord_policy::{EgressServiceSpec, EgressWebSettings};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use zeroize::{Zeroize, Zeroizing};
@@ -410,24 +410,32 @@ fn merge(
             .traffic_multiplier_basis_points
             .or(spec.traffic_multiplier_basis_points)
             .unwrap_or(10_000),
-        web_bind: args.web_bind.or(spec.web_bind),
+        web_bind: args
+            .web_bind
+            .or_else(|| spec.web.as_ref().and_then(|web| web.bind)),
         web_token_file: args.web_token_file.or_else(|| {
-            spec.web_token_file.as_ref().map(|value| {
-                if value.is_absolute() {
-                    value.clone()
-                } else {
-                    base.join(value)
-                }
-            })
+            spec.web
+                .as_ref()
+                .and_then(|web| web.token_file.as_ref())
+                .map(|value| {
+                    if value.is_absolute() {
+                        value.clone()
+                    } else {
+                        base.join(value)
+                    }
+                })
         }),
         web_origins: if args.web_origins.is_empty() {
-            spec.web_origins.iter().cloned().collect()
+            spec.web
+                .as_ref()
+                .map(|web| web.allowed_origins.iter().cloned().collect())
+                .unwrap_or_default()
         } else {
             args.web_origins
         },
         web_protected_transport: args
             .web_protected_transport
-            .or(spec.web_protected_transport)
+            .or_else(|| spec.web.as_ref().and_then(|web| web.protected_transport))
             .unwrap_or(false),
     };
     validate(resolved)
@@ -443,6 +451,12 @@ fn validate(config: EgressConfiguration) -> Result<EgressConfiguration, ServiceE
         max_wire_bandwidth_bps: Some(config.max_wire_bandwidth_bps),
         max_inbound_target_connections: Some(config.max_inbound_target_connections),
         traffic_multiplier_basis_points: Some(config.traffic_multiplier_basis_points),
+        web: Some(EgressWebSettings {
+            bind: config.web_bind,
+            token_file: config.web_token_file.clone(),
+            allowed_origins: config.web_origins.iter().cloned().collect(),
+            protected_transport: Some(config.web_protected_transport),
+        }),
         ..EgressServiceSpec::default()
     }
     .validate()

@@ -17,6 +17,36 @@ Transit adapters and subscription processing SHALL conform to the complete detai
 - **WHEN** a `socks4` or `socks4a` outbound node is imported
 - **THEN** it remains unavailable with a typed diagnostic even though local listeners support those protocols.
 
+#### Scenario: Canonical native option names are authored
+
+- **WHEN** a native TransitProxy uses `hosts`, `maxEarlyDataBytes`, `certificates`, `clientCertificates`, `clientHelloFingerprint`, or `udpOverTcpVersion` in its documented option object
+- **THEN** parsing retains each field's documented type, value, and list order and passes it to the selected adapter without changing its connection semantics
+
+#### Scenario: A retired native option name is authored
+
+- **WHEN** a native TransitProxy uses any retired option path in the migration table, including an empty or default-valued field
+- **THEN** complete-bundle validation rejects the candidate with a bounded `CONFIG_RETIRED_FIELD` diagnostic identifying the resource, exact authored field path, and canonical replacement without exposing values
+
+#### Scenario: Retired and canonical native names are combined
+
+- **WHEN** one native TransitProxy contains both a retired option name and its canonical replacement
+- **THEN** validation rejects the complete candidate instead of merging the values, choosing a winner, or treating the retired name as an alias
+
+#### Scenario: Certificate pins and ClientHello profiles are configured together
+
+- **WHEN** native TLS configuration contains `certificateSha256` and `clientHelloFingerprint`
+- **THEN** the certificate pin remains mandatory and the ClientHello profile independently selects the supported impersonation behavior
+
+#### Scenario: A supported foreign node uses its original option names
+
+- **WHEN** a Clash, sing-box, or share-link node supplies supported foreign TLS, HTTP Host, early-data, or UDP-over-TCP parameters using that source's documented spelling
+- **THEN** import accepts and normalizes those fields into the canonical native model without requiring the foreign document to adopt native field names
+
+#### Scenario: Foreign or private data contains a matching field name
+
+- **WHEN** an HTTP header, private credential field, or retained complete foreign document contains a name matching a retired native option field
+- **THEN** native-key validation does not rewrite or reject that data solely because its name matches a retired native field
+
 ### Requirement: Bounded smux sessions
 
 smux sessions SHALL enforce the detailed per-session and per-stream resource
@@ -88,6 +118,31 @@ Subscription processing SHALL normalize only supported node definitions, preserv
 
 - **WHEN** the subscription's source type, URL, credential reference or effective User-Agent changes
 - **THEN** nodes belonging to the previous source enter draining and cannot be selected for new flows.
+
+#### Scenario: Canonical native options survive a source-bound cache roundtrip
+
+- **WHEN** a verified source-bound cache is written and loaded with canonical native options
+- **THEN** option values, credentials, diagnostics, source identity, and fresh adapter-preparation requirements are preserved
+
+#### Scenario: A cache uses an incompatible normalized option schema
+
+- **WHEN** a cache has an older normalized-option schema version or contains retired normalized native option fields
+- **THEN** cache loading returns a bounded sanitized `cache_incompatible` diagnostic, publishes no nodes from that cache, and allows only bounded authenticated refresh under the current configured source
+
+#### Scenario: An incompatible cache is found while valid nodes are active
+
+- **WHEN** an incompatible cache is encountered and an independently valid active snapshot still satisfies the current source and lifecycle decisions
+- **THEN** that active snapshot may remain available during bounded refresh, without treating the incompatible cache as validation or reviving retired nodes
+
+#### Scenario: A cold start has an incompatible cache and no source connection
+
+- **WHEN** no independently valid active snapshot exists, the cache is incompatible, and the configured source cannot be refreshed
+- **THEN** no nodes are published from that cache and the subscription remains unavailable with typed cache and refresh diagnostics
+
+#### Scenario: A cache conflicts with subscription lifecycle decisions
+
+- **WHEN** a subscription is disabled, deleted, source-replaced, or subject to a persisted node tombstone before cache loading or refresh publication completes
+- **THEN** the current lifecycle decision suppresses the affected publication and no incompatible cache, stale refresh, or retained snapshot resurrects the retired node
 
 ### Requirement: Node probe revocation follows source visibility
 
@@ -223,19 +278,19 @@ REALITY without Vision. `packetaddr` with either Vision flow is rejected during
 adapter preparation. Explicit packet encoding is also incompatible with
 multiplex; supported multiplex uses its own datagram framing.
 
-For REALITY, `fingerprint: chrome` selects the dae 2.1.2 Chrome 133 profile.
+For REALITY, `clientHelloFingerprint: chrome` selects the dae 2.1.2 Chrome 133 profile.
 It initially attempts the classic X25519 form, remembers a successful form,
 and retries the other form only after a complete TLS handshake authenticates a trusted decoy certificate. It
 never sends VLESS data to the decoy. TLS 1.2, HelloRetryRequest, resumption,
 real ECH and a server ALPS response are unavailable in this profile.
-`fingerprint: ios`, `safari`, `edge` and `qq` select dae's iOS 14, Safari 16,
+`clientHelloFingerprint: ios`, `safari`, `edge` and `qq` select dae's iOS 14, Safari 16,
 Edge 85 and QQ 11.1 profiles respectively, using their original X25519 key
-share. `fingerprint: firefox` selects dae's Firefox 120 profile with separate
+share. `clientHelloFingerprint: firefox` selects dae's Firefox 120 profile with separate
 X25519 and P-256 key shares. The peer's `record_size_limit` constrains outgoing
 TLS records independently of the client's advertised receive limit, without
 increasing a stricter local limit. A QQ server ALPS response is rejected
 explicitly. Ordinary TLS also supports these profiles with the configured
-certificate checks. `fingerprint: android` selects dae/uTLS Android 11 OkHttp
+certificate checks. `clientHelloFingerprint: android` selects dae/uTLS Android 11 OkHttp
 for ordinary TLS 1.2 without ALPN; REALITY, Vision and transports requiring
 ALPN are unavailable with this profile. The 360 profile is unavailable because
 its advertised cipher suites have no supported implementation in this TLS
@@ -304,11 +359,11 @@ are retained as unavailable-node diagnostics rather than silently ignored.
 
 | Field | Default and meaning |
 | --- | --- |
-| `tls` | absent; TLS object with `enabled`, `serverName`, `insecure`, ordered `truststore`, `alpn`, `certificate`, `certificateSha256`, `clientCertificate`, `clientKeyField`, `fingerprint`, `reality` |
-| `transport` | absent; object with `type`, `path`, `host`, `headers`, `serviceName`, `maxEarlyData`, `earlyDataHeaderName` |
+| `tls` | absent; TLS object with `enabled`, `serverName`, `insecure`, ordered `truststore`, `alpn`, `certificates`, `certificateSha256`, `clientCertificates`, `clientKeyField`, `clientHelloFingerprint`, `reality` |
+| `transport` | absent; object with `type`, `path`, `hosts`, `headers`, `serviceName`, `maxEarlyDataBytes`, `earlyDataHeaderName` |
 | `headers` | `{}`; non-secret HTTP CONNECT headers |
 | `udp` | absent; use adapter capability; `false` disables ordinary UDP forwarding |
-| `udpOverTcp` | absent; SOCKS5 or Shadowsocks UDP-over-TCP version `1` or `2`; incompatible with `udp: false` |
+| `udpOverTcpVersion` | absent; SOCKS5 or Shadowsocks UDP-over-TCP version `1` or `2`; incompatible with `udp: false` |
 | `vmess` | absent; `globalPadding` and `authenticatedLength` booleans, both default `false` |
 | `multiplex` | absent; object with `enabled`, `protocol`, `maxConnections`, `minStreams`, `maxStreams`, `padding` |
 | `tcpFastOpen` | absent; optional boolean |
@@ -316,8 +371,32 @@ are retained as unavailable-node diagnostics rather than silently ignored.
 | `routingMark` | absent; optional unsigned 32-bit routing mark |
 | `packetEncoding` | absent; `xudp` or `packetaddr` |
 
+These PathChord-owned native option names are canonical and have no aliases.
+The selected adapter MUST reject unsupported combinations or cardinality
+rather than discard fields. Retired names MUST fail with bounded
+`CONFIG_RETIRED_FIELD` diagnostics naming the field and replacement; unknown
+fields remain invalid, and key names are not recursively rewritten.
+
+| Retired native field | Canonical field |
+| --- | --- |
+| `transport.host` | `transport.hosts` |
+| `transport.maxEarlyData` | `transport.maxEarlyDataBytes` |
+| `tls.certificate` | `tls.certificates` |
+| `tls.clientCertificate` | `tls.clientCertificates` |
+| `tls.fingerprint` | `tls.clientHelloFingerprint` |
+| `udpOverTcp` | `udpOverTcpVersion` |
+
+`hosts` is an ordered list of up to 16 nonempty HTTP Host overrides, each at
+most 255 bytes; an adapter may support fewer entries and rejects unsupported
+cardinality. `certificates` and `clientCertificates` are each ordered lists
+of up to 16 inline PEM values, each at most 65,536 bytes. The former adds
+trust anchors; the latter forms the client-authentication chain.
+`maxEarlyDataBytes` is an integer byte limit in `0..=65536`.
+`udpOverTcpVersion` is an optional integer version `1` or `2`, not an
+enable flag.
+
 TLS booleans default to `false`; the truststore defaults to `["system"]` and
-certificate/ALPN lists default to empty. Each truststore source is `system` or
+`certificates`, `clientCertificates`, and `alpn` default to empty lists. Each truststore source is `system` or
 a local PEM/DER file. Relative paths resolve from the selected configuration
 source, absolute paths are allowed, symlink targets must be regular files, and
 an empty list means no trust anchors. Any invalid, oversized, or malformed
@@ -326,14 +405,16 @@ bypass and MUST be explicit.
 `https` implies enabled TLS. A Clash HTTP node with `tls: true` normalizes to
 HTTPS CONNECT. `serverName` overrides certificate/SNI identity independently
 of the connection address. Native HTTPS CONNECT permits HTTP/1.1 ALPN.
-Certificate values are inline PEM; client private keys are resolved only from
-the opaque credential document field named by `clientKeyField`. TLS settings
+`certificates` contains inline PEM trust anchors added to the configured
+truststore; `clientCertificates` contains the inline client-authentication
+chain. Client private keys are resolved only from the opaque credential
+document field named by `clientKeyField`. TLS settings
 with disabled TLS are invalid unless the object is entirely default-valued.
 `certificateSha256` is the hexadecimal SHA-256 of a DER certificate; a leaf
 match authenticates the leaf, and a matched intermediate anchors normal chain,
 name and time validation. The pin remains mandatory when `insecure: true`.
-Reality uses `publicKey` and `shortId`; a fingerprint requires an adapter
-that implements the requested ClientHello profile. `insecure` is an explicit certificate-verification option,
+Reality uses `publicKey` and `shortId`; `clientHelloFingerprint` requires an
+adapter that implements the requested ClientHello profile. `insecure` is an explicit certificate-verification option,
 never a fallback after validation failure.
 
 Transport `type` is `tcp`, `ws`, `grpc`, `http`, `httpupgrade`, `quic`, `meek`,
@@ -343,7 +424,7 @@ path, at most one Host and validated headers for VLESS, VMess and Trojan. It
 uses HTTP/1.1 PUT without TLS and HTTP/2 PUT with TLS and `h2` ALPN; the peer
 response must have status 200. The default path is `/`; without a configured
 Host, plaintext uses the endpoint host and TLS uses `www.example.com`.
-Conflicting Host values, multiple hosts, service-name or early-data options,
+Conflicting Host values, multiple host overrides, service-name or early-data options,
 and framing-controlled headers are rejected. Trojan still requires TLS.
 The V2Ray `quic` transport requires TLS for VLESS, VMess and Trojan; it uses
 `h3` ALPN when no ALPN is configured and preserves explicit ALPN values. It
@@ -355,7 +436,7 @@ header transport options are rejected. Meek's local write shutdown does not
 signal an end-of-stream to the remote endpoint.
 HTTPUpgrade supports its path, Host and validated headers over TCP or TLS.
 WebSocket early data sends up to
-`maxEarlyData` bytes from the first write as unpadded Base64URL in the path or
+`maxEarlyDataBytes` bytes from the first write as unpadded Base64URL in the path or
 the specified `earlyDataHeaderName`, with remaining bytes sent in binary frames.
 Path early data with an unrelated query is unavailable. WebSocket Host
 overrides map to the transport's `Host` header. Conflicting aliases or Host
@@ -431,6 +512,16 @@ performs final protocol validation.
 Conflicting aliases are invalid. Further protocol fields remain unavailable
 until the corresponding native adapter supports them.
 
+Foreign document syntax and private credential JSON retain their source
+spellings. Supported Clash `client-fingerprint` and sing-box
+`tls.utls.fingerprint` normalize to native `tls.clientHelloFingerprint`;
+Clash certificate `fingerprint` normalizes to the distinct
+`tls.certificateSha256`. Foreign Host, early-data and UDP-over-TCP keys
+continue to normalize through their source adapters. Native-key validation
+MUST NOT rewrite HTTP header names, protocol identifiers, private credential
+fields, or complete imported documents merely because a key matches a retired
+native path.
+
 Representable sing-box proxy nodes are normalized to native options and
 credentials. A node with unrepresentable fields retains its complete private
 `sing_box_outbound` document and remains unavailable with a diagnostic;
@@ -488,6 +579,24 @@ The root request and all referenced HTTP providers use the same effective
 User-Agent, defaulting to `clash.meta` when none is configured. A cache from a
 previous version that did not bind a User-Agent cannot establish that source
 identity and MUST NOT publish.
+
+Source-bound normalized-node caches use envelope version `3` and the
+canonical native option names. A version-2 normalized cache or a cache
+containing any retired native option path is incompatible: it MUST return a
+bounded sanitized `cache_incompatible` diagnostic and publish no nodes from
+that cache. A loader MUST NOT install native aliases, discard fields,
+substitute defaults, partially decode nodes, or guess private credential
+content to keep an incompatible cache usable. Version-1 caches remain
+unverified and MUST NOT publish.
+
+When an incompatible cache is rejected, an independently valid active
+snapshot for the current source and lifecycle may remain available while the
+configured source undergoes its existing bounded authenticated refresh. On a
+cold offline start with no such snapshot, the subscription remains
+unavailable. Refresh MUST preserve credential-origin and fetch-budget
+boundaries and pass normal normalization, validation and adapter preparation
+before publication. Disabled, deleted, source-replaced and tombstoned nodes
+MUST NOT be revived by cache load, retained snapshots or stale refresh work.
 
 ### HTTP provider expansion
 

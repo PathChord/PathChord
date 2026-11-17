@@ -52,6 +52,32 @@ residual optional replication, resource-limit errors, passive capacity
 confidence, truststore source validation, and local-control stage deadlines
 are present in the local implementation.
 
+The [configuration and Path-target change](changes/unify-configuration-and-add-path-targets/)
+is implemented in this worktree. Ingress Egress resources now place the
+count-based admission minimum in `pathPool.minUsablePaths`, keep common Egress
+capability requirements in `admission.requiredCapabilities`, and optionally
+set `pathPool.targetUsablePaths`. An omitted target resolves to minimum plus
+one; an explicit target is used as written. Ingress keeps the bounded baseline
+warm without business connections, permits capacity demand to expand above it,
+and slowly drains surplus back toward the baseline. A shortfall above the
+admission minimum is visible without changing admission or service state.
+
+The public resource API remains `pathchord.io/v1` with an intentional native
+configuration break: retired endpoint, Path-pool, EgressService Web, and
+Transit option keys fail with `CONFIG_RETIRED_FIELD` and a canonical replacement
+path. Native endpoints use `host`; EgressService Web options are grouped under
+`web`; Transit option lists, byte limits, UDP-over-TCP versions, and ClientHello
+profiles use explicit canonical names. Foreign subscription syntax and private
+credential JSON remain unchanged. Normalized Transit caches use version 3;
+older or retired-option caches are rejected before node publication and
+refreshed under the configured subscription source and its existing budgets.
+
+Authorized Session queries, events, snapshots, and aggregate Prometheus gauges
+distinguish requested/effective baselines, the current demand target, usable
+Paths, and baseline shortfall with a bounded reason. English and Chinese main
+specifications and user guides have been reconciled with the active change;
+the planning artifacts remain available until the change is archived.
+
 The evidence below remains local Linux build/test evidence unless a section
 explicitly names a native host, external peer, cross-machine run, or soak.
 
@@ -549,13 +575,25 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Validation evidence
 
-The current Linux workspace run on 2026-11-17 passed 1,084 tests with 118
-external or environment-specific tests ignored. `cargo fmt --check`, strict
-workspace Clippy, strict OpenSpec validation, release role-artifact checks, and
-the role-binary TCP/UDP smoke all passed. The current-head GitHub CI run also
-passed the dependency-advisory and external-core jobs. The local Docker
-monitoring deployment is recorded separately below. Native Windows, FreeBSD,
-privileged Linux, and production monitoring/probe calibration remain pending.
+The current Linux workspace run on 2026-11-17 passed 1,097 tests with 118
+external or environment-specific tests ignored. `cargo fmt --all -- --check`,
+`cargo clippy --locked --workspace --all-targets -- -D warnings`,
+`cargo build --locked --workspace --bins`, the role-binary TCP/UDP smoke, all
+main-spec strict validation (11/11), and strict validation of the active
+configuration/path-target change passed. Clippy reports the existing unused
+`netsock` manifest dependency warning.
+
+`openspec validate --all --strict --no-interactive` currently reports four
+older completed but unarchived changes whose MODIFIED deltas predate scenarios
+now merged into the main specs by the active change:
+`finalize-v1-session-resource-contracts`,
+`simplify-egress-path-selection`, `support-egress-multiple-endpoints`, and
+`support-sing-box-dae-transit-protocols`. Those deltas are outside this change;
+the current change itself and all canonical main specs validate. The current-head
+GitHub CI run also passed the dependency-advisory and external-core jobs. The
+local Docker monitoring deployment is recorded separately below. Native
+Windows, FreeBSD, privileged Linux, and production monitoring/probe calibration
+remain pending.
 
 The [specification-alignment repair](changes/fix-spec-alignment-findings/) adds
 regressions for connection churn beyond 16,384 completions, shared admission

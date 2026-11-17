@@ -872,6 +872,7 @@ impl LocalControlDispatcher {
                         "path": cache.path,
                         "max_age_seconds": cache.max_age_seconds,
                     })),
+                    "cache_metadata": subscription.cache_metadata,
                     "enabled": subscription.spec.enabled,
                     "revision": subscription.revision,
                     "state": subscription_state_name(subscription),
@@ -1094,6 +1095,22 @@ impl LocalControlDispatcher {
         );
         let path_reordering_events =
             sum_observed(snapshot.paths.values().map(|path| path.reordering_events));
+        let path_planning_totals =
+            snapshot
+                .sessions
+                .values()
+                .fold((0_u64, 0_u64, 0_u64, 0_u64), |totals, session| {
+                    (
+                        totals
+                            .0
+                            .saturating_add(session.requested_target_usable_paths),
+                        totals
+                            .1
+                            .saturating_add(session.effective_target_usable_paths as u64),
+                        totals.2.saturating_add(session.target_path_count as u64),
+                        totals.3.saturating_add(session.target_shortfall),
+                    )
+                });
         let stream_bytes_sent: u64 = snapshot
             .streams
             .values()
@@ -1277,6 +1294,12 @@ impl LocalControlDispatcher {
                     "active": measured.then_some(snapshot.runtime.sessions),
                     "degraded": measured.then(|| session_count(pathchord_core::SessionState::Degraded)),
                     "draining": measured.then(|| session_count(pathchord_core::SessionState::Draining)),
+                },
+                "path_planning": {
+                    "requested_target_usable_paths": measured.then_some(path_planning_totals.0),
+                    "effective_target_usable_paths": measured.then_some(path_planning_totals.1),
+                    "target_paths": measured.then_some(path_planning_totals.2),
+                    "target_shortfall": measured.then_some(path_planning_totals.3),
                 },
                 "paths": {
                     "ready": measured.then_some(snapshot.runtime.ready_paths),
@@ -1931,7 +1954,11 @@ fn session_value(
         "ready_path_count": session.ready_paths,
         "usable_path_count": session.usable_paths,
         "minimum_usable_paths": session.minimum_usable_paths,
+        "requested_target_usable_paths": session.requested_target_usable_paths,
+        "effective_target_usable_paths": session.effective_target_usable_paths,
         "target_path_count": session.target_path_count,
+        "target_shortfall": session.target_shortfall,
+        "target_shortfall_reason": session.target_shortfall_reason,
         "eligible_transit_count": session.eligible_transit_count,
         "traffic_policy_id": session.traffic_policy_id,
         "traffic_policy_generation": session.traffic_policy_generation,
@@ -2790,7 +2817,11 @@ mod tests {
                     bytes_sent: 4,
                     bytes_received: 5,
                     minimum_usable_paths: 1,
+                    requested_target_usable_paths: 1,
+                    effective_target_usable_paths: 1,
                     target_path_count: 1,
+                    target_shortfall: 0,
+                    target_shortfall_reason: None,
                     usable_paths: 1,
                     eligible_transit_count: 0,
                     traffic_policy_id: None,
@@ -2831,6 +2862,17 @@ mod tests {
                 }],
             )
             .unwrap();
+        let metrics =
+            dispatcher.dispatch(request("metrics.snapshot", &["metrics:read"], json!({})));
+        assert_eq!(
+            metrics.result.unwrap()["path_planning"],
+            json!({
+                "requested_target_usable_paths": 1,
+                "effective_target_usable_paths": 1,
+                "target_paths": 1,
+                "target_shortfall": 0,
+            })
+        );
         let paths = dispatcher.dispatch(request("metrics.paths", &["metrics:read"], json!({})));
         let path = &paths.result.expect("path metrics")["items"][0];
         assert_eq!(path["rtt_ms"], 12);
@@ -3212,7 +3254,11 @@ mod tests {
                     bytes_sent: 0,
                     bytes_received: 0,
                     minimum_usable_paths: 1,
+                    requested_target_usable_paths: 1,
+                    effective_target_usable_paths: 1,
                     target_path_count: 1,
+                    target_shortfall: 0,
+                    target_shortfall_reason: None,
                     usable_paths: 1,
                     eligible_transit_count: 0,
                     traffic_policy_id: None,
@@ -3239,6 +3285,11 @@ mod tests {
             .clone();
         assert_eq!(event["generation"]["scope"], "observation");
         assert_eq!(event["payload"]["egress_id"], "egress-a");
+        assert_eq!(event["payload"]["requested_target_usable_paths"], 1);
+        assert_eq!(event["payload"]["effective_target_usable_paths"], 1);
+        assert_eq!(event["payload"]["target_path_count"], 1);
+        assert_eq!(event["payload"]["target_shortfall"], 0);
+        assert!(event["payload"]["target_shortfall_reason"].is_null());
         let second = dispatcher.dispatch(request("events.subscribe", &["metrics:read"], json!({})));
         let replay = second.result.unwrap()["items"]
             .as_array()
@@ -3248,6 +3299,32 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(event["emitted_at"], replay["emitted_at"]);
+        let mut target_changed =
+            dispatcher.service().observation_snapshot().sessions[&session_id].clone();
+        target_changed.requested_target_usable_paths = 3;
+        target_changed.effective_target_usable_paths = 3;
+        target_changed.target_path_count = 2;
+        target_changed.target_shortfall = 2;
+        target_changed.target_shortfall_reason = Some("recovering".into());
+        dispatcher
+            .service()
+            .observation_handle()
+            .replace_session_observations([target_changed], [])
+            .unwrap();
+        let changed =
+            dispatcher.dispatch(request("events.subscribe", &["metrics:read"], json!({})));
+        let changed_response = changed.result.unwrap();
+        let changed = changed_response["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| {
+                event["type"] == "session.changed" && event["payload"]["target_path_count"] == 2
+            })
+            .unwrap();
+        assert_eq!(changed["payload"]["target_path_count"], 2);
+        assert_eq!(changed["payload"]["target_shortfall"], 2);
+        assert_eq!(changed["payload"]["target_shortfall_reason"], "recovering");
     }
 
     #[test]

@@ -15,8 +15,8 @@ use pathchord_ingress::{
 };
 use pathchord_noise::generate_static_keypair;
 use pathchord_policy::{
-    Capabilities, EgressConfig, EgressId, EgressRule, EgressSelection, EgressStatusRequirements,
-    Endpoint, FallbackAction, FlowMatch, FlowProtocol, Generation, PolicyConfig,
+    Capabilities, EgressAdmission, EgressConfig, EgressId, EgressPathPoolConfig, EgressRule,
+    EgressSelection, Endpoint, FallbackAction, FlowMatch, FlowProtocol, Generation, PolicyConfig,
     RetransmissionReplication, RuleId, Scheduler, Selector, TargetHost, TrafficPolicy,
     TrafficPolicyId, TransitProxyConfig, TransitProxyId, TransitRule, ValidatedPolicySnapshot,
 };
@@ -385,7 +385,7 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
     );
     let mut base_config = base_policy.config().clone();
     base_config.egresses[0].capabilities.udp = true;
-    base_config.egresses[0].status_requirements.min_usable_paths = 3;
+    base_config.egresses[0].path_pool.min_usable_paths = 3;
     base_config.egresses[0].endpoints.push(Endpoint {
         host: "localhost".into(),
         port: egress_address.port(),
@@ -426,6 +426,12 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
         .into_iter()
         .next()
         .expect("Egress session snapshot");
+    assert_eq!(session_snapshot.minimum_usable_paths, 3);
+    assert_eq!(session_snapshot.requested_target_usable_paths, 4);
+    assert_eq!(session_snapshot.effective_target_usable_paths, 4);
+    assert_eq!(session_snapshot.target_path_count, 4);
+    assert_eq!(session_snapshot.target_shortfall, 0);
+    assert_eq!(session_snapshot.target_shortfall_reason, None);
     assert!(session_snapshot.endpoint_states[0].failures >= 1);
     assert_eq!(session_snapshot.endpoint_states[1].state, "available");
     assert!(
@@ -627,9 +633,9 @@ fn policy_with_endpoints(
                     tcp: true,
                     udp: false,
                 },
-                status_requirements: EgressStatusRequirements {
-                    min_usable_paths: 1,
-                    capabilities: BTreeSet::from([FlowProtocol::Tcp]),
+                path_pool: EgressPathPoolConfig::default(),
+                admission: EgressAdmission {
+                    required_capabilities: BTreeSet::from([FlowProtocol::Tcp]),
                 },
                 transit: pathchord_policy::EgressTransitBinding::default(),
                 traffic_policy: Some(traffic_policy_id.clone()),

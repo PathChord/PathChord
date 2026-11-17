@@ -25,11 +25,18 @@ pub struct EgressServiceSpec {
     pub remote_dns_only: Option<bool>,
     pub quota_remaining: Option<u64>,
     pub traffic_multiplier_basis_points: Option<u32>,
-    pub web_bind: Option<SocketAddr>,
-    pub web_token_file: Option<PathBuf>,
     #[serde(default)]
-    pub web_origins: BTreeSet<String>,
-    pub web_protected_transport: Option<bool>,
+    pub web: Option<EgressWebSettings>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EgressWebSettings {
+    pub bind: Option<SocketAddr>,
+    pub token_file: Option<PathBuf>,
+    #[serde(default)]
+    pub allowed_origins: BTreeSet<String>,
+    pub protected_transport: Option<bool>,
 }
 
 impl EgressServiceSpec {
@@ -59,7 +66,7 @@ impl EgressServiceSpec {
                 self.identity.as_ref(),
                 self.authorization_db.as_ref(),
                 self.control_socket.as_ref(),
-                self.web_token_file.as_ref(),
+                self.web.as_ref().and_then(|web| web.token_file.as_ref()),
             ]
             .into_iter()
             .flatten()
@@ -73,7 +80,10 @@ impl EgressServiceSpec {
             || self
                 .max_inbound_target_connections
                 .is_some_and(|value| value > 1_000_000)
-            || self.web_origins.len() > 256
+            || self
+                .web
+                .as_ref()
+                .is_some_and(|web| web.allowed_origins.len() > 256)
         {
             return Err("EgressService capacity or concurrency settings are invalid");
         }
@@ -133,6 +143,26 @@ impl NodeProbePolicySpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deserializes_nested_web_gateway_settings() {
+        let spec: EgressServiceSpec = serde_yaml::from_str(
+            "web:\n  bind: 127.0.0.1:9090\n  tokenFile: tokens/admin.token\n  allowedOrigins: [https://admin.example]\n  protectedTransport: true\n",
+        )
+        .unwrap();
+        let web = spec.web.unwrap();
+        assert_eq!(web.bind.unwrap().port(), 9090);
+        assert_eq!(web.token_file, Some(PathBuf::from("tokens/admin.token")));
+        assert_eq!(
+            web.allowed_origins,
+            BTreeSet::from([String::from("https://admin.example")])
+        );
+        assert_eq!(web.protected_transport, Some(true));
+
+        let retired: Result<EgressServiceSpec, _> =
+            serde_yaml::from_str("webBind: 127.0.0.1:9090\n");
+        assert!(retired.is_err());
+    }
 
     #[test]
     fn accepts_multiple_ipv4_and_ipv6_binds() {

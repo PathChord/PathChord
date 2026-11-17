@@ -18,6 +18,26 @@ pub(crate) fn prometheus(snapshot: &Value) -> String {
             "/runtime/ready_paths",
         ),
         (
+            "pathchord_session_requested_target_usable_paths",
+            "Sum of requested usable-Path baselines across live Sessions.",
+            "/path_planning/requested_target_usable_paths",
+        ),
+        (
+            "pathchord_session_effective_target_usable_paths",
+            "Sum of runtime-bounded usable-Path baselines across live Sessions.",
+            "/path_planning/effective_target_usable_paths",
+        ),
+        (
+            "pathchord_session_target_paths",
+            "Sum of current demand-derived Path targets across live Sessions.",
+            "/path_planning/target_paths",
+        ),
+        (
+            "pathchord_session_target_shortfall",
+            "Sum of requested-baseline shortfalls across live Sessions.",
+            "/path_planning/target_shortfall",
+        ),
+        (
             "pathchord_active_streams",
             "Current active Streams.",
             "/runtime/streams",
@@ -163,6 +183,7 @@ mod tests {
     fn exports_gauges_without_turning_targets_or_admin_tags_into_labels() {
         let result = super::prometheus(&serde_json::json!({
             "runtime": {"sessions": 3, "ready_paths": 2, "streams": 7, "target_connections": 8},
+            "path_planning": {"requested_target_usable_paths": 9, "effective_target_usable_paths": 8, "target_paths": 10, "target_shortfall": 3},
             "egress": {"configured_capacity_bps": 1000, "effective_capacity_bps": 800, "current_wire_rate_bps": 500, "replication_allowance_bps": 100, "admission_denied": 1, "stale_reports": 0},
             "nodes": 4, "observed_connections": 8, "generation": 42,
             "observed_paths": 2, "streams_observed": 3,
@@ -175,6 +196,10 @@ mod tests {
             result.contains("# TYPE pathchord_active_streams gauge\npathchord_active_streams 7\n")
         );
         assert!(result.contains("pathchord_observation_generation 42\n"));
+        assert!(result.contains("pathchord_session_requested_target_usable_paths 9\n"));
+        assert!(result.contains("pathchord_session_effective_target_usable_paths 8\n"));
+        assert!(result.contains("pathchord_session_target_paths 10\n"));
+        assert!(result.contains("pathchord_session_target_shortfall 3\n"));
         assert!(result.contains("pathchord_nodes_up 2\n"));
         assert!(result.contains("pathchord_stream_bytes_sent 10\n"));
         assert!(result.contains("pathchord_path_capacity_bps_sum 2000\n"));

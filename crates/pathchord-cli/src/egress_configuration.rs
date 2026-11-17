@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use pathchord_policy::EgressServiceSpec;
+use pathchord_policy::{EgressServiceSpec, EgressWebSettings};
 
 use crate::configuration::ConfigSelection;
 use crate::{
@@ -143,24 +143,32 @@ fn merge(
             .traffic_multiplier_basis_points
             .or(spec.traffic_multiplier_basis_points)
             .unwrap_or(10_000),
-        web_bind: args.web_bind.or(spec.web_bind),
+        web_bind: args
+            .web_bind
+            .or_else(|| spec.web.as_ref().and_then(|web| web.bind)),
         web_token_file: args.web_token_file.or_else(|| {
-            spec.web_token_file.as_ref().map(|value| {
-                if value.is_absolute() {
-                    value.clone()
-                } else {
-                    base.join(value)
-                }
-            })
+            spec.web
+                .as_ref()
+                .and_then(|web| web.token_file.as_ref())
+                .map(|value| {
+                    if value.is_absolute() {
+                        value.clone()
+                    } else {
+                        base.join(value)
+                    }
+                })
         }),
         web_origins: if args.web_origins.is_empty() {
-            spec.web_origins.iter().cloned().collect()
+            spec.web
+                .as_ref()
+                .map(|web| web.allowed_origins.iter().cloned().collect())
+                .unwrap_or_default()
         } else {
             args.web_origins
         },
         web_protected_transport: args
             .web_protected_transport
-            .or(spec.web_protected_transport)
+            .or_else(|| spec.web.as_ref().and_then(|web| web.protected_transport))
             .unwrap_or(false),
     };
     EgressServiceSpec {
@@ -172,6 +180,12 @@ fn merge(
         max_wire_bandwidth_bps: Some(resolved.max_wire_bandwidth_bps),
         max_inbound_target_connections: Some(resolved.max_inbound_target_connections),
         traffic_multiplier_basis_points: Some(resolved.traffic_multiplier_basis_points),
+        web: Some(EgressWebSettings {
+            bind: resolved.web_bind,
+            token_file: resolved.web_token_file.clone(),
+            allowed_origins: resolved.web_origins.iter().cloned().collect(),
+            protected_transport: Some(resolved.web_protected_transport),
+        }),
         ..EgressServiceSpec::default()
     }
     .validate()
@@ -208,7 +222,10 @@ mod tests {
             identity: Some("identity.json".into()),
             authorization_db: Some("auth.db".into()),
             remote_dns_only: Some(true),
-            web_protected_transport: Some(true),
+            web: Some(EgressWebSettings {
+                protected_transport: Some(true),
+                ..EgressWebSettings::default()
+            }),
             ..Default::default()
         };
         let base = std::env::temp_dir().join("pathchord-config");

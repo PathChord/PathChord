@@ -43,11 +43,27 @@ Mutations SHALL require an expected generation in their owning scope or an expli
 ### Requirement: Bounded typed resource queries
 
 Queries SHALL expose stable resource identities, typed fields, owning generations or revisions, and bounded pagination, filtering, and deterministic sorting. Unknown query or filter keys, unsupported sort fields, invalid page tokens, and out-of-range page sizes SHALL return `VALIDATION_FAILED`. Label/tag mutations SHALL preserve the ownership of source, observation, quota, and hard-state fields.
+Session queries and events SHALL expose the same typed Path-pool planning state.
 
 #### Scenario: Unknown list query field
 
 - **WHEN** a list request includes an unregistered query field
 - **THEN** the service rejects the request with `VALIDATION_FAILED` instead of ignoring the field.
+
+#### Scenario: Inspect an idle Session Path pool
+
+- **WHEN** an authorized client reads a Session that has no active business connections
+- **THEN** its list/detail representation exposes the common minimum, requested baseline, effective baseline, current demand target, ready and usable counts, and typed baseline shortfall under the observation contract
+
+#### Scenario: A Path baseline changes without a health transition
+
+- **WHEN** the current bounded target, usable count, runtime clamp, or dominant baseline-shortfall reason changes while the Session remains active
+- **THEN** the shared observation service makes the new values queryable and emits `session.changed` with the same planning semantics instead of suppressing the change because health is unchanged
+
+#### Scenario: An event client recovers outside the replay window
+
+- **WHEN** an authorized SSE client reconnects with an unavailable `Last-Event-ID`
+- **THEN** its complete recovery snapshot includes current Session Path-pool planning fields before later deltas under the existing bounded replay and generation contract
 
 ### Requirement: Durable subscription control decisions
 
@@ -207,7 +223,10 @@ status:         ingress.state, control_plane.state, runtime_snapshot.state,
                 data_path_summary, configuration_generation, observation_generation
 listeners:      id, kind, platform, bind, allowed_sources, authentication,
                 state, generation, status.reason
-sessions:       session_id, egress_id, state, ready_path_count,
+sessions:       session_id, egress_id, state, ready_path_count, usable_path_count,
+                minimum_usable_paths, requested_target_usable_paths,
+                effective_target_usable_paths, target_path_count,
+                target_shortfall, target_shortfall_reason,
                 admission_generation, close_reason, created_at, last_change_at
 connections:    connection_id, session_id, stream_id, listener_id, protocol,
                 target_kind, state, bytes_sent, bytes_received, close_reason
@@ -220,6 +239,37 @@ system-proxy:   enabled, listener_id, platform_effect, environment_applied,
 ```
 
 Redacted values MUST be represented as `null` with a typed redaction reason.
+
+Session Path-pool planning fields are read-only and come from the same bounded
+observation snapshot:
+
+| Field | Meaning |
+| --- | --- |
+| `minimum_usable_paths` | configured common admission minimum |
+| `requested_target_usable_paths` | unsigned 64-bit requested baseline before runtime clamping |
+| `effective_target_usable_paths` | requested baseline bounded by the hard runtime Path ceiling |
+| `target_path_count` | current demand-derived physical Path target, not a historical peak |
+| `ready_path_count` | authenticated ready Path count under lifecycle semantics |
+| `usable_path_count` | eligible authenticated non-draining `ACTIVE` or `DEGRADED` Paths |
+| `target_shortfall` | nonnegative difference between requested baseline and usable count |
+| `target_shortfall_reason` | null at zero shortfall, otherwise the registered dominant reason |
+
+The requested baseline is the explicit target or the minimum-plus-one default
+and may reach `4294967296`; the effective baseline is clamped without changing
+the configured request. The shortfall is `max(requested_target_usable_paths -
+usable_path_count, 0)`, never the difference from an expanded demand target.
+Reason meanings and precedence are defined by the
+[observability contract](../observability/spec.md).
+Baseline shortfall alone MUST NOT change health or admission. The reason is a
+bounded identifier and never contains raw transport errors.
+
+Session list/detail queries, snapshot-backed drill-down, `session.changed`
+events, and SSE recovery snapshots SHALL use the same typed planning values and
+observation generation. Planning-only changes remain observable even when
+health and business-connection counts do not change. Configured Egress
+resources without a live Session MUST NOT produce fabricated authenticated
+Session rows. These fields are read-only and MUST NOT create a Path-target
+mutation operation or an authenticated Egress wire field.
 
 Registered filter keys are bounded and resource-specific:
 

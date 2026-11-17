@@ -119,7 +119,7 @@ Ingress SHALL 发布有界的上行/下行 Path 观测，并在 Egress 绑定下
 
 ### Requirement: Session Path-pool observations
 
-Session 观测 SHALL 标识所属 Egress、公共最小值、当前 target、合规 Transit 数量、不可变策略快照、聚合方向性 demand 和按发送方协商的复制额度。这些字段必须遵循现有授权、代次、基数和 unknown 规则，不为每条规则或业务类别分配观测。
+Session 观测 SHALL 标识所属 Egress、公共最小值、请求基线、受限后的有效基线、当前按 demand 得出的 target、实际 ready/usable 数量、类型化 target shortfall、合规 Transit 数量、不可变策略、方向性 demand 和复制额度。这些字段 SHALL 遵循现有授权、代次、基数和 unknown 规则，不为每条规则或业务类别分配观测。基线 shortfall 单独 SHALL NOT 改变健康状态或准入。
 
 #### Scenario: Different routing rules use one Egress
 
@@ -135,6 +135,36 @@ Session 观测 SHALL 标识所属 Egress、公共最小值、当前 target、合
 
 - **WHEN** Session 尚未接受复制协商，或聚合 demand 窗口没有权威样本
 - **THEN** 对应字段返回 null 或显式 unknown，不伪造 measured zero
+
+#### Scenario: Runtime ceiling clamps the baseline
+
+- **WHEN** 请求基线为六、硬运行时上限为四且有四条 Path 可用
+- **THEN** 请求基线仍为六，有效基线为四，target shortfall 为二，原因是 `runtime_limit`；基线 shortfall 单独不降级健康状态或拒绝准入
+
+#### Scenario: Partial baseline recovery remains healthy
+
+- **WHEN** 最小值为一、请求基线为三、有两条 Path 可用且有界后台恢复正在进行
+- **THEN** 观测保留最小值、请求/有效基线和实际计数，报告 shortfall 为一及其主导类型化原因，且该 shortfall 单独不导致 degraded 或拒绝准入
+
+#### Scenario: Load expansion does not change the configured baseline
+
+- **WHEN** 请求和有效基线都是三，而当前方向性 demand 在运行时上限内需要五条 Path
+- **THEN** 观测中的两个基线仍为三，`target_path_count` 表示当前有界 demand target 五
+
+#### Scenario: A Session exceeds its idle baseline
+
+- **WHEN** 请求基线为三且有五条 Path 可用
+- **THEN** `target_shortfall` 为零、`target_shortfall_reason` 为 null，即使 demand 或渐进排空使实际数量暂时高于基线
+
+#### Scenario: Several shortfall causes apply
+
+- **WHEN** 基线 shortfall 同时存在多个已注册原因
+- **THEN** 观测按已文档化的优先级选择确定的主导原因，不随 producer 或 adapter 改变
+
+#### Scenario: Prometheus reads live Path-planning totals
+
+- **WHEN** 已授权客户端读取 `/metrics`
+- **THEN** 四个 Path-planning gauge 对同一份 live Session 快照求和，不加新标签，live 集合为空时为零，不包含已退役 Session 历史，也不表示生命周期计数器
 
 ### Requirement: Authorized bounded aggregate metrics
 
@@ -286,10 +316,35 @@ ready_path_count, active_streams, active_udp_associations
 control_pending, control_acked, control_retransmissions
 close_reason, reconnect_attempts
 minimum_usable_paths, target_path_count, usable_path_count
+requested_target_usable_paths, effective_target_usable_paths
+target_shortfall, target_shortfall_reason
 eligible_transit_count, traffic_policy_id, traffic_policy_generation
 demand_upstream_bps, demand_downstream_bps
 replication_cap_bps, replication_upstream_used_bps, replication_downstream_used_bps
 ```
+
+`requested_target_usable_paths` 是显式 target，或最小值加一的解析默认值，且在运行时截断前保留；它使用无符号 64 位值，以容纳最大 32 位最小值再加一。有效 target 受硬运行时 Path 上限限制，`target_path_count` 从有效基线和当前方向性 demand 重新计算，不保留历史峰值。live Session 的基线 shortfall 为 `max(requested_target_usable_paths - usable_path_count, 0)`；它不表示 demand target 的 shortfall，也不会单独影响健康或准入。没有 live Session 的已配置 Egress 不会生成虚假的认证 Session 行。
+
+| 字段 | 类型与含义 |
+| --- | --- |
+| `minimum_usable_paths` | 配置的准入最小值 |
+| `requested_target_usable_paths` | 截断前解析的请求基线，无符号 64 位 `1..=4294967296` |
+| `effective_target_usable_paths` | 按当前硬运行时上限限制后的请求基线 |
+| `target_path_count` | 当前 demand 得出的物理 Path target，受硬上限约束且重新计算，不保留历史峰值 |
+| `ready_path_count` | 按生命周期语义认证完成的 ready Path 数 |
+| `usable_path_count` | 合格、认证完成且非排空的 `ACTIVE` 或 `DEGRADED` Path 数 |
+| `target_shortfall` | 不发生无符号下溢地计算 `max(requested_target_usable_paths - usable_path_count, 0)` |
+| `target_shortfall_reason` | shortfall 为零时为 null，否则为下表中的主导原因 |
+
+shortfall 大于零时，按以下顺序选择第一个适用原因：
+
+| 优先级 | 原因 | 适用情况 |
+| --- | --- | --- |
+| 1 | `runtime_limit` | 当前硬 Path 上限低于请求基线 |
+| 2 | `admission_blocked` | 独立的 Egress 准入约束阻止建立 Path |
+| 3 | `no_eligible_transit` | Egress 绑定没有合格 Transit 候选 |
+| 4 | `connect_failed` | 最近一次有界建连失败，包括其重试退避期 |
+| 5 | `recovering` | shortfall 仍在且前述原因均不适用 |
 
 Stream 视图暴露：
 
@@ -312,8 +367,10 @@ Session/Stream/目标连接数量、配置/有效/当前容量、容量状态、
 和报告新鲜度。不得发布建议 Path 数量或 per-Ingress 配额。Ingress 的 Path 观测必须分别包含
 上行和下行 RTT、抖动、丢包、乱序、吞吐量、有效容量和连接建立质量。
 
-观测提供器还必须暴露一个 Session 池最小值、有界 target、ready/usable 数量、合规关系、捕获的策略
-身份和代次、聚合上下行 demand 以及协商上限。上行用量来自本地发送方权威记账；下行用量在没有
+观测提供器还必须暴露一个 Session 池最小值、请求/有效基线、当前有界 demand target、ready/usable 数量、
+baseline shortfall 及主导原因、合规关系、捕获的策略身份和代次、聚合上下行 demand 以及协商上限。
+baseline shortfall 单独不得改变服务健康、Session 状态或准入权限；它对比请求基线与 usable Path，
+与增大的负载 target 相互独立。上行用量来自本地发送方权威记账；下行用量在没有
 权威 Session 级生产者时返回 null。全局 Egress replication allowance 不能替代它。调度器使用这些类型化字段，不能使用人类可读日志。报告过期时，除非策略明确允许降级运行，
 否则 Egress 必须从新的准入中移除。质量下降时快速减少分配；恢复和缩容遵循状态机的排空及
 稳定化规则。当 Path 因新增容量低于自身开销而被排除时，观测 API 必须暴露原因。
@@ -333,11 +390,17 @@ pathchord_target_connections
 pathchord_observed_nodes
 pathchord_observed_connections
 pathchord_observation_generation
+pathchord_session_requested_target_usable_paths
+pathchord_session_effective_target_usable_paths
+pathchord_session_target_paths
+pathchord_session_target_shortfall
 ```
 
 这些值描述快照当前状态，不得表示为历史事件 counter 或生命周期总量；不得伪造缺失的快照
 事实。高基数连接详情保留在经过授权的资源查询中。提供方 quota、到期时间和显式计费元数据
 遵循[Transit Proxy 用量契约](../transit-proxies/spec.zh-CN.md#提供方用量元数据)。
+
+四个 Path-planning gauge 对同一份当前 live Session 快照求和，排除 closed/retired Session 历史；live 集合为空时为零。它们表示当前状态而非生命周期计数器，不增加标签。Egress 不推荐 Path 数；Ingress 所有请求基线和当前 demand target。这些值属于本地观测，不会加入认证的 Egress `STATUS_REPORT`。
 
 
 服务应提供以下指标族：
@@ -359,7 +422,6 @@ pathchord_path_capacity_bps
 pathchord_egress_load_ratio
 pathchord_egress_connection_utilization_ratio
 pathchord_egress_bandwidth_utilization_ratio
-pathchord_egress_recommended_paths
 pathchord_stream_reorder_bytes
 ```
 

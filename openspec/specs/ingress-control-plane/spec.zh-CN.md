@@ -42,12 +42,27 @@
 
 ### Requirement: Bounded typed resource queries
 
-查询 SHALL 暴露稳定资源标识、类型化字段、所属代次或 revision，以及有界分页、过滤和确定性排序。未知查询或过滤键、不支持的排序字段、无效分页 token 及越界分页大小 SHALL 返回 `VALIDATION_FAILED`。Label/tag 变更 SHALL 保留 source、observed、quota 和硬状态字段的所有权。
+查询 SHALL 暴露稳定资源标识、类型化字段、所属代次或 revision，以及有界分页、过滤和确定性排序。未知查询或过滤键、不支持的排序字段、无效分页 token 及越界分页大小 SHALL 返回 `VALIDATION_FAILED`。Label/tag 变更 SHALL 保留 source、observed、quota 和硬状态字段的所有权。Session 查询和事件 SHALL 暴露同一类型化 Path 池规划状态。
 
 #### Scenario: Unknown list query field
 
 - **WHEN** 列表请求包含未注册的查询字段
 - **THEN** 服务以 `VALIDATION_FAILED` 拒绝请求，不忽略该字段。
+
+#### Scenario: Inspect an idle Session Path pool
+
+- **WHEN** 已授权客户端读取一个没有活动业务连接的 Session
+- **THEN** 列表和详情暴露公共最小值、请求基线、有效基线、当前 demand target、ready/usable 数量及类型化基线 shortfall，并遵循可观测性规范
+
+#### Scenario: A Path baseline changes without a health transition
+
+- **WHEN** Session 保持 active，而当前有界 target、usable 数量、运行时截断值或基线 shortfall 主导原因发生变化
+- **THEN** 共享观测服务可查询新值，并发出语义一致的 `session.changed`，不因健康状态未变而抑制该变化
+
+#### Scenario: An event client recovers outside the replay window
+
+- **WHEN** 已授权 SSE 客户端携带不可重放的 `Last-Event-ID` 重新连接
+- **THEN** 完整恢复快照会在后续增量前包含当前 Session Path 池规划字段，并遵循现有有界重放和代次契约
 
 ### Requirement: Durable subscription control decisions
 
@@ -193,7 +208,10 @@ status:         ingress.state、control_plane.state、runtime_snapshot.state、
                 data_path_summary、configuration_generation、observation_generation
 listeners:      id、kind、platform、bind、allowed_sources、authentication、
                 state、generation、status.reason
-sessions:       session_id、egress_id、state、ready_path_count、
+sessions:       session_id、egress_id、state、ready_path_count、usable_path_count、
+                minimum_usable_paths、requested_target_usable_paths、
+                effective_target_usable_paths、target_path_count、
+                target_shortfall、target_shortfall_reason、
                 admission_generation、close_reason、created_at、last_change_at
 connections:    connection_id、session_id、stream_id、listener_id、protocol、
                 target_kind、state、bytes_sent、bytes_received、close_reason
@@ -206,6 +224,23 @@ system-proxy:   enabled、listener_id、platform_effect、environment_applied、
 ```
 
 脱敏值必须使用 `null` 表示，并附带类型化脱敏原因。
+
+Session Path 池规划字段只读，并来自同一份有界观测快照：
+
+| 字段 | 含义 |
+| --- | --- |
+| `minimum_usable_paths` | 配置的公共准入最小值 |
+| `requested_target_usable_paths` | 运行时截断前的请求基线，无符号 64 位 |
+| `effective_target_usable_paths` | 按硬运行时 Path 上限截断后的请求基线 |
+| `target_path_count` | 当前由 demand 得出的物理 Path target，不是历史峰值 |
+| `ready_path_count` | 按生命周期语义认证完成的 ready Path 数 |
+| `usable_path_count` | 合格、认证完成且非排空的 `ACTIVE` 或 `DEGRADED` Path 数 |
+| `target_shortfall` | 请求基线与 usable 数量之差的非负值 |
+| `target_shortfall_reason` | shortfall 为零时为 null，否则为注册的主导原因 |
+
+请求基线是显式 target 或最小值加一的默认值，最大可达 `4294967296`；有效基线会被截断，但不改变配置请求。shortfall 计算为 `max(requested_target_usable_paths - usable_path_count, 0)`，不得拿扩大的 demand target 来比较。原因含义和优先级见[可观测性规范](../observability/spec.zh-CN.md)。基线 shortfall 单独 MUST NOT 改变健康或准入。原因是有界标识符，不能包含原始传输错误。
+
+Session 列表/详情、基于快照的 drill-down、`session.changed` 事件和 SSE 恢复快照 SHALL 使用相同的类型化规划值和观测代次。即使健康和业务连接数未改变，规划字段变化仍可观察。没有 live Session 的已配置 Egress MUST NOT 被伪造成认证 Session 行。这些字段只读，不创建 Path-target mutation，也不加入认证 Egress wire 字段。
 
 已注册过滤字段必须有界且按资源区分：
 

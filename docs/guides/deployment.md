@@ -191,6 +191,10 @@ Named Pipe names for the corresponding control endpoints. The Web Gateway is
 opt-in through `--web-bind` and shares the local dispatcher. A configured
 `--web-token-file` supplies its bearer token. Prometheus scraping uses the
 same authentication, Origin checks, and `metrics:read` capability at `/metrics`.
+Path-pool gauges report the requested and effective idle baselines, the current
+demand target, and aggregate baseline shortfall across live Sessions. See the
+[observability contract](../../openspec/specs/observability/spec.md) for exact
+field and metric semantics.
 
 Each service accepts Ctrl-C and, on Unix, SIGTERM shutdown and owns its
 task/connection cleanup.

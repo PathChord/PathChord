@@ -16,7 +16,7 @@ pub struct TransitOptions {
     #[serde(default)]
     pub udp: Option<bool>,
     /// SOCKS or Shadowsocks UDP-over-TCP wire version; absent uses native UDP.
-    #[serde(default)]
+    #[serde(default, rename = "udpOverTcpVersion")]
     pub udp_over_tcp: Option<u8>,
     #[serde(default)]
     pub vmess: Option<TransitVmessOptions>,
@@ -40,7 +40,7 @@ impl std::fmt::Debug for TransitOptions {
             .field("transport", &self.transport)
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .field("udp", &self.udp)
-            .field("udp_over_tcp", &self.udp_over_tcp)
+            .field("udpOverTcpVersion", &self.udp_over_tcp)
             .field("vmess", &self.vmess)
             .field("multiplex", &self.multiplex)
             .field("tcp_fast_open", &self.tcp_fast_open)
@@ -74,17 +74,17 @@ pub struct TransitTls {
     pub truststore: Vec<String>,
     #[serde(default)]
     pub alpn: Vec<String>,
-    #[serde(default)]
+    #[serde(default, rename = "certificates")]
     pub certificate: Vec<String>,
     /// SHA-256 of a DER-encoded peer certificate, in hexadecimal form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate_sha256: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "clientCertificates")]
     pub client_certificate: Vec<String>,
     /// The private key stays in the credential document, under this field name.
     #[serde(default)]
     pub client_key_field: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "clientHelloFingerprint")]
     pub fingerprint: Option<String>,
     #[serde(default)]
     pub reality: Option<TransitReality>,
@@ -204,13 +204,13 @@ pub struct TransitTransport {
     pub kind: String,
     #[serde(default)]
     pub path: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "hosts")]
     pub host: Vec<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub service_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "maxEarlyDataBytes")]
     pub max_early_data: Option<u32>,
     #[serde(default)]
     pub early_data_header_name: Option<String>,
@@ -222,10 +222,10 @@ impl std::fmt::Debug for TransitTransport {
             .debug_struct("TransitTransport")
             .field("type", &self.kind)
             .field("path", &self.path.as_ref().map(|_| "<redacted>"))
-            .field("host", &self.host)
+            .field("hosts", &self.host)
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .field("service_name", &self.service_name)
-            .field("max_early_data", &self.max_early_data)
+            .field("maxEarlyDataBytes", &self.max_early_data)
             .field("early_data_header_name", &self.early_data_header_name)
             .finish()
     }
@@ -364,7 +364,7 @@ impl TransitOptions {
             .is_some_and(|version| !matches!(version, 1 | 2))
             || self.udp_over_tcp.is_some() && self.udp == Some(false)
         {
-            return Err("options.udpOverTcp contains an invalid or conflicting version");
+            return Err("options.udpOverTcpVersion contains an invalid or conflicting version");
         }
         if let Some(mux) = &self.multiplex
             && (mux
@@ -395,7 +395,7 @@ mod udp_over_tcp_tests {
             };
             options.validate().unwrap();
             let value = serde_yaml::to_string(&options).unwrap();
-            assert!(value.contains(&format!("udpOverTcp: {version}")));
+            assert!(value.contains(&format!("udpOverTcpVersion: {version}")));
             assert_eq!(
                 serde_yaml::from_str::<TransitOptions>(&value).unwrap(),
                 options
@@ -420,5 +420,55 @@ mod udp_over_tcp_tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn canonical_native_names_roundtrip_and_retired_names_fail() {
+        let encoded = r#"
+udpOverTcpVersion: 2
+tls:
+  enabled: true
+  certificates: ["root.pem"]
+  clientCertificates: ["client.pem"]
+  clientHelloFingerprint: chrome
+transport:
+  type: httpupgrade
+  hosts: ["proxy.example.test"]
+  maxEarlyDataBytes: 4096
+"#;
+        let options: TransitOptions = serde_yaml::from_str(encoded).unwrap();
+        options.validate().unwrap();
+        let normalized = serde_yaml::to_string(&options).unwrap();
+        for field in [
+            "udpOverTcpVersion",
+            "certificates",
+            "clientCertificates",
+            "clientHelloFingerprint",
+            "hosts",
+            "maxEarlyDataBytes",
+        ] {
+            assert!(
+                normalized.contains(field),
+                "missing canonical field {field}"
+            );
+        }
+        assert_eq!(
+            serde_yaml::from_str::<TransitOptions>(&normalized).unwrap(),
+            options
+        );
+
+        for retired in [
+            "udpOverTcp: 2",
+            "tls: {enabled: true, certificate: []}",
+            "tls: {enabled: true, clientCertificate: []}",
+            "tls: {enabled: true, fingerprint: chrome}",
+            "transport: {type: httpupgrade, host: [proxy.example.test]}",
+            "transport: {type: ws, maxEarlyData: 3}",
+        ] {
+            assert!(
+                serde_yaml::from_str::<TransitOptions>(retired).is_err(),
+                "retired field was accepted: {retired}"
+            );
+        }
     }
 }

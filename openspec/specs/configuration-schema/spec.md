@@ -10,7 +10,7 @@ Define the versioned human-authored configuration schema, complete-bundle valida
 
 ### Requirement: Versioned schema conformance
 
-The v1 schema SHALL expose Egress aggregate wire capacity and global inbound target-connection limits while keeping desired Path count, per-Ingress stream quotas, and Path safety ceilings outside the authored Egress policy surface. Each Ingress-side Egress SHALL declare one Transit binding and one TrafficPolicy reference for its Session Path pool.
+The v1 schema SHALL expose Egress aggregate wire capacity and global inbound target-connection limits while keeping per-Ingress stream quotas and Path safety ceilings runtime-owned. Each Ingress-side Egress SHALL declare one Transit binding, one TrafficPolicy reference, a common Path admission minimum, and a best-effort Path baseline. Native resource keys SHALL follow the canonical names and retired-key rules in this contract.
 
 #### Scenario: Removed desired-Path fields are authored
 
@@ -21,6 +21,73 @@ The v1 schema SHALL expose Egress aggregate wire capacity and global inbound tar
 
 - **WHEN** an administrator supplies a resource containing an authored `status` field
 - **THEN** validation rejects the resource and leaves the previously published snapshot active
+
+#### Detailed contract
+
+##### Canonical native naming and field migration
+
+PathChord-owned resource keys MUST use lower camelCase. Resource references
+MUST use the `Ref` suffix and retain namespace resolution; `egressId` remains
+a protocol identity rather than a resource reference. Numeric time, rate, and
+byte limits MUST identify their units. Collection names MUST identify a
+collection, subject to established protocol terms such as `alpn`. A scalar
+remote endpoint host MUST use `host`; a list of HTTP Host overrides MUST use
+`hosts`. User label keys, HTTP header names, foreign source documents, enum
+values, private credential fields, environment variables, and CLI flags are
+outside this native-key spelling rule.
+
+The following table is exhaustive for retired native paths in this change.
+Paths are relative to the named resource's `spec`.
+
+| Resource | Retired native path | Canonical native path | Preserved meaning |
+|---|---|---|---|
+| Egress | `statusRequirements.minUsablePaths` | `pathPool.minUsablePaths` | common usable-Path admission minimum |
+| Egress | `statusRequirements.capabilities` | `admission.requiredCapabilities` | common Egress capability requirement |
+| Egress | `address` | `host` | single-endpoint shorthand host |
+| Egress | `endpoints[].address` | `endpoints[].host` | ordered endpoint candidate host |
+| TransitProxy | `address` | `host` | remote proxy endpoint host |
+| EgressService | `webBind` | `web.bind` | optional management bind |
+| EgressService | `webTokenFile` | `web.tokenFile` | private bearer-token file path |
+| EgressService | `webOrigins` | `web.allowedOrigins` | allowed Web origins |
+| EgressService | `webProtectedTransport` | `web.protectedTransport` | existing protected-transport assertion |
+| TransitProxy | `options.transport.host` | `options.transport.hosts` | ordered HTTP Host override list |
+| TransitProxy | `options.transport.maxEarlyData` | `options.transport.maxEarlyDataBytes` | byte limit with the existing bound |
+| TransitProxy | `options.tls.certificate` | `options.tls.certificates` | inline additional trust anchors |
+| TransitProxy | `options.tls.clientCertificate` | `options.tls.clientCertificates` | inline client certificate chain |
+| TransitProxy | `options.tls.fingerprint` | `options.tls.clientHelloFingerprint` | ClientHello impersonation profile |
+| TransitProxy | `options.udpOverTcp` | `options.udpOverTcpVersion` | explicit supported wire version |
+
+The resource API version remains `pathchord.io/v1`. The `statusRequirements`
+object is retired in its entirety, including an empty object. Each retired
+native key MUST fail complete-bundle validation, including empty/default
+values and documents containing both old and new forms. It MUST NOT act as
+an alias, fallback, or merge input. A bounded `CONFIG_RETIRED_FIELD`
+diagnostic MUST identify the resource, exact authored field path, and
+canonical replacement path or paths without returning field values.
+Unrecognized fields remain invalid; no recursive spelling conversion applies
+to arbitrary data.
+
+The Egress `host`/`port` shorthand and `endpoints: [{host, port}]` form remain
+mutually exclusive. Existing hostname/IP, IPv6, ordering, duplicate detection,
+namespace, public-key, and 1..=32 endpoint limits remain in force. TransitProxy
+`host`/`port` retain the existing direct-adapter exception. NodeProbe targets
+and object-form Listener binds already use `host`/`port`. Listener interface
+`address`, CIDRs, socket-address strings, and literal HTTP `Host` headers have
+different meanings and MUST NOT be renamed as remote endpoint hosts.
+
+EgressService `web` is optional and accepts only `bind`, `tokenFile`,
+`allowedOrigins`, and `protectedTransport`. Omission retains the existing
+disabled-by-default Web Gateway behavior; child defaults, validation limits,
+origin/token checks, and protected-transport requirements are unchanged.
+Relative `web.tokenFile` paths resolve from the selected configuration source
+under the existing private-path rules. Existing CLI flags override the
+corresponding nested resource fields using the existing source precedence;
+grouping does not change secret storage or enable TLS termination.
+
+The published schema MUST document `catchAll` on EgressRule and ProxyRule and
+`require` on ProxyRule, retaining their existing validation and selection
+semantics. This naming contract does not change the routing action model or
+expand `transit.reject` beyond its documented tag conditions.
 
 ### Requirement: Whole-bundle identities and references
 
@@ -42,7 +109,7 @@ Ingress SHALL select command-line configuration before environment configuration
 
 ### Requirement: Atomic publication and resilient watching
 
-The complete candidate SHALL pass parsing, validation, normalization, compilation, and required persistence before one immutable generation is published. Invalid candidates SHALL retain the last good bundle; atomic file and root-directory replacement SHALL preserve watching. Changes to an Egress endpoint set or EgressService bind set, common admission minimum, referenced policy, or resolved policy contents SHALL report restart required and retain the active bundle.
+The complete candidate SHALL pass parsing, validation, normalization, compilation, and required persistence before one immutable generation is published. Invalid candidates SHALL retain the last good bundle; atomic file and root-directory replacement SHALL preserve watching. Changes to Egress endpoints, admission requirements, either resolved Path-pool count, referenced policy, resolved policy contents, or EgressService startup settings SHALL report restart required and retain the active bundle.
 
 #### Scenario: Atomic replacement contains an invalid candidate
 
@@ -73,6 +140,16 @@ The complete candidate SHALL pass parsing, validation, normalization, compilatio
 
 - **WHEN** a reload changes a TrafficPolicy that no configured Egress references
 - **THEN** that change alone does not trigger the Egress startup boundary or alter any live Session policy
+
+#### Scenario: Only the configured Path baseline changes
+
+- **WHEN** a valid candidate changes `pathPool.targetUsablePaths` to a different resolved requested baseline
+- **THEN** reload reports restart required and retains the entire active bundle, including otherwise valid dynamic changes
+
+#### Scenario: An omitted target becomes an equivalent explicit value
+
+- **WHEN** the minimum is one and a valid candidate changes an omitted target to `targetUsablePaths: 2` without changing other normalized values
+- **THEN** the resolved Path-pool fingerprint is unchanged and this edit alone does not require a restart
 
 ### Requirement: Deterministic bounded rule compilation
 
@@ -174,17 +251,90 @@ An Ingress-side Egress SHALL contain a bounded non-empty ordered endpoint list. 
 
 ### Requirement: Ingress Egress endpoint forms normalize without changing identity
 
-The Egress schema SHALL accept the existing `address` and `port` pair as a one-element endpoint shorthand and a plural `endpoints` list. Supplying both forms SHALL be rejected, and endpoint normalization SHALL not change the Egress resource name, Egress ID, or public-key binding.
+The Egress schema SHALL accept `host` and `port` as a one-element endpoint shorthand and a plural `endpoints` list whose entries contain `host` and `port`. Supplying both forms SHALL be rejected, and endpoint normalization SHALL not change the Egress resource name, Egress ID, or public-key binding. Retired native `address` fields SHALL fail with the canonical replacement diagnostic.
 
 #### Scenario: Existing address and port are loaded
 
 - **WHEN** an Egress supplies only `address` and `port`
-- **THEN** validation produces the equivalent one-element normalized endpoint list and preserves existing routing identity
+- **THEN** validation rejects the complete candidate and identifies `host` as the replacement for `address`
 
 #### Scenario: Singular and plural endpoint forms conflict
 
-- **WHEN** an Egress supplies `address`/`port` together with `endpoints`
+- **WHEN** an Egress supplies `host`/`port` together with `endpoints`
 - **THEN** validation rejects the resource instead of silently merging or selecting one form
+
+#### Scenario: Canonical single-endpoint shorthand is loaded
+
+- **WHEN** an Egress supplies only valid `host` and `port` endpoint fields
+- **THEN** validation produces the equivalent one-element normalized endpoint list and preserves its routing identity
+
+### Requirement: Egress Path-pool configuration
+
+Each Ingress-side Egress SHALL accept optional `pathPool.minUsablePaths` and `pathPool.targetUsablePaths`. The minimum SHALL default to one; an omitted target SHALL request the minimum plus one, while an explicit target SHALL receive no implicit reserve. Values SHALL follow the detailed count, admission, and ceiling contract below.
+
+#### Scenario: Path-pool configuration is omitted
+
+- **WHEN** an Egress omits `pathPool`
+- **THEN** its minimum is one and its requested usable-Path baseline is two, subject to runtime ceilings
+
+#### Scenario: A larger minimum has no explicit target
+
+- **WHEN** an Egress sets `minUsablePaths: 3` and omits the target
+- **THEN** its requested baseline is four before runtime ceiling application
+
+#### Scenario: An explicit target equals the minimum
+
+- **WHEN** an Egress sets both counts to two
+- **THEN** its requested baseline is exactly two and no additional spare is implied
+
+#### Scenario: A Path-pool count is invalid
+
+- **WHEN** a count is zero, negative, non-integral, null, outside its unsigned 32-bit range, or an explicit target is below the minimum
+- **THEN** complete-bundle validation rejects the candidate with the resource and offending field path
+
+#### Scenario: A target exceeds the current runtime ceiling
+
+- **WHEN** a valid requested baseline exceeds a lower runtime or negotiated Path ceiling
+- **THEN** configuration retains the requested baseline, runtime planning uses the bounded effective baseline, and the ceiling shortfall remains observable without rejecting otherwise valid configuration
+
+#### Scenario: The default target requires wider arithmetic
+
+- **WHEN** the minimum is the largest unsigned 32-bit integer and the target is omitted
+- **THEN** default resolution uses a wider unsigned value for minimum plus one and does not wrap or turn the request into zero
+
+#### Scenario: Capability requirements move with their meaning intact
+
+- **WHEN** an Egress authors `admission.requiredCapabilities: [tcp, udp]`
+- **THEN** the same common Egress capability eligibility checks apply as the retired capability requirement, without adding per-flow or native-UDP Transit restrictions
+
+#### Detailed contract
+
+| Field relative to Egress `spec` | Type | Default and meaning |
+|---|---|---|
+| `pathPool` | object | omitted or `{}` resolves its child defaults |
+| `pathPool.minUsablePaths` | integer `1..=4294967295` | `1`; minimum authenticated usable non-draining Paths for new business admission |
+| `pathPool.targetUsablePaths` | integer `1..=4294967295`, at least the minimum | omitted requests `minUsablePaths + 1`; explicit value is the requested baseline |
+| `admission` | object | omitted or `{}` supplies no extra capability requirements |
+| `admission.requiredCapabilities` | bounded unique `tcp`/`udp` set | `[]`; common Egress capability eligibility requirement |
+
+Null is not an omitted count. Unknown child fields are invalid. The existing
+common string, set, identity, namespace, and schema numeric rules remain in
+force. Default arithmetic MUST use an unsigned representation wide enough to
+hold `4294967296`. Normalized equality MUST compare the resolved requested
+baseline, not merely whether the target was explicit, and MUST NOT depend on
+the runtime ceiling or current eligible Transit relationships.
+
+Only authenticated `ACTIVE` or `DEGRADED`, otherwise eligible, non-draining
+Paths count toward either count. Connecting, failed, closed, draining, and
+policy-excluded Paths MUST NOT satisfy them. A single eligible Transit may
+carry multiple independent Paths under the existing relationship weighting.
+The target is a maintenance baseline, not a copy count, a new admission gate,
+an exact pool size, or a public maximum. The state-machine contract defines
+capacity-driven expansion and gradual contraction.
+
+Both Path-pool counts and `admission.requiredCapabilities` are Egress startup
+configuration. EgressService MUST NOT accept these Ingress-side fields or
+gain a recommended Path count. No native routing rule may override them.
 
 ### Requirement: Endpoint collections have bounded canonical values
 
@@ -291,7 +441,7 @@ items:
       labels:
         region: jp
     spec:
-      address: egress.example.net
+      host: egress.example.net
       port: 443
       publicKey: <curve25519-public-key>
       capabilities:
@@ -394,34 +544,44 @@ operator labels are carried by `metadata`:
 | Field | Required | Type and semantics |
 |---|---|---|
 | `metadata.name` | yes | resource name; unique in the namespace |
-| `address` | conditional | legacy hostname or IP literal; required together with `port` when `endpoints` is absent |
-| `port` | conditional | legacy endpoint port; required together with `address` when `endpoints` is absent |
-| `endpoints` | conditional | ordered list of 1..=32 `{address, port}` candidates; mutually exclusive with `address`/`port` |
+| `host` | conditional | hostname or IP literal; required together with `port` when `endpoints` is absent |
+| `port` | conditional | endpoint port; required together with `host` when `endpoints` is absent |
+| `endpoints` | conditional | ordered list of 1..=32 `{host, port}` candidates; mutually exclusive with `host`/`port` |
 | `publicKey` | yes | 32-byte unpadded base64url Curve25519 public key |
 | `capabilities` | no | mapping `tcp`/`udp` to booleans; both default `false` |
-| `statusRequirements` | no | `minUsablePaths` and optional capability set; default `minUsablePaths: 1` |
+| `pathPool` | no | `minUsablePaths` and `targetUsablePaths`; defaults to minimum 1 and requested baseline 2 |
+| `admission` | no | `requiredCapabilities`; defaults to no additional common capability requirement |
 | `transit` | yes | common same-namespace Transit binding with optional `require` and `reject` selectors |
 | `trafficPolicyRef` | yes | exactly one same-namespace TrafficPolicy for every Session using this Egress |
 
+The singular `host`/`port` shorthand is mutually exclusive with `endpoints`.
+The requested target defaults to the common minimum plus one; an explicit
+target receives no extra reserve. `pathPool.minUsablePaths` controls
+count-based admission, while `pathPool.targetUsablePaths` is a best-effort
+idle baseline and does not by itself change health or new-work admission. See
+the Path-pool requirement for ranges, wider default arithmetic, runtime
+clamping, and the distinction between requested and effective counts.
 At least one of `capabilities.tcp` or `capabilities.udp` MUST be true. An
 Egress reference MUST resolve to an Egress object. `transit: {}` explicitly
 admits all otherwise eligible same-namespace Transit nodes. Its `require`
 selector uses labels, tags, and capabilities; `reject.tags` excludes matching
 nodes. The binding cannot contain flow matches, order, a second weight, a Path
-subset, or a desired Path count. Egress topology, the binding, and its resolved
-TrafficPolicy are startup configuration and are not hot-reloaded.
+subset, or a desired Path count. Egress topology, Path-pool counts, admission
+requirements, the binding, and its resolved TrafficPolicy are startup
+configuration and are not hot-reloaded.
 
 ### EgressService and NodeProbePolicy
 
 `EgressService.spec` accepts `bind` or `binds`, `egressId`, `identity`,
 `authorizationDb`, `controlSocket`, `maxWireBandwidthBps`,
 `maxInboundTargetConnections`, `quotaRemaining`,
-`trafficMultiplierBasisPoints`, `remoteDnsOnly`, `webBind`, `webTokenFile`,
-`webOrigins`, and `webProtectedTransport`. `bind` is a one-element shorthand;
+`trafficMultiplierBasisPoints`, `remoteDnsOnly`, and optional `web` settings.
+`web` accepts `bind`, `tokenFile`, `allowedOrigins`, and
+`protectedTransport`. `bind` is a one-element shorthand;
 `binds` is an ordered list of 1..=32 unique SocketAddr values and the two forms
-are mutually exclusive. Desired Path counts, per-Ingress
-stream quotas, and Path safety ceilings are runtime-owned and MUST NOT be
-authored. Paths in the resource are resolved
+are mutually exclusive. Ingress Path-pool counts, per-Ingress stream quotas,
+and Path safety ceilings are not EgressService fields and MUST NOT be authored
+on this resource. Paths in the resource are resolved
 relative to the selected configuration source. An Egress process selects at
 most one such resource. `identity` and an Egress ID are required after command
 line overrides; the resource name supplies the ID when `egressId` is absent.
@@ -455,12 +615,12 @@ Each `kind: TransitProxy` object has:
 | `metadata.name` | yes | resource name; unique in the namespace |
 | `source` | no | `{type, subscriptionRef}`; default `{type: static}` |
 | `protocol` | yes | node protocol from the [adapter contract](../transit-proxies/spec.md#adapter-selection-and-failure); executable support is validated separately |
-| `address` | yes except `direct` | hostname or IP literal |
+| `host` | yes except `direct` | hostname or IP literal |
 | `port` | yes except `direct` | port |
 | `tags` | no | sequence of IDs; default `[]` |
 | `weight` | no | integer weight; default `100` |
 | `credentialsRef` | no | opaque local secret reference; never a secret value |
-| `options` | no | typed TLS, transport, header, UDP, SOCKS5/SS `udpOverTcp`, VMess framing, multiplex, and dialer options; default `{}` |
+| `options` | no | typed TLS, transport, header, UDP, SOCKS5/SS `udpOverTcpVersion`, VMess framing, multiplex, and dialer options; default `{}` |
 
 `source.type` is one of the [subscription document types](../transit-proxies/spec.md#subscription-document-families),
 including `static`, `auto`, `clash`, `sip008`, `uri`, `sing_box`, `surge`,
@@ -468,7 +628,7 @@ including `static`, `auto`, `clash`, `sip008`, `uri`, `sing_box`, `surge`,
 an existing `Subscription` object. Imported `source.*`, `observed.*`, and
 `quota.*` attributes are runtime-owned and cannot be authored inside a proxy
 object. Labels belong in `metadata.labels`.
-`direct` has no third-party endpoint and ignores `address` and `port`.
+`direct` has no third-party endpoint and ignores `host` and `port`.
 
 The [Transit Proxy contract](../transit-proxies/spec.md) defines every typed option,
 protocol-specific credential handling, complete engine node documents,
@@ -585,7 +745,8 @@ the built-in direct Transit adapter and is not an Egress selector.
 `EgressRule.spec` has no `requirements`, Transit selector, policy override, or
 traffic-class field. The first rule whose match, selector, capability, and
 current Egress usability all pass wins. The selected Egress binding supplies
-the common Transit candidates, Path minimum, and TrafficPolicy for every flow.
+the common Transit candidates, Path-pool minimum and baseline, and TrafficPolicy
+for every flow.
 If the binding has no admitted Transit Proxy, the next Egress rule is
 considered; evaluation does not silently fall through to an arbitrary Proxy.
 
@@ -594,7 +755,10 @@ default is `any`. `any` chooses uniformly among the highest-scoring usable
 Proxies after filtering by selector and weight; ties are broken by ascending
 canonical ID. A rule may instead set `proxy: direct`, which selects the direct
 Transit adapter without a third-party node; `proxy` and `select` are mutually
-exclusive. The global `fallback.action` is required and is `reject` or `direct`.
+exclusive. `require` is a Proxy selector with the same label/tag/capability
+matching semantics as the documented selector. `catchAll` explicitly marks
+an EgressRule or ProxyRule as a catch-all and cannot be combined with a match.
+The global `fallback.action` is required and is `reject` or `direct`.
 
 Rule evaluation is deterministic, bounded, and I/O-free. It may inspect only
 the connection context, listener/process metadata, target metadata, labels, and
@@ -729,10 +893,12 @@ selection and uses that generation for the complete decision. Runtime
 observations are updated independently and never overwrite administrator-owned
 fields.
 
-Static Egress topology, local private keys, listener bind mode, and platform
-routing settings require restart. Subscription data, imported Transit Proxies,
-administrator labels/tags, DNS runtime health, and compiled dynamic rules may
-be hot-reloaded. Snapshot replacement is atomic. On any parse, validation,
+Static Egress topology, Path-pool counts, admission requirements, Transit
+binding, referenced TrafficPolicy, local private keys, EgressService settings,
+listener bind mode, and platform routing settings require restart. Subscription
+data, imported Transit Proxies, administrator labels/tags, DNS runtime health,
+and compiled dynamic rules may be hot-reloaded. Snapshot replacement is atomic.
+On any parse, validation,
 compilation, persistence, or cache-write failure, the last successful snapshot
 remains active and the failure is exposed through structured status.
 

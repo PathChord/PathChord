@@ -4,16 +4,17 @@ metadata:
   name: exit
 spec:
   endpoints:
-    - address: 127.0.0.1
+    - host: 127.0.0.1
       port: 9443
-    - address: "::1"
+    - host: "::1"
       port: 8443
-    - address: egress.example.net
+    - host: egress.example.net
       port: 443
   publicKey: REPLACE_WITH_EGRESS_PUBLIC_KEY
   capabilities: {tcp: true, udp: true}
-  statusRequirements:
+  pathPool:
     minUsablePaths: 1
+    targetUsablePaths: 2
   transit:
     require:
       capabilities: [tcp]
