@@ -8,11 +8,11 @@ establish a final implementation design.
 ## Current boundary and protocol semantics
 
 At the time of the initial investigation, the
-[Hysteria2 adapter](../../../../crates/pathchord-transit/src/hysteria2_adapter.rs)
+[Hysteria2 adapter](../../../../../crates/pathchord-transit/src/hysteria2_adapter.rs)
 used Quinn BBR, sent the configured `down_mbps` as a receive-rate hint, and
 rejected nonzero `up_mbps` or server receive rates. A server can ignore the
 download hint. See the implementation follow-up below and the
-[implementation status](../../../implementation-status.md) for the current
+[implementation status](../../../../implementation-status.md) for the current
 snapshot and validation evidence.
 
 The protocol uses the same `Hysteria-CC-RX` name in two directions, both in
@@ -175,8 +175,8 @@ the send-window test, and a per-packet switch marker. The marker prevents ACKs
 or losses from packets sent before the BBR-to-Brutal switch entering the new
 controller's sample. This matches the switch fence in the `sagernet/quic-go`
 version used by sing-box 1.14.4. The default methods retain Quinn's normal
-pacer and window behavior. See [the patch record](../../../../vendor/quinn-proto/PATHCHORD-PATCH.md)
-and [the Brutal controller](../../../../crates/pathchord-transit/src/hysteria2_brutal.rs).
+pacer and window behavior. See [the patch record](../../../../../vendor/quinn-proto/PATHCHORD-PATCH.md)
+and [the Brutal controller](../../../../../crates/pathchord-transit/src/hysteria2_brutal.rs).
 The Hysteria2 connection begins with BBR and switches after authentication to
 the negotiated nonzero Brutal target. Numeric response `0` uses the configured
 upload rate; a positive response uses the smaller of that value and the

@@ -294,6 +294,20 @@ For one configured Egress, Ingress SHALL maintain one Session Path pool while se
 - **WHEN** a Path establishment starts with an ordered endpoint list
 - **THEN** the selection cursor and bounded wraparound preserve the configured candidate order and do not retry one candidate indefinitely
 
+### Requirement: Endpoint attempts use one static bounded sequence
+
+Each Egress Path establishment SHALL start from the per-Egress endpoint selection cursor, visit each normalized candidate at most once with wraparound, and use one shared deadline for the sequence. The cursor advances after successful admission or exhaustion; endpoint failover applies only before Path admission.
+
+#### Scenario: A Path sequence reaches a successful candidate
+
+- **WHEN** a candidate succeeds and Noise admission reaches readiness
+- **THEN** the Path records that candidate, the cursor advances, and no later Stream or UDP retry changes the Path's transport
+
+#### Scenario: A Path sequence is exhausted
+
+- **WHEN** every candidate fails or times out before readiness
+- **THEN** the operation returns the existing typed Path connection failure without extending its deadline or bypassing the Egress Transit binding and TrafficPolicy
+
 ### Requirement: Endpoint failure uses bounded pre-admission failover
 
 Before a Path reaches authenticated readiness, Ingress SHALL try eligible Egress endpoint candidates within the Path connection deadline and a finite attempt bound. If every candidate fails, the Path attempt SHALL return a typed connection failure without selecting Direct, an unrelated Egress, or an ordinary Proxy route.

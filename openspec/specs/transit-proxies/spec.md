@@ -47,6 +47,34 @@ Transit adapters and subscription processing SHALL conform to the complete detai
 - **WHEN** an HTTP header, private credential field, or retained complete foreign document contains a name matching a retired native option field
 - **THEN** native-key validation does not rewrite or reject that data solely because its name matches a retired native field
 
+### Requirement: Native compatibility for existing proxy protocols
+
+Transit SHALL provide native support only for the protocol and option combinations marked supported in the detailed adapter matrix. Supported provider nodes SHALL preserve authentication, transport, security, and datagram semantics; unsupported or incomplete combinations remain unavailable with a typed diagnostic.
+
+#### Scenario: A supported provider node uses a native adapter
+
+- **WHEN** a provider supplies a node with a protocol and option combination listed as supported
+- **THEN** Transit normalizes and prepares the corresponding native adapter without launching an external proxy core, preserving the documented connection semantics
+
+#### Scenario: A combination cannot be represented safely
+
+- **WHEN** a node contains an unsupported or incomplete connection-option combination
+- **THEN** it remains unavailable with a redacted diagnostic, and no downgraded route is used
+
+### Requirement: VLESS Vision flow and datagrams
+
+VLESS Vision SHALL preserve each direction's framing transitions over direct TLS 1.3 or REALITY, using XUDP without multiplex and the selected multiplex framing when enabled. The `-udp443` flow SHALL additionally allow UDP to port 443.
+
+#### Scenario: Vision datagrams to port 443
+
+- **WHEN** a Vision node opens UDP to port 443
+- **THEN** the request succeeds only for `xtls-rprx-vision-udp443` and carries the base Vision flow name on the wire
+
+#### Scenario: Peer switches a Vision direction to direct copy
+
+- **WHEN** a peer sends a valid Vision DIRECT transition after its framed content
+- **THEN** the receiver delivers buffered plaintext and subsequent raw bytes in order without exposing the outer TLS record stream
+
 ### Requirement: Bounded smux sessions
 
 smux sessions SHALL enforce the detailed per-session and per-stream resource

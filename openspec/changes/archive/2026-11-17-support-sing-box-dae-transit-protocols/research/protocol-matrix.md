@@ -44,11 +44,11 @@ transports; dae also lists Meek in its VMess/VLESS transport support.
 [sing-box transport options](https://github.com/SagerNet/sing-box/blob/v1.14.4/option/v2ray_transport.go)
 and the [dae protocol table](https://github.com/daeuniverse/dae/blob/v2.1.2/docs/en/proxy-protocols.md#L3-L17)
 identify the upstream vocabulary. PathChord's
-[shared transport validation](../../../../crates/pathchord-transit/src/native_transport.rs)
+[shared transport validation](../../../../../crates/pathchord-transit/src/native_transport.rs)
 currently handles TCP, HTTP, HTTPUpgrade, gRPC, QUIC, Meek and WebSocket including
 bounded early data; it rejects unsupported transport and dial options. The
 registry applies eligible multiplex options through a separate adapter. Its
-[TLS configuration](../../../../crates/pathchord-transit/src/tls.rs) rejects
+[TLS configuration](../../../../../crates/pathchord-transit/src/tls.rs) rejects
 fingerprint settings that it cannot honor. A combination is supported only
 when each relevant adapter, transport, TLS option, importer and credential
 path consumes it and the independent peer verifies it.
@@ -65,9 +65,9 @@ after the last stream release, pending I/O shares a ten-second drain deadline. S
 [smux investigation](smux-and-padding.md) for framing, further limits and
 the distinction between the peer tests and open validation.
 
-The [adapter registry](../../../../crates/pathchord-transit/src/adapter_registry.rs)
+The [adapter registry](../../../../../crates/pathchord-transit/src/adapter_registry.rs)
 shows which families can be built; the individual adapters define their
 parameter checks and TCP/UDP capabilities. The
-[implementation status](../../../implementation-status.md) records existing
+[implementation status](../../../../implementation-status.md) records existing
 test evidence and its limits. External-core fixtures are explicitly invoked
 test peers and must not become runtime, source or release dependencies.

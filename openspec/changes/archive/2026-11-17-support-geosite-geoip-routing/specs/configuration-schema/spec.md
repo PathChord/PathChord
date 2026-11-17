@@ -32,7 +32,7 @@ The loader SHALL read and validate each referenced database as part of the compl
 
 ### Requirement: Detailed geodata contract
 
-Geodata configuration SHALL follow the complete [detailed contract](#geodata-databases).
+Geodata configuration SHALL follow the complete [detailed contract](../../../../../specs/configuration-schema/spec.md#geodata-databases).
 
 #### Scenario: Apply the detailed contract
 

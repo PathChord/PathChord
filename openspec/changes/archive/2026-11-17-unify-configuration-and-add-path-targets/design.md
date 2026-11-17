@@ -11,11 +11,11 @@ and Session observations can obtain their target from a different snapshot
 than the Ingress maintenance target.
 
 Relevant implementation seams are
-[native resource parsing](../../../crates/pathchord-policy/src/config.rs),
-[service settings](../../../crates/pathchord-policy/src/service_config.rs),
-[typed options](../../../crates/pathchord-policy/src/transit_options.rs),
-[Ingress maintenance](../../../crates/pathchord-ingress/src/data_plane.rs), and
-[capacity scaling](../../../crates/pathchord-path/src/autoscale.rs).
+[native resource parsing](../../../../crates/pathchord-policy/src/config.rs),
+[service settings](../../../../crates/pathchord-policy/src/service_config.rs),
+[typed options](../../../../crates/pathchord-policy/src/transit_options.rs),
+[Ingress maintenance](../../../../crates/pathchord-ingress/src/data_plane.rs), and
+[capacity scaling](../../../../crates/pathchord-path/src/autoscale.rs).
 Both role binaries and the workspace CLI contain service configuration and
 observation consumers. Subscription caches embed serialized native options,
 so changing their public serde names also changes the normalized cache format.

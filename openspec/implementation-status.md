@@ -52,7 +52,7 @@ residual optional replication, resource-limit errors, passive capacity
 confidence, truststore source validation, and local-control stage deadlines
 are present in the local implementation.
 
-The [configuration and Path-target change](changes/unify-configuration-and-add-path-targets/)
+The [configuration and Path-target change](changes/archive/2026-11-17-unify-configuration-and-add-path-targets/)
 is implemented in this worktree. Ingress Egress resources now place the
 count-based admission minimum in `pathPool.minUsablePaths`, keep common Egress
 capability requirements in `admission.requiredCapabilities`, and optionally
@@ -75,8 +75,9 @@ refreshed under the configured subscription source and its existing budgets.
 Authorized Session queries, events, snapshots, and aggregate Prometheus gauges
 distinguish requested/effective baselines, the current demand target, usable
 Paths, and baseline shortfall with a bounded reason. English and Chinese main
-specifications and user guides have been reconciled with the active change;
-the planning artifacts remain available until the change is archived.
+specifications and user guides have been reconciled with the completed change;
+the archived planning artifacts preserve its migration table and verification
+checklist.
 
 The evidence below remains local Linux build/test evidence unless a section
 explicitly names a native host, external peer, cross-machine run, or soak.
@@ -583,13 +584,12 @@ main-spec strict validation (11/11), and strict validation of the active
 configuration/path-target change passed. Clippy reports the existing unused
 `netsock` manifest dependency warning.
 
-`openspec validate --all --strict --no-interactive` currently reports four
-older completed but unarchived changes whose MODIFIED deltas predate scenarios
-now merged into the main specs by the active change:
-`finalize-v1-session-resource-contracts`,
-`simplify-egress-path-selection`, `support-egress-multiple-endpoints`, and
-`support-sing-box-dae-transit-protocols`. Those deltas are outside this change;
-the current change itself and all canonical main specs validate. The current-head
+After archiving the completed changes, strict all-change OpenSpec validation
+passes all 15 remaining items. Four changes remain active:
+native platform validation, native package validation, provider/runtime
+reliability evidence, and the role-binary change. The role-binary task for
+cross-role private-file isolation is reopened because the packaged Ingress and
+Egress services still share a service UID on Arch and Debian. The current-head
 GitHub CI run also passed the dependency-advisory and external-core jobs. The
 local Docker monitoring deployment is recorded separately below. Native
 Windows, FreeBSD, privileged Linux, and production monitoring/probe calibration
@@ -613,9 +613,9 @@ loopback CONNECT flows while Ingress remains running, then shuts it down
 normally. Workspace Clippy and formatting checks pass. All-target workspace
 checks passed for Windows GNU and FreeBSD x86_64; the FreeBSD check used the
 existing SDK/compiler wrappers described below and does not execute native
-FreeBSD tests. The current strict OpenSpec validation passes all 23 items,
-and local documentation links, anchors, and bilingual structural identities
-pass validation.
+FreeBSD tests. That prior repair run's strict OpenSpec validation passed all 23
+items, and its local documentation links, anchors, and bilingual structural
+identities passed validation.
 
 The 2026-11-17 protocol acceptance rerun passed the applicable independent
 peers and local control paths. sing-box 1.14.4 passed the native AnyTLS,

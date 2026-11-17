@@ -60,7 +60,7 @@ Geodata predicates SHALL use the database snapshot captured with the routing gen
 
 ### Requirement: Detailed geodata contract
 
-Geodata processing SHALL follow the complete [detailed contract](#detailed-contract).
+Geodata processing SHALL follow the complete [detailed contract](../../../../../specs/geodata-routing/spec.md#detailed-contract).
 
 #### Scenario: Apply the detailed contract
 
