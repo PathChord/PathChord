@@ -74,12 +74,21 @@ EgressService 的 `web` 可选，只接受 `bind`、`tokenFile`、`allowedOrigin
 
 ### Requirement: Whole-bundle identities and references
 
-加载器必须（SHALL）跨所有来源文件验证完整资源图，按 namespace、kind 和 name 解析引用，并拒绝重复身份，不得采用后文件覆盖语义。完整配置必须（SHALL）恰好包含一个 DNSPolicy 和一个 FallbackPolicy。
+Ingress 必须（SHALL）跨所有来源文件验证完整资源图，按 namespace、kind 和 name
+解析引用，并拒绝重复身份，不得采用后文件覆盖语义。完整 Ingress 配置必须（SHALL）
+恰好包含一个 DNSPolicy 和一个 FallbackPolicy。Egress 必须（SHALL）使用下述角色专用
+Egress 来源契约，不得要求 Ingress 资源图。
 
 #### Scenario: Duplicate resources are split between files
 
 - **WHEN** 配置目录中的两个文件声明了相同 `(namespace, kind, metadata.name)` 身份
 - **THEN** 必须拒绝完整候选配置集合，不得选择文件名靠后的资源
+
+#### Scenario: Egress does not require Ingress-only resources
+
+- **WHEN** Egress 来源包含一个有效 `EgressService`，且没有
+  `DNSPolicy`、`FallbackPolicy`、Listener 或路由资源
+- **THEN** Egress 从该服务来源验证并启动，不虚构或要求 Ingress 策略资源。
 
 ### Requirement: Explicit source precedence and bounded discovery
 
@@ -89,6 +98,58 @@ Ingress 必须（SHALL）先选择命令行配置，再选择环境配置和账�
 
 - **WHEN** 提供了有效的显式命令行来源，同时两个配置环境变量均非空
 - **THEN** 显式来源具有优先权，并覆盖环境变量层的冲突
+
+### Requirement: Role-specific Egress configuration source
+
+Egress 配置来源必须（SHALL）在单个资源文件或目录树中恰好包含一个
+`EgressService`，并拒绝 Ingress 专属资源类型，而不载入完整 Ingress 策略图。来源必须
+（SHALL）保留现有 `EgressService` 字段验证、私有路径规则和 namespace 身份语义。
+
+#### Scenario: Egress loads a service-only source
+
+- **WHEN** Egress 来源恰好包含一个有效 `EgressService`
+- **THEN** Egress 接受其 bind、identity、authorization database、control socket、资源限制、
+  DNS 模式和可选 Web Gateway 设置，且不要求任何 Ingress 资源。
+
+#### Scenario: Egress source contains an Ingress resource
+
+- **WHEN** Egress 来源包含 Listener、TransitProxy、Subscription、EgressRule、ProxyRule、
+  DNSPolicy、FallbackPolicy 或 geodata 资源
+- **THEN** 来源验证以类型化诊断失败，指出该资源超出 Egress 配置契约。
+
+#### Scenario: Egress source contains zero or multiple services
+
+- **WHEN** Egress 来源不含 `EgressService`，或在所选来源中包含多个
+  `EgressService` 身份
+- **THEN** Egress 拒绝启动，且不打开 Path listener 或修改授权数据库。
+
+#### Scenario: Egress private paths remain outside the resource tree
+
+- **WHEN** `EgressService` 引用 identity、authorization database、control socket 或 bearer-token 路径
+- **THEN** 相对路径从所选 Egress 来源目录解析，私有文件留在资源文档之外，且服务在启动前
+  执行现有的所有权和权限检查。
+
+### Requirement: Egress source precedence and restart boundary
+
+Egress 必须（SHALL）先选择显式命令行资源来源，其次选择
+`PATHCHORD_CONFIG` 或 `PATHCHORD_CONFIG_DIR`，最后使用账号默认值。CLI 字段覆写必须（SHALL）
+优先于选定的 `EgressService`；identity、listener bind、授权存储、控制端点或其他仅启动时
+服务字段发生变化时，必须（SHALL）要求重启 Egress。
+
+#### Scenario: Egress command-line source overrides the environment
+
+- **WHEN** 同时提供 Egress 配置环境变量及显式 `--config` 或 `--config-dir` 来源
+- **THEN** Egress 只载入显式来源，不把环境来源合并进来。
+
+#### Scenario: Egress source fails validation
+
+- **WHEN** 所选 Egress 来源不可读、格式错误或违反角色专用资源契约
+- **THEN** Egress 在绑定公共 Path listener 之前报告类型化配置错误，并保留已有服务状态。
+
+#### Scenario: Egress startup configuration changes
+
+- **WHEN** 后续 Egress 来源改变 identity、bind 地址、授权数据库、控制端点或其他仅启动时字段
+- **THEN** 服务报告需要重启，且不把变更部分应用到活动运行时。
 
 ### Requirement: Atomic publication and resilient watching
 
