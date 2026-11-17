@@ -1,0 +1,52 @@
+# Tasks
+
+All items below are implementation work and remain unchecked in this planning
+change. Backward compatibility with retired native configuration is not
+required. Each group lands its own behavioral regressions and documentation;
+the final group verifies the integrated result.
+
+## 1. Canonical resource schema and validation
+
+- [ ] 1.1 Add the Egress Path-pool and admission models, resolve the default minimum and requested baseline, and preserve capability eligibility; verify parser/domain tests cover omission, empty objects, explicit target equal to minimum, target below minimum, null/non-integral/zero/out-of-range values, and wider default arithmetic at the unsigned 32-bit boundary.
+- [ ] 1.2 Reject every retired native path in the configuration-schema migration table with `CONFIG_RETIRED_FIELD`, resource identity, exact field path, and canonical replacement; verify table-driven tests cover old-only, old-plus-new, empty/default-valued old fields, multi-document/List inputs, last-good-bundle retention, and redaction, with no compatibility aliases, legacy readers, or automatic translator.
+- [ ] 1.3 Standardize Egress single/plural and TransitProxy remote endpoints on `host`; verify hostname/IPv4/IPv6, port, duplicate, order, shorthand-conflict, public-key/identity retention, and direct-adapter behavior, while tests confirm Listener interface addresses, NodeProbe targets, HTTP Host values, and user maps are not recursively renamed.
+- [ ] 1.4 Group EgressService Web fields under `web` in service models and both `pathchord-egressd` and workspace CLI resolvers; verify unchanged flags override the matching nested fields, omitted Web remains disabled, relative token paths use the selected source, origins/protected-transport validation remains effective, and every retired flat Web key is rejected.
+- [ ] 1.5 Include the resolved requested baseline and capability requirement in normalization and startup fingerprints; verify equivalent omitted/explicit defaults and file/mapping moves preserve identity, while semantic minimum/target/admission changes report restart required and reject a mixed startup/dynamic candidate atomically.
+- [ ] 1.6 Reconcile the configuration-schema English main spec and Chinese counterpart, publish the native migration table and naming rules in the paired configuration guides, and migrate resource/role examples and packaging fixtures; verify all documented canonical fields match parser fixtures and `catchAll` plus `ProxyRule.require` are fully documented without changing routing semantics.
+
+## 2. Native adapter options, imports, and caches
+
+- [ ] 2.1 Implement the six canonical native option names and their normalized serialization across adapter consumers; verify strict parsing and roundtrip tests retain HTTP Host list order/cardinality, byte bounds, UDP-over-TCP versions/conflicts, certificate trust anchors versus client chains, and independent ClientHello-profile/certificate-pin behavior.
+- [ ] 2.2 Update subscription normalization into the canonical model while retaining original Clash, sing-box, and share-link spellings; verify existing import/adapter regressions for TLS, HTTP/WebSocket early data, Host conflicts, and UDP-over-TCP, including rejection of unconsumed options and preservation of header names, private credentials, and complete unavailable foreign documents.
+- [ ] 2.3 Write normalized-node cache envelope version 3 and check bounded envelope/schema metadata before decoding typed native payloads; verify canonical cache roundtrips and that version-2 or retired-option payloads produce sanitized `cache_incompatible` without partial node publication or native compatibility aliases.
+- [ ] 2.4 Preserve source identity and lifecycle decisions during incompatible-cache recovery; verify independently valid active nodes can survive an allowed refresh, cold offline startup cannot promote an incompatible cache, authenticated refresh obeys byte/provider/origin budgets, and disabled/deleted/source-replaced/tombstoned nodes cannot be revived by cache load or stale in-flight work.
+- [ ] 2.5 Reconcile the full Transit Proxy English/Chinese option tables, ClientHello examples, cache contract, and paired user guides; verify renamed keys occur only in canonical native examples, retired-key explanations or negative tests, while foreign-format and private-credential examples preserve their documented spellings.
+
+## 3. Egress baseline maintenance and autoscaling
+
+- [ ] 3.1 Introduce one authoritative Egress-owned planning state for minimum, requested/effective baseline, current directional demand target, and usable count; replace the hard-coded reserve calculations in Session creation, warmup, retirement, and reset, and verify defaults, explicit no-extra-reserve, runtime clamping without configuration rewrite, and current-target recomputation without a sticky peak.
+- [ ] 3.2 Maintain the effective baseline with zero business connections through bounded background establishment; verify deterministic fake-transport tests for no route match, zero/unknown idle demand, no eligible candidate, failing candidates with backoff, hard/admission restrictions, and occupied/in-flight/draining slot accounting under the runtime ceiling.
+- [ ] 3.3 Restore deficits after Path failure and fresh Session creation using the configured baseline; verify surviving Stream/UDP work and new admission continue when the minimum is met, below-minimum admission is denied, last-ready-Path loss retires the SessionID, and replacement Sessions clear old demand/hysteresis without bypassing trust circuit breakers.
+- [ ] 3.4 Allow sustained directional capacity demand to expand above the baseline under existing quality, overhead, hysteresis and hard-limit guards; verify asymmetric upstream/downstream demand, known overhead exclusion, unknown capacity remaining unknown, and no expansion justified solely by idle throughput.
+- [ ] 3.5 Contract surplus gradually toward the effective baseline using recovery stabilization, a separate low-utilization window, cooldown, and one drain per decision; verify concurrent selected drains never cross the baseline/minimum or remaining capacity requirement, draining Paths do not count as usable, accepted work follows normal drain deadlines, and hard failure/revoke can still close immediately.
+- [ ] 3.6 Merge and reconcile the configuration and state-machine deltas into both main-spec languages and update paired architecture/design and configuration/operation guides; verify the idle, shortfall, directional expansion, contraction, restart, and independent replication semantics are equivalent across documents and every superseded Detailed contract paragraph is updated.
+
+## 4. Coherent observation and control surfaces
+
+- [ ] 4.1 Carry requested/effective baseline, current target, usable count, shortfall, and its typed reason from the authoritative planner through data-plane Session snapshots, role/CLI observation assembly, and `SessionObservation`; verify a stale actor target cannot overwrite current planning and no fake authenticated Session is created for a configured-only Egress.
+- [ ] 4.2 Expose the same fields in Session list/detail, REST/drill-down, and `session.changed` payloads using the public `ready_path_count`/`usable_path_count` names; verify count-only and reason-only changes emit events and retain the identified observation generation, with replay/resync snapshots preceding later deltas.
+- [ ] 4.3 Add the four aggregate live-Session planning gauges from the observability delta and remove any stale Egress-recommended-Path family; verify an authenticated scrape declares gauge types, sums one shared live snapshot, excludes retired history, returns zero for an empty live set, and introduces no new metric labels or secret-bearing output.
+- [ ] 4.4 Verify cross-surface fixtures for minimum one/requested three/usable two, requested six/runtime ceiling four, load target five above baseline three, zero shortfall above baseline, and every reason-precedence combination; assert baseline shortfall alone never changes health/admission and missing demand remains null/unknown across queries, events, and recovery snapshots.
+- [ ] 4.5 Merge and reconcile the observability and ingress-control-plane deltas into their English/Chinese main specs, including complete field/metric registries and removal of the obsolete recommendation entry; update paired operating/monitoring guides and initial implementation-status entries, and verify field names, reasons, generation rules, and health meanings agree.
+
+## 5. Integration verification and evidence
+
+- [ ] 5.1 Extend the existing local Ingress/Transit/Egress integration fixtures with canonical configuration and a no-business baseline followed by traffic and recovery; verify the baseline forms without opening a target, existing and new work survive a target-only deficit, capacity-scale decisions can exceed and later approach the baseline, and typed resource failures never create hidden direct or unrelated-route fallback.
+- [ ] 5.2 Run `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo build --locked --workspace --bins`, and `cargo test --locked --workspace --all-targets`; verify workspace binaries exist before cross-package process tests and report environment-dependent ignored peer tests separately from executed local evidence.
+- [ ] 5.3 Run `openspec validate --all --strict --no-interactive`, `git diff --check`, and `rg -n '^#{1,6} ' README.md README.zh-CN.md docs openspec AGENTS.md`; verify local links/anchors, reciprocal language switches, paired requirement/scenario identities, canonical field examples and registries, and absence of implementation-progress claims in final-state design/specifications.
+- [ ] 5.4 Update `openspec/implementation-status.md` with the actual completed behavior, commands/results, remaining constraints, and local-versus-native/deployed evidence; verify every task is checked only after its own completion check and this change's English deltas reconcile with the complete bilingual main contracts before any archive operation.
+
+## Workflow follow-up
+
+- Archive only after implementation and its checks are complete. Preserve and repair relative links in planning artifacts when moving the change into the archive directory.
+- Native-platform, real-provider, production tuning, and deployment evidence remain separate from local tests; this planning request does not authorize a live rollout.
