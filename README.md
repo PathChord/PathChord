@@ -107,9 +107,7 @@ remain listed until they are reviewed and archived.
 
 | Change | Scope |
 | --- | --- |
-| [Native platforms](openspec/changes/validate-native-platforms/tasks.md) | Windows/FreeBSD listeners and local control; privileged Linux transparent/TUN/eBPF checks. |
 | [Providers and runtime reliability](openspec/changes/validate-provider-and-runtime-reliability/tasks.md) | Real provider exports, independent peers, cross-machine flows, and failure/restart soak tests. |
-| [Native packages](openspec/changes/validate-native-packages/tasks.md) | Debian, Alpine, Arch Linux, FreeBSD, and NSIS package-host acceptance. |
 
 ## OpenSpec workflow
 

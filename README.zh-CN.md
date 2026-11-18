@@ -75,9 +75,7 @@ direct/SOCKS5/Shadowsocks UDP（包括 SS2022）
 
 | 变更 | 范围 |
 | --- | --- |
-| [原生平台](openspec/changes/validate-native-platforms/tasks.md) | Windows/FreeBSD 监听器与本地控制，以及 Linux 透明代理/TUN/eBPF 的特权验证。 |
 | [提供商与运行时可靠性](openspec/changes/validate-provider-and-runtime-reliability/tasks.md) | 真实提供商导出、独立协议 peer、跨机器流量、故障与重启长时间测试。 |
-| [原生软件包](openspec/changes/validate-native-packages/tasks.md) | Debian、Alpine、Arch Linux、FreeBSD 和 NSIS 打包主机验收。 |
 
 ## OpenSpec 工作流
 

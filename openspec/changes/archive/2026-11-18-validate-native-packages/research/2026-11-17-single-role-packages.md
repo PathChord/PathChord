@@ -115,7 +115,7 @@ stops an active matching role in `PRE-INSTALL` and reports the recovery command;
 the package-host harness waits for `pkg` to return, then calls `service ...
 onestart` and verifies control and state. Rollback uses the same outer recovery
 step. No background process or privilege broker is used to escape the reaper.
-The [FreeBSD package guide](../../../../packaging/freebsd/README.md#upgrade-and-rollback)
+The [FreeBSD package guide](../../../../../packaging/freebsd/README.md#upgrade-and-rollback)
 documents that service interruption and recovery procedure.
 
 ## Acceptance state

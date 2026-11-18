@@ -88,13 +88,13 @@ PathChord 已经具备 eBPF 后端所需的多个用户态接口，这支持“�
 
 | 责任 | PathChord 当前定位 | 与 dae/eBPF 的关系 |
 | --- | --- | --- |
-| TCP 透明 listener | [`LinuxTransparentTcpListener::bind`](../../../../crates/pathchord-ingress/src/linux_transparent.rs#L38-L89) 设置 TPROXY 的 `IP_TRANSPARENT`，并在 [`original_destination`](../../../../crates/pathchord-ingress/src/linux_transparent.rs#L97-L115) 使用 TPROXY 的 `local_addr` | 可继续复用；TC eBPF 只把包送到 listener，不替代 accept/flow context。 |
-| UDP 原目标 | [`LinuxTproxyUdpSocket::bind`](../../../../crates/pathchord-ingress/src/linux_tproxy_udp.rs#L110-L137) 设置透明 UDP socket；[`receive_ready`](../../../../crates/pathchord-ingress/src/linux_tproxy_udp.rs#L140-L195) 解析 IPv4/IPv6 original-destination cmsg | 与 dae 的 UDP OOB 方案相同，eBPF 仍需要把 datagram 正确送到该 socket。 |
-| mark/rule/table | [`LinuxTransparentRouteManager::apply`](../../../../crates/pathchord-ingress/src/linux_routing.rs#L183-L221) 预检、写 journal、安装 rule/route；[`restore`](../../../../crates/pathchord-ingress/src/linux_routing.rs#L223-L300) 负责恢复 | eBPF TC 路径仍需要 fwmark/local route；若采用 dae 的 netns/veth 方案，还会新增接口和回程状态管理。 |
-| 平台隔离 | [`IngressPlatformFactories`](../../../../crates/pathchord-ingress/src/platform_runtime.rs#L154-L182) 将 TUN、路由、透明 UDP 等平台能力注入 | `LinuxEbpfInterception` 仅作为 Linux 平台 owner，而不是把 eBPF 放进跨平台核心。 |
-| TUN | [`TunFlowRuntime`](../../../../crates/pathchord-ingress/src/tun_netstack.rs#L119-L218) 使用 smoltcp 从 TUN 包重建 TCP/UDP flow | eBPF TC 重定向不能替代 TUN 的 IP stack；两者应保持独立。 |
+| TCP 透明 listener | [`LinuxTransparentTcpListener::bind`](../../../../../crates/pathchord-ingress/src/linux_transparent.rs#L38-L89) 设置 TPROXY 的 `IP_TRANSPARENT`，并在 [`original_destination`](../../../../../crates/pathchord-ingress/src/linux_transparent.rs#L97-L115) 使用 TPROXY 的 `local_addr` | 可继续复用；TC eBPF 只把包送到 listener，不替代 accept/flow context。 |
+| UDP 原目标 | [`LinuxTproxyUdpSocket::bind`](../../../../../crates/pathchord-ingress/src/linux_tproxy_udp.rs#L110-L137) 设置透明 UDP socket；[`receive_ready`](../../../../../crates/pathchord-ingress/src/linux_tproxy_udp.rs#L140-L195) 解析 IPv4/IPv6 original-destination cmsg | 与 dae 的 UDP OOB 方案相同，eBPF 仍需要把 datagram 正确送到该 socket。 |
+| mark/rule/table | [`LinuxTransparentRouteManager::apply`](../../../../../crates/pathchord-ingress/src/linux_routing.rs#L183-L221) 预检、写 journal、安装 rule/route；[`restore`](../../../../../crates/pathchord-ingress/src/linux_routing.rs#L223-L300) 负责恢复 | eBPF TC 路径仍需要 fwmark/local route；若采用 dae 的 netns/veth 方案，还会新增接口和回程状态管理。 |
+| 平台隔离 | [`IngressPlatformFactories`](../../../../../crates/pathchord-ingress/src/platform_runtime.rs#L154-L182) 将 TUN、路由、透明 UDP 等平台能力注入 | `LinuxEbpfInterception` 仅作为 Linux 平台 owner，而不是把 eBPF 放进跨平台核心。 |
+| TUN | [`TunFlowRuntime`](../../../../../crates/pathchord-ingress/src/tun_netstack.rs#L119-L218) 使用 smoltcp 从 TUN 包重建 TCP/UDP flow | eBPF TC 重定向不能替代 TUN 的 IP stack；两者应保持独立。 |
 
-当前仓库的架构约束也要求保留 Windows/FreeBSD 的显式 listener 路径；因此 eBPF 只能是 Linux 平台实现，而不能成为 `pathchord-core` 的通用抽象。相关平台能力判断见[`validate_listener_platforms`](../../../../crates/pathchord-ingress/src/platform_runtime.rs#L869-L887)。
+当前仓库的架构约束也要求保留 Windows/FreeBSD 的显式 listener 路径；因此 eBPF 只能是 Linux 平台实现，而不能成为 `pathchord-core` 的通用抽象。相关平台能力判断见[`validate_listener_platforms`](../../../../../crates/pathchord-ingress/src/platform_runtime.rs#L869-L887)。
 
 ## 是否应采用 eBPF 后端
 
