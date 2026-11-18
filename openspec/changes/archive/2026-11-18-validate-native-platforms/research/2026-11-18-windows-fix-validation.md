@@ -121,7 +121,7 @@ The machine-readable result is
   Tokio time rather than depending on Windows timer resolution.
 
 NSIS and service-account repairs and their separate native acceptance are
-recorded under the [package change](../../validate-native-packages/).
+recorded under the [package change](../../2026-11-18-validate-native-packages/).
 
 ## Evidence and validation limits
 

@@ -1,7 +1,7 @@
 # Linux kernel validation on 2026-11-17
 
 This is execution evidence for tasks 3.1 and 3.2. The existing
-[platform contract](../../../specs/platform-and-dns/spec.md) remains authoritative.
+[platform contract](../../../../specs/platform-and-dns/spec.md) remains authoritative.
 The run uses the current working tree, including uncommitted implementation
 fixes; the manifests record the base revision, dirty state and executable hashes.
 

@@ -92,9 +92,9 @@ Unix `pathchord` service account. Mutually exclusive role packages and native
 service lifecycles have passed on Debian, Alpine, Arch Linux, FreeBSD and
 Windows; each payload contains only its selected daemon and `pathchordctl`, and
 an opposite-role install is rejected before state changes. The
-[single-role package report](changes/validate-native-packages/research/2026-11-17-single-role-packages.md)
+[single-role package report](changes/archive/2026-11-18-validate-native-packages/research/2026-11-17-single-role-packages.md)
 records the Unix package hosts; the
-[final Windows package report](changes/validate-native-packages/research/2026-11-18-windows-package-final.md)
+[final Windows package report](changes/archive/2026-11-18-validate-native-packages/research/2026-11-18-windows-package-final.md)
 records both Windows role profiles and their service identities.
 
 The scheduling slice now has deterministic coverage for independent mixed-flow
@@ -497,9 +497,9 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   SOCKS4/4a/5, Mixed and SOCKS5 UDP exercised native Windows sockets, including
   authentication, IPv4/IPv6/domain resolution, bounded resources and shutdown.
   Three formerly unstable ordering/timeout/watcher cases also passed ten
-  repeats each. The [current Windows report](changes/validate-native-platforms/research/2026-11-18-windows-fix-validation.md)
+  repeats each. The [current Windows report](changes/archive/2026-11-18-validate-native-platforms/research/2026-11-18-windows-fix-validation.md)
   records source/artifact hashes and the reusable prepared snapshot; the
-  [first failed run](changes/validate-native-platforms/research/2026-11-17-windows-qemu-validation.md)
+  [first failed run](changes/archive/2026-11-18-validate-native-platforms/research/2026-11-17-windows-qemu-validation.md)
   remains historical evidence.
 - Linux TPROXY/REDIRECT/TUN and optional TC/eBPF ownership, IPv4/IPv6 forwarding,
   rollback, crash recovery, foreign-object preservation and fallback passed a
@@ -611,7 +611,7 @@ The source revision was `9caf37278a61e28c6c5c1669eb793eb2b5ba33df` with a
 dirty worktree. The Ingress binary SHA-256 was
 `186a5dd8c8f47336ed72a6d7ce30b2f622bd50e627b66d3f42d8ab90ae9db647`. Exact
 guest/tool versions, all result groups and source/APK/log/pcap hashes are in
-[the machine-readable manifest](changes/validate-native-platforms/research/2026-11-17-linux-kernel-validation.json);
+[the machine-readable manifest](changes/archive/2026-11-18-validate-native-platforms/research/2026-11-17-linux-kernel-validation.json);
 full behavior and implementation findings are in the adjacent Markdown record.
 
 The explicit-listener reliability soak ran for 300.24 seconds over 12 cycles,
@@ -634,7 +634,7 @@ verified `0600` identity, SQLite database and control socket ownership/modes,
 normal SIGTERM exit and socket removal. Source revision:
 `9caf37278a61e28c6c5c1669eb793eb2b5ba33df`. The full per-executable, binary,
 SDK, image and toolchain evidence is recorded in the
-[FreeBSD validation manifest](changes/validate-native-platforms/research/2026-11-17-freebsd-native-validation.json).
+[FreeBSD validation manifest](changes/archive/2026-11-18-validate-native-platforms/research/2026-11-17-freebsd-native-validation.json).
 The cached image for this run came from the official FreeBSD mirror and its
 published SHA-256; `scripts/qemu_freebsd.py` now defaults future downloads to
 the user-recommended CERNET mirror.
@@ -673,9 +673,9 @@ preserved the actual identity/SQLite hashes on removal. Windows NSIS/PowerShell
 native lifecycle acceptance passed for both roles in the prepared QEMU overlay;
 the repaired helper and installer completed the full upgrade/rollback/uninstall
 and role-replacement matrix. The historical first exit-code-2 run remains in
-the [first Windows QEMU package report](changes/validate-native-packages/research/2026-11-17-windows-qemu-package-validation.md),
-and the passing evidence is in the [final Windows package report](changes/validate-native-packages/research/2026-11-18-windows-package-final.md).
-The [single-role package report](changes/validate-native-packages/research/2026-11-17-single-role-packages.md)
+the [first Windows QEMU package report](changes/archive/2026-11-18-validate-native-packages/research/2026-11-17-windows-qemu-package-validation.md),
+and the passing evidence is in the [final Windows package report](changes/archive/2026-11-18-validate-native-packages/research/2026-11-18-windows-package-final.md).
+The [single-role package report](changes/archive/2026-11-18-validate-native-packages/research/2026-11-17-single-role-packages.md)
 links the non-Windows per-profile evidence under `/data/pathchord-qemu/runs/native-packages/`.
 The package fixture versions 0.1.0/0.1.1 use identical tested binaries and do
 not establish cross-protocol-version or database-schema migration.
@@ -1052,7 +1052,7 @@ FreeBSD 15.1 guest to `/data/pathchord-qemu/freebsd-build/sysroot`, then used
 Clang/Clang++ and LLD 23 with Rust 1.100.0 to build all workspace targets and
 test executables. The resulting executables were uploaded back to that FreeBSD
 guest and ran as `pathchord`; native results and artifact hashes are in the
-[FreeBSD validation manifest](changes/validate-native-platforms/research/2026-11-17-freebsd-native-validation.json).
+[FreeBSD validation manifest](changes/archive/2026-11-18-validate-native-platforms/research/2026-11-17-freebsd-native-validation.json).
 The plain host GCC/LLD target failure described in older validation notes still
 applies when target-specific SDK wrappers are not selected; Rust's target
 standard library alone does not supply system headers or libraries.

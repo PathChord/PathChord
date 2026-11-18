@@ -2,7 +2,7 @@
 
 ## Context
 
-The existing runtime has portable listener regressions and Windows/FreeBSD target build checks. Native forwarding and host integration remain unverified. See [status](../../implementation-status.md) and the [platform contract](../../specs/platform-and-dns/spec.md).
+The existing runtime has portable listener regressions and Windows/FreeBSD target build checks. Native forwarding and host integration remain unverified. See [status](../../../implementation-status.md) and the [platform contract](../../../specs/platform-and-dns/spec.md).
 
 ## Goals / non-goals
 

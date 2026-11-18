@@ -47,8 +47,8 @@ The compressed image SHA-256 is
 
 ## Reproduce
 
-The [runner](../../../../scripts/test-freebsd-platforms.py) owns its guest through
-the [FreeBSD lab context](../../../../scripts/qemu_freebsd.py). It does not
+The [runner](../../../../../scripts/test-freebsd-platforms.py) owns its guest through
+the [FreeBSD lab context](../../../../../scripts/qemu_freebsd.py). It does not
 change host accounts, routes, firewall rules or service configuration.
 
 ```sh

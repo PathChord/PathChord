@@ -2,7 +2,7 @@
 
 ## Context
 
-The recipes provide mutually exclusive Ingress and Egress packages, a pathchord(1) manual and role-specific configuration. Each package installs only the selected daemon and `pathchordctl`; Unix uses the local non-login `pathchord` account. Host tooling and native-service acceptance are separate from artifact assembly. See the [package guide](../../../packaging/README.md), [deployment contract](../../specs/deployment/spec.md) and [status](../../implementation-status.md).
+The recipes provide mutually exclusive Ingress and Egress packages, a pathchord(1) manual and role-specific configuration. Each package installs only the selected daemon and `pathchordctl`; Unix uses the local non-login `pathchord` account. Host tooling and native-service acceptance are separate from artifact assembly. See the [package guide](../../../../packaging/README.md), [deployment contract](../../../specs/deployment/spec.md) and [status](../../../implementation-status.md).
 
 ## Goals / non-goals
 
