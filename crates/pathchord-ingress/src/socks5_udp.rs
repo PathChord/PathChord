@@ -370,7 +370,13 @@ async fn handle_client(
     let Some(handshake) = handshake else {
         return Ok(Socks5RuntimeReport::default());
     };
-    let handshake = handshake.map_err(listener_error)?;
+    let handshake = match handshake {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            crate::listener_rejection::finish(&mut stream).await;
+            return Err(listener_error(error));
+        }
+    };
     let identity = handshake.authentication_identity;
     let request = handshake.request;
     let process = if descriptor.process_metadata.is_empty() {
@@ -453,6 +459,7 @@ async fn handle_client(
                 .reject_command(&mut stream)
                 .await
                 .map_err(listener_error)?;
+            crate::listener_rejection::finish(&mut stream).await;
             Err(Socks5RuntimeError::Protocol(
                 "SOCKS command is disabled".to_owned(),
             ))

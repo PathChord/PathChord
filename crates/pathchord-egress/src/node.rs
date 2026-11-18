@@ -1676,12 +1676,25 @@ impl UdpTargetFactory for TokioUdpTargetFactory {
 }
 
 async fn connect_udp_target(address: SocketAddr) -> Option<(UdpSocket, u16)> {
+    if let SocketAddr::V6(address) = address
+        && address.ip().is_unicast_link_local()
+        && address.scope_id() == 0
+    {
+        // A link-local IPv6 address without an interface scope cannot be
+        // routed. Windows may leave connect() pending for several seconds
+        // for this candidate instead of returning an immediate error, which
+        // would prevent trying the next resolved address.
+        return None;
+    }
     let bind = match address {
         SocketAddr::V4(_) => "0.0.0.0:0",
         SocketAddr::V6(_) => "[::]:0",
     };
     let socket = UdpSocket::bind(bind).await.ok()?;
-    socket.connect(address).await.ok()?;
+    tokio::time::timeout(Duration::from_secs(1), socket.connect(address))
+        .await
+        .ok()?
+        .ok()?;
     let visible_port = socket.local_addr().ok()?.port();
     Some((socket, visible_port))
 }

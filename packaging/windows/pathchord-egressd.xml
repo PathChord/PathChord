@@ -6,9 +6,8 @@
   <name>PathChord Egressd</name>
   <description>PathChord authenticated Egress Path listener.</description>
   <startmode>Manual</startmode>
-  <serviceaccount>
-    <username>NT SERVICE\PathChordEgressd</username>
-  </serviceaccount>
+  <!-- The installer registers the wrapper first, then assigns the virtual
+       service account through SCM once the service SID exists. -->
   <executable>%BASE%\pathchord-egressd.exe</executable>
   <arguments>--config-dir "%ProgramData%\PathChord\config\egress" --control-socket "\\.\pipe\pathchord-egress"</arguments>
   <workingdirectory>%ProgramData%\PathChord</workingdirectory>

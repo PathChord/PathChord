@@ -538,7 +538,7 @@ async fn ordinary_proxy_attempts_only_a_bounded_number_of_eligible_nodes() {
     assert_eq!(calls[MAX_ORDINARY_PROXY_ATTEMPTS].load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ordinary_proxy_times_out_a_stalled_candidate_and_tries_the_next() {
     let first_config = proxy("first", "127.0.0.1:9".parse().unwrap());
     let second_config = proxy("second", "127.0.0.1:9".parse().unwrap());

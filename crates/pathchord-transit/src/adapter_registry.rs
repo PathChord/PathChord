@@ -592,7 +592,10 @@ mod tests {
         assert_eq!(
             resolved.options.tls.unwrap().truststore,
             vec![
-                "/var/lib/pathchord/config/certs/ca.pem".to_owned(),
+                std::path::PathBuf::from("/var/lib/pathchord/config")
+                    .join("certs/ca.pem")
+                    .to_string_lossy()
+                    .into_owned(),
                 "system".to_owned()
             ]
         );

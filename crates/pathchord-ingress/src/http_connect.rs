@@ -321,12 +321,13 @@ where
 
 async fn reject_authentication<S>(mut stream: S) -> ListenerError
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let _ = stream
         .write_all(PROXY_AUTHENTICATION_REQUIRED_RESPONSE)
         .await;
     let _ = stream.flush().await;
+    crate::listener_rejection::finish(&mut stream).await;
     ListenerError::Policy("HTTP proxy authentication failed".to_owned())
 }
 
@@ -376,19 +377,21 @@ pub(crate) fn parse_authority(authority: &str) -> Result<TargetEndpoint, String>
 
 async fn reject<S>(mut stream: S, reason: &str) -> ListenerError
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let _ = stream.write_all(BAD_REQUEST_RESPONSE).await;
     let _ = stream.flush().await;
+    crate::listener_rejection::finish(&mut stream).await;
     ListenerError::Protocol(reason.to_owned())
 }
 
 async fn reject_policy<S>(mut stream: S, reason: &str) -> ListenerError
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
     let _ = stream.write_all(BAD_REQUEST_RESPONSE).await;
     let _ = stream.flush().await;
+    crate::listener_rejection::finish(&mut stream).await;
     ListenerError::Policy(reason.to_owned())
 }
 

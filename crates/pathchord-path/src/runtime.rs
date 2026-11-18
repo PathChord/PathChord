@@ -8176,8 +8176,24 @@ mod tests {
                 }),
             )
             .await;
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            drop(io);
+            // Wait for the peer to consume SessionClose before closing the
+            // synthetic carrier. A fixed sleep races the actor on Windows and
+            // can turn orderly Session shutdown into an unrelated PathClosed.
+            let limits = ProtocolLimits::default();
+            let mut peer = NoiseRecordStream::new(io, noise, limits);
+            loop {
+                let frame = crate::CompleteFrameTransport::receive_frame(&mut peer)
+                    .await
+                    .unwrap()
+                    .expect("peer acknowledges SessionClose before carrier closure");
+                if matches!(
+                    Message::decode(frame.header().frame_type(), frame.payload(), limits).unwrap(),
+                    Message::SessionControlAck(ack) if ack.highest_contiguous == 2
+                ) {
+                    break;
+                }
+            }
+            drop(peer);
             egress.wait().await.unwrap();
             factory.join().await;
         })

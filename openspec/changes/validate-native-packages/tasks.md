@@ -9,7 +9,7 @@ These pending tasks were carried over from the implementation plan during the
 - [x] 1.2 Build/install each Alpine role package with native tooling; inspect metadata, selected daemon and management client, pathchord(1), matching OpenRC definition and /etc/pathchord template, then verify service lifecycle, local control and opposite-role rejection.
 - [x] 1.3 Build/install each Arch Linux role package with native tooling; inspect metadata, selected daemon and management client, compressed manual, matching systemd/sysusers/tmpfiles payload and default template, then verify service behavior and opposite-role rejection.
 - [x] 1.4 Build/install each FreeBSD role package using native pkg/ports tooling; inspect metadata, selected daemon and management client, manual, matching rc.d script, /usr/local/etc/pathchord paths and socket permissions, then verify service, local control and opposite-role rejection.
-- [ ] 1.5 Build/install each Windows NSIS role artifact with native tooling; inspect selected daemon and management client, manual, matching service definition and %ProgramData%\PathChord\config defaults, then verify installer/service agreement, Named Pipe control and opposite-role rejection.
+- [x] 1.5 Build/install each Windows NSIS role artifact with native tooling; inspect selected daemon and management client, manual, matching service definition and %ProgramData%\PathChord\config defaults, then verify installer/service agreement, Named Pipe control and opposite-role rejection.
 
 ## 2. Upgrade and release evidence
 
