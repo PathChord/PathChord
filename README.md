@@ -23,12 +23,13 @@ Upgrade; SOCKS5 also provides UDP ASSOCIATE. The
 `socks` listener spelling is accepted as an alias for canonical `socks5`.
 `type: mixed` serves HTTP and SOCKS on one TCP port, including SOCKS5 UDP
 ASSOCIATE through its negotiated relay endpoint.
-FreeBSD has explicit-listener platform validation and Unix local
-control. Target compilation and CLI linking pass; native host validation
-remains outstanding. Portable listener regressions run in the existing Rust CI
-job. Transparent TCP/UDP interception and TUN packet flows use the same policy
-and Session/Path data plane. Privileged host routing, real TUN device smoke,
-and platform-specific packaging validation remain separate acceptance steps.
+Windows and FreeBSD explicit listeners and local control have passed their
+recorded native QEMU validation matrices. Portable listener regressions run in
+the existing Rust CI job. Transparent TCP/UDP interception and TUN packet flows
+use the same policy and Session/Path data plane. Linux privileged routing,
+real TUN devices and optional eBPF checks have separate QEMU host evidence.
+Native platform and package results, host versions and validation limits are
+recorded in the implementation status linked below.
 Linux TPROXY also accepts `backend: ebpf` for an interface-bound TC classifier;
 the ordinary `tproxy` backend remains the default and fallback.
 See the [active OpenSpec changes](#active-changes) for pending platform,
@@ -100,8 +101,9 @@ versions; planning artifacts and the implementation-status snapshot use English.
 
 ### Active changes
 
-The following task lists carry the remaining work. Unchecked tasks do not imply
-implementation or native-host validation.
+The active change task lists track implementation and validation. Unchecked
+tasks do not imply implementation or native-host validation; completed changes
+remain listed until they are reviewed and archived.
 
 | Change | Scope |
 | --- | --- |

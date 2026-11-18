@@ -1,6 +1,6 @@
 # PathChord implementation status
 
-Status snapshot: 2026-11-17.
+Status snapshot: 2026-11-18.
 
 This document records the current implementation and validation state. Final
 architecture remains under `docs/design/`; behavioral contracts live under
@@ -17,8 +17,8 @@ each Path selects and retains its endpoint with bounded pre-admission failover.
 Local control observations expose bounded listener and endpoint ordinals while
 the authenticated `STATUS_REPORT` remains aggregate and unchanged. Linux
 loopback evidence covers IPv4, IPv6, hostname candidates, different ports,
-HTTP CONNECT, and UDP; Windows and FreeBSD native host execution remain
-unverified.
+HTTP CONNECT, and UDP. Windows and FreeBSD native suite and host integration
+results are recorded below, separately from cross-build and deployed evidence.
 
 ## Current focus
 
@@ -89,11 +89,13 @@ Ingress runtime; Egress configuration accepts exactly one EgressService and
 Egress dependency inspection excludes Ingress and Transit runtime crates. The
 supported packaged deployment selects one role per device and uses one local
 Unix `pathchord` service account. Mutually exclusive role packages and native
-service lifecycles have passed on Debian, Alpine, Arch Linux and FreeBSD; each
-payload contains only its selected daemon and `pathchordctl`, and an opposite-role
-install is rejected before state changes. Package evidence and the remaining
-Windows-only validation gap are in the
-[single-role package report](changes/validate-native-packages/research/2026-11-17-single-role-packages.md).
+service lifecycles have passed on Debian, Alpine, Arch Linux, FreeBSD and
+Windows; each payload contains only its selected daemon and `pathchordctl`, and
+an opposite-role install is rejected before state changes. The
+[single-role package report](changes/validate-native-packages/research/2026-11-17-single-role-packages.md)
+records the Unix package hosts; the
+[final Windows package report](changes/validate-native-packages/research/2026-11-18-windows-package-final.md)
+records both Windows role profiles and their service identities.
 
 The scheduling slice now has deterministic coverage for independent mixed-flow
 replication budgets, reserved control/retransmission priority, directional
@@ -149,16 +151,18 @@ proxy-compatibility work:
 - `openspec validate --all --strict --no-interactive`, `git diff --check`, and
   the repository heading/bilingual documentation audit passed.
 - Native Windows execution and prolonged soak were unverified at this earlier
-  validation point. Privileged Linux, native FreeBSD and the later provider soak
-  are now documented in the dated evidence below; external-peer and cross-machine
-  claims remain limited to their separately identified runs.
+  validation point. Privileged Linux, native FreeBSD, the completed Windows
+  host matrix and the later provider soak are now documented in the dated
+  evidence below; external-peer and cross-machine claims remain limited to
+  their separately identified runs.
 
 The explicit-listener runtime prioritizes HTTP forwarding/CONNECT,
 SOCKS4/4a/5 CONNECT, SOCKS5 UDP ASSOCIATE, and same-port Mixed listeners.
 FreeBSD configuration, native process metadata, platform identity and Unix
-local control have passed their FreeBSD 15.1 native QEMU test run below. Native
-Windows coverage remains outstanding. Portable listener regressions run in the
-existing Rust CI job.
+local control have passed their FreeBSD 15.1 native QEMU test run below. The
+Windows 11 native suite, registry recovery and regular-user/service control
+acceptance also pass. Portable listener regressions run in the existing Rust CI
+job.
 
 TPROXY, REDIRECT, transparent UDP interception, and TUN integration are wired
 into the Ingress platform runtime with configuration, rollback, protected
@@ -192,9 +196,10 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 - Native single-role package recipes cover Debian, Alpine, Arch Linux, FreeBSD,
   and Windows NSIS. Linux packages use `/etc/pathchord`, FreeBSD uses
   `/usr/local/etc/pathchord`, and Windows uses `%ProgramData%\PathChord\config`.
-  Debian/Alpine/Arch/FreeBSD role payloads and lifecycle tests pass; Windows
-  static NSIS checks pass, but Windows native package/service execution remains
-  unverified.
+  Debian/Alpine/Arch/FreeBSD and Windows role payloads and lifecycle tests pass;
+  the Windows result covers both roles, virtual service SIDs, private ACLs,
+  Named Pipe control, opposite-role rejection, upgrade, rollback, uninstall and
+  explicit replacement in the QEMU guest.
 - Noise IK uses Clatter zeroizing key and cipher containers with an Orion
   SHA-256/HMAC adapter. Static, ephemeral, chaining, and traffic-key owners
   have explicit cleanup paths. Frozen vectors preserve the previous wire bytes.
@@ -486,18 +491,31 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   Session UDP forwarding. A 300-second explicit-listener failure/restart soak
   and the selected cross-machine protocol matrix both passed; neither represents
   production WAN performance or deployment evidence.
-- Native Windows HTTP/SOCKS5 still needs end-to-end and long-running validation
-  of authentication, source restrictions, TCP/UDP forwarding, DNS, bounded
-  resources, shutdown, reload, and local control. The FreeBSD 15.1 native QEMU
-  suite passed below; portable loopback tests do not establish Windows coverage.
+- Native Windows 11 Pro 26H2 QEMU coverage passed 52 staged executable groups:
+  1,075 tests passed, zero failed, 117 external-peer/explicit host child-entry
+  fixtures were ignored, and no executable timed out. HTTP/CONNECT,
+  SOCKS4/4a/5, Mixed and SOCKS5 UDP exercised native Windows sockets, including
+  authentication, IPv4/IPv6/domain resolution, bounded resources and shutdown.
+  Three formerly unstable ordering/timeout/watcher cases also passed ten
+  repeats each. The [current Windows report](changes/validate-native-platforms/research/2026-11-18-windows-fix-validation.md)
+  records source/artifact hashes and the reusable prepared snapshot; the
+  [first failed run](changes/validate-native-platforms/research/2026-11-17-windows-qemu-validation.md)
+  remains historical evidence.
 - Linux TPROXY/REDIRECT/TUN and optional TC/eBPF ownership, IPv4/IPv6 forwarding,
   rollback, crash recovery, foreign-object preservation and fallback passed a
   disposable native-kernel QEMU matrix; see the evidence below. The development
   host kernel could not run the full matrix because its nft TPROXY module does
   not match the running kernel.
-- Windows registry, WinINet refresh, Named Pipe ACL, and system-proxy crash
-  recovery still need validation on a real Windows host. Cross-compiling and
-  fake adapters are not equivalent to host evidence.
+- Windows Secure Boot and TPM readiness were verified before the cold snapshot.
+  The explicit native WinINet host fixture now passes apply/refresh, exact
+  prior registry type/byte restoration, absent-value restoration, forced-kill
+  journal recovery and restart. The saved `REG_EXPAND_SZ` type is reapplied
+  after WinINet notification before deleting the journal. The ordinary-user
+  Named Pipe ACL and host watcher phase also passed using an SCM-launched
+  nonadministrator Users account: the daemon owner SID matched the owner-token
+  probe, administrators retained access, an unrelated ordinary user was
+  denied, and valid, invalid, in-place and atomic configuration changes had the
+  expected visibility.
 - The FreeBSD 15.1 QEMU guest completed the native listener/control workspace
   suite and selected-role Egress permission/signal checks. Both FreeBSD role
   packages also passed native `pkg` creation, service, upgrade, rollback,
@@ -534,10 +552,12 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   a source with an in-use node may wait for that node before promoting the new
   adapter. SSE recovery snapshots are assembled from bounded resource queries
   rather than a single atomic cross-resource transaction.
-- Native Windows runtime matrices, production monitoring rollout and
-  probe/autoscaler calibration, and provenance-backed real-provider samples for
-  every document family remain validation work. SSR, SOCKS4/4a outbound and
-  other unregistered protocols stay explicitly unavailable. The QEMU
+- Production monitoring rollout and probe/autoscaler calibration, and
+  provenance-backed real-provider samples for every document family remain
+  validation work. The Windows native platform and package matrices are
+  complete for the recorded Windows build and fixture versions.
+  SSR, SOCKS4/4a outbound and other unregistered protocols stay explicitly
+  unavailable. The QEMU
   cross-machine adapter matrix is complete for its selected peer, protocol and
   network conditions; it is not WAN or production deployment evidence.
 - The authenticated Prometheus endpoint exports aggregate Egress configured,
@@ -650,28 +670,32 @@ covered service start/control, active upgrade, rollback, uninstall, explicit
 role replacement, and sentinel configuration/identity/authorization retention.
 FreeBSD Egress also verified a real enrollment record across restart and
 preserved the actual identity/SQLite hashes on removal. Windows NSIS/PowerShell
-static checks passed, but no Windows VM/native service run is claimed. The
-[single-role package report](changes/validate-native-packages/research/2026-11-17-single-role-packages.md)
-links per-profile evidence under `/data/pathchord-qemu/runs/native-packages/`.
+native lifecycle acceptance passed for both roles in the prepared QEMU overlay;
+the repaired helper and installer completed the full upgrade/rollback/uninstall
+and role-replacement matrix. The historical first exit-code-2 run remains in
+the [first Windows QEMU package report](changes/validate-native-packages/research/2026-11-17-windows-qemu-package-validation.md),
+and the passing evidence is in the [final Windows package report](changes/validate-native-packages/research/2026-11-18-windows-package-final.md).
+The [single-role package report](changes/validate-native-packages/research/2026-11-17-single-role-packages.md)
+links the non-Windows per-profile evidence under `/data/pathchord-qemu/runs/native-packages/`.
 The package fixture versions 0.1.0/0.1.1 use identical tested binaries and do
 not establish cross-protocol-version or database-schema migration.
 
-The current Linux workspace quality run on 2026-11-17 passed
+The current Linux workspace quality run on 2026-11-18 passed
 `cargo fmt --all -- --check`,
 `cargo clippy --locked --workspace --all-targets -- -D warnings`,
 `cargo build --locked --workspace --bins`, and
-`cargo test --locked --workspace --all-targets`. Standard workspace runs keep
+`cargo test --locked --workspace --all-targets` (1,108 passed, zero failed,
+118 ignored). Standard workspace runs keep
 external peer cases ignored unless their pinned server binaries are provided;
 the native peer matrices above were run separately. Clippy reports the existing
 unused `netsock` manifest dependency warning.
 
-Strict all-change OpenSpec validation passes all 15 items. Four changes remain
-listed: the role-binary change has all 21 tasks complete, while native platform
-validation is 5/8, native package validation is 6/7, and provider/runtime
-reliability is 5/6. The remaining gaps are Windows-native listener/control and
-NSIS lifecycle evidence, plus provenance-backed provider samples for every
-document family. The mutually exclusive single-role package model uses one
-Unix service account; prior dual-role tests are not counted for it. The
+Strict all-change OpenSpec validation passes all 14 items. Three changes remain
+listed: native platform validation is 8/8, native package validation is 7/7,
+and provider/runtime reliability is 5/6. The remaining gap in these three
+changes is provenance-backed provider samples for every document family. The
+mutually exclusive single-role package model
+uses one Unix service account; prior dual-role tests are not counted for it. The
 current-head GitHub CI run also passed the dependency-advisory and external-core
 jobs. The local Docker monitoring deployment is recorded separately below.
 Production monitoring/probe calibration remains pending; privileged Linux and

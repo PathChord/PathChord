@@ -337,9 +337,16 @@ impl WindowsSystemProxyAdapter {
         let internet = windows_registry::CURRENT_USER
             .create(INTERNET_SETTINGS_KEY)
             .map_err(registry_error)?;
-        restore_values(&environment, journal.environment)?;
-        restore_values(&internet, journal.internet_settings)?;
+        // WinINet may normalize registry value types while processing the
+        // settings-change notification. Restore once before notifying so the
+        // API sees the saved values, then restore a second time after the
+        // notification so the journal's exact type and bytes win over any
+        // normalization (for example REG_EXPAND_SZ -> REG_SZ).
+        restore_values(&environment, &journal.environment)?;
+        restore_values(&internet, &journal.internet_settings)?;
         refresh_windows_proxy()?;
+        restore_values(&environment, &journal.environment)?;
+        restore_values(&internet, &journal.internet_settings)?;
         std::fs::remove_file(&self.journal_path)
             .map_err(|error| PlatformProxyError::Journal(error.to_string()))?;
         Ok(PlatformProxyEffect::restored())
@@ -417,19 +424,19 @@ fn read_registry_value(
 #[cfg(windows)]
 fn restore_values(
     key: &windows_registry::Key,
-    values: Vec<(String, Option<SavedRegistryValue>)>,
+    values: &[(String, Option<SavedRegistryValue>)],
 ) -> Result<(), PlatformProxyError> {
     const FILE_NOT_FOUND_HRESULT: i32 = 0x8007_0002_u32 as i32;
     for (name, value) in values {
         match value {
             Some(value) => key
                 .set_bytes(
-                    &name,
+                    name,
                     windows_registry::Type::from(value.registry_type),
                     &value.bytes,
                 )
                 .map_err(registry_error)?,
-            None => match key.remove_value(&name) {
+            None => match key.remove_value(name) {
                 Ok(()) => {}
                 Err(error) if error.code().0 == FILE_NOT_FOUND_HRESULT => {}
                 Err(error) => return Err(registry_error(error)),

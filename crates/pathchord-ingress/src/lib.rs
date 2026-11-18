@@ -39,6 +39,7 @@ mod linux_tproxy_udp;
 mod linux_transparent;
 #[cfg(target_os = "linux")]
 mod linux_udp_runtime;
+mod listener_rejection;
 mod local_dispatch;
 mod mixed;
 mod node_probe;

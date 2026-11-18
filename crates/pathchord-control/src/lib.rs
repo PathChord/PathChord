@@ -52,6 +52,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
     use tokio::net::UnixStream;
     use tokio::sync::oneshot;
 
@@ -73,11 +74,15 @@ mod tests {
 
     #[tokio::test]
     async fn local_server_preserves_framing_and_dispatches_without_role_runtime() {
-        let path = std::env::temp_dir().join(format!(
+        let name = format!(
             "pathchord-control-{}-{}",
             std::process::id(),
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
-        ));
+        );
+        #[cfg(unix)]
+        let path = std::env::temp_dir().join(name);
+        #[cfg(windows)]
+        let path = std::path::PathBuf::from(format!(r"\\.\pipe\{name}"));
         let server = LocalControlServer::bind(&path, |request: RequestEnvelope| {
             ResponseEnvelope::success(
                 request.request_id,
@@ -89,7 +94,12 @@ mod tests {
             )
         })
         .expect("bind local control server");
+        #[cfg(unix)]
         let mut client = UnixStream::connect(&path).await.expect("connect");
+        #[cfg(windows)]
+        let mut client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&path)
+            .expect("connect");
         let request = request("status.get");
         let (server_result, response) = tokio::join!(server.serve_once(), async {
             write_object(&mut client, &request)

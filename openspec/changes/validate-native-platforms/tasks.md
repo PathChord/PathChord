@@ -5,9 +5,9 @@ These pending tasks were carried over from the implementation plan during the
 
 ## 1. Windows hosts
 
-- [ ] 1.1 Run native HTTP/CONNECT, SOCKS4/4a/5, Mixed and SOCKS5 UDP tests across authentication, source restrictions, IPv4/IPv6/domain targets, DNS, bounded resources, reload and shutdown; retain commands and results from the Windows host.
-- [ ] 1.2 Exercise Named Pipe ACLs, configuration watching, and local management under service and regular-user identities; verify unauthorized access is rejected and accepted changes become visible.
-- [ ] 1.3 Exercise WinINet refresh, exact previous-value restoration, and crash/journal recovery for the system-proxy switch; verify restored host settings after shutdown and restart.
+- [x] 1.1 Run native HTTP/CONNECT, SOCKS4/4a/5, Mixed and SOCKS5 UDP tests across authentication, source restrictions, IPv4/IPv6/domain targets, DNS, bounded resources, reload and shutdown; retain commands and results from the Windows host.
+- [x] 1.2 Exercise Named Pipe ACLs, configuration watching, and local management under service and regular-user identities; verify unauthorized access is rejected and accepted changes become visible.
+- [x] 1.3 Exercise WinINet refresh, exact previous-value restoration, and crash/journal recovery for the system-proxy switch; verify restored host settings after shutdown and restart.
 
 ## 2. FreeBSD hosts
 

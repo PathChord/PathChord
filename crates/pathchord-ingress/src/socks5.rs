@@ -154,15 +154,23 @@ impl Socks5Listener {
             return Err(policy_error("source address is not allowed"));
         }
         let mut stream = stream;
-        let handshake = accept_handshake(
+        let handshake = match accept_handshake(
             &mut stream,
             descriptor.authentication_required,
             credential_verifier.as_ref(),
         )
-        .await?;
+        .await
+        {
+            Ok(handshake) => handshake,
+            Err(error) => {
+                crate::listener_rejection::finish(&mut stream).await;
+                return Err(error);
+            }
+        };
         let request = handshake.request;
         if request.command != SocksCommand::Connect {
             handshake.version.reject_command(&mut stream).await?;
+            crate::listener_rejection::finish(&mut stream).await;
             return Err(error("SOCKS command is not CONNECT"));
         }
         Ok(AcceptedConnection {

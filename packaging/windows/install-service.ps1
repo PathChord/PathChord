@@ -7,6 +7,15 @@ param(
     [string] $Role = ''
 )
 
+# NSIS can inherit PSModulePath from PowerShell 7. Windows PowerShell 5 must
+# load its Desktop modules rather than Core modules with the same names.
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    $env:PSModulePath = @(
+        ([IO.Path]::Combine([Environment]::GetFolderPath('MyDocuments'), 'WindowsPowerShell\Modules')),
+        ([IO.Path]::Combine($env:ProgramFiles, 'WindowsPowerShell\Modules')),
+        ([IO.Path]::Combine($PSHOME, 'Modules'))
+    ) -join [IO.Path]::PathSeparator
+}
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $privateRoot = Join-Path $env:ProgramData 'PathChord'
@@ -57,6 +66,17 @@ if ($registeredRole -and $registeredRole -ne $Role) { throw 'Uninstall the other
 $id = if ($Role -eq 'ingress') { 'PathChordIngressd' } else { 'PathChordEgressd' }
 $services = @(@{Name = "pathchord-${Role}d"; Id = $id; Role = $Role})
 $installerState = Join-Path $privateRoot 'installer'
+trap {
+    # A silent NSIS install has no interactive console. Preserve the helper's
+    # exact failure without requiring the operator to reproduce it manually.
+    $failure = $_ | Out-String
+    try {
+        Set-RoleDirectoryAcl $installerState $null $false
+        $failure | Set-Content -LiteralPath (Join-Path $installerState "$Role-$Action-error.log")
+    } catch { }
+    Write-Error -Message $failure -ErrorAction Continue
+    exit 1
+}
 if ($Action -eq 'Stop') {
     Set-RoleDirectoryAcl $installerState $null $false
     $active = @()
@@ -78,7 +98,7 @@ if ($Action -eq 'Prepare') {
         if ($installed) {
             Copy-Item -LiteralPath (Join-Path $PSScriptRoot "$($service.Name).xml") -Destination (Join-Path $root "$($service.Name)-service.xml") -Force
             $changed = Invoke-CimMethod -InputObject $installed -MethodName Change -Arguments @{
-                StartName = "NT SERVICE\$($service.Id)"; StartPassword = ''
+                StartName = "NT SERVICE\$($service.Id)"
             }
             if ($changed.ReturnValue -ne 0) { throw "Could not isolate $($service.Id)." }
             & sc.exe sidtype $service.Id unrestricted | Out-Null
@@ -93,7 +113,16 @@ if ($Action -eq 'Prepare') {
     }
     $activeFile = Join-Path $installerState 'active.json'
     if (Test-Path -LiteralPath $activeFile) {
-        foreach ($id in @(Get-Content -LiteralPath $activeFile -Raw | ConvertFrom-Json)) {
+        # Windows PowerShell deserializes JSON [] as one empty pipeline value
+        # when wrapped in @(...). Filter it before passing names to SCM.
+        $activeText = (Get-Content -LiteralPath $activeFile -Raw).Trim()
+        $activeIds = @()
+        if ($activeText -and $activeText -ne '[]') {
+            $activeValue = $activeText | ConvertFrom-Json
+            $activeIds = @($activeValue | ForEach-Object { [string]$_ } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+        foreach ($id in $activeIds) {
             Start-Service -Name $id -ErrorAction Stop
         }
         Remove-Item -LiteralPath $activeFile -Force
@@ -123,6 +152,16 @@ foreach ($service in $services) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot "$name.xml") -Destination $wrapperConfig -Force
         & $wrapper install
         if ($LASTEXITCODE -ne 0) { throw "WinSW failed to install $name (exit code $LASTEXITCODE)." }
+        # Register the wrapper under LocalSystem first. The virtual service
+        # account SID is created by SCM only after CreateService succeeds, so
+        # WinSW cannot safely grant logon rights to NT SERVICE\<id> during its
+        # own install step. Assign the virtual account through SCM afterwards.
+        $installed = Get-CimInstance Win32_Service -Filter "Name='$($service.Id)'"
+        if (-not $installed) { throw "SCM did not create $name." }
+        $changed = Invoke-CimMethod -InputObject $installed -MethodName Change -Arguments @{
+            StartName = "NT SERVICE\$($service.Id)"
+        }
+        if ($changed.ReturnValue -ne 0) { throw "Could not assign the virtual service account to $name (return $($changed.ReturnValue))." }
         & sc.exe sidtype $service.Id unrestricted | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "Could not enable the service SID for $name." }
         $serviceSid = [System.Security.Principal.NTAccount]::new('NT SERVICE', $service.Id).Translate(

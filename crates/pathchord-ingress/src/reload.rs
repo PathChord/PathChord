@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
 use pathchord_policy::{
     CompileError, CompiledPolicy, ConfigError, Generation, KubeConfig, PolicyConfig,
     ValidationError,
@@ -699,6 +699,16 @@ impl ConfigHotReloader {
                 return true;
             }
             if path == self.source.path() {
+                // The Windows parent watch reports the root as Modify(Any)
+                // when a child changes, including ignored runtime files. The
+                // recursive watch supplies the actual resource path, so only
+                // root rename/create/remove events require a root rescan.
+                if cfg!(target_os = "windows")
+                    && self.source.is_directory()
+                    && matches!(event.kind, EventKind::Modify(kind) if !matches!(kind, ModifyKind::Name(_)))
+                {
+                    return false;
+                }
                 return true;
             }
             if cfg!(target_os = "freebsd")
@@ -1713,6 +1723,37 @@ spec: {scheduler: effectiveCapacityWeighted}
         wait_until(&handle, 4, ReloadState::Applied).await;
         assert!(matched(&handle.snapshot().unwrap(), "fourth.test"));
         stop(shutdown, task).await;
+    }
+
+    #[tokio::test]
+    async fn directory_watch_events_distinguish_resource_writes_from_root_noise() {
+        use notify::event::{DataChange, RenameMode};
+
+        let parent = Directory::new();
+        let path = parent.0.join("active");
+        std::fs::create_dir(&path).unwrap();
+        let resource = path.join("base.yaml");
+        std::fs::write(&resource, VALID).unwrap();
+        let reloader = ConfigHotReloader::bind(&path, 1).await.unwrap();
+        let path = reloader.source.path().to_path_buf();
+        let resource = path.join("base.yaml");
+        let data = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(reloader.reload_event(&Event::new(data).add_path(resource)));
+        assert!(!reloader.reload_event(&Event::new(data).add_path(path.join("runtime.db"))));
+        assert_eq!(
+            reloader.reload_event(&Event::new(data).add_path(path.clone())),
+            !cfg!(target_os = "windows"),
+            "Windows root data notifications cannot identify a resource write"
+        );
+        assert_eq!(
+            reloader.reload_event(
+                &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.clone())
+            ),
+            !cfg!(target_os = "windows")
+        );
+        assert!(reloader.reload_event(
+            &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both))).add_path(path)
+        ));
     }
 
     #[tokio::test]
