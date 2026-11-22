@@ -8,39 +8,39 @@ publish.workspace = true
 
 [dependencies]
 atomic-write-file.workspace = true
-aes-gcm = { version = "0.10.3", features = ["zeroize"] }
-aes = { version = "0.8.4", features = ["zeroize"] }
-chacha20 = { version = "0.9.1", features = ["zeroize"] }
-chacha20poly1305 = "0.10.1"
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+aes = { version = "0.9.4", features = ["zeroize"] }
+chacha20 = { version = "0.10.2", features = ["zeroize"] }
+chacha20poly1305 = "0.11.0"
 async-trait.workspace = true
 base64.workspace = true
 getrandom.workspace = true
 bytes.workspace = true
-blake2 = "0.10.6"
+blake2 = "0.11.0"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
-h2 = "=0.4.19"
+h2 = "=0.4.20"
 http = "1"
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http2"] }
 hyper-util.workspace = true
 trojan-proto = "=0.18.0"
-sha2 = "0.10.9"
-sha3 = "0.10.9"
+sha2 = "0.11.1"
+sha3 = "0.12.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
-hmac = "0.12.1"
+hmac = "0.13.0"
 crc32fast = "1.5.5"
-md-5 = "0.10.6"
-hkdf = "0.12.4"
-x25519-dalek = { version = "2.0.1", features = ["static_secrets", "getrandom"] }
+md-5 = "0.11.0"
+hkdf = "0.13.0"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
 pathchord-policy = { path = "../pathchord-policy" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 shadowsocks.workspace = true
-sha1 = "0.10.6"
+sha1 = "0.11.0"
 rustls = { version = "0.23.46", features = ["brotli", "zlib"] }
 rustls-native-certs = "0.8.5"
 thiserror.workspace = true
