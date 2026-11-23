@@ -32,6 +32,8 @@ pub enum LocalServerError {
     Protocol(#[from] LocalProtocolError),
     #[error("max concurrent control requests must be greater than zero")]
     InvalidConcurrency,
+    #[error("local control dispatcher is already shared")]
+    DispatcherShared,
     #[error("local control request task failed: {0}")]
     Task(String),
 }
@@ -108,10 +110,10 @@ where
         &self.path
     }
 
-    pub fn dispatcher_mut(&mut self) -> &mut D {
+    pub fn dispatcher_mut(&mut self) -> Result<&mut D, LocalServerError> {
         Arc::get_mut(&mut self.dispatcher)
-            .expect("dispatcher is unique before the server starts")
-            .get_mut()
+            .ok_or(LocalServerError::DispatcherShared)
+            .map(Mutex::get_mut)
     }
 
     /// Returns the dispatcher shared by local and optional Web Gateway transports.
@@ -256,10 +258,10 @@ where
         &self.name
     }
 
-    pub fn dispatcher_mut(&mut self) -> &mut D {
+    pub fn dispatcher_mut(&mut self) -> Result<&mut D, LocalServerError> {
         Arc::get_mut(&mut self.dispatcher)
-            .expect("dispatcher is unique before the server starts")
-            .get_mut()
+            .ok_or(LocalServerError::DispatcherShared)
+            .map(Mutex::get_mut)
     }
 
     /// Returns the dispatcher shared by local and optional Web Gateway transports.
@@ -368,8 +370,8 @@ where
         })
     }
 
-    pub fn dispatcher_mut(&mut self) -> &mut D {
-        &mut self.dispatcher
+    pub fn dispatcher_mut(&mut self) -> Result<&mut D, LocalServerError> {
+        Ok(&mut self.dispatcher)
     }
 
     pub async fn run(self) -> Result<(), LocalServerError> {
@@ -759,6 +761,7 @@ mod tests {
         .expect("bind");
         server
             .dispatcher_mut()
+            .expect("dispatcher is unique before the server starts")
             .service_mut()
             .register_listener(crate::ListenerDescriptor {
                 id: crate::ListenerId::new("local-http"),

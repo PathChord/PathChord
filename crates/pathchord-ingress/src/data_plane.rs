@@ -338,10 +338,9 @@ impl SessionSlot {
             .collect()
     }
 
-    fn record_endpoint_attempt(&self, endpoint_index: usize, success: bool) {
-        if let Ok(mut states) = self.endpoint_states.try_lock()
-            && let Some(state) = states.get_mut(endpoint_index)
-        {
+    async fn record_endpoint_attempt(&self, endpoint_index: usize, success: bool) {
+        let mut states = self.endpoint_states.lock().await;
+        if let Some(state) = states.get_mut(endpoint_index) {
             state.attempts = state.attempts.saturating_add(1);
             if success {
                 state.state = "available";
@@ -2751,12 +2750,12 @@ impl IngressDataPlane {
             {
                 Ok(Ok(io)) => io,
                 Ok(Err(error)) => {
-                    slot.record_endpoint_attempt(endpoint_index, false);
+                    slot.record_endpoint_attempt(endpoint_index, false).await;
                     last_error = Some(DataPlaneError::Transit(error));
                     continue;
                 }
                 Err(_) => {
-                    slot.record_endpoint_attempt(endpoint_index, false);
+                    slot.record_endpoint_attempt(endpoint_index, false).await;
                     last_error = Some(DataPlaneError::Transit(TransitError::Connection(
                         "Egress Path connection timed out".into(),
                     )));
@@ -2775,12 +2774,12 @@ impl IngressDataPlane {
             {
                 Ok(Ok(outcome)) => outcome,
                 Ok(Err(error)) => {
-                    slot.record_endpoint_attempt(endpoint_index, false);
+                    slot.record_endpoint_attempt(endpoint_index, false).await;
                     last_error = Some(DataPlaneError::Admission(error));
                     continue;
                 }
                 Err(_) => {
-                    slot.record_endpoint_attempt(endpoint_index, false);
+                    slot.record_endpoint_attempt(endpoint_index, false).await;
                     last_error = Some(DataPlaneError::Transit(TransitError::Connection(
                         "Egress Path admission timed out".into(),
                     )));
@@ -2789,12 +2788,12 @@ impl IngressDataPlane {
             };
             match outcome {
                 PathAdmissionOutcome::Ready(path) => {
-                    slot.record_endpoint_attempt(endpoint_index, true);
+                    slot.record_endpoint_attempt(endpoint_index, true).await;
                     slot.record_path_endpoint(path_id, endpoint_index).await;
                     return Ok(path);
                 }
                 PathAdmissionOutcome::Rejected { .. } => {
-                    slot.record_endpoint_attempt(endpoint_index, false);
+                    slot.record_endpoint_attempt(endpoint_index, false).await;
                     last_error = Some(DataPlaneError::AdmissionRejected);
                 }
             }
@@ -3471,8 +3470,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 0]
         );
-        slot.record_endpoint_attempt(0, false);
-        slot.record_endpoint_attempt(1, true);
+        slot.record_endpoint_attempt(0, false).await;
+        slot.record_endpoint_attempt(1, true).await;
         slot.record_path_endpoint(PathId::new(7), 1).await;
         assert_eq!(
             slot.path_endpoints.lock().await.get(&PathId::new(7)),

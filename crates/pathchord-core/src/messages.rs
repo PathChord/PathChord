@@ -644,7 +644,8 @@ impl<'a> Reader<'a> {
     }
 
     fn byte(&mut self, field: &'static str) -> Result<u8, MessageCodecError> {
-        Ok(*self.take(1, field)?.first().expect("one byte checked"))
+        let bytes = self.take(1, field)?;
+        Ok(bytes[0])
     }
 
     fn bool(&mut self, field: &'static str) -> Result<bool, MessageCodecError> {
@@ -656,9 +657,8 @@ impl<'a> Reader<'a> {
     }
 
     fn u16(&mut self, field: &'static str) -> Result<u16, MessageCodecError> {
-        Ok(u16::from_be_bytes(
-            self.take(2, field)?.try_into().expect("two bytes checked"),
-        ))
+        let bytes = self.take(2, field)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
     fn varint(&mut self, field: &'static str) -> Result<u64, MessageCodecError> {
@@ -669,10 +669,10 @@ impl<'a> Reader<'a> {
     }
 
     fn id128(&mut self, field: &'static str) -> Result<[u8; 16], MessageCodecError> {
-        Ok(self
-            .take(16, field)?
-            .try_into()
-            .expect("sixteen bytes checked"))
+        let bytes = self.take(16, field)?;
+        let mut value = [0_u8; 16];
+        value.copy_from_slice(bytes);
+        Ok(value)
     }
 
     fn bytes(&mut self, maximum: usize, field: &'static str) -> Result<Vec<u8>, MessageCodecError> {

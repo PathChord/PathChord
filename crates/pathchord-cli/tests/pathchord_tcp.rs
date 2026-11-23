@@ -494,7 +494,7 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
     base_config.egresses[0].capabilities.udp = true;
     base_config.egresses[0].path_pool.min_usable_paths = 3;
     base_config.egresses[0].endpoints.push(Endpoint {
-        host: "localhost".into(),
+        host: egress_address.ip().to_string(),
         port: egress_address.port(),
     });
     let base_policy = ValidatedPolicySnapshot::new(Generation::new(1), base_config).unwrap();
