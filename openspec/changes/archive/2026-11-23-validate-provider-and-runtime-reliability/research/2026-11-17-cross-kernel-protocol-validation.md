@@ -29,7 +29,7 @@ SHA-256 is `1aeca7c5892c7ab6d3b655b79a7eb98d06d1e1cca27a98e32aa0cb804b6d50ca`.
 | Independent test server | sing-box 1.14.4, SHA-256 `1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a` |
 | PathChord musl probe | SHA-256 `0fb2689c453979c25efd10f928558ce8f416bd49d51eb4d08301bcc8c9ab2dba` |
 
-The native [probe](../../../../crates/pathchord-transit/examples/cross_machine_probe.rs)
+The native [probe](../../../../../crates/pathchord-transit/examples/cross_machine_probe.rs)
 calls the product's `AdapterRegistry` and native Transit adapters. It does not
 start a compatibility process. The independent sing-box binary and its private
 guest loader/libraries are test fixtures; their hashes are recorded separately

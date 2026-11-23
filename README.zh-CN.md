@@ -71,11 +71,7 @@ direct/SOCKS5/Shadowsocks UDP（包括 SS2022）
 
 ### 进行中的变更
 
-进行中的变更任务清单跟踪实现和验证；未勾选的任务不代表已经实现或通过原生主机验证，已完成的变更在审阅并归档之前仍会列出。
-
-| 变更 | 范围 |
-| --- | --- |
-| [提供商与运行时可靠性](openspec/changes/validate-provider-and-runtime-reliability/tasks.md) | 真实提供商导出、独立协议 peer、跨机器流量、故障与重启长时间测试。 |
+OpenSpec 当前没有进行中的变更。已完成的工作见[变更归档](openspec/changes/archive/)。
 
 ## OpenSpec 工作流
 

@@ -600,7 +600,7 @@ Base64 URI lists, Surge and Loon. The supplied endpoint returned HTTP 403 for
 Quantumult X. A fixture based on the Mihomo documentation exercises HTTP
 provider expansion and credential origin boundaries. Separate provider tests
 exercise fetch budgets. See the
-[provider acceptance matrix](changes/validate-provider-and-runtime-reliability/research/2026-11-17-acceptance-matrix.md#supplied-subscription-probe).
+[provider acceptance matrix](changes/archive/2026-11-23-validate-provider-and-runtime-reliability/research/2026-11-17-acceptance-matrix.md#supplied-subscription-probe).
 
 Privileged Linux platform validation completed on 2026-11-17 in Alpine 3.24.4,
 x86_64 QEMU/KVM with Linux `6.18.63-0-virt`, iproute2/TC 7.0.0, nftables 1.1.6
@@ -631,7 +631,7 @@ or node-drain windows; retained-provider, parse/DNS/reload and stable windows
 had no extra failures. Peak file descriptors were 17/20/18 and RSS was
 17.1/50.1/52.0 MiB for Egress/Path-Ingress/provider processes. Detailed
 per-cycle evidence and its limits are in the
-[runtime reliability report](changes/validate-provider-and-runtime-reliability/research/2026-11-17-runtime-reliability.md).
+[runtime reliability report](changes/archive/2026-11-23-validate-provider-and-runtime-reliability/research/2026-11-17-runtime-reliability.md).
 
 Native FreeBSD validation completed on 2026-11-17 in FreeBSD 15.1-RELEASE,
 amd64, under QEMU/KVM. The 51 native test executables passed 1,083 tests with
@@ -664,11 +664,11 @@ verified 262,142 TCP echo bytes and 18,892 UDP echo bytes. Two negative cases
 verified that unsupported VLESS gRPC parameters remain unavailable and retired
 SSR does not register. The command, guest boot IDs, peer/client hashes,
 source hashes and raw result hash are in the
-[cross-machine protocol manifest](changes/validate-provider-and-runtime-reliability/research/2026-11-17-cross-kernel-protocol-validation.json).
+[cross-machine protocol manifest](changes/archive/2026-11-23-validate-provider-and-runtime-reliability/research/2026-11-17-cross-kernel-protocol-validation.json).
 This is isolated virtual-network evidence, not a real WAN or deployed-peer
 result. The provider/import format matrix still lacks retained, anonymized
 source-provenance examples for every document family; see the provider
-[acceptance matrix](changes/validate-provider-and-runtime-reliability/research/2026-11-17-acceptance-matrix.md).
+[acceptance matrix](changes/archive/2026-11-23-validate-provider-and-runtime-reliability/research/2026-11-17-acceptance-matrix.md).
 
 Single-role package and service lifecycle acceptance passed on Debian 12,
 Alpine 3.24.4, Arch Linux and FreeBSD 15.1 for both Ingress and Egress
@@ -699,16 +699,11 @@ external peer cases ignored unless their pinned server binaries are provided;
 the native peer matrices above were run separately. Clippy reports the existing
 unused `netsock` manifest dependency warning.
 
-Strict all-change OpenSpec validation passes all 14 items. Three changes remain
-listed: native platform validation is 8/8, native package validation is 7/7,
-and provider/runtime reliability is 6/6. The remaining gaps are production
-monitoring calibration and deliberately unsupported provider/protocol families. The
-mutually exclusive single-role package model
-uses one Unix service account; prior dual-role tests are not counted for it. The
-current-head GitHub CI run also passed the dependency-advisory and external-core
-jobs. The local Docker monitoring deployment is recorded separately below.
-Production monitoring/probe calibration remains pending; privileged Linux and
-FreeBSD execution are recorded above.
+The native platform, native package, and provider/runtime reliability
+validation changes are archived. The mutually exclusive single-role package
+model uses one Unix service account. The 2026-11-18 GitHub CI evidence includes
+the dependency-advisory and external-core jobs. The local Docker monitoring
+deployment is recorded separately below.
 
 The [specification-alignment repair](changes/archive/2026-11-17-fix-spec-alignment-findings/) adds
 regressions for connection churn beyond 16,384 completions, shared admission

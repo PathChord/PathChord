@@ -2,7 +2,7 @@
 
 ## Context
 
-The [status snapshot](../../implementation-status.md) distinguishes local fixtures, ignored external-peer tests, and missing cross-machine/soak coverage. Exact format and parameter boundaries belong to the [Transit Proxy contract](../../specs/transit-proxies/spec.md); backend source comparisons are [research evidence](research/rust-outbound-backends.md).
+The [status snapshot](../../../implementation-status.md) distinguishes local fixtures, ignored external-peer tests, and missing cross-machine/soak coverage. Exact format and parameter boundaries belong to the [Transit Proxy contract](../../../specs/transit-proxies/spec.md); backend source comparisons are [research evidence](research/rust-outbound-backends.md).
 
 ## Goals / non-goals
 

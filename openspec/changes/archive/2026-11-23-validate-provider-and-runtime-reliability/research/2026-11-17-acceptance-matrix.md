@@ -3,11 +3,11 @@
 This is a non-normative inventory for `validate-provider-and-runtime-reliability`,
 recorded on 2026-11-17. It makes the inherited phrase "remaining combinations"
 finite by using the supported contract and the completed
-[native compatibility change](../../archive/2026-11-17-support-sing-box-dae-transit-protocols/tasks.md).
+[native compatibility change](../../2026-11-17-support-sing-box-dae-transit-protocols/tasks.md).
 Expected rejection is a matrix outcome, not an unbounded promise to implement
 every option exposed by another application. A new protocol or behavior still
 requires a separate delta. See the authoritative
-[Transit Proxy contract](../../../specs/transit-proxies/spec.md).
+[Transit Proxy contract](../../../../specs/transit-proxies/spec.md).
 
 ## Provider source provenance
 
@@ -22,9 +22,9 @@ requires a separate delta. See the authoritative
 | Loon text nodes | Supported forms, positional credentials and obfs parameters | Sanitized proxy lines from the supplied endpoint | Replay diagnostics for unsupported options |
 
 The deterministic cases are in
-[subscription import tests](../../../../crates/pathchord-transit/src/subscription_import/tests.rs)
-and [provider tests](../../../../crates/pathchord-transit/src/subscription_providers/tests.rs).
-The new [local reliability harness](../../../../scripts/test-runtime-reliability.py)
+[subscription import tests](../../../../../crates/pathchord-transit/src/subscription_import/tests.rs)
+and [provider tests](../../../../../crates/pathchord-transit/src/subscription_providers/tests.rs).
+The new [local reliability harness](../../../../../scripts/test-runtime-reliability.py)
 uses generated localhost credentials and provider documents. Its successful
 sibling, retired-SSR diagnostic, redaction, cache, accounting, live-refresh and
 failure checks are **synthetic local evidence**. They do not fill the real
@@ -35,7 +35,7 @@ fixture based on the Mihomo documentation complete the scoped provider evidence 
 
 On 2026-11-23, provider responses for `clash.meta`, `Shadowsocks`,
 `sing-box`, `Mihomo`, `v2rayN`, `Surge`, and `Loon` supplied the
-[redacted test excerpts](../../../../crates/pathchord-transit/tests/fixtures/provider-samples/README.md).
+[redacted test excerpts](../../../../../crates/pathchord-transit/tests/fixtures/provider-samples/README.md).
 The SIP008 response had three placeholder server records. The sing-box response
 had 76 outbounds, and the two identical Base64 responses contained 65 URI
 entries each. Quantumult X returned HTTP 403. The Clash response supplied
@@ -48,7 +48,7 @@ responses to exercise concurrent format selection and mixed node outcomes.
 ## Independent peer scope
 
 The prior compatibility change completed the native implementation slices and
-the [status snapshot](../../../implementation-status.md) records its 2026-11-17
+the [status snapshot](../../../../implementation-status.md) records its 2026-11-17
 acceptance run. The following is the explicit scope for task 1.2. Re-running it
 on the implementation revision confirms current evidence; inventing another
 unspecified cross-product of options does not expand this acceptance scope.

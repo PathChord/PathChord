@@ -101,13 +101,7 @@ versions; planning artifacts and the implementation-status snapshot use English.
 
 ### Active changes
 
-The active change task lists track implementation and validation. Unchecked
-tasks do not imply implementation or native-host validation; completed changes
-remain listed until they are reviewed and archived.
-
-| Change | Scope |
-| --- | --- |
-| [Providers and runtime reliability](openspec/changes/validate-provider-and-runtime-reliability/tasks.md) | Real provider exports, independent peers, cross-machine flows, and failure/restart soak tests. |
+OpenSpec currently lists no active changes. See the [change archive](openspec/changes/archive/) for completed work.
 
 ## OpenSpec workflow
 

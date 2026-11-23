@@ -3,8 +3,8 @@
 Evidence snapshot preserved during the documentation migration: 2026-11-14.
 This is a non-normative source comparison, not a fresh upstream version audit or
 a protocol roadmap. Availability and validation evidence belong in
-[implementation status](../../../implementation-status.md); behavior belongs in the
-[Transit Proxy specification](../../../specs/transit-proxies/spec.md).
+[implementation status](../../../../implementation-status.md); behavior belongs in the
+[Transit Proxy specification](../../../../specs/transit-proxies/spec.md).
 SSR remains retired regardless of the capabilities of any reference library.
 
 ## Source comparison
