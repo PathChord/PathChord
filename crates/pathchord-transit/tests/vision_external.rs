@@ -445,7 +445,7 @@ async fn inner_tls_roundtrip(flow: &str, fragmented: bool, tls13: bool) {
     } else {
         vec![&rustls::version::TLS12]
     };
-    let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+    let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&versions)
         .unwrap()
         .with_no_client_auth()
@@ -454,29 +454,37 @@ async fn inner_tls_roundtrip(flow: &str, fragmented: bool, tls13: bool) {
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der())),
         )
         .unwrap();
+    // Keep post-handshake tickets out of the first application-data exchange.
+    server_config.send_tls13_tickets = 0;
     let client_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&versions)
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
     let payload: Vec<u8> = (0..100_123).map(|i| (i % 241) as u8).collect();
+    // Give Xray a small, complete TLS record to switch the download to DIRECT.
+    // The client waits for its echo before starting the bulk transfer.
+    let (probe, bulk) = payload.split_at(32);
+    let exchanges = [probe, bulk];
     let server = async {
         let (stream, _) = target.accept().await.unwrap();
         let mut stream = TlsAcceptor::from(Arc::new(server_config))
             .accept(stream)
             .await
             .expect("inner TLS server handshake");
-        let mut received = vec![0; payload.len()];
-        stream
-            .read_exact(&mut received)
-            .await
-            .expect("inner TLS upload");
-        assert!(received == payload, "inner TLS upload bytes differ");
-        stream
-            .write_all(&received)
-            .await
-            .expect("inner TLS download");
-        stream.flush().await.expect("flush inner TLS download");
+        for expected in exchanges {
+            let mut received = vec![0; expected.len()];
+            stream
+                .read_exact(&mut received)
+                .await
+                .expect("inner TLS upload");
+            assert!(received == expected, "inner TLS upload bytes differ");
+            stream
+                .write_all(&received)
+                .await
+                .expect("inner TLS download");
+            stream.flush().await.expect("flush inner TLS download");
+        }
     };
     let client = async {
         let stream = fixture.adapter(flow).connect(endpoint(port)).await.unwrap();
@@ -490,14 +498,16 @@ async fn inner_tls_roundtrip(flow: &str, fragmented: bool, tls13: bool) {
             )
             .await
             .expect("inner TLS client handshake");
-        stream.write_all(&payload).await.expect("inner TLS write");
-        stream.flush().await.expect("inner TLS flush");
-        let mut received = vec![0; payload.len()];
-        stream
-            .read_exact(&mut received)
-            .await
-            .expect("inner TLS read");
-        assert!(received == payload, "inner TLS download bytes differ");
+        for expected in exchanges {
+            stream.write_all(expected).await.expect("inner TLS write");
+            stream.flush().await.expect("inner TLS flush");
+            let mut received = vec![0; expected.len()];
+            stream
+                .read_exact(&mut received)
+                .await
+                .expect("inner TLS read");
+            assert!(received == expected, "inner TLS download bytes differ");
+        }
     };
     tokio::join!(server, client);
     let log = fixture.log();
