@@ -1,0 +1,151 @@
+---
+name: Release packages
+
+"on":
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pathchord-release-${{ github.event.release.tag_name || 'nightly' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+env:
+  RUST_TOOLCHAIN: 1.100.0
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            builder: cross
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            builder: cross
+            archive: tar.gz
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            builder: cross
+            archive: tar.gz
+          - target: x86_64-unknown-freebsd
+            runner: ubuntu-latest
+            builder: cross
+            archive: tar.gz
+          - target: x86_64-pc-windows-gnu
+            runner: windows-latest
+            builder: cargo
+            archive: zip
+          - target: aarch64-pc-windows-gnullvm
+            runner: windows-latest
+            builder: cargo
+            archive: zip
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            builder: cargo
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            builder: cargo
+            archive: tar.gz
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        uses: taiki-e/install-action@cross
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILDER: ${{ matrix.builder }}
+        run: |
+          set -euo pipefail
+          "$BUILDER" build --locked --release --target "$TARGET" \
+            --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
+
+      - name: Assemble archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+          VERSION: ${{ github.event.release.tag_name || 'nightly' }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          stage="pathchord-${version}-${TARGET}"
+          mkdir -p "dist/$stage"
+          for binary in pathchord-ingressd pathchord-egressd pathchordctl; do
+            source="target/$TARGET/release/$binary"
+            if [ "$ARCHIVE" = zip ]; then
+              source="$source.exe"
+            fi
+            cp "$source" "dist/$stage/"
+          done
+          cp README.md LICENSE* "dist/$stage/" 2>/dev/null || true
+          (cd dist && openssl dgst -sha256 -r "$stage"/* > "$stage.sha256")
+          if [ "$ARCHIVE" = zip ]; then
+            (cd dist && 7z a -tzip "$stage.zip" "$stage" >/dev/null)
+          else
+            (cd dist && tar -czf "$stage.tar.gz" "$stage")
+          fi
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pathchord-${{ matrix.target }}
+          path: dist/pathchord-*.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: pathchord-*
+          merge-multiple: true
+
+      - name: Publish tagged release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: dist/pathchord-*
+
+      - name: Publish nightly release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: PathChord nightly
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          files: dist/pathchord-*
