@@ -7,14 +7,10 @@ name: Release packages
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: pathchord-release-${{ github.event.release.tag_name || 'nightly' }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
-
-env:
-  RUST_TOOLCHAIN: 1.100.0
+  group: packages-${{ github.event.release.tag_name || 'nightly' }}
 
 jobs:
   build:
@@ -25,56 +21,67 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             builder: cross
-            archive: tar.gz
           - target: aarch64-unknown-linux-musl
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             builder: cross
-            archive: tar.gz
           - target: armv7-unknown-linux-musleabihf
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             builder: cross
-            archive: tar.gz
           - target: x86_64-unknown-freebsd
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             builder: cross
-            archive: tar.gz
-          - target: x86_64-pc-windows-gnu
-            runner: windows-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
             builder: cargo
-            archive: zip
-          - target: aarch64-pc-windows-gnullvm
-            runner: windows-latest
+            msvc-arch: amd64
+          - target: aarch64-pc-windows-msvc
+            runner: windows-2025
             builder: cargo
-            archive: zip
+            msvc-arch: amd64_arm64
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
             builder: cargo
-            archive: tar.gz
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             builder: cargo
-            archive: tar.gz
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Check out source commit
+        uses: actions/checkout@v7
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: ${{ matrix.target }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust target
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
 
       - name: Install cross
         if: matrix.builder == 'cross'
-        uses: taiki-e/install-action@cross
-
-      - name: Cache Rust build data
-        uses: Swatinem/rust-cache@v2
+        uses: taiki-e/install-action@v2
         with:
-          key: release-${{ matrix.target }}
+          tool: cross@0.2.5
+
+      - name: Include Clang for the Linux eBPF build
+        if: endsWith(matrix.target, '-linux-musl') || endsWith(matrix.target, '-linux-musleabihf')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cat > Cross.toml <<EOF
+          [target.$TARGET]
+          pre-build = ["apt-get update && apt-get install -y --no-install-recommends clang"]
+          EOF
+
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc-arch }}
 
       - name: Build release binaries
         shell: bash
@@ -82,70 +89,77 @@ jobs:
           TARGET: ${{ matrix.target }}
           BUILDER: ${{ matrix.builder }}
         run: |
-          set -euo pipefail
           "$BUILDER" build --locked --release --target "$TARGET" \
             --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
 
-      - name: Assemble archive
+      - name: Assemble role packages
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          ARCHIVE: ${{ matrix.archive }}
-          VERSION: ${{ github.event.release.tag_name || 'nightly' }}
         run: |
-          set -euo pipefail
-          version="${VERSION#v}"
-          stage="pathchord-${version}-${TARGET}"
-          mkdir -p "dist/$stage"
-          for binary in pathchord-ingressd pathchord-egressd pathchordctl; do
-            source="target/$TARGET/release/$binary"
-            if [ "$ARCHIVE" = zip ]; then
-              source="$source.exe"
+          binaries="$PWD/target/$TARGET/release"
+          mkdir -p dist
+          cd dist
+          for role in ingress egress; do
+            package="pathchord-$role-$TARGET"
+            mkdir "$package"
+            cp ../LICENSE "$package/"
+            if [[ "$RUNNER_OS" == Windows ]]; then
+              cp "$binaries/pathchord-${role}d.exe" "$binaries/pathchordctl.exe" "$package/"
+              python -m zipfile -c "$package.zip" "$package"
+            else
+              cp "$binaries/pathchord-${role}d" "$binaries/pathchordctl" "$package/"
+              tar -czf "$package.tar.gz" "$package"
             fi
-            cp "$source" "dist/$stage/"
           done
-          cp README.md LICENSE* "dist/$stage/" 2>/dev/null || true
-          (cd dist && openssl dgst -sha256 -r "$stage"/* > "$stage.sha256")
-          if [ "$ARCHIVE" = zip ]; then
-            (cd dist && 7z a -tzip "$stage.zip" "$stage" >/dev/null)
-          else
-            (cd dist && tar -czf "$stage.tar.gz" "$stage")
-          fi
 
-      - name: Upload package artifact
+      - name: Upload role packages
         uses: actions/upload-artifact@v4
         with:
           name: pathchord-${{ matrix.target }}
-          path: dist/pathchord-*.${{ matrix.archive }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
           if-no-files-found: error
           retention-days: 14
 
   publish:
     name: Publish release assets
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - name: Download package artifacts
+      - name: Download role packages
         uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: pathchord-*
           merge-multiple: true
 
-      - name: Publish tagged release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: dist/pathchord-*
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: sha256sum pathchord-* > SHA256SUMS
 
-      - name: Publish nightly release
+      - name: Attach packages to published release
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload --clobber -- "$RELEASE_TAG" dist/*
+
+      - name: Publish Nightly prerelease
         if: github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: nightly
-          name: PathChord nightly
-          prerelease: true
-          make_latest: false
-          generate_release_notes: true
-          files: dist/pathchord-*
+        run: |
+          notes="Built from \`$GITHUB_SHA\` ([workflow run]($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID))."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release upload nightly dist/* --clobber
+            gh release edit nightly --prerelease --latest=false --notes "$notes"
+          else
+            gh release create nightly dist/* --target "$GITHUB_SHA" \
+              --title "PathChord Nightly" --prerelease --latest=false --notes "$notes"
+          fi
+          gh api --method PATCH "repos/$GH_REPO/git/refs/tags/nightly" \
+            -f "sha=$GITHUB_SHA" -F force=true >/dev/null
