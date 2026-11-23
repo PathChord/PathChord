@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Pure Rust REALITY cryptographic/session codec.
 //!
 //! REALITY's custom TLS ClientHello and certificate verifier require a

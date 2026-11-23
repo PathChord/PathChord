@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Small, pure Rust VMess AEAD client.
 //!
 //! VMess keeps its protocol framing independent from the outer byte transport,
@@ -8,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aes::cipher::BlockEncrypt;
+use aes::cipher::BlockCipherEncrypt;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
 use async_trait::async_trait;
@@ -17,10 +18,9 @@ use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use pathchord_policy::TransitProxyConfig;
 use sha2::Sha256;
-use sha3::{
-    Shake128, Shake128Reader,
-    digest::{ExtendableOutput, XofReader},
-};
+use sha3::digest::{ExtendableOutput, XofReader};
+use shake::{Shake128, Shake128Reader};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use zeroize::Zeroize;
@@ -743,7 +743,7 @@ fn seal_legacy_request(
     mut header: Vec<u8>,
 ) -> Result<Vec<u8>, TransitError> {
     let timestamp = timestamp.to_be_bytes();
-    let mut id = <Hmac<Md5> as Mac>::new_from_slice(alter_key)
+    let mut id = Hmac::<Md5>::new_from_slice(alter_key)
         .map_err(|_| protocol("VMess legacy authentication initialization failed"))?;
     Mac::update(&mut id, &timestamp);
     let mut time_hash = Md5::new();
@@ -819,7 +819,7 @@ fn wrap_digest<H: DigestState>(mut state: H, key: &[u8]) -> WrappedDigest<H> {
 }
 
 fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
-    let salt = <Hmac<Sha256> as Mac>::new_from_slice(b"VMess AEAD KDF").expect("valid KDF salt");
+    let salt = Hmac::<Sha256>::new_from_slice(b"VMess AEAD KDF").expect("valid KDF salt");
     match path {
         [] => {
             let mut state = salt;

@@ -5,8 +5,9 @@
 //! pieces will be added to a native adapter only after an independent
 //! Hysteria2 interoperability fixture exists.
 
-use blake2::Blake2bVar;
-use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2b;
+use blake2::digest::Digest;
+use blake2::digest::consts::U32;
 
 pub const FRAME_TYPE_TCP_REQUEST: u64 = 0x401;
 pub const MAX_ADDRESS_LENGTH: usize = 2048;
@@ -225,13 +226,10 @@ pub fn decode_udp_message(input: &[u8]) -> Result<UdpMessage, &'static str> {
 }
 
 pub fn salamander_xor(password: &[u8], packet: &[u8], salt: &[u8; 8]) -> Vec<u8> {
-    let mut hasher = Blake2bVar::new(32).expect("valid BLAKE2b output length");
-    hasher.update(password);
-    hasher.update(salt);
-    let mut key = [0_u8; 32];
-    hasher
-        .finalize_variable(&mut key)
-        .expect("fixed BLAKE2b output length");
+    let mut hasher = Blake2b::<U32>::new();
+    Digest::update(&mut hasher, password);
+    Digest::update(&mut hasher, salt);
+    let key = hasher.finalize();
     packet
         .iter()
         .enumerate()

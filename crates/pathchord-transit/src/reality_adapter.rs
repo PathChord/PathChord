@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Native VLESS + REALITY adapter.
 //!
 //! REALITY is a TLS ClientHello proof profile used by VLESS nodes. The local
@@ -612,7 +613,7 @@ impl ServerCertVerifier for RealityVerifier {
                     .to_id_string()
                     == "1.3.101.112"
             {
-                let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&key)
+                let mut mac = Hmac::<Sha512>::new_from_slice(&key)
                     .map_err(|_| Error::General("REALITY HMAC key failed".into()))?;
                 mac.update(
                     certificate

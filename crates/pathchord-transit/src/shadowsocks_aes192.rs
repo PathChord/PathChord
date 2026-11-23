@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! SIP004 AES-192-GCM, absent from the upstream Shadowsocks cipher registry.
 
 use std::fmt;
