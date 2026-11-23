@@ -10,7 +10,7 @@ Validate existing native adapters and fill incomplete combinations against the e
 
 ## Decisions
 
-Start from native platform/listener smoke evidence, then expand provider/peer cases and run long-lived failure tests. Capture sanitized real-provider exports for URI/Base64, Clash/Mihomo HTTP providers, SIP008, sing-box and supported Surge/Quantumult X/Loon text nodes. Verify bounded fetch expansion, credential origin boundaries, redaction, source metadata, cache state and unsupported-node diagnostics.
+Start from native platform/listener smoke evidence, then expand provider/peer cases and run long-lived failure tests. Capture sanitized provider exports for URI/Base64, inline Clash, SIP008, sing-box, Surge and Loon. Use a fixture based on the Mihomo documentation for referenced HTTP providers. Quantumult X falls outside this release acceptance matrix. Verify bounded fetch expansion, credential origin boundaries, redaction, source metadata, cache state and unsupported-node diagnostics.
 
 Independent sing-box, Mihomo, Xray and V2Fly binaries are test-only server peers, each limited to its native server protocols; they never enter the runtime or Cargo dependency graph. Keep local fixtures, cross-machine sessions and prolonged soak results separate. Extend REALITY, Hysteria2, TUIC, AnyTLS and VMess parameter coverage through narrow native adapters with exact validation.
 

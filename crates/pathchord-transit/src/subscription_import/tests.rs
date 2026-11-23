@@ -1690,3 +1690,76 @@ async fn malformed_document_retains_good_snapshot_but_bad_nodes_publish_independ
     assert_eq!(manager.snapshot(), &before);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn sanitized_provider_exports_from_format_specific_user_agents_import() {
+    let samples = [
+        (
+            SubscriptionSourceType::Clash,
+            include_str!("../../tests/fixtures/provider-samples/clash-meta.yaml"),
+            "clash",
+            "vless",
+            4,
+            4,
+        ),
+        (
+            SubscriptionSourceType::Sip008,
+            include_str!("../../tests/fixtures/provider-samples/sip008.json"),
+            "sip008",
+            "ss",
+            3,
+            3,
+        ),
+        (
+            SubscriptionSourceType::SingBox,
+            include_str!("../../tests/fixtures/provider-samples/sing-box.json"),
+            "sing_box",
+            "vless",
+            4,
+            4,
+        ),
+        (
+            SubscriptionSourceType::Uri,
+            include_str!("../../tests/fixtures/provider-samples/uri-base64.txt"),
+            "uri",
+            "vless",
+            8,
+            8,
+        ),
+        (
+            SubscriptionSourceType::Surge,
+            include_str!("../../tests/fixtures/provider-samples/surge.conf"),
+            "surge",
+            "ss",
+            3,
+            0,
+        ),
+        (
+            SubscriptionSourceType::Loon,
+            include_str!("../../tests/fixtures/provider-samples/loon.conf"),
+            "loon",
+            "vless",
+            2,
+            0,
+        ),
+    ];
+    for (source_type, body, source_format, protocol, count, active) in samples {
+        let nodes = imports(source_type, body);
+        assert_eq!(nodes.len(), count, "{source_format}");
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| node.state == DynamicNodeState::Active)
+                .count(),
+            active,
+            "{source_format}",
+        );
+        for node in &nodes {
+            assert_eq!(node.config.labels["source.format"], source_format);
+            assert!(
+                !format!("{:?} {:?}", node.config, node.diagnostic).contains("fixture-password")
+            );
+        }
+        assert!(nodes.iter().any(|node| node.config.protocol == protocol));
+    }
+}

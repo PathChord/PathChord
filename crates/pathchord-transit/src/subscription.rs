@@ -2897,20 +2897,77 @@ proxies:
         tokio::time::timeout(Duration::from_secs(5), async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
+            let cases = [
+                (
+                    "clash.meta",
+                    "clash",
+                    "yaml-node",
+                    "http",
+                    r#"
+proxies:
+  - {name: yaml-node, type: http, server: proxy.test, port: 8080}
+proxy-providers:
+  local: {type: file, path: ./fixture-proxies.yaml}
+"#,
+                    Some(("local", "proxy-providers")),
+                ),
+                (
+                    "shadowsocks",
+                    "sip008",
+                    "sip-node",
+                    "ss",
+                    r#"{
+  "version": 1,
+  "servers": [
+    {"id":"11111111-1111-4111-8111-111111111111","remarks":"sip-node",
+     "server":"proxy.test","server_port":8388,"method":"aes-256-gcm",
+     "password":"fixture-password","plugin":"","plugin_opts":""},
+    {"id":"22222222-2222-4222-8222-222222222222","remarks":"sip-invalid",
+     "server":"proxy.test","server_port":8389,"method":"aes-256-gcm"}
+  ]
+}"#,
+                    Some(("sip-invalid", "password")),
+                ),
+                (
+                    "sing-box",
+                    "sing_box",
+                    "box-node",
+                    "http",
+                    r#"{
+  "outbounds": [
+    {"type":"http","tag":"box-node","server":"proxy.test","server_port":8082,
+     "username":"fixture-user","password":"fixture-password"},
+    {"type":"http","tag":"box-chain","server":"proxy.test","server_port":8083,
+     "password":"fixture-password","detour":"box-node"},
+    {"type":"selector","tag":"selection","outbounds":["box-node"]}
+  ]
+}"#,
+                    Some(("box-chain", "sing_box_outbound")),
+                ),
+                (
+                    "v2rayn",
+                    "uri",
+                    "uri-node",
+                    "http",
+                    "http://proxy.test:8081#uri-node",
+                    None,
+                ),
+            ];
+            let server_cases = cases;
             let server = tokio::spawn(async move {
-                for _ in 0..2 {
+                for _ in 0..server_cases.len() {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let mut request = Vec::new();
                     while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
                         request.push(stream.read_u8().await.unwrap());
                     }
                     let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
-                    let body = if request.contains("\r\nuser-agent: client-a/1\r\n") {
-                        "proxies: [{name: yaml-node, type: http, server: proxy.test, port: 8080}]"
-                    } else {
-                        assert!(request.contains("\r\nuser-agent: client-b/1\r\n"));
-                        "http://proxy.test:8081#uri-node"
-                    };
+                    let (_, _, _, _, body, _) = server_cases
+                        .iter()
+                        .find(|(agent, ..)| {
+                            request.contains(&format!("\r\nuser-agent: {agent}\r\n"))
+                        })
+                        .expect("configured User-Agent");
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
@@ -2919,33 +2976,43 @@ proxies:
                 }
             });
             let fetcher = Arc::new(HttpSubscriptionFetcher::new().unwrap());
-            let mut first = config(SubscriptionSourceType::Auto, None);
-            first.source.url = format!("http://{address}/sub");
-            first.source.user_agent = Some("Client-A/1".into());
-            let mut second = first.clone();
-            second.id = SubscriptionId::new("provider-b");
-            second.source.user_agent = Some("Client-B/1".into());
-            let mut a = SubscriptionManager::new(
-                fetcher.clone(),
-                std::env::temp_dir(),
-                BTreeSet::from(["http".into()]),
-            );
-            let mut b = SubscriptionManager::new(
-                fetcher,
-                std::env::temp_dir(),
-                BTreeSet::from(["http".into()]),
-            );
-            let (first_result, second_result) = tokio::join!(a.refresh(&first), b.refresh(&second));
-            assert!(matches!(first_result, RefreshOutcome::Published { .. }));
-            assert!(matches!(second_result, RefreshOutcome::Published { .. }));
-            assert_eq!(
-                a.snapshot().candidate_nodes().next().unwrap().config.labels["source.name"],
-                "yaml-node"
-            );
-            assert_eq!(
-                b.snapshot().candidate_nodes().next().unwrap().config.labels["source.name"],
-                "uri-node"
-            );
+            let mut clients = tokio::task::JoinSet::new();
+            for (agent, format, name, protocol, _, unavailable) in cases.iter().copied() {
+                let mut subscription = config(SubscriptionSourceType::Auto, None);
+                subscription.id = SubscriptionId::new(format.replace('_', "-"));
+                subscription.source.url = format!("http://{address}/sub");
+                subscription.source.user_agent = Some(agent.to_owned());
+                let mut manager = SubscriptionManager::new(
+                    fetcher.clone(),
+                    std::env::temp_dir(),
+                    BTreeSet::from(["http".into(), "ss".into()]),
+                );
+                clients.spawn(async move {
+                    let outcome = manager.refresh(&subscription).await;
+                    assert!(matches!(outcome, RefreshOutcome::Published { .. }));
+                    let snapshot = manager.snapshot();
+                    let mut candidates = snapshot.candidate_nodes();
+                    let node = candidates.next().expect("supported sibling");
+                    assert_eq!(node.config.labels["source.name"], name);
+                    assert_eq!(node.config.labels["source.format"], format);
+                    assert_eq!(node.config.protocol, protocol);
+                    assert!(candidates.next().is_none());
+                    assert_eq!(snapshot.nodes.len(), 1 + usize::from(unavailable.is_some()));
+                    if let Some((name, field)) = unavailable {
+                        let node = snapshot
+                            .nodes
+                            .values()
+                            .find(|node| node.config.labels["source.name"] == name)
+                            .expect("unavailable sibling");
+                        assert!(matches!(node.state, DynamicNodeState::Unavailable(_)));
+                        assert_eq!(node.diagnostic.as_ref().unwrap().fields, [field]);
+                    }
+                    assert!(!format!("{snapshot:?}").contains("fixture-password"));
+                });
+            }
+            while let Some(result) = clients.join_next().await {
+                result.unwrap();
+            }
             server.await.unwrap();
         })
         .await

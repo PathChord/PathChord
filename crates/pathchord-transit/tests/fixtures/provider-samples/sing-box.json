@@ -1,0 +1,128 @@
+{
+  "outbounds": [
+    {
+      "tag": "fixture-node-1",
+      "type": "direct"
+    },
+    {
+      "tag": "fixture-node-2",
+      "type": "block"
+    },
+    {
+      "type": "vless",
+      "tag": "fixture-node-3",
+      "server": "node.example.invalid",
+      "server_port": 443,
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "packet_encoding": "xudp",
+      "flow": "",
+      "tls": {
+        "enabled": true,
+        "insecure": false,
+        "server_name": "node.example.invalid",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "ios"
+        }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/fixture",
+        "headers": {
+          "Host": [
+            "node.example.invalid"
+          ]
+        },
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "fixture-node-4",
+      "server": "node.example.invalid",
+      "server_port": 443,
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "packet_encoding": "xudp",
+      "flow": "",
+      "tls": {
+        "enabled": true,
+        "insecure": false,
+        "server_name": "node.example.invalid",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/fixture",
+        "headers": {
+          "Host": [
+            "node.example.invalid"
+          ]
+        },
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "fixture-node-5",
+      "server": "node.example.invalid",
+      "server_port": 443,
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "packet_encoding": "xudp",
+      "flow": "",
+      "tls": {
+        "enabled": true,
+        "insecure": false,
+        "server_name": "node.example.invalid",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/fixture",
+        "headers": {
+          "Host": [
+            "node.example.invalid"
+          ]
+        },
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "fixture-node-6",
+      "server": "node.example.invalid",
+      "server_port": 443,
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "packet_encoding": "xudp",
+      "flow": "",
+      "tls": {
+        "enabled": true,
+        "insecure": false,
+        "server_name": "node.example.invalid",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/fixture",
+        "headers": {
+          "Host": [
+            "node.example.invalid"
+          ]
+        },
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    }
+  ]
+}

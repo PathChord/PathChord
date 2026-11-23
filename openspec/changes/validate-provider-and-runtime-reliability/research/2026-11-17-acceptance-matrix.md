@@ -13,13 +13,13 @@ requires a separate delta. See the authoritative
 
 | Document family | Existing deterministic coverage | Real-provider evidence retained in the repository | Remaining acceptance |
 | --- | --- | --- | --- |
-| URI and Base64 URI lists | Common schemes, percent encoding, plain/Base64 forms, valid/invalid siblings, strict parameters | The status records requests using `v2rayN`, but does not retain an anonymized export with source provenance | Obtain a sanitized real export; do not relabel generated URI vectors as provider evidence |
-| Clash/Mihomo and referenced HTTP providers | Import diagnostics, recursive expansion, per-refresh depth/reference/body budgets, interrupted downloads, same-origin credential inheritance, cross-origin isolation | Two supplied providers imported 32 and 65 nodes using `clash.meta`, `sing-box`, and `v2rayN` User-Agents; per-node TCP/UDP probes are separately recorded | Retain sanitized exports and provenance for root documents and referenced HTTP-provider cases |
-| SIP008 array and versioned `servers` wrapper | Both forms normalize SS nodes | No provenance-backed anonymized real export is retained | Obtain a sanitized real export of each supplied form |
-| sing-box node documents | Native normalization, unknown-field diagnostics, private unsupported documents, selectors excluded, no implicit detour or route-graph fallback | The prior change exercised supplied sing-box forms; the status does not establish a retained anonymous export suitable for replay | Retain a sanitized real export with source provenance |
-| Surge text nodes | Supported node/proxy-section forms and authentication/TLS vectors | No provenance-backed anonymized real export is retained | Obtain a sanitized supported real export |
-| Quantumult X text nodes | Supported node forms, authentication and TLS vectors | No provenance-backed anonymized real export is retained | Obtain a sanitized supported real export |
-| Loon text nodes | Supported forms, positional credentials and obfs parameters | No provenance-backed anonymized real export is retained | Obtain a sanitized supported real export |
+| URI and Base64 URI lists | Common schemes, percent encoding, plain/Base64 forms, valid/invalid siblings, strict parameters | Sanitized Base64 export from the supplied endpoint | Replay the captured Base64 wrapper |
+| Clash/Mihomo and referenced HTTP providers | Recursive expansion, depth/reference/body budgets, interrupted downloads and credential origin checks | Sanitized provider export plus a reference based on the Mihomo documentation | Scripted fetches exercise expansion and credential origins |
+| SIP008 array and versioned `servers` wrapper | Both forms normalize SS nodes | Sanitized versioned export with three placeholder server records | Replay the versioned export |
+| sing-box node documents | Native normalization, unsupported document diagnostics and exclusion of selectors | Sanitized outbounds from the supplied endpoint | Replay the proxy and non-proxy records |
+| Surge text nodes | Supported node/proxy-section forms and authentication/TLS vectors | Sanitized proxy lines from the supplied endpoint | Replay diagnostics for unsupported options |
+| Quantumult X text nodes | Outside the v0.1.0 acceptance matrix | The supplied endpoint returned HTTP 403 | No successful response required for this acceptance run |
+| Loon text nodes | Supported forms, positional credentials and obfs parameters | Sanitized proxy lines from the supplied endpoint | Replay diagnostics for unsupported options |
 
 The deterministic cases are in
 [subscription import tests](../../../../crates/pathchord-transit/src/subscription_import/tests.rs)
@@ -28,8 +28,22 @@ The new [local reliability harness](../../../../scripts/test-runtime-reliability
 uses generated localhost credentials and provider documents. Its successful
 sibling, retired-SSR diagnostic, redaction, cache, accounting, live-refresh and
 failure checks are **synthetic local evidence**. They do not fill the real
-source-provenance column. Task 1.1 therefore remains incomplete until the
-missing real-provider cases are available and sanitized.
+source-provenance column. The supplied samples and Clash HTTP provider
+fixture based on the Mihomo documentation complete the scoped provider evidence for this change.
+
+## Supplied subscription probe
+
+On 2026-11-23, provider responses for `clash.meta`, `Shadowsocks`,
+`sing-box`, `Mihomo`, `v2rayN`, `Surge`, and `Loon` supplied the
+[redacted test excerpts](../../../../crates/pathchord-transit/tests/fixtures/provider-samples/README.md).
+The SIP008 response had three placeholder server records. The sing-box response
+had 76 outbounds, and the two identical Base64 responses contained 65 URI
+entries each. Quantumult X returned HTTP 403. The Clash response supplied
+inline proxies. The local HTTP-provider fixture follows the Mihomo documentation.
+
+The importer tests replay the captured excerpts with placeholder connection
+details. The local HTTP User-Agent regression uses independent constructed
+responses to exercise concurrent format selection and mixed node outcomes.
 
 ## Independent peer scope
 

@@ -304,17 +304,22 @@ async fn repeated_display_names_across_providers_have_distinct_stable_ids() {
 #[tokio::test]
 async fn provider_fetch_credentials_do_not_cross_origin_boundaries() {
     let fetcher = Arc::new(Fetcher::default());
-    fetcher.document("https://root.invalid/sub", "proxy-providers: {same: {type: http, url: https://root.invalid/nodes}, cross: {type: http, url: https://external.invalid/nodes}, downgrade: {type: http, url: http://root.invalid/nodes}}");
+    fetcher.document(
+        "https://root.invalid/sub",
+        include_str!("../../tests/fixtures/provider-samples/clash-http-providers.yaml"),
+    );
     fetcher.document("https://root.invalid/nodes", &node("same"));
     fetcher.document("https://external.invalid/nodes", &node("cross"));
     fetcher.document("http://root.invalid/nodes", &node("downgrade"));
     let mut instance = manager(fetcher.clone());
     let mut subscription = config();
     subscription.source.user_agent = Some("CustomProviderClient/1".into());
-    assert!(matches!(
-        instance.refresh(&subscription).await,
-        RefreshOutcome::Published { .. }
-    ));
+    let RefreshOutcome::Published { diff, .. } = instance.refresh(&subscription).await else {
+        panic!("provider expansion");
+    };
+    assert_eq!(diff.added.len(), 3);
+    assert!(diff.unavailable.is_empty());
+    assert_eq!(instance.snapshot.candidate_nodes().count(), 3);
     let requests = fetcher.requests.lock().unwrap();
     assert_eq!(requests.len(), 4);
     for request in requests.iter() {

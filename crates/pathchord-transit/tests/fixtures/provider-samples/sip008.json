@@ -1,0 +1,31 @@
+{
+  "servers": [
+    {
+      "id": 1,
+      "remarks": "fixture-node-1",
+      "server": "node.example.invalid",
+      "server_port": 443,
+      "password": "fixture-password",
+      "method": "aes-128-gcm"
+    },
+    {
+      "id": 2,
+      "remarks": "fixture-node-2",
+      "server": "node.example.invalid",
+      "server_port": 443,
+      "password": "fixture-password",
+      "method": "aes-128-gcm"
+    },
+    {
+      "id": 3,
+      "remarks": "fixture-node-3",
+      "server": "node.example.invalid",
+      "server_port": 443,
+      "password": "fixture-password",
+      "method": "aes-128-gcm"
+    }
+  ],
+  "bytes_used": 1024,
+  "bytes_remaining": 4096,
+  "version": 1
+}

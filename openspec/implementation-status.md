@@ -552,9 +552,9 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   a source with an in-use node may wait for that node before promoting the new
   adapter. SSE recovery snapshots are assembled from bounded resource queries
   rather than a single atomic cross-resource transaction.
-- Production monitoring rollout and probe/autoscaler calibration, and
-  provenance-backed real-provider samples for every document family remain
-  validation work. The Windows native platform and package matrices are
+- Production monitoring rollout and probe/autoscaler calibration remain
+  validation work. Quantumult X provider validation falls outside the
+  v0.1.0 acceptance matrix. The Windows native platform and package matrices are
   complete for the recorded Windows build and fixture versions.
   SSR, SOCKS4/4a outbound and other unregistered protocols stay explicitly
   unavailable. The QEMU
@@ -592,6 +592,15 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   protocol-specific interoperability fixtures.
 
 ## Validation evidence
+
+On 2026-11-23, the Transit subscription test suite passed 96 tests on Linux,
+including import replay of six sanitized excerpts from one supplied
+subscription. The excerpts cover inline Clash, versioned SIP008, sing-box,
+Base64 URI lists, Surge and Loon. The supplied endpoint returned HTTP 403 for
+Quantumult X. A fixture based on the Mihomo documentation exercises HTTP
+provider expansion and credential origin boundaries. Separate provider tests
+exercise fetch budgets. See the
+[provider acceptance matrix](changes/validate-provider-and-runtime-reliability/research/2026-11-17-acceptance-matrix.md#supplied-subscription-probe).
 
 Privileged Linux platform validation completed on 2026-11-17 in Alpine 3.24.4,
 x86_64 QEMU/KVM with Linux `6.18.63-0-virt`, iproute2/TC 7.0.0, nftables 1.1.6
@@ -692,8 +701,8 @@ unused `netsock` manifest dependency warning.
 
 Strict all-change OpenSpec validation passes all 14 items. Three changes remain
 listed: native platform validation is 8/8, native package validation is 7/7,
-and provider/runtime reliability is 5/6. The remaining gap in these three
-changes is provenance-backed provider samples for every document family. The
+and provider/runtime reliability is 6/6. The remaining gaps are production
+monitoring calibration and deliberately unsupported provider/protocol families. The
 mutually exclusive single-role package model
 uses one Unix service account; prior dual-role tests are not counted for it. The
 current-head GitHub CI run also passed the dependency-advisory and external-core

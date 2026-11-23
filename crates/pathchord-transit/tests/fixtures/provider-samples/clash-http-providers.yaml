@@ -1,0 +1,16 @@
+proxy-providers:
+  same:
+    type: http
+    url: https://root.invalid/nodes
+    path: ./providers/same.yaml
+    interval: 3600
+  cross:
+    type: http
+    url: https://external.invalid/nodes
+    path: ./providers/cross.yaml
+    interval: 3600
+  downgrade:
+    type: http
+    url: http://root.invalid/nodes
+    path: ./providers/downgrade.yaml
+    interval: 3600
