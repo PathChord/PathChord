@@ -64,3 +64,15 @@ an explicit node diagnostic; never silently downgrade TLS or discard transport
 parameters. Keep complete engine documents in private credential storage and
 validate the configured backend before making a node eligible. Subscription
 provider references must preserve fetch budgets and credential origin boundaries.
+
+## Commit identity by harness
+
+Commits must use the identity of the harness that created them so GitHub
+attribution remains accurate. Codex commits use exactly `Codex
+<codex@openai.com>`. Commits created by `dsh`, Claude Code, or OpenCode use
+that harness's configured name and email, and the configured identity must be
+recognizable on GitHub. Do not use the Codex identity for another harness.
+
+Before committing, verify the effective repository-local `user.name` and
+`user.email` values. When rewriting history, preserve Dependabot-authored
+commits and their metadata.
