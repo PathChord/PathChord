@@ -138,9 +138,256 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  package-debian:
+    name: Debian packages
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [ingress, egress]
+    steps:
+      - name: Check out source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: pathchord-x86_64-unknown-linux-musl
+          path: dist-input
+      - name: Extract selected binaries
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          archive="dist-input/pathchord-$ROLE-x86_64-unknown-linux-musl.tar.gz"
+          mkdir -p package-input
+          tar -xzf "$archive" -C package-input --strip-components=1
+      - name: Build Debian package
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          PATHCHORD_ROLE="$ROLE" \
+            PATHCHORD_DAEMON_BINARY="$PWD/package-input/pathchord-${ROLE}d" \
+            PATHCHORDCTL_BINARY="$PWD/package-input/pathchordctl" \
+            make -C packaging package-deb
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: pathchord-native-debian-${{ matrix.role }}
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  package-alpine:
+    name: Alpine packages
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [ingress, egress]
+    steps:
+      - name: Check out source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: pathchord-x86_64-unknown-linux-musl
+          path: dist-input
+      - name: Extract selected binaries
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          archive="dist-input/pathchord-$ROLE-x86_64-unknown-linux-musl.tar.gz"
+          mkdir -p package-input
+          tar -xzf "$archive" -C package-input --strip-components=1
+      - name: Build Alpine package in a native container
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          version="$(./packaging/version.sh)"
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/src:ro" -v "$PWD/dist:/out" \
+            -e ROLE="$ROLE" -e VERSION="$version" \
+            alpine:3.22 sh -ec '
+              apk add --no-cache alpine-sdk
+              adduser -D builder
+              addgroup builder abuild
+              chmod 777 /out
+              cp -a /src /work
+              chown -R builder:builder /work
+              su builder -s /bin/sh -c "abuild-keygen -a -n >/dev/null 2>&1 && \
+                PATHCHORD_ROLE=$ROLE PATHCHORD_VERSION=$VERSION \
+                PATHCHORD_DAEMON_BINARY=/work/package-input/pathchord-${ROLE}d \
+                PATHCHORDCTL_BINARY=/work/package-input/pathchordctl \
+                /work/packaging/alpine/build.sh /out"
+            '
+      - name: Upload Alpine package
+        uses: actions/upload-artifact@v7
+        with:
+          name: pathchord-native-alpine-${{ matrix.role }}
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  package-arch:
+    name: Arch Linux packages
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [ingress, egress]
+    steps:
+      - name: Check out source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: pathchord-x86_64-unknown-linux-musl
+          path: dist-input
+      - name: Extract selected binaries
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          archive="dist-input/pathchord-$ROLE-x86_64-unknown-linux-musl.tar.gz"
+          mkdir -p package-input
+          tar -xzf "$archive" -C package-input --strip-components=1
+      - name: Build Arch package in a native container
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          version="$(./packaging/version.sh)"
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/src:ro" -v "$PWD/dist:/out" \
+            -e ROLE="$ROLE" -e VERSION="$version" \
+            archlinux:base-devel sh -ec '
+              pacman -Syu --noconfirm archlinux-keyring
+              useradd --create-home builder
+              chmod 777 /out
+              cp -a /src /work
+              chown -R builder:builder /work
+              su builder -s /bin/bash -c "PATHCHORD_ROLE=$ROLE PATHCHORD_VERSION=$VERSION \
+                PATHCHORD_DAEMON_BINARY=/work/package-input/pathchord-${ROLE}d \
+                PATHCHORDCTL_BINARY=/work/package-input/pathchordctl \
+                /work/packaging/arch/build.sh /out"
+            '
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v7
+        with:
+          name: pathchord-native-arch-${{ matrix.role }}
+          path: dist/*.pkg.tar.*
+          if-no-files-found: error
+          retention-days: 14
+
+  package-freebsd:
+    name: FreeBSD packages
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [ingress, egress]
+    steps:
+      - name: Check out source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download FreeBSD binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: pathchord-x86_64-unknown-freebsd
+          path: dist-input
+      - name: Extract selected binaries
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          archive="dist-input/pathchord-$ROLE-x86_64-unknown-freebsd.tar.gz"
+          mkdir -p package-input
+          tar -xzf "$archive" -C package-input --strip-components=1
+      - name: Build FreeBSD package in a native VM
+        env:
+          ROLE: ${{ matrix.role }}
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y pkg
+          run: |
+            PATHCHORD_ROLE="$ROLE" \
+              PATHCHORD_DAEMON_BINARY="$PWD/package-input/pathchord-${ROLE}d" \
+              PATHCHORDCTL_BINARY="$PWD/package-input/pathchordctl" \
+              sh packaging/freebsd/build.sh dist
+      - name: Upload FreeBSD package
+        uses: actions/upload-artifact@v7
+        with:
+          name: pathchord-native-freebsd-${{ matrix.role }}
+          path: dist/*.pkg
+          if-no-files-found: error
+          retention-days: 14
+
+  package-windows:
+    name: Windows installers
+    needs: build
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [ingress, egress]
+    steps:
+      - name: Check out source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download Windows binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: pathchord-x86_64-pc-windows-msvc
+          path: dist-input
+      - name: Extract selected binaries
+        shell: pwsh
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          $archive = Join-Path $env:GITHUB_WORKSPACE "dist-input/pathchord-$env:ROLE-x86_64-pc-windows-msvc.zip"
+          Expand-Archive -LiteralPath $archive -DestinationPath package-input -Force
+          $nested = Get-ChildItem package-input -Directory | Select-Object -First 1
+          Get-ChildItem $nested.FullName | Move-Item -Destination package-input -Force
+          Remove-Item $nested.FullName -Recurse -Force
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --no-progress --yes
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          $daemon = Join-Path $env:GITHUB_WORKSPACE "package-input/pathchord-${env:ROLE}d.exe"
+          $ctl = Join-Path $env:GITHUB_WORKSPACE 'package-input/pathchordctl.exe'
+          & packaging/windows/build.ps1 -Role $env:ROLE `
+            -DaemonBinary $daemon -CtlBinary $ctl -OutputDirectory (Join-Path $env:GITHUB_WORKSPACE 'dist')
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: pathchord-native-windows-${{ matrix.role }}
+          path: dist/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Publish release assets
-    needs: build
+    needs: [build, package-debian, package-alpine, package-arch, package-freebsd, package-windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

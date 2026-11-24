@@ -162,10 +162,12 @@ Debian (`.deb`), Alpine (`.apk`), Arch Linux (`.pkg.tar.*`), FreeBSD (`.pkg`),
 and Windows NSIS (`.exe`). A machine installs one role package: each carries
 only its selected daemon, `pathchordctl`, matching service definition and
 role-specific configuration. Role packages are mutually exclusive; remove the
-installed role explicitly before switching. Build the selected daemon together
-with `pathchordctl` and select `ROLE=ingress` or `ROLE=egress` with
-`make -C packaging`; the package guide documents native host tools and
-precompiled artifact overrides.
+installed role explicitly before switching. Published releases and nightly
+builds attach the available native packages alongside the binary archives and a
+shared `SHA256SUMS` file. Build the selected daemon together with
+`pathchordctl` and select `ROLE=ingress` or `ROLE=egress` with `make -C
+packaging`; the package guide documents native host tools and precompiled
+artifact overrides.
 
 ## Development
 

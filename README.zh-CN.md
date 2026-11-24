@@ -123,7 +123,8 @@ target bridge。
 Arch Linux（`.pkg.tar.*`）、FreeBSD（`.pkg`）和 Windows NSIS（`.exe`）的原生
 打包配方。每台机器只安装一个角色包；每个包只包含所选 daemon、`pathchordctl`、对应
 服务定义和角色配置。两种角色包互斥，切换角色前需显式移除现有包。构建所选 daemon 和
-`pathchordctl`，并在 `make -C packaging` 中选择 `ROLE=ingress` 或 `ROLE=egress`；
+`pathchordctl`，并在 `make -C packaging` 中选择 `ROLE=ingress` 或 `ROLE=egress`。正式
+发布和 nightly 构建会将可用的原生软件包与二进制归档及共享的 `SHA256SUMS` 一起附加。
 软件包指南说明所需的原生构建工具以及预编译产物覆盖方式。
 
 ## 开发
