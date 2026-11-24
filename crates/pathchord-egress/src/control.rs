@@ -249,6 +249,7 @@ impl AuthorizationControlDispatcher {
         match request.operation.as_str() {
             "status.get" => self.status(request).await,
             "metrics.snapshot" => self.metrics_snapshot(request).await,
+            "diagnostics.get" => self.metrics_snapshot(request).await,
             "metrics.paths" => {
                 self.metric_resources(request, "path_metrics", "path_id")
                     .await

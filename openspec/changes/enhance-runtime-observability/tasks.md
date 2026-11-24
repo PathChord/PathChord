@@ -15,16 +15,16 @@
 
 ## 3. Operator access
 
-- [ ] 3.1 Add role-local management queries and CLI help, filtering, pagination and structured output. Verify equivalent query and redaction behavior through local control and authorized Web Gateway reads.
+- [x] 3.1 Add role-local management queries and CLI help, filtering, pagination and structured output. Verify equivalent query and redaction behavior through local control and authorized Web Gateway reads.
 - [ ] 3.2 Add scoped capture start, read and stop operations with authorization, audit, generation and idempotency handling. Verify duration and budget enforcement, expiry and restart, and denied changes from read-only actors.
-- [ ] 3.3 Connect existing event replay and Prometheus adapters. Verify ordered terminal updates, replay gaps, counter monotonicity across eviction, histogram units and buckets, and bounded label cardinality under high resource churn.
+- [x] 3.3 Connect existing event replay and Prometheus adapters. Verify ordered terminal updates, replay gaps, counter monotonicity across eviction, histogram units and buckets, and bounded label cardinality under high resource churn.
 - [ ] 3.4 Inspect outputs from both roles for blocked secret fields, target-detail authorization, and raw errors. Measure baseline and capture overhead under load and verify forwarding continues during collector backpressure.
 - [ ] 3.5 Add versioned diagnostic export and coverage metadata. Check an empty filtered result, partial retention, process restart, byte-limit truncation, redaction, and offline correlation across roles.
 
 ## 4. Documentation and validation
 
 - [ ] 4.1 Add paired operator instructions for local inspection, scoped capture, cross-role correlation, metric queries and interpreting gaps. Synchronize all affected English and Simplified Chinese main contracts and complete their detailed schemas when merging the deltas.
-- [ ] 4.2 Run workspace Rust quality gates, strict OpenSpec validation, whitespace, links, anchors and bilingual structure checks. Record the actual evidence and any unsupported producer fields in the implementation status.
+- [x] 4.2 Run workspace Rust quality gates, strict OpenSpec validation, whitespace, links, anchors and bilingual structure checks. Record the actual evidence and any unsupported producer fields in the implementation status.
 - [ ] 4.3 Verify commands and diagnostics using installed Ingress and Egress packages on native hosts with the Web Gateway disabled. Check optional authenticated scrape separately.
 - [ ] 4.4 On an authorized deployment, run a sustained bounded download and a controlled interruption with a known trigger. Reconstruct the first Path failure, failover or Session loss, client result, and any evidence gaps from the two roles. Keep deployed results distinct from local fault injection.
 - [ ] 4.5 Verify distinct evidence for Stream/Session credit exhaustion, application queue pressure, and Path write timeout. Exercise missing OS queue support, stale producers, collector overload, and process restarts during collection.

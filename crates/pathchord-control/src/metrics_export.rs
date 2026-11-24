@@ -160,6 +160,35 @@ pub(crate) fn prometheus(snapshot: &Value) -> String {
             );
         }
     }
+    let diagnostics = snapshot
+        .pointer("/path_diagnostics")
+        .or_else(|| snapshot.pointer("/runtime/path_diagnostics"));
+    if let Some(path_diagnostics) = diagnostics {
+        for (reason, value) in path_diagnostics
+            .pointer("/path_terminations")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|values| values.iter())
+        {
+            if let Some(count) = value.as_u64() {
+                let name = "pathchord_path_terminations_total";
+                let _ = writeln!(
+                    text,
+                    "# HELP {name} Terminal Path observations by local reason.\n# TYPE {name} counter\n{name}{{reason=\"{reason}\"}} {count}"
+                );
+            }
+        }
+        if let Some(value) = path_diagnostics
+            .pointer("/producer_drops")
+            .and_then(Value::as_u64)
+        {
+            let name = "pathchord_diagnostic_records_dropped_total";
+            let _ = writeln!(
+                text,
+                "# HELP {name} Diagnostic records dropped by the producer.\n# TYPE {name} counter\n{name}{{source=\"producer\"}} {value}"
+            );
+        }
+    }
     for (state, pointer) in [
         ("unknown", "/node_health/unknown"),
         ("up", "/node_health/up"),

@@ -237,6 +237,7 @@ impl LocalControlDispatcher {
             "subscriptions.disable" => self.dispatch_subscription_enabled(request, false),
             "subscriptions.refresh" => self.dispatch_subscription_refresh(request),
             "metrics.snapshot" => self.dispatch_metrics_snapshot(request),
+            "diagnostics.get" => self.dispatch_diagnostics(request),
             "metrics.paths" => self.dispatch_path_metrics(request),
             "metrics.streams" => self.dispatch_stream_metrics(request),
             "events.subscribe" => self.dispatch_events(request),
@@ -251,6 +252,28 @@ impl LocalControlDispatcher {
                 Some(json!({"operation": operation})),
             ),
         }
+    }
+
+    fn dispatch_diagnostics(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if let Err(response) = self.require_capability(&request, "metrics:read") {
+            return *response;
+        }
+        let Some(plane) = &self.subscription_data_plane else {
+            return self.failure(
+                request.request_id,
+                self.observed_generation(),
+                ErrorCode::PersistenceUnavailable,
+                "runtime diagnostics are unavailable",
+                None,
+            );
+        };
+        self.success(
+            request.request_id,
+            json!({
+                "diagnostics": plane.diagnostic_snapshot().path_summary(),
+                "observation_generation": self.service.observation_snapshot().generation,
+            }),
+        )
     }
 
     fn dispatch_status(&self, request: RequestEnvelope) -> ResponseEnvelope {
@@ -1326,6 +1349,8 @@ impl LocalControlDispatcher {
                 },
                 "udp": {"associations": measured.then_some(udp_associations)},
                 "policy": {"generation": control.generation},
+                "path_diagnostics": self.subscription_data_plane.as_ref()
+                    .map(|plane| plane.diagnostic_snapshot().path_summary()),
                 "subscriptions": {
                     "configured": control.subscriptions.len(),
                     "healthy": subscriptions_healthy,

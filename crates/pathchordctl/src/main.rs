@@ -55,6 +55,8 @@ enum Command {
     Describe(DescribeCommand),
     /// Query local runtime status.
     Status,
+    /// Query retained runtime diagnostics.
+    Diagnostics,
     /// Manage the Windows system-proxy switch.
     #[command(subcommand)]
     SystemProxy(SystemProxyCommand),
@@ -74,6 +76,7 @@ enum Output {
 #[derive(Debug, Subcommand)]
 enum GetCommand {
     Status,
+    Diagnostics,
     Enrollments,
 }
 
@@ -222,6 +225,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             .map_err(|error| CliError::Config(error.to_string()));
         }
         Command::Get(GetCommand::Status) => Command::Status,
+        Command::Get(GetCommand::Diagnostics) => Command::Diagnostics,
         Command::Get(GetCommand::Enrollments) => Command::Enroll(EnrollmentArgs {
             command: EnrollmentCommand::List,
         }),
@@ -254,6 +258,18 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             Some(status) => status,
             None => call_local(&socket, status_request(actor)).await?,
         },
+        Command::Diagnostics => {
+            call_local(
+                &socket,
+                request(
+                    "diagnostics.get",
+                    actor,
+                    serde_json::json!({}),
+                    vec!["metrics:read"],
+                ),
+            )
+            .await?
+        }
         Command::SystemProxy(command) => {
             let status = get_status(&socket, &actor, status).await?;
             if !status.ok {
