@@ -5,6 +5,11 @@ name: Release packages
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to receive the built assets
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -155,13 +160,13 @@ jobs:
         run: sha256sum pathchord-* > SHA256SUMS
 
       - name: Attach packages to published release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
         run: gh release upload --clobber -- "$RELEASE_TAG" dist/*
 
       - name: Publish Nightly prerelease
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag == ''
         run: |
           notes="Built from \`$GITHUB_SHA\` ([workflow run]($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID))."
           if gh release view nightly >/dev/null 2>&1; then
