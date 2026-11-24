@@ -9,11 +9,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use pathchord_core::{PathId, ProtocolLimits, SessionId, TargetEndpoint as WireTargetEndpoint};
 use pathchord_noise::{STATIC_KEY_LEN, StaticKeypair, WIRE_PROFILE_V1_PROLOGUE_PREFIX};
+use pathchord_path::diagnostics::{DiagnosticHistory, DiagnosticRole, DiagnosticSnapshot};
 use pathchord_path::{
     AutoscaleDecision, AutoscaleInput, IngressPathAdmissionConfig, IngressSessionHandle,
     MultipathConfig, MultipathPathObservation, OpenStreamError, OpenUdpError, PathAdmissionError,
     PathAdmissionOutcome, PathAutoscaler, PathAutoscalerConfig, PathEconomicStatus,
-    PathQualitySnapshot, SessionRuntimeError, SessionSnapshot, SessionUdpHandle, dial_path,
+    PathQualitySnapshot, SessionDiagnostics, SessionRuntimeError, SessionSnapshot,
+    SessionUdpHandle, dial_path,
 };
 use pathchord_policy::{
     CompiledPolicy, EgressConfig, EgressId, EgressRouteCandidate, EgressRuntimeStatus, Evaluation,
@@ -419,6 +421,7 @@ impl TrustFailureState {
 }
 
 pub struct IngressDataPlane {
+    diagnostics: Arc<DiagnosticHistory>,
     ingress_id: String,
     identity: Arc<StaticKeypair>,
     compiled: RwLock<CompiledPolicy>,
@@ -556,7 +559,15 @@ impl IngressDataPlane {
             retired_paths: Mutex::new(JoinSet::new()),
             probes: Mutex::new(crate::node_probe::ProbeStore::default()),
             probe_running: Mutex::new(()),
+            diagnostics: Arc::new(
+                DiagnosticHistory::new(DiagnosticRole::Ingress)
+                    .map_err(|_| DataPlaneError::IdentifierGeneration)?,
+            ),
         })
+    }
+
+    pub fn diagnostic_snapshot(&self) -> DiagnosticSnapshot {
+        self.diagnostics.snapshot()
     }
 
     pub async fn register_transit_adapter(
@@ -2598,12 +2609,13 @@ impl IngressDataPlane {
                 .unwrap_or(10_000)
                 .clamp(1, 10_000) as u16;
             session
-                .add_path(
+                .add_path_observed(
                     path,
                     MultipathPathObservation {
                         weight_basis_points: weight,
                         ..MultipathPathObservation::default()
                     },
+                    Some(transit_id.as_str().to_owned()),
                 )
                 .await?;
             slot.transit_paths
@@ -2646,7 +2658,14 @@ impl IngressDataPlane {
         let path = self
             .dial_session_path(slot, transit_id, session_id, path_id, dial_timeout)
             .await?;
-        let session = Arc::new(IngressSessionHandle::start(path)?);
+        let session = Arc::new(IngressSessionHandle::start_observed(
+            path,
+            Some(SessionDiagnostics {
+                history: Arc::clone(&self.diagnostics),
+                egress_id: egress_id.as_str().to_owned(),
+                transit_proxy_id: Some(transit_id.as_str().to_owned()),
+            }),
+        )?);
         let weight = slot
             .eligible_transits
             .lock()

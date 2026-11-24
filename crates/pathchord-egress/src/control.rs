@@ -285,7 +285,7 @@ impl AuthorizationControlDispatcher {
             Ok(snapshot) => snapshot,
             Err(error) => return self.store_failure(request.request_id, error),
         };
-        let runtime = match (self.status_hook)().await {
+        let mut runtime = match (self.status_hook)().await {
             Ok(runtime) => runtime,
             Err(_) => {
                 return failure(
@@ -297,6 +297,15 @@ impl AuthorizationControlDispatcher {
                 );
             }
         };
+        if !request
+            .actor
+            .capabilities
+            .iter()
+            .any(|cap| cap == "metrics:read")
+            && let Some(runtime) = runtime.as_object_mut()
+        {
+            runtime.remove("path_diagnostics");
+        }
         ResponseEnvelope::success(
             request.request_id,
             generation(snapshot.generation()),

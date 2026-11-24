@@ -1338,6 +1338,7 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
                     "active_streams": snapshot.active_streams,
                     "active_target_connections": snapshot.active_target_connections,
                     "last_session_end": snapshot.last_session_end,
+                    "path_diagnostics": status_node.diagnostic_snapshot().map(|value| value.path_summary()),
                     "target_open": {
                         "attempts": snapshot.target_open_attempts,
                         "successes": snapshot.target_open_successes,

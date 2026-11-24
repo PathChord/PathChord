@@ -2,9 +2,9 @@
 
 ## 1. Diagnostic records and correlation
 
-- [ ] 1.1 Define typed records, stage and reason registries, process-scoped cursors, and ID ownership. Verify normalization, handling of unknown values, and correlation between two independently ordered role timelines.
-- [ ] 1.2 Implement bounded baseline history and loss accounting. Verify that terminal records remain queryable after live inventory removal, expiration and eviction are visible, and producer saturation preserves counters and forwarding.
-- [ ] 1.3 Record Path and Session terminal transitions at the owning runtime. Inject write timeout, read and write errors, EOF, heartbeat expiry, protocol failure, drain and shutdown. Assert one counted terminal transition per Path, including racing triggers and cascading Session cleanup.
+- [x] 1.1 Define typed records, stage and reason registries, process-scoped cursors, and ID ownership. Verify normalization, handling of unknown values, and correlation between two independently ordered role timelines.
+- [x] 1.2 Implement bounded baseline history and loss accounting. Verify that terminal records remain queryable after live inventory removal, expiration and eviction are visible, and producer saturation preserves counters and forwarding.
+- [x] 1.3 Record Path and Session terminal transitions at the owning runtime. Inject write timeout, read and write errors, EOF, heartbeat expiry, protocol failure, drain and shutdown. Assert one counted terminal transition per Path, including racing triggers and cascading Session cleanup.
 
 ## 2. Runtime coverage
 

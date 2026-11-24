@@ -13,13 +13,14 @@ use pathchord_core::{
     TargetEndpoint,
 };
 use pathchord_noise::{StaticKeypair, WIRE_PROFILE_V1_PROLOGUE_PREFIX};
+use pathchord_path::diagnostics::{DiagnosticHistory, DiagnosticRole, DiagnosticSnapshot};
 use pathchord_path::{
     AuthorizationState as PathAuthorizationState, BoxedSessionStream, BoxedUdpTargetSocket,
     EgressPathAdmissionConfig, EgressSessionController, EgressSessionHandle, EgressStatusConfig,
     EgressStatusProvider, EgressStatusSample, EgressStreamFactory, EgressStreamOpenError,
     MultipathPathObservation, PathAdmissionOutcome, PathAuthorization, PathAuthorizer,
-    SessionRuntimeError, UdpTargetError, UdpTargetFactory, UdpTargetSocket, WireBudget,
-    WirePriority, accept_path,
+    SessionDiagnostics, SessionRuntimeError, UdpTargetError, UdpTargetFactory, UdpTargetSocket,
+    WireBudget, WirePriority, accept_path,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -117,6 +118,8 @@ pub enum EgressNodeError {
     CleanupPending,
     #[error("Egress authorization cleanup timed out")]
     CleanupTimeout,
+    #[error("Egress diagnostic identity generation failed")]
+    DiagnosticIdentity,
 }
 
 pub struct EgressNode<C> {
@@ -199,7 +202,13 @@ where
             traffic_multiplier_basis_points: config.traffic_multiplier_basis_points,
         };
         let runtime = Arc::new(Mutex::new(NodeRuntimeState::default()));
-        let observations = Arc::new(NodeObservations::default());
+        let observations = Arc::new(NodeObservations {
+            diagnostics: Some(Arc::new(
+                DiagnosticHistory::new(DiagnosticRole::Egress)
+                    .map_err(|_| EgressNodeError::DiagnosticIdentity)?,
+            )),
+            ..NodeObservations::default()
+        });
         let wire_budget = Arc::new(WireBudget::new(config.capacity_bps).ok_or(
             EgressNodeError::InvalidConfig("capacity is below one byte per second"),
         )?);
@@ -262,6 +271,13 @@ where
             .expect("status provider is not shared before starting the node")
             .status = status;
         Ok(self)
+    }
+
+    pub fn diagnostic_snapshot(&self) -> Option<DiagnosticSnapshot> {
+        self.observations
+            .diagnostics
+            .as_ref()
+            .map(|history| history.snapshot())
     }
 
     pub fn snapshot(&self) -> Result<EgressNodeSnapshot, EgressNodeError> {
@@ -924,6 +940,7 @@ struct ActivePathMetadata {
 
 #[derive(Default)]
 struct NodeObservations {
+    diagnostics: Option<Arc<DiagnosticHistory>>,
     accepted: AtomicU64,
     admitted: AtomicU64,
     rejected: AtomicU64,
@@ -1347,26 +1364,33 @@ async fn run_path_task<C>(
     };
     match claimed.await.unwrap_or(ClaimDecision::Reject) {
         ClaimDecision::New => {
-            let handle =
-                match EgressSessionHandle::start_with_udp_and_status_provider_and_target_slots(
-                    path,
-                    factory,
-                    TokioUdpTargetFactory {
-                        remote_dns_only,
-                        target_slots: Arc::clone(&target_slots),
-                        session_targets: Arc::clone(&active_targets),
-                        global_targets: Arc::clone(&observations.active_targets),
-                    },
-                    session_status,
-                    status_provider,
-                    Arc::clone(&target_slots),
-                ) {
-                    Ok(handle) => handle,
-                    Err(_) => {
-                        let _ = events.send(NodeEvent::Failed);
-                        return;
-                    }
-                };
+            let handle = match EgressSessionHandle::start_observed(
+                path,
+                factory,
+                TokioUdpTargetFactory {
+                    remote_dns_only,
+                    target_slots: Arc::clone(&target_slots),
+                    session_targets: Arc::clone(&active_targets),
+                    global_targets: Arc::clone(&observations.active_targets),
+                },
+                session_status,
+                status_provider,
+                Arc::clone(&target_slots),
+                observations
+                    .diagnostics
+                    .as_ref()
+                    .map(|history| SessionDiagnostics {
+                        history: Arc::clone(history),
+                        egress_id: String::from_utf8_lossy(&admission.egress_id).into_owned(),
+                        transit_proxy_id: None,
+                    }),
+            ) {
+                Ok(handle) => handle,
+                Err(_) => {
+                    let _ = events.send(NodeEvent::Failed);
+                    return;
+                }
+            };
             let controller = handle.controller();
             if events
                 .send(NodeEvent::RegisterController {
@@ -1417,6 +1441,7 @@ fn session_end_reason(error: &SessionRuntimeError) -> &'static str {
         SessionRuntimeError::UnacknowledgedData { .. } => "unacknowledged_data",
         SessionRuntimeError::PathWrite { .. } => "path_write",
         SessionRuntimeError::Io(_) => "io",
+        SessionRuntimeError::PathWriteTimeout { .. } => "write_timeout",
         SessionRuntimeError::Noise(_) => "noise",
         SessionRuntimeError::Frame(_) => "frame",
         SessionRuntimeError::Message(_) => "message",

@@ -30,6 +30,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::diagnostics::{
+    DiagnosticDetail, DiagnosticHistory, DiagnosticIds, DiagnosticOutcome, DiagnosticReason,
+    PathTerminationReason,
+};
+
 use crate::{
     DemandKey, EgressAdmittedPath, IngressAdmittedPath, MultipathConfig, MultipathError,
     MultipathPathObservation, MultipathSession, NoiseRecordStream, PathEconomicStatus,
@@ -414,6 +419,8 @@ pub enum SessionRuntimeError {
     WrongPathIdentity,
     #[error("Session received unexpected frame {0:?}")]
     UnexpectedFrame(FrameType),
+    #[error("Path write timed out after {elapsed_ms} ms")]
+    PathWriteTimeout { elapsed_ms: u64 },
     #[error("Session Path closed")]
     PathClosed,
     #[error("Path {path_id} write failed: {source}")]
@@ -453,6 +460,22 @@ impl SessionRuntimeError {
         }
     }
 
+    fn write_termination_reason(&self) -> PathTerminationReason {
+        match self {
+            Self::PathWrite { source, .. } => source.write_termination_reason(),
+            Self::PathWriteTimeout { .. } => PathTerminationReason::WriteTimeout,
+            _ => PathTerminationReason::WriteError,
+        }
+    }
+
+    fn write_elapsed_ms(&self) -> Option<u64> {
+        match self {
+            Self::PathWrite { source, .. } => source.write_elapsed_ms(),
+            Self::PathWriteTimeout { elapsed_ms } => Some(*elapsed_ms),
+            _ => None,
+        }
+    }
+
     fn is_flow_recoverable(&self) -> bool {
         matches!(
             self,
@@ -462,6 +485,13 @@ impl SessionRuntimeError {
                 | Self::WireBudgetExhausted
         )
     }
+}
+
+#[derive(Clone)]
+pub struct SessionDiagnostics {
+    pub history: Arc<DiagnosticHistory>,
+    pub egress_id: String,
+    pub transit_proxy_id: Option<String>,
 }
 
 pub struct IngressSessionHandle {
@@ -483,6 +513,16 @@ impl std::fmt::Debug for IngressSessionHandle {
 
 impl IngressSessionHandle {
     pub fn start<S>(path: IngressAdmittedPath<S>) -> Result<Self, SessionRuntimeError>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::start_observed(path, None)
+    }
+
+    pub fn start_observed<S>(
+        path: IngressAdmittedPath<S>,
+        diagnostics: Option<SessionDiagnostics>,
+    ) -> Result<Self, SessionRuntimeError>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
@@ -523,6 +563,7 @@ impl IngressSessionHandle {
         let actor = SessionActor::new(
             records,
             SessionActorInit {
+                diagnostics,
                 role: ActorRole::Ingress,
                 udp_factory: None,
                 session_id,
@@ -713,7 +754,20 @@ impl IngressSessionHandle {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let path = ErasedAdmittedPath::from_ingress(path);
+        self.add_path_observed(path, observation, None).await
+    }
+
+    pub async fn add_path_observed<S>(
+        &self,
+        path: IngressAdmittedPath<S>,
+        observation: MultipathPathObservation,
+        transit_proxy_id: Option<String>,
+    ) -> Result<(), SessionRuntimeError>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let mut path = ErasedAdmittedPath::from_ingress(path);
+        path.transit_proxy_id = transit_proxy_id;
         let (reply, result) = oneshot::channel();
         self.commands
             .send(IngressCommand::AddPath {
@@ -964,6 +1018,7 @@ impl EgressSessionHandle {
             EgressStatusConfig::default(),
             None,
             None,
+            None,
         )
     }
 
@@ -984,6 +1039,7 @@ impl EgressSessionHandle {
             EgressStatusConfig::default(),
             None,
             None,
+            None,
         )
     }
 
@@ -1002,7 +1058,7 @@ impl EgressSessionHandle {
         {
             return Err(SessionRuntimeError::InvalidRuntimeLimit);
         }
-        Self::start_inner(path, factory, None, status, None, None)
+        Self::start_inner(path, factory, None, status, None, None, None)
     }
 
     pub fn start_with_udp_and_status<S, F, U>(
@@ -1029,6 +1085,7 @@ impl EgressSessionHandle {
             status,
             None,
             None,
+            None,
         )
     }
 
@@ -1051,6 +1108,7 @@ impl EgressSessionHandle {
             status,
             Some(provider),
             None,
+            None,
         )
     }
 
@@ -1067,6 +1125,31 @@ impl EgressSessionHandle {
         F: EgressStreamFactory,
         U: UdpTargetFactory + 'static,
     {
+        Self::start_observed(
+            path,
+            factory,
+            udp_factory,
+            status,
+            provider,
+            target_slots,
+            None,
+        )
+    }
+
+    pub fn start_observed<S, F, U>(
+        path: EgressAdmittedPath<S>,
+        factory: F,
+        udp_factory: U,
+        status: EgressStatusConfig,
+        provider: Arc<dyn EgressStatusProvider>,
+        target_slots: Arc<Semaphore>,
+        diagnostics: Option<SessionDiagnostics>,
+    ) -> Result<Self, SessionRuntimeError>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        F: EgressStreamFactory,
+        U: UdpTargetFactory + 'static,
+    {
         Self::start_inner(
             path,
             factory,
@@ -1074,6 +1157,7 @@ impl EgressSessionHandle {
             status,
             Some(provider),
             Some(target_slots),
+            diagnostics,
         )
     }
 
@@ -1084,6 +1168,7 @@ impl EgressSessionHandle {
         egress_status: EgressStatusConfig,
         status_provider: Option<Arc<dyn EgressStatusProvider>>,
         target_open_slots: Option<Arc<Semaphore>>,
+        diagnostics: Option<SessionDiagnostics>,
     ) -> Result<Self, SessionRuntimeError>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -1135,6 +1220,7 @@ impl EgressSessionHandle {
         let actor = SessionActor::new(
             records,
             SessionActorInit {
+                diagnostics,
                 role: ActorRole::Egress {
                     factory: Arc::new(factory),
                 },
@@ -1200,6 +1286,7 @@ enum ActorRole {
 }
 
 struct SessionActorInit {
+    diagnostics: Option<SessionDiagnostics>,
     role: ActorRole,
     udp_factory: Option<Arc<dyn UdpTargetFactory>>,
     session_id: SessionId,
@@ -1262,6 +1349,7 @@ enum IngressCommand {
 }
 
 struct ErasedAdmittedPath {
+    transit_proxy_id: Option<String>,
     capabilities: u64,
     replication_budget_bytes_per_second: u64,
     session_id: SessionId,
@@ -1284,6 +1372,7 @@ impl ErasedAdmittedPath {
         let limits = records.limits();
         let (io, noise) = records.into_parts();
         Self {
+            transit_proxy_id: None,
             capabilities,
             replication_budget_bytes_per_second,
             session_id,
@@ -1306,6 +1395,7 @@ impl ErasedAdmittedPath {
         let limits = records.limits();
         let (io, noise) = records.into_parts();
         Self {
+            transit_proxy_id: None,
             capabilities,
             replication_budget_bytes_per_second,
             session_id,
@@ -1538,6 +1628,8 @@ struct PendingSessionControl {
 }
 
 struct PathHealth {
+    transit_proxy_id: Option<String>,
+    terminal_write: Option<(PathTerminationReason, Option<u64>)>,
     sender: ControlSender<PendingHeartbeat>,
     receiver: ControlReceiver,
     last_heartbeat_received: Instant,
@@ -1571,6 +1663,8 @@ struct PathHealth {
 impl PathHealth {
     fn new(now: Instant) -> Result<Self, ReliabilityError> {
         Ok(Self {
+            transit_proxy_id: None,
+            terminal_write: None,
             sender: ControlSender::new(MAX_PENDING_CONTROL_MESSAGES)?,
             receiver: ControlReceiver::new(MAX_PENDING_CONTROL_MESSAGES)?,
             last_heartbeat_received: now,
@@ -1613,6 +1707,7 @@ struct PendingUdpSend {
 }
 
 struct SessionActor<W> {
+    diagnostics: Option<SessionDiagnostics>,
     session_control_sender: ControlSender<PendingSessionControl>,
     next_session_control: u64,
     queued_session_controls: BTreeMap<u64, (BTreeSet<PathId>, SessionControlEntry)>,
@@ -1692,6 +1787,7 @@ where
         init: SessionActorInit,
     ) -> Result<Self, SessionRuntimeError> {
         let SessionActorInit {
+            diagnostics,
             role,
             udp_factory,
             session_id,
@@ -1758,6 +1854,7 @@ where
         let status_provider: Arc<dyn EgressStatusProvider> =
             status_provider.unwrap_or_else(|| Arc::new(StaticEgressStatusProvider(egress_status)));
         Ok(Self {
+            diagnostics,
             session_control_sender: ControlSender::new(MAX_SESSION_CONTROL_MESSAGES)?,
             next_session_control: 0,
             queued_session_controls: BTreeMap::new(),
@@ -1868,6 +1965,37 @@ where
             self.trust_failure = true;
         }
         self.terminate_paths().await;
+        if let Some(diagnostics) = &self.diagnostics {
+            let reason = match &result {
+                Ok(()) => None,
+                Err(SessionRuntimeError::SessionTrustFailure) => Some(DiagnosticReason::Protocol),
+                Err(SessionRuntimeError::PathClosed | SessionRuntimeError::EgressHardFailure) => {
+                    Some(DiagnosticReason::Unavailable)
+                }
+                Err(SessionRuntimeError::PathWriteTimeout { .. }) => {
+                    Some(DiagnosticReason::Timeout)
+                }
+                Err(_) => Some(DiagnosticReason::Unknown),
+            };
+            diagnostics.history.record(
+                DiagnosticIds {
+                    egress_id: Some(diagnostics.egress_id.clone()),
+                    session_id: Some(self.session_id),
+                    path_id: None,
+                    stream_id: None,
+                    transit_proxy_id: None,
+                    attempt_id: None,
+                },
+                DiagnosticDetail::SessionTermination {
+                    outcome: if reason.is_some() {
+                        DiagnosticOutcome::Failure
+                    } else {
+                        DiagnosticOutcome::Success
+                    },
+                    reason,
+                },
+            );
+        }
         self.cleanup().await;
         self.publish_snapshot(true);
         result.map(|()| self.current_snapshot(true))
@@ -1908,7 +2036,7 @@ where
                         }
                         Some(ReaderEvent::Closed { path_id }) => {
                             if self.remote_closing { return Ok(()); }
-                            if self.handle_path_failure(path_id).await? {
+                            if self.retire_path(path_id, false, PathTerminationReason::PeerEof, None).await? {
                                 let retained = self.retained_outbound_bytes();
                                 return if retained == 0 {
                                     Err(SessionRuntimeError::PathClosed)
@@ -1919,7 +2047,8 @@ where
                         }
                         Some(ReaderEvent::Failed { path_id, error }) => {
                             if self.remote_closing { return Ok(()); }
-                            if self.handle_path_failure(path_id).await? {
+                            let reason = if matches!(&error, SessionRuntimeError::Io(_)) { PathTerminationReason::ReadError } else { PathTerminationReason::ProtocolError };
+                            if self.retire_path(path_id, false, reason, None).await? {
                                 return Err(error);
                             }
                         }
@@ -1997,7 +2126,13 @@ where
             .then_some(received_path_id)
             .flatten();
         if let Some(path_id) = error.failed_path().or(received_path_id) {
-            if self.handle_path_failure(path_id).await? {
+            let closed = if error.failed_path().is_some() {
+                self.retire_write_failure(path_id, &error).await?
+            } else {
+                self.retire_path(path_id, false, PathTerminationReason::ProtocolError, None)
+                    .await?
+            };
+            if closed {
                 return Err(error);
             }
             return Ok(());
@@ -2202,12 +2337,20 @@ where
                         if error.failed_path().is_none() && !error.is_flow_recoverable() {
                             return Err(error);
                         }
-                        if self.handle_path_failure(path_id).await? {
+                        if self.retire_write_failure(path_id, &error).await? {
                             return Err(error);
                         }
                         return Ok(false);
                     }
-                    match self.handle_path_failure(path_id).await {
+                    match self
+                        .retire_path(
+                            path_id,
+                            false,
+                            PathTerminationReason::AdministrativeClose,
+                            None,
+                        )
+                        .await
+                    {
                         Ok(session_closed) => {
                             let _ = reply.send(Ok(()));
                             Ok(session_closed)
@@ -2232,7 +2375,7 @@ where
                         if error.failed_path().is_none() && !error.is_flow_recoverable() {
                             return Err(error);
                         }
-                        if self.handle_path_failure(path_id).await? {
+                        if self.retire_write_failure(path_id, &error).await? {
                             return Err(error);
                         }
                         return Ok(false);
@@ -2451,6 +2594,7 @@ where
             },
         );
         let mut health = PathHealth::new(Instant::now())?;
+        health.transit_proxy_id = path.transit_proxy_id;
         health.relationship_weight_basis_points = observation.weight_basis_points;
         health.effective_capacity_bps = observation.effective_capacity_bps;
         health.congestion_window_bytes = observation.congestion_window_bytes;
@@ -2486,18 +2630,82 @@ where
         }
     }
 
+    fn record_path_termination(
+        &self,
+        path_id: PathId,
+        health: &PathHealth,
+        closed: bool,
+        reason: PathTerminationReason,
+        write_elapsed_ms: Option<u64>,
+    ) {
+        let Some(diagnostics) = &self.diagnostics else {
+            return;
+        };
+        let transit_proxy_id = if path_id == self.path_id {
+            diagnostics.transit_proxy_id.clone()
+        } else {
+            health.transit_proxy_id.clone()
+        };
+        diagnostics.history.record(
+            DiagnosticIds {
+                egress_id: Some(diagnostics.egress_id.clone()),
+                session_id: Some(self.session_id),
+                path_id: Some(path_id),
+                stream_id: None,
+                transit_proxy_id,
+                attempt_id: None,
+            },
+            DiagnosticDetail::PathTermination {
+                state: if closed {
+                    pathchord_core::PathState::Closed
+                } else {
+                    pathchord_core::PathState::Failed
+                },
+                reason,
+                write_elapsed_ms,
+                heartbeat_age_ms: Some(health.last_heartbeat_received.elapsed().as_millis() as u64),
+            },
+        );
+    }
+
+    async fn retire_write_failure(
+        &mut self,
+        path_id: PathId,
+        error: &SessionRuntimeError,
+    ) -> Result<bool, SessionRuntimeError> {
+        self.retire_path(
+            path_id,
+            false,
+            error.write_termination_reason(),
+            error.write_elapsed_ms(),
+        )
+        .await
+    }
+
     async fn handle_path_failure(&mut self, path_id: PathId) -> Result<bool, SessionRuntimeError> {
-        self.retire_path(path_id, false).await
+        self.retire_path(path_id, false, PathTerminationReason::Unknown, None)
+            .await
     }
 
     async fn retire_path(
         &mut self,
         path_id: PathId,
         drained: bool,
+        reason: PathTerminationReason,
+        write_elapsed_ms: Option<u64>,
     ) -> Result<bool, SessionRuntimeError> {
         if !self.path_health.contains_key(&path_id) {
             return Ok(self.multipath.state() == pathchord_core::SessionState::Closed);
         }
+        let health = self.path_health.remove(&path_id).expect("live Path");
+        let (reason, write_elapsed_ms) =
+            health.terminal_write.unwrap_or((reason, write_elapsed_ms));
+        let outcome = if drained {
+            self.multipath.mark_path_closed(path_id)?
+        } else {
+            self.multipath.mark_path_failed(path_id)?
+        };
+        self.record_path_termination(path_id, &health, drained, reason, write_elapsed_ms);
         if path_id == self.path_id {
             if let Some(task) = self.reader_task.take() {
                 task.abort();
@@ -2512,12 +2720,6 @@ where
             let _ = path.writer_task.await;
             let _ = path.reader_task.await;
         }
-        self.path_health.remove(&path_id);
-        let outcome = if drained {
-            self.multipath.mark_path_closed(path_id)?
-        } else {
-            self.multipath.mark_path_failed(path_id)?
-        };
         self.retired_path_states.insert(
             path_id,
             if drained {
@@ -2573,7 +2775,7 @@ where
                             && failed_path_id != path_id
                             && self.path_health.contains_key(&failed_path_id)
                         {
-                            if Box::pin(self.retire_path(failed_path_id, false)).await? {
+                            if Box::pin(self.retire_write_failure(failed_path_id, &error)).await? {
                                 return Ok(true);
                             }
                             continue;
@@ -2696,7 +2898,7 @@ where
                     continue;
                 }
                 if let Some(failed_path_id) = error.failed_path() {
-                    if self.handle_path_failure(failed_path_id).await? {
+                    if self.retire_write_failure(failed_path_id, &error).await? {
                         return Err(error);
                     }
                     continue;
@@ -3004,7 +3206,7 @@ where
             let heartbeat_age = now.duration_since(health.last_heartbeat_received);
             let status_age = now.duration_since(health.last_status_received);
             if heartbeat_age >= PATH_FAILED_AFTER {
-                failed.push(*path_id);
+                failed.push((*path_id, PathTerminationReason::HeartbeatTimeout, None));
                 continue;
             }
             if heartbeat_age >= PATH_DEGRADED_AFTER
@@ -3191,19 +3393,29 @@ where
             ));
         }
         for (path_id, message) in outgoing {
-            if self.send_message_on(path_id, message).await.is_err() {
-                failed.push(path_id);
+            if let Err(error) = self.send_message_on(path_id, message).await {
+                failed.push((
+                    path_id,
+                    error.write_termination_reason(),
+                    error.write_elapsed_ms(),
+                ));
             }
         }
-        failed.sort_unstable();
-        failed.dedup();
+        failed.sort_by_key(|(path_id, _, _)| *path_id);
+        failed.dedup_by_key(|(path_id, _, _)| *path_id);
         for path_id in expired_drains {
-            if self.retire_path(path_id, true).await? {
+            if self
+                .retire_path(path_id, true, PathTerminationReason::Drained, None)
+                .await?
+            {
                 return Ok(true);
             }
         }
-        for path_id in failed {
-            if self.handle_path_failure(path_id).await? {
+        for (path_id, reason, write_elapsed_ms) in failed {
+            if self
+                .retire_path(path_id, false, reason, write_elapsed_ms)
+                .await?
+            {
                 return Ok(true);
             }
         }
@@ -4086,7 +4298,7 @@ where
             self.record_emitted_range(stream_id, chunk.offset, length)?;
         }
         if let Err(error) = send_result
-            && self.handle_path_failure(path_id).await?
+            && self.retire_write_failure(path_id, &error).await?
         {
             return Err(error);
         }
@@ -5187,16 +5399,19 @@ where
                     path_id,
                     source: Box::new(SessionRuntimeError::PathClosed),
                 })?;
-            result
-                .await
-                .map_err(|_| SessionRuntimeError::PathWrite {
-                    path_id,
-                    source: Box::new(SessionRuntimeError::PathClosed),
-                })?
-                .map_err(|error| SessionRuntimeError::PathWrite {
+            let result = result.await.unwrap_or(Err(SessionRuntimeError::PathClosed));
+            if let Err(error) = result {
+                if let Some(health) = self.path_health.get_mut(&path_id) {
+                    health.terminal_write.get_or_insert((
+                        error.write_termination_reason(),
+                        error.write_elapsed_ms(),
+                    ));
+                }
+                return Err(SessionRuntimeError::PathWrite {
                     path_id,
                     source: Box::new(error),
-                })?;
+                });
+            }
             if let Some(health) = self.path_health.get_mut(&path_id) {
                 health.bytes_since_observation =
                     health.bytes_since_observation.saturating_add(data_bytes);
@@ -5445,7 +5660,12 @@ where
         {
             let _ = self.multipath.mark_path_closed(path_id);
         }
-        self.path_health.clear();
+        for (path_id, health) in std::mem::take(&mut self.path_health) {
+            let (reason, elapsed) = health
+                .terminal_write
+                .unwrap_or((PathTerminationReason::SessionClosed, None));
+            self.record_path_termination(path_id, &health, true, reason, elapsed);
+        }
     }
 
     async fn cleanup(&mut self) {
@@ -5625,12 +5845,15 @@ where
                 .map_err(|_| SessionRuntimeError::NoiseStatePoisoned)?;
             noise.seal_frame(&frame, self.limits)?.encode()
         };
+        let started = Instant::now();
         tokio::time::timeout(PATH_WRITE_TIMEOUT, async {
             self.io.write_all(&encoded).await?;
             self.io.flush().await
         })
         .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Path write timed out"))??;
+        .map_err(|_| SessionRuntimeError::PathWriteTimeout {
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })??;
         Ok(())
     }
 }
@@ -6015,6 +6238,7 @@ mod tests {
         let mut actor = SessionActor::new(
             path.into_transport(),
             SessionActorInit {
+                diagnostics: None,
                 role: ActorRole::Ingress,
                 udp_factory: None,
                 session_id,
@@ -6114,6 +6338,7 @@ mod tests {
         let mut actor = SessionActor::new(
             path.into_transport(),
             SessionActorInit {
+                diagnostics: None,
                 role: ActorRole::Ingress,
                 udp_factory: None,
                 session_id,
@@ -6207,6 +6432,7 @@ mod tests {
         let mut actor = SessionActor::new(
             ingress_path.into_transport(),
             SessionActorInit {
+                diagnostics: None,
                 role: ActorRole::Ingress,
                 udp_factory: None,
                 session_id,
@@ -6339,6 +6565,7 @@ mod tests {
         let mut actor = SessionActor::new(
             path.into_transport(),
             SessionActorInit {
+                diagnostics: None,
                 role: ActorRole::Ingress,
                 udp_factory: None,
                 session_id,
@@ -6458,6 +6685,7 @@ mod tests {
             let mut actor = SessionActor::new(
                 path.into_transport(),
                 SessionActorInit {
+                    diagnostics: None,
                     role: ActorRole::Ingress,
                     udp_factory: None,
                     session_id,
@@ -6998,6 +7226,7 @@ mod tests {
             EgressStatusConfig::default(),
             Some(status.clone()),
             None,
+            None,
         )
         .unwrap();
         let ingress = IngressSessionHandle::start(ingress_path).unwrap();
@@ -7115,6 +7344,7 @@ mod tests {
             None,
             EgressStatusConfig::default(),
             Some(status.clone()),
+            None,
             None,
         )
         .unwrap();
@@ -7403,7 +7633,23 @@ mod tests {
                     )
                     .await;
                 let factory = EchoFactory::default();
-                let egress = EgressSessionHandle::start(egress_primary, factory.clone()).unwrap();
+                let history = Arc::new(
+                    DiagnosticHistory::new(crate::diagnostics::DiagnosticRole::Egress).unwrap(),
+                );
+                let egress = EgressSessionHandle::start_inner(
+                    egress_primary,
+                    factory.clone(),
+                    None,
+                    EgressStatusConfig::default(),
+                    None,
+                    None,
+                    Some(SessionDiagnostics {
+                        history: Arc::clone(&history),
+                        egress_id: "egress-test".to_owned(),
+                        transit_proxy_id: None,
+                    }),
+                )
+                .unwrap();
                 let egress_controller = egress.controller();
                 let ingress = IngressSessionHandle::start(ingress_primary).unwrap();
                 egress_controller
@@ -7434,10 +7680,41 @@ mod tests {
                 assert_eq!(ingress.snapshot().ready_paths, 1);
                 assert_eq!(egress_controller.snapshot().ready_paths, 1);
 
+                let records = history.snapshot().records;
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].ids.path_id, Some(PathId::new(301)));
+                let expected_reason = if stall {
+                    PathTerminationReason::WriteTimeout
+                } else {
+                    PathTerminationReason::WriteError
+                };
+                assert!(
+                    matches!(
+                        records[0].detail,
+                        DiagnosticDetail::PathTermination { reason, write_elapsed_ms, .. }
+                            if reason == expected_reason && write_elapsed_ms.is_some() == stall
+                    ),
+                    "{:?}",
+                    records[0]
+                );
+
                 stream.shutdown().await.unwrap();
                 stream.read_to_end(&mut Vec::new()).await.unwrap();
                 ingress.shutdown().await.unwrap();
                 egress.wait().await.unwrap();
+                let records = history.snapshot().records;
+                assert_eq!(records.len(), 3);
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|record| record.ids.path_id == Some(PathId::new(301)))
+                        .count(),
+                    1
+                );
+                assert!(matches!(
+                    records[2].detail,
+                    DiagnosticDetail::SessionTermination { .. }
+                ));
                 factory.join().await;
             })
             .await
@@ -8472,6 +8749,7 @@ mod tests {
             let mut actor = SessionActor::new(
                 ingress_path.into_transport(),
                 SessionActorInit {
+                    diagnostics: None,
                     role: ActorRole::Ingress,
                     udp_factory: None,
                     session_id: id,

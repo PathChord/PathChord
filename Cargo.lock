@@ -2548,6 +2548,7 @@ dependencies = [
  "pathchord-core",
  "pathchord-egress",
  "pathchord-noise",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

@@ -11,6 +11,7 @@ async-trait.workspace = true
 getrandom.workspace = true
 pathchord-core = { path = "../pathchord-core" }
 pathchord-noise = { path = "../pathchord-noise" }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
 

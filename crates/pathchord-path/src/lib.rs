@@ -17,6 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod admission;
 mod autoscale;
+pub mod diagnostics;
 mod multipath;
 mod runtime;
 mod session;
@@ -40,8 +41,8 @@ pub use runtime::{
     BoxedSessionStream, DemandSnapshot, EgressSessionController, EgressSessionHandle,
     EgressStatusConfig, EgressStatusObservation, EgressStatusProvider, EgressStatusSample,
     EgressStreamFactory, EgressStreamOpenError, IngressSessionHandle, IngressUdpHandle,
-    OpenStreamError, OpenUdpError, PathExclusionReason, PathQualitySnapshot, SessionRuntimeError,
-    SessionSnapshot, SessionStream, StreamSnapshot, run_egress_session,
+    OpenStreamError, OpenUdpError, PathExclusionReason, PathQualitySnapshot, SessionDiagnostics,
+    SessionRuntimeError, SessionSnapshot, SessionStream, StreamSnapshot, run_egress_session,
 };
 pub use session::{EgressPathSession, IngressPathSession, PathSessionConfig, PathSessionError};
 pub use single_path::{

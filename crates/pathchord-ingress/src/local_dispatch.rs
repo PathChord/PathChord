@@ -278,6 +278,18 @@ impl LocalControlDispatcher {
             }
             crate::control::RuntimeSnapshotState::Fresh => "down",
         };
+        let path_diagnostics = if request
+            .actor
+            .capabilities
+            .iter()
+            .any(|cap| cap == "metrics:read")
+        {
+            self.subscription_data_plane
+                .as_ref()
+                .map(|plane| plane.diagnostic_snapshot().path_summary())
+        } else {
+            None
+        };
         self.success(
             request.request_id,
             json!({
@@ -288,6 +300,7 @@ impl LocalControlDispatcher {
                     "state": if snapshot.resource_limits.is_empty() {"running"} else {"degraded"},
                     "resource_limits": snapshot.resource_limits,
                 },
+                "path_diagnostics": path_diagnostics,
                 "data_path_summary": data_path_summary,
                 "configuration_generation": self.service.snapshot().generation,
                 "observation_generation": snapshot.generation,
