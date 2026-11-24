@@ -19,7 +19,7 @@ hickory-proto.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
-notify = "8.2.0"
+notify = "9.0.0"
 orion.workspace = true
 pathchord-core = { path = "../pathchord-core" }
 pathchord-config = { path = "../pathchord-config" }
