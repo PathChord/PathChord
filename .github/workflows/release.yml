@@ -83,13 +83,23 @@ jobs:
         with:
           arch: ${{ matrix.msvc-arch }}
 
-      - name: Build release binaries
+      - name: Build release binaries on Unix
+        if: runner.os != 'Windows'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           BUILDER: ${{ matrix.builder }}
         run: |
           "$BUILDER" build --locked --release --target "$TARGET" \
+            --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
+
+      - name: Build release binaries on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --target "$env:TARGET" `
             --bin pathchord-ingressd --bin pathchord-egressd --bin pathchordctl
 
       - name: Assemble role packages
