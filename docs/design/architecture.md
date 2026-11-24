@@ -220,6 +220,13 @@ checks for concurrent edits, and retain the last successful subscription
 snapshot after a failed refresh. Web/API adapters call the owning typed service
 and never edit configuration files or caches directly.
 
+The daemons and `pathchordctl` share a role-aware layout for authored
+resources, runtime endpoints, and private state. CLI resource editing changes
+the selected directory's authored graph. A resource adoption transaction
+coordinates both file replacements with configuration readers and recovers an
+interrupted edit before the next load. Runtime publication stays with the
+daemon. Egress authorization remains a control operation on the Egress host.
+
 ## 12. Service artifacts
 
 PathChord publishes three executables in one versioned release bundle:

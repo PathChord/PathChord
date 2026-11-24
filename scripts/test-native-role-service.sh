@@ -30,7 +30,7 @@ install_package "$older"
 if [ "$role" = egress ]; then
     identity=/var/lib/pathchord-egress/egress.key.json
     if [ ! -e "$identity" ]; then
-        pathchordctl keygen --output "$identity" >/dev/null
+        pathchordctl -o json keygen --identity-file "$identity" >/dev/null
         chown pathchord:pathchord "$identity"
     fi
 fi
@@ -64,7 +64,7 @@ ready() {
         exit 1
     fi
     if [ "$role" = egress ] && [ -e /var/lib/pathchord-egress/native-enrollment.fixture ]; then
-        pathchordctl --socket "$endpoint" enroll get --ingress-id lifecycle-fixture > /tmp/pathchord-enrollment.json
+        pathchordctl -o json --socket "$endpoint" enroll get --ingress-id lifecycle-fixture > /tmp/pathchord-enrollment.json
         grep -q lifecycle-fixture /tmp/pathchord-enrollment.json
         grep -q native-upgrade /tmp/pathchord-enrollment.json
         grep -Fq -e "$(cat /var/lib/pathchord-egress/native-enrollment.fixture)" /tmp/pathchord-enrollment.json
@@ -85,7 +85,7 @@ ready() {
 start_service
 ready
 if [ "$role" = egress ]; then
-    public=$(pathchordctl keygen --output /var/lib/pathchord-egress/native-ingress.key.json | sed -n 's/.*"public_key": "\([^" ]*\)".*/\1/p')
+    public=$(pathchordctl -o json keygen --identity-file /var/lib/pathchord-egress/native-ingress.key.json | sed -n 's/.*"public_key": "\([^" ]*\)".*/\1/p')
     pathchordctl --socket "$endpoint" enroll add --ingress-id lifecycle-fixture --egress-id egress \
         --public-key "$public" --expected-generation 0 --label sentinel=native-upgrade
     printf '%s\n' "$public" > /var/lib/pathchord-egress/native-enrollment.fixture

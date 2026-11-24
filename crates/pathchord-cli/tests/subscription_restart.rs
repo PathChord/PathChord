@@ -227,7 +227,7 @@ async fn disabled_and_deleted_subscriptions_stay_unselectable_across_process_res
             let directory = Directory(std::env::temp_dir().join(format!("pathchord-subscription-{}-{}", std::process::id(), port())));
             std::fs::create_dir_all(&directory.0).unwrap();
             let identity = directory.0.join("identity");
-            assert!(Command::new(binary("pathchordctl")).args(["keygen", "--output", identity.to_str().unwrap()]).stdout(Stdio::null()).status().unwrap().success());
+            assert!(Command::new(binary("pathchordctl")).args(["keygen", "--identity-file", identity.to_str().unwrap()]).stdout(Stdio::null()).status().unwrap().success());
             let socket = directory.0.join("ingress.sock");
             let config = directory.0.join("config.yaml");
             let proxy_port = port();

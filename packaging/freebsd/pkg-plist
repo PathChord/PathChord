@@ -5,6 +5,7 @@ libexec/pathchord-setup-layout
 etc/rc.d/%%DAEMON%%
 share/licenses/%%DAEMON%%/LICENSE
 share/man/man1/pathchord.1
+share/man/zh_CN/man1/pathchord.1
 @dir(root,wheel,0755) etc/pathchord
 @dir(root,pathchord,0750) etc/pathchord/%%ROLE%%
 @dir(pathchord,pathchord,0700) /var/db/pathchord-%%ROLE%%

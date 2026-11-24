@@ -55,7 +55,7 @@ config="/etc/pathchord/$role/$role.yaml"
 printf '\n# operator-lifecycle-sentinel\n' >> "$config"
 state="/var/lib/pathchord-$role"
 printf 'operator-%s\n' "$role" > "$state/lifecycle-sentinel"
-pathchordctl keygen --output "$state/lifecycle.key.json" >/dev/null
+pathchordctl keygen --identity-file "$state/lifecycle.key.json" >/dev/null
 printf 'authorization-state-fixture\n' > "$state/lifecycle.authorizations.db"
 chown pathchord:pathchord "$state"/lifecycle*
 chmod 0600 "$state"/lifecycle*

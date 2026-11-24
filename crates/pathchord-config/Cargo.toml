@@ -8,11 +8,16 @@ publish.workspace = true
 description = "Shared PathChord configuration source and role-aware loading"
 
 [dependencies]
+atomic-write-file.workspace = true
+serde.workspace = true
 pathchord-policy = { path = "../pathchord-policy" }
 thiserror.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user", "fs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

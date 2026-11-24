@@ -15,6 +15,10 @@ path = "src/main.rs"
 base64.workspace = true
 clap.workspace = true
 getrandom.workspace = true
+pathchord-config = { path = "../pathchord-config" }
+pathchord-policy = { path = "../pathchord-policy" }
+serde_yaml.workspace = true
+noyalib = "=0.0.63"
 pathchord-control = { path = "../pathchord-control" }
 pathchord-core = { path = "../pathchord-core" }
 pathchord-noise = { path = "../pathchord-noise" }

@@ -91,7 +91,12 @@ pub enum ReloadError {
 impl From<ConfigurationError> for ReloadError {
     fn from(error: ConfigurationError) -> Self {
         match error {
-            ConfigurationError::Io => Self::Io,
+            ConfigurationError::Io
+            | ConfigurationError::MissingHome
+            | ConfigurationError::ConflictingEnvironment
+            | ConfigurationError::ExpectedDirectory
+            | ConfigurationError::Transaction(_)
+            | ConfigurationError::PrivatePath(_) => Self::Io,
             ConfigurationError::TooLarge => Self::TooLarge,
             ConfigurationError::TooManyFiles => Self::TooManyFiles,
             ConfigurationError::TooDeep => Self::TooDeep,
@@ -1052,7 +1057,8 @@ fn spec_error_field(kind: &str, reason: &str) -> &'static str {
 }
 
 fn startup_fields_changed(current: &PolicyConfig, candidate: &PolicyConfig) -> bool {
-    current.listeners != candidate.listeners
+    current.ingress_service != candidate.ingress_service
+        || current.listeners != candidate.listeners
         || current.egresses != candidate.egresses
         || current.dns_policy != candidate.dns_policy
 }

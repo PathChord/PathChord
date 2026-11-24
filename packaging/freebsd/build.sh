@@ -20,6 +20,8 @@ install -m0755 "$root_dir/packaging/common/setup-layout.sh" "$stage/usr/local/li
 install -m0755 "$root_dir/packaging/freebsd/$package_name.in" "$stage/usr/local/etc/rc.d/$package_name"
 install -m0644 "$root_dir/LICENSE" "$stage/usr/local/share/licenses/$package_name/LICENSE"
 install -m0644 "$root_dir/packaging/common/pathchord.1" "$stage/usr/local/share/man/man1/pathchord.1"
+install -d "$stage/usr/local/share/man/zh_CN/man1"
+install -m0644 "$root_dir/packaging/common/pathchord.zh-CN.1" "$stage/usr/local/share/man/zh_CN/man1/pathchord.1"
 if [ "$role" = ingress ]; then template=default-config.yaml; else template=default-egress-config.yaml; fi
 sed -e 's@/var/lib/pathchord-@/var/db/pathchord-@g' -e 's@/run/pathchord/@/var/run/pathchord/@g' \
     "$root_dir/packaging/common/$template" > "$stage/usr/local/etc/pathchord/$role/$role.yaml.sample"

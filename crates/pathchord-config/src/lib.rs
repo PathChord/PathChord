@@ -1,5 +1,11 @@
 //! Shared configuration source and role-aware loading primitives.
 
+mod layout;
+mod transaction;
+pub use transaction::{ResourceChange, SourceTransaction};
+
+pub use layout::{Role, RoleLayout, SelectedSource, SourceOrigin};
+
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
@@ -14,6 +20,16 @@ pub const MAX_CONFIGURATION_DEPTH: usize = 16;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigurationError {
+    #[error("the current account's home directory could not be determined")]
+    MissingHome,
+    #[error("configuration transaction failed: {0}")]
+    Transaction(&'static str),
+    #[error("set only one of PATHCHORD_CONFIG and PATHCHORD_CONFIG_DIR")]
+    ConflictingEnvironment,
+    #[error("a configuration directory was required")]
+    ExpectedDirectory,
+    #[error("private path for {0} must be outside the scanned resource tree")]
+    PrivatePath(&'static str),
     #[error("configuration source I/O failed")]
     Io,
     #[error("configuration exceeds the size bound")]
@@ -134,6 +150,7 @@ pub struct ConfigurationSource {
 pub struct ConfigurationDocuments {
     pub documents: Vec<String>,
     pub directories: BTreeSet<PathBuf>,
+    pub files: Vec<PathBuf>,
 }
 
 impl ConfigurationSource {
@@ -180,7 +197,58 @@ impl ConfigurationSource {
         })
     }
 
+    /// Check a private path even when its leaf has not been created yet.
+    pub fn validate_private_path(
+        &self,
+        field: &'static str,
+        path: &Path,
+    ) -> Result<(), ConfigurationError> {
+        if !self.directory {
+            return Ok(());
+        }
+        let absolute = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            std::env::current_dir()
+                .map_err(|_| ConfigurationError::Io)?
+                .join(path)
+        };
+        let mut normalized = PathBuf::new();
+        for component in absolute.components() {
+            if component == Component::ParentDir {
+                normalized.pop();
+                continue;
+            }
+            normalized.push(component);
+            match std::fs::canonicalize(&normalized) {
+                Ok(canonical) => normalized = canonical,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(_) => return Err(ConfigurationError::Io),
+            }
+        }
+        if normalized.starts_with(&self.path) {
+            return Err(ConfigurationError::PrivatePath(field));
+        }
+        Ok(())
+    }
+
     pub async fn load(&self) -> Result<ConfigurationDocuments, ConfigurationError> {
+        let root = self.base_directory().to_owned();
+        let guard = SourceTransaction::read_guard(root.clone()).await?;
+        let loaded = self.load_unlocked().await;
+        if guard.lock_appeared() {
+            let guard = SourceTransaction::read_guard(root).await?;
+            let mut loaded = self.load_unlocked().await?;
+            guard.restore_view(&mut loaded, self);
+            Ok(loaded)
+        } else {
+            let mut loaded = loaded?;
+            guard.restore_view(&mut loaded, self);
+            Ok(loaded)
+        }
+    }
+
+    pub async fn load_unlocked(&self) -> Result<ConfigurationDocuments, ConfigurationError> {
         let metadata = tokio::fs::symlink_metadata(&self.path)
             .await
             .map_err(|_| ConfigurationError::Io)?;
@@ -246,14 +314,15 @@ impl ConfigurationSource {
         }
         let mut documents = Vec::with_capacity(files.len());
         let mut remaining = MAX_CONFIGURATION_BYTES;
-        for path in files {
-            let bytes = read_bounded_file(&path, remaining).await?;
+        for path in &files {
+            let bytes = read_bounded_file(path, remaining).await?;
             remaining -= bytes.len() as u64;
             documents.push(String::from_utf8(bytes).map_err(|_| ConfigurationError::Io)?);
         }
         Ok(ConfigurationDocuments {
             documents,
             directories,
+            files,
         })
     }
 }
@@ -333,10 +402,10 @@ mod tests {
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    struct Directory(PathBuf);
+    pub(super) struct Directory(pub(super) PathBuf);
 
     impl Directory {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
                 "pc-config-source-{}-{}",
                 std::process::id(),
@@ -351,6 +420,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test]
+    async fn private_paths_resolve_from_a_directory_but_stay_outside_its_tree() {
+        let directory = Directory::new();
+        let resources = directory.0.join("resources");
+        std::fs::create_dir(&resources).unwrap();
+        let source = ConfigurationSource::bind(resources).await.unwrap();
+        assert!(
+            source
+                .validate_private_path("identity", &source.path().join("nested/key"))
+                .is_err()
+        );
+        let sibling = source.base_directory().join("../private/key");
+        source.validate_private_path("identity", &sibling).unwrap();
     }
 
     #[tokio::test]

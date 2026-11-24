@@ -16,7 +16,9 @@ pub mod geodata;
 mod resource;
 mod service_config;
 mod transit_options;
-pub use service_config::{EgressServiceSpec, EgressWebSettings, NodeProbePolicySpec};
+pub use service_config::{
+    EgressServiceSpec, EgressWebSettings, IngressServiceSpec, NodeProbePolicySpec,
+};
 
 pub use transit_options::{
     TransitMultiplex, TransitOptions, TransitReality, TransitTls, TransitTransport,
@@ -595,6 +597,8 @@ pub struct GeoIpDatabaseConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PolicyConfig {
+    #[serde(default)]
+    pub ingress_service: Option<IngressServiceSpec>,
     pub node_probe: Option<NodeProbePolicySpec>,
     pub egresses: Vec<EgressConfig>,
     pub transit_proxies: Vec<TransitProxyConfig>,

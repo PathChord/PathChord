@@ -47,13 +47,18 @@ cargo build --locked --release --bin pathchord-ingressd --bin pathchord-egressd 
 ./target/release/pathchord-ingressd --config examples/ingress-direct.yaml
 ```
 
-For a regular Unix user, the default Ingress control socket uses
-`$XDG_RUNTIME_DIR/pathchord/ingress.sock` when that directory is available, or
-`~/.config/pathchord/ingress.sock` otherwise. Root and packaged service accounts
-use `/run/pathchord/ingress.sock`; the service package creates that runtime
-directory before startup. An explicit `--socket` may be used when a different
-local endpoint is required. The `enroll` command defaults to the corresponding
-`egress.sock` endpoint; an explicitly selected socket takes precedence.
+Regular Unix users load resources from `~/.config/pathchord/<role>` and keep
+state under `~/.local/state/pathchord/<role>`. The socket defaults to
+`$XDG_RUNTIME_DIR/pathchord`, with `~/.config/pathchord` as the fallback.
+Service accounts default to `/etc/pathchord/<role>`, `/run/pathchord`, and
+`/var/lib/pathchord/<role>`. FreeBSD uses `/var/run` and `/var/db` for its
+runtime and state roots. Packages can explicitly select existing service paths.
+
+`pathchordctl` uses an explicit `--socket` first, then the role's configured
+`controlSocket`, then the applicable XDG runtime, home configuration,
+`/run/pathchord`, and `/var/run/pathchord` candidates. `get status` defaults
+to Ingress, and `enroll` addresses Egress authorization. Human-readable output
+is the default. Scripts can select `-o json` or `-o yaml`.
 
 The mixed listener binds to `127.0.0.1:7890`. Its unauthenticated example is
 restricted to loopback. Applications can select HTTP or SOCKS on that address:
@@ -156,8 +161,8 @@ Generate a private identity on each corresponding machine. The command prints
 only the public key; the private file MUST remain local to its owner:
 
 ```sh
-pathchordctl keygen --output ingress.key.json
-pathchordctl keygen --output egress.key.json
+pathchordctl keygen --identity-file ingress.key.json
+pathchordctl keygen --identity-file egress.key.json
 ```
 
 Start Egress in its own terminal. The Unix control socket is local to Egress:
@@ -174,15 +179,15 @@ different IPv4, IPv6, hostname, or port candidates; all entries use the same
 verified Egress ID and public key. A single `--bind` and the older
 `address`/`port` form remain valid for one-endpoint deployments.
 
-On the Egress machine, explicitly enroll the Ingress public key. Replace
-`INGRESS_PUBLIC_KEY` with the public output from the Ingress key generation.
-Generation 0 applies to a new authorization database; subsequent mutations
-MUST use its observed generation:
+On Egress, enroll the independently verified Ingress public key. The CLI
+reads the Egress ID and current authorization generation from the selected
+service. Explicit `--egress-id` and `--expected-generation` remain available.
+Review a generation conflict before retrying. Revocation and deletion prompt
+for confirmation. Use `--yes` for unattended operations.
 
 ```sh
 pathchordctl --socket /tmp/pathchord-egress.sock enroll add \
-  --ingress-id entry --egress-id exit --public-key INGRESS_PUBLIC_KEY \
-  --expected-generation 0
+  --ingress-id entry --public-key INGRESS_PUBLIC_KEY
 ```
 
 In `examples/ingress-egress.yaml`, replace `REPLACE_WITH_EGRESS_PUBLIC_KEY`
@@ -194,10 +199,11 @@ explicitly verified key and canonical Egress ID. Start Ingress in a separate
 terminal:
 
 ```sh
+pathchordctl -C /path/to/ingress config create -f examples/ingress-egress.yaml
 pathchord-ingressd --socket /tmp/pathchord-ingress.sock \
   --ingress-id entry --identity ingress.key.json \
-  --config examples/ingress-egress.yaml
-pathchordctl --socket /tmp/pathchord-ingress.sock status
+  --config-dir /path/to/ingress
+pathchordctl --socket /tmp/pathchord-ingress.sock get status
 pathchordctl --socket /tmp/pathchord-egress.sock enroll list
 ```
 

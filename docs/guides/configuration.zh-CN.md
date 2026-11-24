@@ -18,6 +18,24 @@
 
 透明和 TUN 示例需要平台特权及主机路由设置。[部署指南](deployment.zh-CN.md)说明这些前提、服务启动和注册命令。FreeBSD 支持显式 HTTP、SOCKS 和 Mixed 监听器；其平台契约不包含透明和 TUN 监听器。
 
+## 使用 pathchordctl 管理配置
+
+用 `config init --role ingress` 或 `config init --role egress` 创建角色目录和初始清单。
+无人值守时，可显式传入 `--generate-identity` 生成缺失的身份。
+`config init --both` 为本地开发创建两套目录。
+
+用 `config validate` 校验所选来源，`config paths` 查看解析后的路径和权限，
+`config view` 查看资源。操作 Egress 时使用 `--role egress`。
+结构化输出使用 `-o json` 或 `-o yaml`。只有在交互式终端中执行
+`config view --reveal-secrets` 才能显示敏感字段。
+
+目录来源下，`config create -f resource.yaml` 将资源加入 `managed.yaml`。
+`config get Egress/exit` 查看资源及来源，`config patch Egress/exit -f patch.yaml`
+合并 YAML 映射，`config delete Egress/exit` 删除受管资源。
+用 `-n` 指定命名空间，用 `--dry-run` 校验编辑候选。
+`config adopt Egress/exit` 和 `config adopt --all-from peers.yaml` 会预览从手写文件
+迁移的资源，并要求两次确认。静态变更会提示重启。Egress 恰好接受一个 `EgressService`。
+
 ## 选择配置来源
 
 将角色可执行文件放入 `PATH` 后，选择以下命令之一。示例路径相对于仓库根目录；目录占位路径需替换为自己的资源目录。

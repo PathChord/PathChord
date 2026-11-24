@@ -80,9 +80,8 @@ EgressService `web` is optional and accepts only `bind`, `tokenFile`,
 disabled-by-default Web Gateway behavior; child defaults, validation limits,
 origin/token checks, and protected-transport requirements are unchanged.
 Relative `web.tokenFile` paths resolve from the selected configuration source
-under the existing private-path rules. Existing CLI flags override the
-corresponding nested resource fields using the existing source precedence;
-grouping does not change secret storage or enable TLS termination.
+under the existing private-path rules. The Web Gateway uses the existing secret
+storage and protected-transport boundary.
 
 The published schema MUST document `catchAll` on EgressRule and ProxyRule and
 `require` on ProxyRule, retaining their existing validation and selection
@@ -159,9 +158,9 @@ namespace identity semantics.
 ### Requirement: Egress source precedence and restart boundary
 
 Egress SHALL select an explicit command-line resource source before
-`PATHCHORD_CONFIG` or `PATHCHORD_CONFIG_DIR`, then the account default. CLI
-field overrides SHALL take precedence over the selected `EgressService`, and
-changes to identity, listener bind, authorization storage, control endpoint, or
+`PATHCHORD_CONFIG` or `PATHCHORD_CONFIG_DIR`, then the account default. `EgressService` fields SHALL take precedence over role defaults. Explicit
+control socket and temporary identity overrides SHALL take precedence over
+resource values. Changes to identity, listener bind, authorization storage, control endpoint, or
 other startup-only service fields SHALL require an Egress restart.
 
 #### Scenario: Egress command-line source overrides the environment
@@ -492,6 +491,26 @@ Geodata configuration SHALL follow the complete [detailed contract](#geodata-dat
 - **WHEN** geodata configuration or matching is processed
 - **THEN** the schema, limits, and failure semantics in the detailed contract are enforced
 
+### Requirement: Role startup settings in the selected source
+
+The selected source SHALL support authoring startup settings for either role.
+Private values SHALL remain in separate files. Omitted private paths SHALL
+resolve from the role's directory layout.
+
+#### Scenario: Ingress startup settings are authored with its policy graph
+
+- **WHEN** the selected Ingress bundle declares its service settings
+- **THEN** the daemon resolves its identity, state and credential directories,
+  control socket, and Web Gateway settings alongside the complete policy graph.
+
+#### Scenario: Minimal Egress resource uses role defaults
+
+- **WHEN** an EgressService declares its name and Path listener and omits
+  identity and private paths
+- **THEN** the service uses the resource name as its default Egress ID and
+  resolves the identity, authorization database, and control socket paths
+  from role defaults.
+
 ## Detailed contract
 
 This document is the normative versioned schema for the human-authored YAML
@@ -648,6 +667,16 @@ subset, or a desired Path count. Egress topology, Path-pool counts, admission
 requirements, the binding, and its resolved TrafficPolicy are startup
 configuration and are not hot-reloaded.
 
+### IngressService
+
+An Ingress bundle accepts one optional `IngressService`. Its `spec` accepts
+`ingressId`, `identity`, `dataDir`, `credentialsDir`, `controlSocket`, and
+`web`. The default Ingress ID is `local-ingress`. The `web` mapping uses
+`bind`, `tokenFile`, `allowedOrigins`, and `protectedTransport`. Resolve
+relative paths against the selected configuration source and keep private
+files and state outside a scanned resource directory. These settings require
+restart.
+
 ### EgressService and NodeProbePolicy
 
 `EgressService.spec` accepts `bind` or `binds`, `egressId`, `identity`,
@@ -661,15 +690,16 @@ are mutually exclusive. Ingress Path-pool counts, per-Ingress stream quotas,
 and Path safety ceilings are not EgressService fields and MUST NOT be authored
 on this resource. Paths in the resource are resolved
 relative to the selected configuration source. An Egress process selects at
-most one such resource. `identity` and an Egress ID are required after command
-line overrides; the resource name supplies the ID when `egressId` is absent.
+most one such resource. The resource name supplies the default Egress ID.
+The identity, authorization database, and control socket paths default to
+the role layout.
 `remoteDnsOnly` defaults to false. When true and an original hostname is
 present, Egress resolves it using its own system resolver for TCP and UDP and
 does not use Ingress-provided candidates. A literal IP without a hostname is
 still a valid target. The option applies to target names, not the independent
 Ingress DNS routing policy.
 
-An Egress source MUST reject Listener, TransitProxy, Subscription, EgressRule,
+An Egress source MUST reject IngressService, Listener, TransitProxy, Subscription, EgressRule,
 ProxyRule, TrafficPolicy, DNSPolicy, FallbackPolicy, GeoSiteDatabase,
 GeoIpDatabase, and NodeProbePolicy resources. Relative private paths resolve
 from the selected Egress source root and identity, authorization database,

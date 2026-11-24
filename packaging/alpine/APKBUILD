@@ -26,7 +26,9 @@ package() {
     install -Dm0755 packaging/common/setup-layout.sh "$pkgdir/usr/libexec/pathchord-setup-layout"
     install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm0644 packaging/common/pathchord.1 "$pkgdir/usr/share/man/man1/pathchord.1"
+    install -Dm0644 packaging/common/pathchord.zh-CN.1 "$pkgdir/usr/share/man/zh_CN/man1/pathchord.1"
     gzip -n -9 "$pkgdir/usr/share/man/man1/pathchord.1"
+    gzip -n -9 "$pkgdir/usr/share/man/zh_CN/man1/pathchord.1"
     if [ "$role" = ingress ]; then template=default-config.yaml; else template=default-egress-config.yaml; fi
     install -Dm0644 "packaging/common/$template" "$pkgdir/etc/pathchord/$role/$role.yaml"
     chmod 0750 "$pkgdir/etc/pathchord/$role"

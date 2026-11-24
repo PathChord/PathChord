@@ -38,12 +38,16 @@ cargo build --locked --release --bin pathchord-ingressd --bin pathchord-egressd 
 ./target/release/pathchord-ingressd --config examples/ingress-direct.yaml
 ```
 
-普通 Unix 用户的 Ingress 控制 socket 默认使用
-`$XDG_RUNTIME_DIR/pathchord/ingress.sock`（该目录可用时），否则使用
-`~/.config/pathchord/ingress.sock`。root 和软件包服务账号使用
-`/run/pathchord/ingress.sock`；服务包会在启动前创建该运行目录。需要其他本地端点时，
-可以显式传入 `--socket`。`enroll` 命令默认使用对应的 `egress.sock` 端点；显式指定的
-socket 优先。
+普通 Unix 用户从 `~/.config/pathchord/<role>` 读取资源，默认状态位于
+`~/.local/state/pathchord/<role>`。socket 默认位于 `$XDG_RUNTIME_DIR/pathchord`，
+缺少运行目录时使用 `~/.config/pathchord`。服务账号默认使用 `/etc/pathchord/<role>`、
+`/run/pathchord` 和 `/var/lib/pathchord/<role>`，FreeBSD 的运行和状态目录分别位于
+`/var/run` 和 `/var/db`。软件包还可在服务定义中显式指定现有路径。
+
+`pathchordctl` 优先使用显式 `--socket`，随后尝试角色配置中的 `controlSocket`，
+再依次搜索适用的 XDG 运行目录、用户配置目录、`/run/pathchord` 和 `/var/run/pathchord`。
+`get status` 默认查询 Ingress，`enroll` 查询或修改 Egress 授权。
+终端默认显示人类可读结果，脚本可用 `-o json` 或 `-o yaml`。
 
 Mixed 监听器绑定 `127.0.0.1:7890`。无认证示例限制在回环地址。应用可以对同一个地址选择
 HTTP 或 SOCKS：
@@ -124,8 +128,8 @@ PathChord 不启动或嵌入外部代理进程作为兼容后端。见
 在各自对应的机器上生成私有身份。命令只打印公钥；私有文件必须保留在其所有者本地：
 
 ```sh
-pathchordctl keygen --output ingress.key.json
-pathchordctl keygen --output egress.key.json
+pathchordctl keygen --identity-file ingress.key.json
+pathchordctl keygen --identity-file egress.key.json
 ```
 
 在独立终端中启动 Egress。Unix 控制 socket 位于 Egress 本机：
@@ -140,13 +144,13 @@ pathchord-egressd --egress-id exit --identity egress.key.json \
 表达不同的 IPv4、IPv6、域名或端口候选；所有项都使用相同、已经核验的 Egress ID 和公钥。单个
 `--bind` 以及旧的 `address`/`port` 形式仍可用于单 endpoint 部署。
 
-在 Egress 机器上显式登记 Ingress 公钥。把 `INGRESS_PUBLIC_KEY` 替换为 Ingress 身份生成命令
-打印的公钥。代次 0 适用于新授权数据库；后续变更必须使用其观测到的代次：
+在 Egress 主机上登记独立核验过的 Ingress 公钥。CLI 从所选服务读取 Egress ID 和当前授权代次。
+也可以显式传入 `--egress-id` 和 `--expected-generation`。代次冲突后请先检查再重试。
+撤销和删除会要求确认。无人值守时可传入 `--yes`。
 
 ```sh
 pathchordctl --socket /tmp/pathchord-egress.sock enroll add \
-  --ingress-id entry --egress-id exit --public-key INGRESS_PUBLIC_KEY \
-  --expected-generation 0
+  --ingress-id entry --public-key INGRESS_PUBLIC_KEY
 ```
 
 在 `examples/ingress-egress.yaml` 中，把 `REPLACE_WITH_EGRESS_PUBLIC_KEY` 替换为 Egress 公钥。
@@ -155,10 +159,11 @@ pathchordctl --socket /tmp/pathchord-egress.sock enroll add \
 公钥和规范 Egress ID。在另一个独立终端中启动 Ingress：
 
 ```sh
+pathchordctl -C /path/to/ingress config create -f examples/ingress-egress.yaml
 pathchord-ingressd --socket /tmp/pathchord-ingress.sock \
   --ingress-id entry --identity ingress.key.json \
-  --config examples/ingress-egress.yaml
-pathchordctl --socket /tmp/pathchord-ingress.sock status
+  --config-dir /path/to/ingress
+pathchordctl --socket /tmp/pathchord-ingress.sock get status
 pathchordctl --socket /tmp/pathchord-egress.sock enroll list
 ```
 

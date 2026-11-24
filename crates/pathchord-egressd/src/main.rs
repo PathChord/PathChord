@@ -9,7 +9,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{ArgAction, Args, Parser};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use pathchord_config::{
-    EgressServiceResource, load_configuration_documents, parse_egress_service_documents,
+    EgressServiceResource, Role, RoleLayout, SelectedSource, SourceOrigin,
+    parse_egress_service_documents,
 };
 use pathchord_control::{
     DEFAULT_MAX_CONCURRENT_CONTROL_REQUESTS, LocalControlServer, WebBearerToken, WebGateway,
@@ -105,6 +106,7 @@ enum ServiceError {
     Configuration(String),
     #[error("identity file is invalid")]
     InvalidIdentity,
+    #[cfg(unix)]
     #[error("identity file permissions must deny group and other access")]
     InsecureIdentityPermissions,
     #[error("identity file I/O failed: {0}")]
@@ -297,45 +299,33 @@ async fn run(args: EgressArgs) -> Result<(), ServiceError> {
 }
 
 async fn resolve(args: EgressArgs) -> Result<EgressConfiguration, ServiceError> {
-    let source = select_source(&args)?;
-    let Some(source) = source else {
-        return merge(args, None, Path::new("."), None);
-    };
-    let documents = load_configuration_documents(source.clone()).await?;
-    let service =
-        parse_egress_service_documents(documents.iter().map(|document| document.as_str()))
-            .map_err(|error| ServiceError::Configuration(error.to_string()))?;
-    let base = if source.is_dir() {
-        source.clone()
-    } else {
-        source.parent().unwrap_or(Path::new(".")).to_owned()
-    };
-    merge(args, Some(service), &base, Some(source))
-}
-
-fn select_source(args: &EgressArgs) -> Result<Option<PathBuf>, ServiceError> {
-    if let Some(path) = args.config_dir.clone() {
-        return Ok(Some(path));
+    let layout = RoleLayout::current(Role::Egress)?;
+    let selected =
+        SelectedSource::resolve(&layout, args.config.as_deref(), args.config_dir.as_deref())?;
+    if selected.origin == SourceOrigin::AccountDefault
+        && !selected.path.try_exists()?
+        && args.identity.is_some()
+        && args.egress_id.is_some()
+    {
+        return merge(args, None, Path::new("."), None, &layout);
     }
-    if let Some(path) = args.config.clone() {
-        return Ok(Some(path));
+    let source = selected.bind().await?;
+    let documents = source.load().await?;
+    let service = parse_egress_service_documents(documents.documents.iter().map(String::as_str))
+        .map_err(|error| ServiceError::Configuration(error.to_string()))?;
+    let resolved = merge(
+        args,
+        Some(service),
+        source.base_directory(),
+        Some(source.path().to_owned()),
+        &layout,
+    )?;
+    source.validate_private_path("identity", &resolved.identity)?;
+    source.validate_private_path("authorizationDb", &resolved.authorization_db)?;
+    if let Some(path) = &resolved.web_token_file {
+        source.validate_private_path("web.tokenFile", path)?;
     }
-    let environment_file = std::env::var_os("PATHCHORD_CONFIG")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let environment_directory = std::env::var_os("PATHCHORD_CONFIG_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    if environment_file.is_some() && environment_directory.is_some() {
-        return Err(ServiceError::Configuration(
-            "set only one of PATHCHORD_CONFIG and PATHCHORD_CONFIG_DIR".into(),
-        ));
-    }
-    if let Some(path) = environment_file.or(environment_directory) {
-        return Ok(Some(path));
-    }
-    let default = PathBuf::from("/etc/pathchord/egress");
-    Ok(default.is_dir().then_some(default))
+    Ok(resolved)
 }
 
 fn merge(
@@ -343,99 +333,72 @@ fn merge(
     service: Option<EgressServiceResource>,
     base: &Path,
     source_path: Option<PathBuf>,
+    layout: &RoleLayout,
 ) -> Result<EgressConfiguration, ServiceError> {
     let defaults = EgressServiceSpec::default();
     let service_name = service.as_ref().map(|service| service.name.as_str());
     let spec = service.as_ref().map_or(&defaults, |service| &service.spec);
-    let path = |cli: Option<PathBuf>, configured: &Option<PathBuf>, fallback: &str| {
-        cli.or_else(|| {
-            configured.as_ref().map(|value| {
-                if value.is_absolute() {
-                    value.clone()
-                } else {
-                    base.join(value)
-                }
-            })
-        })
-        .unwrap_or_else(|| PathBuf::from(fallback))
+    let path = |cli: Option<PathBuf>, configured: &Option<PathBuf>, fallback: &Path| {
+        cli.unwrap_or_else(|| RoleLayout::resolve_path(base, configured.as_deref(), fallback))
     };
-    let egress_id = args
+    let egress_id = spec
         .egress_id
-        .or_else(|| spec.egress_id.clone())
+        .clone()
         .or_else(|| service_name.map(str::to_owned))
+        .or(args.egress_id)
         .ok_or_else(|| ServiceError::Configuration("egressId or --egress-id is required".into()))?;
-    let identity = path(args.identity, &spec.identity, "");
-    if identity.as_os_str().is_empty() {
-        return Err(ServiceError::Configuration(
-            "identity or --identity is required".into(),
-        ));
-    }
-    let control_socket = path(
-        args.control_socket,
-        &spec.control_socket,
-        &default_control_socket().to_string_lossy(),
-    );
+    let identity = path(args.identity, &spec.identity, &layout.identity);
+    let control_socket = path(args.control_socket, &spec.control_socket, &layout.socket);
     let resolved = EgressConfiguration {
         source_path,
-        binds: if !args.binds.is_empty() {
-            args.binds
-        } else if let Some(binds) = &spec.binds {
+        binds: if let Some(binds) = &spec.binds {
             binds.clone()
+        } else if let Some(bind) = spec.bind {
+            vec![bind]
+        } else if args.binds.is_empty() {
+            vec![DEFAULT_BIND.parse().expect("constant address")]
         } else {
-            vec![
-                spec.bind
-                    .unwrap_or_else(|| DEFAULT_BIND.parse().expect("constant address")),
-            ]
+            args.binds
         },
         egress_id,
         identity,
         authorization_db: path(
-            args.authorization_db,
+            args.authorization_db
+                .filter(|_| spec.authorization_db.is_none()),
             &spec.authorization_db,
-            "pathchord-egress-authorizations.db",
+            &layout.authorization_db,
         ),
         control_socket,
         max_concurrent_paths: DEFAULT_MAX_CONCURRENT_PATHS,
-        max_wire_bandwidth_bps: args
+        max_wire_bandwidth_bps: spec
             .max_wire_bandwidth_bps
-            .or(spec.max_wire_bandwidth_bps)
+            .or(args.max_wire_bandwidth_bps)
             .unwrap_or(1_000_000_000),
-        max_inbound_target_connections: args
+        max_inbound_target_connections: spec
             .max_inbound_target_connections
-            .or(spec.max_inbound_target_connections)
+            .or(args.max_inbound_target_connections)
             .unwrap_or(4096),
         remote_dns_only: spec.remote_dns_only.unwrap_or(false),
-        quota_remaining: args.quota_remaining.or(spec.quota_remaining),
-        traffic_multiplier_basis_points: args
+        quota_remaining: spec.quota_remaining.or(args.quota_remaining),
+        traffic_multiplier_basis_points: spec
             .traffic_multiplier_basis_points
-            .or(spec.traffic_multiplier_basis_points)
+            .or(args.traffic_multiplier_basis_points)
             .unwrap_or(10_000),
-        web_bind: args
-            .web_bind
-            .or_else(|| spec.web.as_ref().and_then(|web| web.bind)),
-        web_token_file: args.web_token_file.or_else(|| {
-            spec.web
-                .as_ref()
-                .and_then(|web| web.token_file.as_ref())
-                .map(|value| {
-                    if value.is_absolute() {
-                        value.clone()
-                    } else {
-                        base.join(value)
-                    }
-                })
+        web_bind: spec.web.as_ref().and_then(|web| web.bind).or(args.web_bind),
+        web_token_file: spec
+            .web
+            .as_ref()
+            .and_then(|web| web.token_file.as_ref())
+            .map(|value| base.join(value))
+            .or(args.web_token_file),
+        web_origins: spec.web.as_ref().map_or(args.web_origins, |web| {
+            web.allowed_origins.iter().cloned().collect()
         }),
-        web_origins: if args.web_origins.is_empty() {
-            spec.web
-                .as_ref()
-                .map(|web| web.allowed_origins.iter().cloned().collect())
-                .unwrap_or_default()
-        } else {
-            args.web_origins
-        },
-        web_protected_transport: args
-            .web_protected_transport
-            .or_else(|| spec.web.as_ref().and_then(|web| web.protected_transport))
+        web_protected_transport: spec
+            .web
+            .as_ref()
+            .and_then(|web| web.protected_transport)
+            .or(args.web_protected_transport)
             .unwrap_or(false),
     };
     validate(resolved)
@@ -516,13 +479,6 @@ fn start_restart_watcher(
         }
     });
     (stop, task)
-}
-
-fn default_control_socket() -> PathBuf {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("pathchord/egress.sock");
-    }
-    PathBuf::from("/run/pathchord/egress.sock")
 }
 
 fn load_identity(path: &Path) -> Result<StaticKeypair, ServiceError> {
@@ -621,5 +577,29 @@ async fn service_shutdown_signal() -> Result<(), std::io::Error> {
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimal_service_uses_role_paths_and_listener() {
+        let layout = RoleLayout::current(Role::Egress).unwrap();
+        let service = parse_egress_service_documents([
+            "apiVersion: pathchord.io/v1\nkind: EgressService\nmetadata: {name: edge}\nspec: {bind: '127.0.0.1:7444'}\n",
+        ]).unwrap();
+        let args = Cli::parse_from(["pathchord-egressd"]).args;
+        let result = merge(args, Some(service), Path::new("."), None, &layout).unwrap();
+        assert_eq!(result.egress_id, "edge");
+        assert_eq!(result.identity, layout.identity);
+        assert_eq!(result.authorization_db, layout.authorization_db);
+        assert_eq!(result.control_socket, layout.socket);
+        assert_eq!(
+            result.binds,
+            ["127.0.0.1:7444".parse::<SocketAddr>().unwrap()]
+        );
+        assert!(result.authorization_db.is_absolute());
     }
 }

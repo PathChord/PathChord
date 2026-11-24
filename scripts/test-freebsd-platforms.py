@@ -246,7 +246,7 @@ cd "$work"
 export HOME=$root/home TMPDIR=$root/tmp PATH=$root/bin:/bin:/sbin:/usr/bin:/usr/sbin
 test "$(id -un)" = pathchord
 test "$(id -u)" != 0
-pathchordctl keygen --output identity > public.json
+pathchordctl -o json keygen --identity-file identity > public.json
 pathchord-egressd --egress-id native-check --identity "$work/identity" \
   --authorization-db "$work/authorizations.db" --control-socket "$work/control.sock" \
   --bind 127.0.0.1:37443 > service.log 2>&1 &
@@ -259,7 +259,7 @@ until test -S control.sock; do
   test "$attempt" -lt 100
   sleep 0.05
 done
-pathchordctl --socket "$work/control.sock" status > status.json
+pathchordctl -o json --socket "$work/control.sock" status > status.json
 for file in identity authorizations.db control.sock; do
   test "$(stat -f %Lp "$file")" = 600
   test "$(stat -f %Su "$file")" = pathchord

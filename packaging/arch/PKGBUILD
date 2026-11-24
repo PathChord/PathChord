@@ -26,6 +26,7 @@ package() {
     install -Dm0755 target/release/pathchordctl "$pkgdir/usr/bin/pathchordctl"
     install -Dm0755 packaging/common/setup-layout.sh "$pkgdir/usr/libexec/pathchord-setup-layout"
     install -Dm0644 packaging/common/pathchord.1 "$pkgdir/usr/share/man/man1/pathchord.1"
+    install -Dm0644 packaging/common/pathchord.zh-CN.1 "$pkgdir/usr/share/man/zh_CN/man1/pathchord.1"
     if [ "$role" = ingress ]; then
         template=default-config.yaml
         install -Dm0644 packaging/common/ingress-transparent.conf "$pkgdir/usr/share/pathchord/systemd/transparent.conf"

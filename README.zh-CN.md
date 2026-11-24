@@ -107,7 +107,8 @@ openspec validate --all --strict --no-interactive
 pathchord-ingressd
 pathchord-ingressd --config-dir /path/to/ingress
 pathchord-egressd --config-dir /path/to/egress
-pathchordctl status
+pathchordctl get status
+pathchordctl get status -o json
 pathchordctl enroll list
 ```
 

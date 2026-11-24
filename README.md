@@ -144,7 +144,8 @@ separate `EgressService` source under `~/.config/pathchord/egress` or
 pathchord-ingressd
 pathchord-ingressd --config-dir /path/to/ingress
 pathchord-egressd --config-dir /path/to/egress
-pathchordctl status
+pathchordctl get status
+pathchordctl get status -o json
 pathchordctl enroll list
 ```
 

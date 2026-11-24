@@ -43,6 +43,7 @@ impl<T> Drop for Task<T> {
 
 fn command_json(arguments: &[&str]) -> Value {
     let output = Command::new(binary("pathchordctl"))
+        .args(["-o", "json"])
         .args(arguments)
         .output()
         .expect("run CLI");
@@ -136,8 +137,8 @@ async fn separate_cli_processes_enroll_and_forward_http_and_udp_through_a_transi
         let directory = Directory(directory);
         let ingress_key = directory.0.join("ingress.json");
         let egress_key = directory.0.join("egress.json");
-        let ingress_public = command_json(&["keygen", "--output", ingress_key.to_str().unwrap()]);
-        let egress_public = command_json(&["keygen", "--output", egress_key.to_str().unwrap()]);
+        let ingress_public = command_json(&["keygen", "--identity-file", ingress_key.to_str().unwrap()]);
+        let egress_public = command_json(&["keygen", "--identity-file", egress_key.to_str().unwrap()]);
         assert_private_owner(&ingress_key);
         assert_private_owner(&egress_key);
         let egress_port = unused_port();
@@ -145,13 +146,30 @@ async fn separate_cli_processes_enroll_and_forward_http_and_udp_through_a_transi
         let egress_socket = directory.0.join("e.sock");
         let ingress_socket = directory.0.join("i.sock");
         let egress_address = format!("127.0.0.1:{egress_port}");
-        let mut egress = spawn(&["egress", "--egress-id", "exit", "--identity", egress_key.to_str().unwrap(),
-            "--bind", &egress_address, "--control-socket", egress_socket.to_str().unwrap()], &directory.0);
+        let egress_config = directory.0.join("egress.yaml");
+        std::fs::write(&egress_config, format!(
+            "apiVersion: pathchord.io/v1\nkind: EgressService\nmetadata: {{name: exit}}\nspec: {{bind: '{egress_address}', identity: egress.key, authorizationDb: auth.db, controlSocket: e.sock}}\n"
+        )).unwrap();
+        let mut egress = spawn(&["egress", "--config", egress_config.to_str().unwrap(), "--identity", egress_key.to_str().unwrap()], &directory.0);
         wait_for_socket(&egress_socket, &mut egress).await;
         assert_private_owner(&egress_socket);
-        let enrolled = command_json(&["--socket", egress_socket.to_str().unwrap(), "enroll", "add",
-            "--ingress-id", "entry", "--egress-id", "exit", "--public-key", ingress_public["public_key"].as_str().unwrap(), "--expected-generation", "0"]);
+        let enrolled = command_json(&["--config", egress_config.to_str().unwrap(), "enroll", "add",
+            "--ingress-id", "entry", "--public-key", ingress_public["public_key"].as_str().unwrap()]);
         assert_eq!(enrolled["ok"], true);
+
+        for (options, expected) in [
+            (vec!["--expected-generation", "0", "--yes"], "GenerationConflict"),
+            (vec![], "confirmation declined"),
+        ] {
+            let output = Command::new(binary("pathchordctl"))
+                .args(["--socket", egress_socket.to_str().unwrap(), "enroll", "revoke", "--ingress-id", "entry"])
+                .args(options)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains(expected), "{output:?}");
+        }
 
         let transit = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let transit_port = transit.local_addr().unwrap().port();
@@ -224,11 +242,13 @@ spec: {{action: reject}}
         for (index, document) in yaml.split("\n---\n").enumerate() {
             std::fs::write(config_path.join(format!("{index:02}.yaml")), document).unwrap();
         }
-        let mut ingress = spawn(&["--socket", ingress_socket.to_str().unwrap(), "ingress", "--ingress-id", "entry",
-            "--config-dir", config_path.to_str().unwrap(), "--identity", ingress_key.to_str().unwrap()], &directory.0);
+        std::fs::write(config_path.join("service.yaml"),
+            "apiVersion: pathchord.io/v1\nkind: IngressService\nmetadata: {name: local}\nspec: {ingressId: entry, dataDir: ../data, credentialsDir: ../credentials, controlSocket: ../i.sock}\n"
+        ).unwrap();
+        let mut ingress = spawn(&["ingress", "--config-dir", config_path.to_str().unwrap(), "--identity", ingress_key.to_str().unwrap()], &directory.0);
         wait_for_socket(&ingress_socket, &mut ingress).await;
         assert_private_owner(&ingress_socket);
-        assert_eq!(command_json(&["--socket", ingress_socket.to_str().unwrap(), "status"])["ok"], true);
+        assert_eq!(command_json(&["--config-dir", config_path.to_str().unwrap(), "get", "status"])["ok"], true);
 
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_address = origin.local_addr().unwrap();
@@ -263,6 +283,19 @@ spec: {{action: reject}}
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap(); udp.send_to(&packet, relay).await.unwrap();
         let mut data = [0; 128]; let (count, _) = udp.recv_from(&mut data).await.unwrap(); assert_eq!(&data[..count], packet);
         drop(control);
+        let replacement = std::fs::read_to_string(&egress_config).unwrap()
+            .replace(&format!("127.0.0.1:{egress_port}"), "127.0.0.1:7444");
+        std::fs::write(&egress_config, replacement).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = command_json(&["--socket", egress_socket.to_str().unwrap(), "get", "status"]);
+            assert_eq!(status["result"]["runtime"]["running"], true);
+            if status["result"]["runtime"]["configuration"]["state"] == "restart_required" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Egress did not report a restart requirement: {status}");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
         for process in [&mut ingress, &mut egress] {
             assert!(Command::new("kill").args(["-TERM", &process.0.id().to_string()]).status().unwrap().success());
             let deadline = Instant::now() + Duration::from_secs(5);

@@ -18,6 +18,27 @@ Start with the example closest to your routing goal, then split it into files if
 
 Transparent and TUN examples need platform privileges and host routing setup. The [deployment guide](deployment.md) covers those prerequisites, service startup, and enrollment commands. FreeBSD supports explicit HTTP, SOCKS, and Mixed listeners; transparent and TUN listeners are outside its platform contract.
 
+## Manage configuration with pathchordctl
+
+Use `config init --role ingress` or `config init --role egress` to create
+the role directories and a starter manifest. Use `--generate-identity` to
+explicitly generate the missing identity for unattended initialization.
+`config init --both` creates both layouts for local development.
+
+Use `config validate` to check the selected source, `config paths` to see
+resolved paths and permissions, and `config view` to inspect the resources.
+Use `--role egress` for Egress. Add `-o json` or `-o yaml` for structured output.
+Secret reveal requires `config view --reveal-secrets` in an interactive terminal.
+
+With a directory source, `config create -f resource.yaml` adds a resource to
+`managed.yaml`. Use `config get Egress/exit` to inspect a resource and its
+origin, `config patch Egress/exit -f patch.yaml` to merge a YAML mapping, and
+`config delete Egress/exit` to remove a managed resource. Use `-n` to select a
+namespace and `--dry-run` to validate an edit without committing it.
+`config adopt Egress/exit` and `config adopt --all-from peers.yaml` preview the
+move from a hand-authored file and require two confirmations. Static changes
+report a restart requirement. Egress accepts exactly one `EgressService`.
+
 ## Select a configuration source
 
 With the role executables on `PATH`, run one of these commands. Example paths are relative to the repository root; replace the directory placeholder with your own resource directory.

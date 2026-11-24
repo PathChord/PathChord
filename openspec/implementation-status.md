@@ -20,6 +20,16 @@ loopback evidence covers IPv4, IPv6, hostname candidates, different ports,
 HTTP CONNECT, and UDP. Windows and FreeBSD native suite and host integration
 results are recorded below, separately from cross-build and deployed evidence.
 
+The [pathchordctl interaction redesign](changes/redesign-pathchordctl-interaction/)
+adds role-aware source and socket resolution, human and structured output, and
+local configuration inspection and managed YAML editing. The enrollment CLI
+uses Egress authorization preconditions while Ingress edits its local Egress
+resource. Linux verification includes the workspace suite, a two-process
+TCP/UDP loopback fixture, and interrupted adoption recovery. Windows GNU
+cross-checks for the CLI and Egress compile their platform-specific paths.
+Native package lifecycle and deployed interoperability evidence are recorded
+separately.
+
 ## Current focus
 
 The [geosite and geoip routing change](changes/archive/2026-11-17-support-geosite-geoip-routing/)

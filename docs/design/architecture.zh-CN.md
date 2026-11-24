@@ -173,6 +173,11 @@ Egress 拓扑、Egress 公钥、Transit 绑定、公共 Path 要求、已解析 
 
 Ingress 管理员元数据和订阅操作属于控制面 mutation。它们原子发布新的代次，使用期望代次检查处理并发编辑；刷新失败时保留最近一次成功的订阅快照。Web/API 适配器调用拥有者的类型化 service，不能直接编辑配置文件或缓存。
 
+两个 daemon 与 `pathchordctl` 共用按角色解析的资源、运行端点和私有状态目录。
+CLI 资源编辑更新所选目录中的声明式资源图。资源迁移事务协调两个文件的替换与配置读取，
+并在下次读取前恢复中断的编辑。运行时发布由 daemon 负责。Egress 授权通过 Egress 主机的
+控制接口操作。
+
 ## 12. 服务 artifact
 
 PathChord 在同一个版本化 release bundle 中发布三个可执行文件：

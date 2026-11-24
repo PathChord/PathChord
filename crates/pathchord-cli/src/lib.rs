@@ -126,17 +126,17 @@ pub struct IngressArgs {
     #[arg(short = 'C', long, conflicts_with = "config")]
     pub config_dir: Option<PathBuf>,
     /// Canonical Ingress identity used during Session attachment.
-    #[arg(long, default_value = "local-ingress")]
-    pub ingress_id: String,
+    #[arg(long)]
+    pub ingress_id: Option<String>,
     /// Versioned private identity file. Required when Egress topology is configured.
     #[arg(long)]
     pub identity: Option<PathBuf>,
     /// Runtime cache and durable local data directory.
-    #[arg(long, default_value = "pathchord-ingress-data")]
-    pub data_dir: PathBuf,
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
     /// Directory containing private JSON credential maps named by credentialsRef.
-    #[arg(long, default_value = "pathchord-ingress-secrets")]
-    pub credentials_dir: PathBuf,
+    #[arg(long)]
+    pub credentials_dir: Option<PathBuf>,
     /// Optional Web Gateway bind. Omit to keep the browser adapter disabled.
     #[arg(long)]
     pub web_bind: Option<SocketAddr>,
@@ -285,6 +285,8 @@ impl Command {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("configuration source selection failed: {0}")]
+    SharedConfiguration(#[from] pathchord_config::ConfigurationError),
     #[error("configuration source selection failed: {0}")]
     ConfigurationSource(#[from] configuration::ConfigurationError),
     #[error("configuration source {path} could not be loaded: {source}")]
@@ -576,7 +578,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         _ => configuration::default_control_socket("ingress.sock", DEFAULT_SOCKET_PATH),
     });
     match command {
-        Command::Ingress(args) => run_ingress(&socket, args).await,
+        Command::Ingress(args) => run_ingress(explicit_socket, args).await,
         Command::Egress(mut args) => {
             if args.control_socket.is_none() {
                 args.control_socket = explicit_socket;
@@ -617,10 +619,7 @@ pub async fn run_ingress_service(
     socket: Option<PathBuf>,
     args: IngressArgs,
 ) -> Result<(), CliError> {
-    let socket = socket.unwrap_or_else(|| {
-        configuration::default_control_socket("ingress.sock", DEFAULT_SOCKET_PATH)
-    });
-    run_ingress(&socket, args).await
+    run_ingress(socket, args).await
 }
 
 async fn local_configuration_generation(
@@ -678,16 +677,16 @@ async fn run_enrollment(
     print_response(call_local(socket, request).await?)
 }
 
-async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), CliError> {
-    let source = configuration::ConfigSelection::resolve_ingress(
-        args.config.as_deref(),
-        args.config_dir.as_deref(),
-    )?;
-    source.validate()?;
-    let reloader = ConfigHotReloader::bind(source.path.clone(), 1)
+async fn run_ingress(socket: Option<PathBuf>, args: IngressArgs) -> Result<(), CliError> {
+    use pathchord_config::{Role, RoleLayout, SelectedSource};
+    let layout = RoleLayout::current(Role::Ingress)?;
+    let selected =
+        SelectedSource::resolve(&layout, args.config.as_deref(), args.config_dir.as_deref())?;
+    let source = selected.bind().await?;
+    let reloader = ConfigHotReloader::bind(source.path().to_owned(), 1)
         .await
         .map_err(|error| CliError::ConfigurationLoad {
-            path: source.path.clone(),
+            path: source.path().to_owned(),
             source: error,
         })?;
     let reload_handle = reloader.handle();
@@ -697,30 +696,65 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     let policy =
         pathchord_policy::ValidatedPolicySnapshot::new(Generation::new(1), policy_config.clone())
             .map_err(pathchord_policy::ConfigError::from)?;
-    let identity = match args.identity {
-        Some(path) => load_identity(&path)?,
-        None if policy_config.egresses.is_empty() => generate_static_keypair()?,
-        None => return Err(CliError::MissingIdentity),
+    let settings = policy_config.ingress_service.as_ref();
+    let base = source.base_directory();
+    let socket = socket.unwrap_or_else(|| {
+        RoleLayout::resolve_path(
+            base,
+            settings.and_then(|spec| spec.control_socket.as_deref()),
+            &layout.socket,
+        )
+    });
+    let startup_path = |configured: Option<&std::path::Path>,
+                        legacy: Option<PathBuf>,
+                        default: &std::path::Path| {
+        configured
+            .map(|path| base.join(path))
+            .or(legacy)
+            .unwrap_or_else(|| default.to_owned())
     };
+    let data_dir = startup_path(
+        settings.and_then(|spec| spec.data_dir.as_deref()),
+        args.data_dir,
+        &layout.state,
+    );
+    let credentials_dir = startup_path(
+        settings.and_then(|spec| spec.credentials_dir.as_deref()),
+        args.credentials_dir,
+        &layout.credentials,
+    );
+    let identity_path = args.identity.or_else(|| {
+        settings
+            .and_then(|spec| spec.identity.as_ref())
+            .map(|path| base.join(path))
+    });
+    source.validate_private_path("dataDir", &data_dir)?;
+    source.validate_private_path("credentialsDir", &credentials_dir)?;
+    if let Some(path) = &identity_path {
+        source.validate_private_path("identity", path)?;
+    }
+    let identity = match identity_path {
+        Some(path) => load_identity(&path)?,
+        None if layout.identity.try_exists()? || !policy_config.egresses.is_empty() => {
+            load_identity(&layout.identity)?
+        }
+        None => generate_static_keypair()?,
+    };
+    let ingress_id = settings
+        .and_then(|spec| spec.ingress_id.clone())
+        .or(args.ingress_id)
+        .unwrap_or_else(|| "local-ingress".to_owned());
     let platform = SystemProxyPlatform::current();
     let data_plane = Arc::new(IngressDataPlane::new_with_compiled(
-        IngressDataPlaneConfig::new(args.ingress_id, identity, policy),
+        IngressDataPlaneConfig::new(ingress_id, identity, policy),
         (*initial_snapshot.compiled).clone(),
     )?);
     data_plane
         .configure_node_probe(node_probe_config(policy_config.node_probe.as_ref()))
         .await?;
-    std::fs::create_dir_all(&args.data_dir)?;
-    let credentials = Arc::new(FileTransitCredentialProvider::new(&args.credentials_dir)?);
-    let source_dir = if source.directory {
-        source.path.clone()
-    } else {
-        source
-            .path
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-    };
+    std::fs::create_dir_all(&data_dir)?;
+    let credentials = Arc::new(FileTransitCredentialProvider::new(&credentials_dir)?);
+    let source_dir = base.to_owned();
     let adapter_registry = AdapterRegistry::with_native_roots(
         Arc::clone(&credentials),
         pathchord_ingress::DEFAULT_PATH_CONNECT_TIMEOUT,
@@ -751,11 +785,11 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     // Path warmup, or listener startup. Reconcile only actual declarative
     // changes, then use the effective control snapshot for runtime sources.
     let control_store = Arc::new(IngressControlStore::open(
-        args.data_dir.join("ingress-control.db"),
+        data_dir.join("ingress-control.db"),
     )?);
     let mut control_service = IngressControlService::open_with_platform_proxy(
         control_store,
-        platform_proxy_adapter(&args.data_dir),
+        platform_proxy_adapter(&data_dir),
     )?;
     control_service.set_reload_handle(reload_handle.clone());
     let (configured_nodes, configured_subscriptions) =
@@ -805,7 +839,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
     )?);
     let mut subscription_manager = SubscriptionManager::new(
         fetcher,
-        args.data_dir.join("subscriptions"),
+        data_dir.join("subscriptions"),
         adapter_registry.available_protocols(),
     );
     subscription_manager.reconcile(&effective_subscriptions);
@@ -863,7 +897,7 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         }),
         ..IngressPlatformFactories::default()
     };
-    let mut platform_config = IngressPlatformConfig::new(args.data_dir.join("platform"));
+    let mut platform_config = IngressPlatformConfig::new(data_dir.join("platform"));
     platform_config.dns = dns_runtime.clone();
     let mut runtime = IngressPlatformRuntime::bind_with_factories(
         platform_config,
@@ -900,18 +934,30 @@ async fn run_ingress(socket: &std::path::Path, args: IngressArgs) -> Result<(), 
         control_snapshot.generation,
     )
     .await?;
-    let web_gateway = if let Some(bind) = args.web_bind {
-        let bearer_token = args
-            .web_token_file
-            .as_deref()
-            .map(load_web_token)
-            .transpose()?;
+    let web = settings.and_then(|spec| spec.web.as_ref());
+    let token_path = web
+        .and_then(|settings| settings.token_file.as_deref())
+        .map(|path| base.join(path))
+        .or(args.web_token_file);
+    if let Some(path) = &token_path {
+        source.validate_private_path("web.tokenFile", path)?;
+    }
+    let web_bind = web.and_then(|settings| settings.bind).or(args.web_bind);
+    let web_origins = web.map_or_else(
+        || args.web_origins.into_iter().collect(),
+        |settings| settings.allowed_origins.clone(),
+    );
+    let web_protected = web
+        .and_then(|settings| settings.protected_transport)
+        .unwrap_or(args.web_protected_transport);
+    let web_gateway = if let Some(bind) = web_bind {
+        let bearer_token = token_path.as_deref().map(load_web_token).transpose()?;
         let gateway = WebGateway::bind(
             WebGatewayConfig {
                 bind,
                 bearer_token,
-                allowed_origins: args.web_origins.into_iter().collect(),
-                protected_transport: args.web_protected_transport,
+                allowed_origins: web_origins,
+                protected_transport: web_protected,
                 ..WebGatewayConfig::default()
             },
             Arc::clone(&control_dispatcher),

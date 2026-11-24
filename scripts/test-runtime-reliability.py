@@ -452,7 +452,7 @@ def write_config(path, documents):
 
 
 def keygen(binary, output):
-    result = subprocess.run([str(binary), "keygen", "--output", str(output)],
+    result = subprocess.run([str(binary), "-o", "json", "keygen", "--identity-file", str(output)],
                             capture_output=True, check=True, timeout=8)
     return json.loads(result.stdout)["public_key"]
 

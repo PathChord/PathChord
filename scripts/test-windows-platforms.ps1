@@ -58,7 +58,7 @@ function Invoke-Native([string] $Executable, [string[]] $Arguments, [string] $La
     return [pscustomobject] $result
 }
 function Invoke-Control([string] $Pipe) {
-    $value = Invoke-Native (Join-Path $BinDirectory 'pathchordctl.exe') @('--socket', $Pipe, 'status') 'control-status'
+    $value = Invoke-Native (Join-Path $BinDirectory 'pathchordctl.exe') @('-o', 'json', '--socket', $Pipe, 'status') 'control-status'
     if ($value.exit_code -ne 0) { throw "Local control failed: $($value.output)" }
     $response = $value.output | ConvertFrom-Json
     Assert-Condition $response.ok 'Local control did not return success.'

@@ -152,3 +152,270 @@ Ingress SHALL 遵循[配置来源契约](../configuration-schema/spec.zh-CN.md#�
 
 - **WHEN** 重载报告身份、监听器拓扑或其他仅启动时配置变更需要重启
 - **THEN** 必须重启服务才能应用该变更；其他持久配置变更遵循重载契约。
+
+### Requirement: Dedicated management client
+
+`pathchordctl` 必须为 Ingress 和 Egress 提供面向资源的本地管理界面。标准查询使用
+`get` 和 `describe`，授权变更归入 `enroll`。过渡期间继续接受已有状态和授权命令。
+客户端保留版本化的控制信封、操作者能力和代次检查。
+
+#### Scenario: Canonical status command
+
+- **WHEN** 操作者运行 `pathchordctl get status`
+- **THEN** 客户端向自动发现或由 `--socket` 指定的 Ingress 端点发送状态请求，并按所选格式输出
+
+#### Scenario: Compatibility status command
+
+- **WHEN** 操作者运行 `pathchordctl status`
+- **THEN** 客户端执行与 `pathchordctl get status` 相同的操作和端点选择
+
+#### Scenario: Enrollment resource commands
+
+- **WHEN** 操作者查询授权或执行 `enroll` 变更
+- **THEN** 客户端使用本地 Egress 授权端点，保留已有授权操作和代次前置条件，并按所选格式输出
+
+#### Scenario: Enrollment resolves omitted arguments
+
+- **WHEN** Egress 授权变更省略预期代次，或 `enroll add` 省略 Egress ID
+- **THEN** 客户端从所选 Egress 端点读取省略值并向同一端点发送变更。代次冲突会报告当前代次，由操作者重新发起
+
+#### Scenario: Confirm destructive authorization changes
+
+- **WHEN** 操作者撤销或删除授权
+- **THEN** 客户端在发送请求前要求交互确认或显式传入 `--yes`
+
+#### Scenario: Configure an enrolled peer on Ingress
+
+- **WHEN** Ingress 操作者使用 `config create` 或 `config patch` 配置已核验的 Egress ID、公钥和可达端点
+- **THEN** 客户端校验完整 Ingress 资源图，更新本地受管 `Egress` YAML，并在拓扑变化时提示重启。通过 Egress 管理接口写入授权
+
+### Requirement: Local control endpoint discovery
+
+省略 `--socket` 时，客户端必须按角色依次尝试已配置的 `controlSocket` 和标准端点，
+对候选去重，并在发送变更前选定端点。Windows 继续使用默认命名管道。
+显式 `--socket` 跳过发现。
+
+#### Scenario: Packaged runtime socket is found automatically
+
+- **WHEN** 已安装的 daemon 监听 `/run/pathchord/ingress.sock`，且未显式指定 socket
+- **THEN** `pathchordctl get status` 连接到该端点
+
+#### Scenario: Standard Unix candidates are searched
+
+- **WHEN** 在 Unix 上省略 `--socket`
+- **THEN** 客户端依次检查适用的 `$XDG_RUNTIME_DIR/pathchord/<role>.sock`、`$HOME/.config/pathchord/<role>.sock`、`/run/pathchord/<role>.sock` 和 `/var/run/pathchord/<role>.sock`，并去重
+
+#### Scenario: FreeBSD runtime alias is found automatically
+
+- **WHEN** daemon 监听 `/var/run/pathchord/egress.sock`，且未显式指定 socket
+- **THEN** 授权命令在前序候选后尝试该端点并连接
+
+#### Scenario: Candidate failure continues discovery
+
+- **WHEN** 候选无法连接或未通过只读探测
+- **THEN** 客户端记录失败并尝试下一个候选
+
+#### Scenario: Mutation response is lost
+
+- **WHEN** 变更请求可能已发送，但响应无法读取
+- **THEN** 客户端报告结果未知，不向其他候选重发
+
+#### Scenario: Discovery failure is actionable
+
+- **WHEN** 全部候选均不可用
+- **THEN** 客户端以非零状态退出，并在 stderr 报告角色、检查过的候选及相关传输错误
+
+### Requirement: Human and structured output modes
+
+`pathchordctl` 必须支持全局 `--output` 和 `-o`，取值为 `human`、`json` 和
+`yaml`。默认 `human` 展示主要状态或授权字段。显式选择 JSON 或 YAML 时，
+stdout 必须包含表达相同响应数据的一个机器可读文档。
+
+#### Scenario: Status defaults to human output
+
+- **WHEN** 操作者运行 `pathchordctl get status` 且省略 `-o`
+- **THEN** stdout 显示人类可读的状态
+
+#### Scenario: JSON output is explicit
+
+- **WHEN** 操作者运行 `pathchordctl get status -o json`
+- **THEN** stdout 输出一个格式化的有效 JSON 文档，诊断写入 stderr
+
+#### Scenario: YAML output is explicit
+
+- **WHEN** 操作者运行 `pathchordctl get enrollments --output yaml`
+- **THEN** stdout 输出表达响应的一个有效 YAML 文档
+
+#### Scenario: Structured response error
+
+- **WHEN** 已选择结构化输出，且本地服务返回类型化错误
+- **THEN** 客户端以非零状态退出，并在 stdout 输出所选格式的稳定错误文档
+
+### Requirement: Unified role configuration layout
+
+Ingress、Egress 和 `pathchordctl` 必须对配置资源、运行 socket、状态及私有凭据使用统一的角色路径模型。
+
+#### Scenario: Regular-user paths
+
+- **WHEN** 普通 Unix 账号使用默认值
+- **THEN** 资源位于 `~/.config/pathchord/{ingress,egress}`，socket 位于
+  `$XDG_RUNTIME_DIR/pathchord`，状态位于 `~/.local/state/pathchord/{ingress,egress}`
+
+#### Scenario: Packaged service paths
+
+- **WHEN** 软件包服务账号使用默认值
+- **THEN** 资源位于 `/etc/pathchord/{ingress,egress}`，socket 位于
+  `/run/pathchord`，状态位于 `/var/lib/pathchord/{ingress,egress}`
+
+#### Scenario: No working-directory state fallback
+
+- **WHEN** 省略显式状态路径
+- **THEN** daemon 从角色路径模型解析状态路径，当前工作目录不参与默认路径选择
+
+### Requirement: Configuration lifecycle commands
+
+`pathchordctl` 必须提供按角色操作的 `config init`、`validate`、`paths` 和 `view`。
+
+#### Scenario: Role initialization
+
+- **WHEN** 操作者运行 `config init --role ingress` 或 `--role egress`
+- **THEN** 客户端创建缺失目录和模板，询问是否生成缺失身份，并保持现有远端授权
+
+#### Scenario: Development initialization
+
+- **WHEN** 操作者运行 `config init --both`
+- **THEN** 客户端创建两套角色目录并标明同机开发用途
+
+#### Scenario: Configuration validation
+
+- **WHEN** 操作者运行 `config validate`
+- **THEN** 客户端校验所选完整资源图并报告来源、资源、路径和字段诊断，整个流程可离线执行
+
+#### Scenario: Effective paths are inspectable
+
+- **WHEN** 操作者运行 `config paths`
+- **THEN** 客户端报告有效路径、路径来源或优先级、角色及相关文件权限
+
+### Requirement: Configuration-first startup overrides
+
+资源必须作为启动配置主来源。CLI 覆写只用于来源、socket、日志或调试，以及显式临时身份。
+
+#### Scenario: Resource values are effective defaults
+
+- **WHEN** 资源值和对应默认值同时存在
+- **THEN** 使用资源值，并在有效视图中标明来源
+
+#### Scenario: Temporary identity override
+
+- **WHEN** 操作者显式提供临时身份覆写
+- **THEN** 临时身份在该次调用中优先，原有资源文件保持原值
+
+### Requirement: Effective configuration secret handling
+
+`config view` 必须默认脱敏，仅允许在交互式终端中显式显示敏感值。
+
+#### Scenario: Default configuration view is redacted
+
+- **WHEN** 操作者运行 `config view` 且省略显示敏感值的选项
+- **THEN** 省略或遮盖敏感值和私有身份材料
+
+#### Scenario: Secret reveal requires an interactive terminal
+
+- **WHEN** 操作者运行 `config view --reveal-secrets`
+- **THEN** 客户端只接受交互式终端中的人类可读输出，拒绝重定向和 JSON/YAML，始终排除私有身份材料
+
+### Requirement: Declarative resource editing
+
+资源编辑命令必须先校验完整资源图，再更新受管 YAML。运行状态由 daemon 管理。
+
+#### Scenario: Create a managed resource
+
+- **WHEN** 操作者对目录来源运行 `config create`，且候选有效
+- **THEN** 校验完整候选后原子更新 `managed.yaml`，并报告文件变更和重启或重载要求
+
+#### Scenario: Patch or delete a resource
+
+- **WHEN** 操作者按资源身份运行 `config patch` 或 `config delete`
+- **THEN** 客户端修改 `managed.yaml` 中的对应资源，拒绝未解析引用和重复资源，校验失败时保留原文件
+
+#### Scenario: Single-file source is read-only for resource editing
+
+- **WHEN** 操作者尝试编辑单文件配置来源
+- **THEN** 客户端拒绝编辑，并提示先迁移到目录来源
+
+### Requirement: User-resource adoption
+
+客户端必须支持将用户手写资源显式迁移到受管 YAML，并保留来源中的其他内容。
+
+#### Scenario: Adopt one resource
+
+- **WHEN** 操作者运行 `config adopt <kind>/<name>`
+- **THEN** 客户端预览受管文件的新增内容和来源文件的移除内容，经二次确认和完整校验后提交两项变更
+
+#### Scenario: Adopt all resources from one file
+
+- **WHEN** 操作者运行 `config adopt --all-from <file>`
+- **THEN** 客户端预览全部选中资源，经显式确认后迁移到 `managed.yaml`
+
+#### Scenario: Adoption preserves source organization
+
+- **WHEN** 从手写文件迁移选中资源
+- **THEN** 仅移除相应资源，保留无关文档、注释和空来源文件
+
+#### Scenario: Adoption failure is atomic
+
+- **WHEN** 校验、权限、来源指纹或替换检查失败
+- **THEN** 客户端报告失败的检查项，保留受管文件和来源文件的原内容
+
+#### Scenario: Interrupted adoption is recovered
+
+- **WHEN** 迁移在替换文件时中断
+- **THEN** 下次 PathChord 读取或编辑前，恢复迁移前或迁移后的完整资源包
+
+### Requirement: Static configuration activation reporting
+
+配置编辑必须分别报告期望文件的变更和运行时生效要求。重启由操作者发起。
+
+#### Scenario: Static Egress edit
+
+- **WHEN** 通过受管资源编辑 Egress 启动字段
+- **THEN** 校验后更新文件，保留当前运行配置并报告 `restart required`
+
+#### Scenario: Ingress dynamic edit
+
+- **WHEN** 修改可动态生效的 Ingress 资源
+- **THEN** Ingress 可通过现有重载流程发布候选。静态修改仍需重启
+
+#### Scenario: Egress watcher observes an edit
+
+- **WHEN** 运行中的 Egress 检测到来源变化
+- **THEN** Egress 标记需要重启，并继续使用当前运行配置
+
+### Requirement: Egress resource editing boundary
+
+Egress 配置编辑必须只操作唯一的 `EgressService`。Egress 授权由控制接口管理。
+
+#### Scenario: Minimal EgressService edit
+
+- **WHEN** 操作者创建或编辑含一个 `EgressService` 且声明 `bind` 或 `binds` 的配置
+- **THEN** 客户端接受有效资源图，从角色默认值解析省略的服务身份和私有文件路径，并报告重启状态
+
+#### Scenario: Second EgressService is rejected
+
+- **WHEN** 所选来源已包含一个 `EgressService`，操作者尝试添加第二个
+- **THEN** 客户端拒绝编辑并保留受管文件
+
+#### Scenario: Last EgressService cannot be deleted
+
+- **WHEN** 操作者尝试删除来源中唯一的 `EgressService`
+- **THEN** 客户端拒绝会导致配置失效的删除
+
+#### Scenario: Egress edit does not use control protocol
+
+- **WHEN** 操作者编辑 Egress 监听、身份路径、资源上限、DNS 设置或 Web 配置
+- **THEN** 客户端在本地更新 YAML，整个操作可离线执行，并报告 `restart required`
+
+#### Scenario: Authorization remains a control operation
+
+- **WHEN** 操作者登记、启用、禁用、撤销或删除 Ingress 授权
+- **THEN** `pathchordctl` 使用现有 Egress 控制操作。授权记录由数据库持有

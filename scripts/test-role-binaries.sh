@@ -31,10 +31,10 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 umask 077
-mkdir -p "$tmp_dir/ingress-data" "$tmp_dir/ingress-secrets"
+mkdir -p "$tmp_dir/ingress-config" "$tmp_dir/ingress-data" "$tmp_dir/ingress-secrets"
 
-egress_key_json=$($ctl keygen --output "$tmp_dir/egress.key.json")
-ingress_key_json=$($ctl keygen --output "$tmp_dir/ingress.key.json")
+egress_key_json=$($ctl -o json keygen --identity-file "$tmp_dir/egress.key.json")
+ingress_key_json=$($ctl -o json keygen --identity-file "$tmp_dir/ingress.key.json")
 egress_public=$(printf '%s\n' "$egress_key_json" | jq -r '.public_key')
 ingress_public=$(printf '%s\n' "$ingress_key_json" | jq -r '.public_key')
 
@@ -56,10 +56,11 @@ for _ in $(seq 1 100); do
 done
 [ -S "$tmp_dir/egress.sock" ]
 
-$ctl --socket "$tmp_dir/egress.sock" enroll add \
-	--ingress-id entry --egress-id exit --public-key "$ingress_public" \
-	--expected-generation 0 >"$tmp_dir/enroll.json"
+$ctl -o json --socket "$tmp_dir/egress.sock" enroll add \
+	--ingress-id entry --public-key "$ingress_public" >"$tmp_dir/enroll.json"
 jq -e '.ok == true' "$tmp_dir/enroll.json" >/dev/null
+
+$ctl --config-dir "$tmp_dir/ingress-config" config create -f "$tmp_dir/ingress.yaml"
 
 nc -l 18080 < "$root_dir/scripts/fixtures/http-ok-response.txt" \
 	>"$tmp_dir/target.log" 2>&1 &
@@ -68,7 +69,7 @@ target_pid=$!
 $ingressd \
 	--socket "$tmp_dir/ingress.sock" \
 	--ingress-id entry \
-	--config "$tmp_dir/ingress.yaml" \
+	--config-dir "$tmp_dir/ingress-config" \
 	--identity "$tmp_dir/ingress.key.json" \
 	--data-dir "$tmp_dir/ingress-data" \
 	--credentials-dir "$tmp_dir/ingress-secrets" \
@@ -81,11 +82,11 @@ for _ in $(seq 1 100); do
 done
 [ -S "$tmp_dir/ingress.sock" ]
 
-$ctl --socket "$tmp_dir/ingress.sock" status >"$tmp_dir/ingress-status.json"
-$ctl --socket "$tmp_dir/egress.sock" status >"$tmp_dir/egress-status.json"
+$ctl -o json --socket "$tmp_dir/ingress.sock" status >"$tmp_dir/ingress-status.json"
+$ctl -o json --socket "$tmp_dir/egress.sock" status >"$tmp_dir/egress-status.json"
 for _ in $(seq 1 100); do
-	$ctl --socket "$tmp_dir/ingress.sock" status >"$tmp_dir/ingress-status.json"
-	$ctl --socket "$tmp_dir/egress.sock" status >"$tmp_dir/egress-status.json"
+	$ctl -o json --socket "$tmp_dir/ingress.sock" status >"$tmp_dir/ingress-status.json"
+	$ctl -o json --socket "$tmp_dir/egress.sock" status >"$tmp_dir/egress-status.json"
 	if jq -e '.ok == true and .result.ingress.state == "running" and .result.ready_paths > 0' "$tmp_dir/ingress-status.json" >/dev/null \
 		&& jq -e '.ok == true and .result.runtime.running == true and .result.runtime.active_paths > 0' "$tmp_dir/egress-status.json" >/dev/null; then
 		break

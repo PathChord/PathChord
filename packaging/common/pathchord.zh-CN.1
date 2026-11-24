@@ -1,0 +1,54 @@
+.TH PATHCHORD 1 "2026 年 11 月" "PathChord" "PathChord 手册"
+.SH 名称
+pathchordctl \- PathChord 本地管理客户端
+.SH 用法
+.B pathchordctl
+.RI [ 全局选项 ] " 命令"
+.SH 命令
+.TP
+.B get status
+查询 Ingress 状态。使用 describe status 查看详细信息。
+.TP
+.B get enrollments
+查询 Egress 授权列表。使用 describe enrollment INGRESS_ID 查看单条记录。
+.TP
+.B enroll
+在 Egress 主机上管理 Ingress 授权。省略 Egress ID 或授权代次时，
+客户端从所选端点读取相应值。撤销或删除授权需要确认，可显式传入 --yes。
+.TP
+.B keygen --identity-file 路径
+生成私有静态身份文件并输出公钥。已有身份文件会保留。
+.TP
+.B config init
+使用 --role ingress 或 --role egress 初始化单个角色，使用 --both 初始化同机开发环境。
+.TP
+.B config validate, paths, view
+校验完整资源图，查看实际路径及权限，或查看生效配置。显示敏感值需要在交互式终端中显式传入 --reveal-secrets。
+.TP
+.B config create, get, patch, delete, adopt
+查询或编辑本地声明式资源。资源编辑需要目录来源，并在整体校验后写入 managed.yaml。
+迁移手写资源会预览并要求两次确认。静态变更会提示重启，重启由操作者发起。
+.SH 全局选项
+.TP
+.BI -o, --output\  human|json|yaml
+选择输出格式。默认使用人类可读格式。
+.TP
+.BI -c, --config\  路径
+选择一个配置文件或目录。
+.TP
+.BI -C, --config-dir\  路径
+选择配置目录，包含子目录。
+.TP
+.BI --socket\  路径
+选择本地 Unix socket 或 Windows 命名管道。省略时优先尝试资源中的 controlSocket，
+随后尝试标准运行目录。
+.SH 配置来源
+优先级依次是显式命令行来源、PATHCHORD_CONFIG 或 PATHCHORD_CONFIG_DIR、角色默认目录。
+目录内资源组成一张图，重复身份会报错。私有凭据和状态应放在扫描目录之外。
+.SH 示例
+.EX
+pathchordctl get status
+pathchordctl get status -o json
+pathchordctl config validate --role egress
+pathchordctl -C /etc/pathchord/ingress config create -f egress.yaml
+.EE

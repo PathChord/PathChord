@@ -2212,9 +2212,12 @@ checksum = "f132f5ea38d74a519b65995b2f7dc7714a8b34df53952eb744107af7c1645a87"
 dependencies = [
  "hashbrown",
  "indexmap",
+ "itoa",
  "memchr",
  "rustc-hash",
+ "ryu",
  "serde_core",
+ "serde_ignored",
  "smallvec",
 ]
 
@@ -2385,8 +2388,11 @@ dependencies = [
 name = "pathchord-config"
 version = "0.1.0"
 dependencies = [
+ "atomic-write-file",
+ "nix 0.32.0",
  "noyalib-serde-yaml",
  "pathchord-policy",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
@@ -2622,9 +2628,13 @@ dependencies = [
  "base64",
  "clap",
  "getrandom 0.4.3",
+ "noyalib",
+ "noyalib-serde-yaml",
+ "pathchord-config",
  "pathchord-control",
  "pathchord-core",
  "pathchord-noise",
+ "pathchord-policy",
  "serde_json",
  "thiserror",
  "tokio",
@@ -3317,6 +3327,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

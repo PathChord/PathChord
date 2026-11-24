@@ -35,6 +35,8 @@ post-install:
 		${WRKSRC}/packaging/common/${ROLE_TEMPLATE} > \
 		${STAGEDIR}${PREFIX}/etc/pathchord/${PATHCHORD_ROLE}/${PATHCHORD_ROLE}.yaml.sample
 	${INSTALL_DATA} ${WRKSRC}/packaging/common/pathchord.1 ${STAGEDIR}${PREFIX}/share/man/man1/pathchord.1
+	${MKDIR} ${STAGEDIR}${PREFIX}/share/man/zh_CN/man1
+	${INSTALL_DATA} ${WRKSRC}/packaging/common/pathchord.zh-CN.1 ${STAGEDIR}${PREFIX}/share/man/zh_CN/man1/pathchord.1
 	${INSTALL_SCRIPT} ${WRKSRC}/packaging/common/setup-layout.sh ${STAGEDIR}${PREFIX}/libexec/pathchord-setup-layout
 	${INSTALL_SCRIPT} ${WRKSRC}/packaging/freebsd/${PORTNAME}.in ${STAGEDIR}${PREFIX}/etc/rc.d/${PORTNAME}
 .include <bsd.port.mk>

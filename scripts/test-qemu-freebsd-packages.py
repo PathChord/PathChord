@@ -38,7 +38,7 @@ getent passwd pathchord
 state="/var/db/pathchord-$role"
 config="/usr/local/etc/pathchord/$role/$role.yaml"
 printf '\n# operator-lifecycle-sentinel\n' >> "$config"
-pathchordctl keygen --output "$state/lifecycle.key.json" >/dev/null
+pathchordctl -o json keygen --identity-file "$state/lifecycle.key.json" >/dev/null
 printf authorization-state-fixture > "$state/lifecycle.authorizations.db"
 chown pathchord:pathchord "$state"/lifecycle*
 chmod 0600 "$state"/lifecycle*
@@ -66,7 +66,7 @@ verify_state
 [ -x "/usr/local/bin/$name" ]
 [ ! -e "/usr/local/bin/$other_name" ]
 if [ "$role" = egress ]; then
-    pathchordctl keygen --output "$state/egress.key.json" >/dev/null
+    pathchordctl -o json keygen --identity-file "$state/egress.key.json" >/dev/null
     chown pathchord:pathchord "$state/egress.key.json"
 fi
 service "$name" onestart
@@ -81,7 +81,7 @@ ready() {
     env SHELL=/bin/sh su -m pathchord -c "pathchordctl --socket $endpoint status"
     [ "$(stat -f '%Su:%Sg:%Lp' "$endpoint")" = 'pathchord:pathchord:600' ]
     if [ "$role" = egress ] && [ -e "$state/native-enrollment.fixture" ]; then
-        pathchordctl --socket "$endpoint" enroll get --ingress-id lifecycle-fixture > /tmp/pathchord-enrollment.json
+        pathchordctl -o json --socket "$endpoint" enroll get --ingress-id lifecycle-fixture > /tmp/pathchord-enrollment.json
         grep -q lifecycle-fixture /tmp/pathchord-enrollment.json
         grep -q native-upgrade /tmp/pathchord-enrollment.json
         grep -Fq -e "$(cat "$state/native-enrollment.fixture")" /tmp/pathchord-enrollment.json
@@ -101,7 +101,7 @@ fi
 verify_state
 ready
 if [ "$role" = egress ]; then
-    public=$(pathchordctl keygen --output "$state/native-ingress.key.json" | sed -n 's/.*"public_key": "\([^" ]*\)".*/\1/p')
+    public=$(pathchordctl -o json keygen --identity-file "$state/native-ingress.key.json" | sed -n 's/.*"public_key": "\([^" ]*\)".*/\1/p')
     pathchordctl --socket "$endpoint" enroll add --ingress-id lifecycle-fixture --egress-id egress \
         --public-key "$public" --expected-generation 0 --label sentinel=native-upgrade
     printf '%s\n' "$public" > "$state/native-enrollment.fixture"

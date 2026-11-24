@@ -124,7 +124,7 @@ function Invoke-Installer([string] $Path, [string] $Label, [switch] $AllowFailur
 }
 function Invoke-Control([string] $CurrentRole, [string[]] $Arguments, [string] $Label) {
     $ctl = Join-Path $InstallDirectory 'pathchordctl.exe'
-    $result = Invoke-Native $ctl (@('--socket', "\\.\pipe\pathchord-$CurrentRole") + $Arguments) $Label
+    $result = Invoke-Native $ctl (@('-o', 'json', '--socket', "\\.\pipe\pathchord-$CurrentRole") + $Arguments) $Label
     return $result.Text | ConvertFrom-Json
 }
 function Invoke-ServiceOwnerProbe([int] $ProcessId, [string] $Pipe, [string] $Label) {
@@ -313,12 +313,12 @@ try {
         $credentialPath = Join-Path $PrivateRoot "credentials\$currentRole"
         $ctl = Join-Path $InstallDirectory 'pathchordctl.exe'
         if (-not (Test-Path -LiteralPath (Join-Path $statePath 'lifecycle.identity'))) {
-            Invoke-Native $ctl @('keygen', '--output', (Join-Path $statePath 'lifecycle.identity')) "$currentRole-keygen-sentinel" | Out-Null
+            Invoke-Native $ctl @('-o', 'json', 'keygen', '--identity-file', (Join-Path $statePath 'lifecycle.identity')) "$currentRole-keygen-sentinel" | Out-Null
         }
         [IO.File]::WriteAllText((Join-Path $statePath 'lifecycle.authorizations'), ('authorization-state-fixture-' + $RunId))
         [IO.File]::WriteAllText((Join-Path $credentialPath 'lifecycle.credential'), ('private-credential-fixture-' + $RunId))
         if ($currentRole -eq 'egress' -and -not (Test-Path -LiteralPath (Join-Path $statePath 'egress.key.json'))) {
-            Invoke-Native $ctl @('keygen', '--output', (Join-Path $statePath 'egress.key.json')) 'egress-keygen' | Out-Null
+            Invoke-Native $ctl @('-o', 'json', 'keygen', '--identity-file', (Join-Path $statePath 'egress.key.json')) 'egress-keygen' | Out-Null
         }
         $expectedState = Read-State $currentRole
         $register = Join-Path $InstallDirectory 'services\install-service.ps1'
@@ -341,7 +341,7 @@ try {
         Assert-True $denied.AccessDenied 'The ordinary user was not denied by the private Named Pipe ACL.'
         Save-Event "$currentRole-account-acl-control" @{service_sid = $serviceSid; actual_owner_sid = $owner.Sid; acl = $acls; owner_control = $true; admin_control = $true; ordinary_user_denied = $true; ordinary_user_sid = $denied.Sid}
         if ($currentRole -eq 'egress') {
-            $keyResult = Invoke-Native $ctl @('keygen', '--output', (Join-Path $statePath 'native-ingress.key.json')) 'egress-enrollment-keygen'
+            $keyResult = Invoke-Native $ctl @('-o', 'json', 'keygen', '--identity-file', (Join-Path $statePath 'native-ingress.key.json')) 'egress-enrollment-keygen'
             $public = ($keyResult.Text | ConvertFrom-Json).public_key
             Invoke-Control 'egress' @('enroll', 'add', '--ingress-id', 'lifecycle-fixture', '--egress-id', 'egress', '--public-key', $public, '--expected-generation', '0', '--label', 'sentinel=native-upgrade') 'egress-enroll' | Out-Null
             $identityHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $statePath 'egress.key.json')).Hash

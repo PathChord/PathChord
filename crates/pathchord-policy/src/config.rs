@@ -580,6 +580,7 @@ fn default_enabled() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KubeResource {
+    IngressService(Resource<crate::IngressServiceSpec>),
     EgressService(Resource<crate::EgressServiceSpec>),
     NodeProbePolicy(Resource<crate::NodeProbePolicySpec>),
     Egress(Resource<EgressSpec>),
@@ -600,6 +601,7 @@ impl KubeResource {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
+            Self::IngressService(_) => "IngressService",
             Self::EgressService(_) => "EgressService",
             Self::NodeProbePolicy(_) => "NodeProbePolicy",
             Self::Egress(_) => "Egress",
@@ -619,6 +621,9 @@ impl KubeResource {
 
     fn key(&self) -> (&str, &str, &str) {
         match self {
+            Self::IngressService(value) => {
+                (&value.metadata.namespace, &value.kind, &value.metadata.name)
+            }
             Self::EgressService(value) => {
                 (&value.metadata.namespace, &value.kind, &value.metadata.name)
             }
@@ -659,6 +664,7 @@ impl KubeResource {
 
     fn metadata(&self) -> &ObjectMeta {
         match self {
+            Self::IngressService(value) => &value.metadata,
             Self::EgressService(value) => &value.metadata,
             Self::NodeProbePolicy(value) => &value.metadata,
             Self::Egress(value) => &value.metadata,
@@ -775,6 +781,23 @@ impl KubeConfig {
                 });
             }
             resources.push(resource);
+        }
+        if resources
+            .iter()
+            .filter(|resource| matches!(resource, KubeResource::IngressService(_)))
+            .count()
+            > 1
+        {
+            return Err(ConfigError::InvalidEnvelope(
+                "at most one IngressService is allowed".into(),
+            ));
+        }
+        if require_ingress
+            && resources
+                .iter()
+                .any(|resource| matches!(resource, KubeResource::EgressService(_)))
+        {
+            return Err(ConfigError::UnsupportedKind("EgressService".into()));
         }
         resources.sort_by(|left, right| left.key().cmp(&right.key()));
         validate_resource_set(&resources, require_ingress)?;
@@ -1229,6 +1252,7 @@ impl KubeConfig {
                     });
                 }
                 KubeResource::FallbackPolicy(value) => config.fallback = Some(value.spec.action),
+                KubeResource::IngressService(value) => config.ingress_service = Some(value.spec),
                 KubeResource::EgressService(_) => {}
                 KubeResource::NodeProbePolicy(value) => config.node_probe = Some(value.spec),
             }
@@ -1334,6 +1358,7 @@ fn parse_resource(value: Value) -> Result<KubeResource, ConfigError> {
         }};
     }
     match kind.as_str() {
+        "IngressService" => parse!(crate::IngressServiceSpec, IngressService),
         "EgressService" => parse!(crate::EgressServiceSpec, EgressService),
         "NodeProbePolicy" => parse!(crate::NodeProbePolicySpec, NodeProbePolicy),
         "Egress" => parse!(EgressSpec, Egress),

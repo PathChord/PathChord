@@ -10,9 +10,9 @@ pathchordctl \- PathChord local management client
 .br
 .B pathchordctl
 .RI [ global-options ]
-.B status
+.B get status
 .br
-.B pathchordctl keygen --output
+.B pathchordctl keygen --identity-file
 .I identity.json
 .SH DESCRIPTION
 PathChord provides local HTTP forwarding, HTTP CONNECT, SOCKS4/4a/5, and
@@ -41,7 +41,7 @@ for a resource directory.
 Start the Egress runtime.  The Egress service owns its authorization database
 and public Path listener.
 .TP
-.B pathchordctl status
+.B pathchordctl get status
 Query the local control endpoint.
 .TP
 .B pathchordctl keygen
@@ -50,10 +50,17 @@ overwritten; the public key is printed to standard output.
 .TP
 .B pathchordctl enroll
 Manage Egress authorization records from a protected local control endpoint.
+.TP
+.B pathchordctl config
+Initialize, validate, inspect, and edit the local configuration. Resource changes
+are written to managed.yaml in a directory source.
 .SH OPTIONS
 .TP
+.BI -o, --output\  human|json|yaml
+Select output format. Human-readable output is the default.
+.TP
 .BI -c, --config\  path
-Use one YAML, YML, or JSON resource file.
+Use a YAML, YML, or JSON resource file or a resource directory.
 .TP
 .BI -C, --config-dir\  path
 Use a configuration directory.  Subdirectories are included.
@@ -130,7 +137,7 @@ Packaged Windows Egress configuration directory.
 .EX
 pathchord-ingressd --config-dir /etc/pathchord/ingress
 pathchord-egressd --config-dir /etc/pathchord/egress
-pathchordctl keygen --output /var/lib/pathchord-egress/egress.key.json
+pathchordctl keygen --identity-file /var/lib/pathchord-egress/egress.key.json
 pathchordctl --socket /run/pathchord/egress.sock status
 .EE
 .SH SECURITY

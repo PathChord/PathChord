@@ -48,6 +48,7 @@ package() {
     install -Dm0755 "$srcdir/pathchordctl" "$pkgdir/usr/bin/pathchordctl"
     install -Dm0755 "$srcdir/common/setup-layout.sh" "$pkgdir/usr/libexec/pathchord-setup-layout"
     install -Dm0644 "$srcdir/common/pathchord.1" "$pkgdir/usr/share/man/man1/pathchord.1"
+    install -Dm0644 "$srcdir/common/pathchord.zh-CN.1" "$pkgdir/usr/share/man/zh_CN/man1/pathchord.1"
     install -Dm0644 "$srcdir/common/role.yaml" "$pkgdir/etc/pathchord/__ROLE__/__ROLE__.yaml"
     chmod 0750 "$pkgdir/etc/pathchord/__ROLE__"
     install -Dm0644 "$srcdir/common/role.service" "$pkgdir/usr/lib/systemd/system/$pkgname.service"

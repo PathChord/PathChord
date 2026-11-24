@@ -67,7 +67,7 @@ Listener interface 的 `address`、CIDR、socket address 字符串和字面 HTTP
 EgressService 的 `web` 可选，只接受 `bind`、`tokenFile`、`allowedOrigins` 和
 `protectedTransport`。省略后仍保持 Web Gateway 默认禁用；子字段默认值、校验限制、origin/token
 检查和受保护传输要求不变。相对的 `web.tokenFile` 路径按现有私有路径规则相对于选定配置来源解析。
-已有 CLI flag 按现有来源优先级覆写对应嵌套资源字段；分组不改变密钥存储，也不启用 TLS 终止。
+Web Gateway 沿用已有密钥存储和受保护传输边界。
 
 规范 MUST 说明 EgressRule 和 ProxyRule 的 `catchAll`，以及 ProxyRule 的 `require`，并保持现有验证和
 选择语义。本次名称整理不改变路由动作模型，也不扩展 `transit.reject` 当前仅支持 tag 的条件。
@@ -131,10 +131,10 @@ Egress 配置来源必须（SHALL）在单个资源文件或目录树中恰好�
 
 ### Requirement: Egress source precedence and restart boundary
 
-Egress 必须（SHALL）先选择显式命令行资源来源，其次选择
-`PATHCHORD_CONFIG` 或 `PATHCHORD_CONFIG_DIR`，最后使用账号默认值。CLI 字段覆写必须（SHALL）
-优先于选定的 `EgressService`；identity、listener bind、授权存储、控制端点或其他仅启动时
-服务字段发生变化时，必须（SHALL）要求重启 Egress。
+Egress 必须先选择显式命令行资源来源，其次选择 `PATHCHORD_CONFIG` 或
+`PATHCHORD_CONFIG_DIR`，最后使用账号默认值。`EgressService` 字段优先于角色默认值。
+显式指定的控制 socket 和临时身份优先于资源值。身份、监听地址、授权存储、控制端点
+或其他仅在启动时读取的服务字段发生变更时，Egress 必须重启。
 
 #### Scenario: Egress command-line source overrides the environment
 
@@ -460,6 +460,21 @@ Geodata 配置 SHALL 遵循完整的[详细契约](#geodata-数据库)。
 - **WHEN** 处理 geodata 配置或匹配
 - **THEN** 执行详细契约中的 schema、限制和失败语义
 
+### Requirement: Role startup settings in the selected source
+
+所选来源必须支持声明对应角色的启动设置。私有值保存在独立文件中。
+省略的私有文件路径从角色目录布局解析。
+
+#### Scenario: Ingress startup settings are authored with its policy graph
+
+- **WHEN** 所选 Ingress 资源包声明了服务设置
+- **THEN** daemon 随完整策略图解析身份、状态目录、凭据目录、控制 socket 和 Web Gateway 设置
+
+#### Scenario: Minimal Egress resource uses role defaults
+
+- **WHEN** EgressService 声明名称和 Path 监听，且省略身份和私有文件路径
+- **THEN** 服务以资源名称为默认 Egress ID，从角色默认值解析身份、授权库和控制 socket 路径
+
 ## Detailed contract
 
 本文档是人工编写 YAML 配置的规范性版本化 schema。[配置规范](../configuration/spec.zh-CN.md)
@@ -576,6 +591,14 @@ mutation 写入。导入的 source、observed、quota 和 billing 值均由运�
 或 desired Path 数量。Egress 拓扑、Path-pool 数量、admission 要求、绑定和已解析 TrafficPolicy
 属于启动配置，不能热重载。
 
+### IngressService
+
+每个 Ingress 资源包最多可声明一个 `IngressService`，其 `spec` 接受
+`ingressId`、`identity`、`dataDir`、`credentialsDir`、`controlSocket` 和 `web`。
+默认 Ingress ID 为 `local-ingress`。`web` 接受 `bind`、`tokenFile`、
+`allowedOrigins` 和 `protectedTransport`。相对路径以所选配置来源为基准解析。
+私有文件和状态保存在扫描目录之外。这些设置变更后需重启。
+
 ### EgressService 和 NodeProbePolicy
 
 `EgressService.spec` 接受 `bind` 或 `binds`、`egressId`、`identity`、`authorizationDb`、
@@ -587,12 +610,12 @@ mutation 写入。导入的 source、observed、quota 和 billing 值均由运�
 Ingress Path-pool 数量、per-Ingress stream 配额和 Path 安全上限不属于 EgressService 字段，不得写入
 该资源。
 资源中的相对路径相对于所选配置来源解析。一个 Egress 进程最多选择一个此类资源。
-应用命令行覆写后必须提供 `identity` 和 Egress ID；缺少 `egressId` 时使用资源名。
+缺少 `egressId` 时使用资源名。身份、授权库和控制 socket 路径从角色目录布局解析默认值。
 `remoteDnsOnly` 默认 false。设为 true 且存在原始主机名时，Egress 对 TCP 和 UDP 使用自身系统
 解析器解析该名称，不使用 Ingress 提供的地址候选。没有主机名的字面 IP 仍是有效目标。
 该选项作用于目标名称，不改变独立的 Ingress DNS 路由策略。
 
-Egress 来源不得包含 Listener、TransitProxy、Subscription、EgressRule、ProxyRule、TrafficPolicy、
+Egress 来源不得包含 IngressService、Listener、TransitProxy、Subscription、EgressRule、ProxyRule、TrafficPolicy、
 DNSPolicy、FallbackPolicy、GeoSiteDatabase、GeoIpDatabase 或 NodeProbePolicy。私有身份、授权库、
 控制 socket 和 bearer token 密钥内容位于用户资源文档之外。相对 `web.tokenFile` 路径从所选 Egress
 配置来源根解析。

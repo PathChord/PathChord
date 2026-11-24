@@ -10,6 +10,17 @@ use crate::Endpoint;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IngressServiceSpec {
+    pub ingress_id: Option<String>,
+    pub identity: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
+    pub credentials_dir: Option<PathBuf>,
+    pub control_socket: Option<PathBuf>,
+    pub web: Option<EgressWebSettings>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EgressServiceSpec {
     pub bind: Option<SocketAddr>,
     #[serde(default)]
