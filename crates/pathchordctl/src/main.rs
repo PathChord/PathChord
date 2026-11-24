@@ -57,6 +57,8 @@ enum Command {
     Status,
     /// Query retained runtime diagnostics.
     Diagnostics,
+    /// Export retained runtime diagnostics to a bounded JSON file.
+    ExportDiagnostics(ExportDiagnosticsArgs),
     /// Manage the Windows system-proxy switch.
     #[command(subcommand)]
     SystemProxy(SystemProxyCommand),
@@ -143,6 +145,12 @@ struct EnrollmentMutationArgs {
     ingress_id: String,
     #[arg(long)]
     expected_generation: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct ExportDiagnosticsArgs {
+    #[arg(long)]
+    output: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -258,6 +266,29 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             Some(status) => status,
             None => call_local(&socket, status_request(actor)).await?,
         },
+        Command::ExportDiagnostics(args) => {
+            let response = call_local(
+                &socket,
+                request(
+                    "diagnostics.get",
+                    actor,
+                    serde_json::json!({"export": true}),
+                    vec!["metrics:read"],
+                ),
+            )
+            .await?;
+            if !response.ok {
+                return print_response(&response, output, false);
+            }
+            let envelope = serde_json::json!({
+                "format_version": 1,
+                "collected_at_unix_ms": now_unix_ms(),
+                "response": response,
+            });
+            write_json_file(&args.output, &envelope)?;
+            println!("{}", args.output.display());
+            return Ok(());
+        }
         Command::Diagnostics => {
             call_local(
                 &socket,
@@ -593,6 +624,28 @@ fn request_id() -> Result<String, CliError> {
     let mut bytes = [0_u8; 16];
     fill(&mut bytes).map_err(|error| CliError::RequestId(error.to_string()))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn now_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
+}
+
+fn write_json_file(path: &Path, value: &Value) -> Result<(), CliError> {
+    let contents = serde_json::to_vec_pretty(value)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(&contents)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn print_response(
