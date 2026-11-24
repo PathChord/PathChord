@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: packages-${{ github.event.release.tag_name || 'nightly' }}
+  group: packages-${{ github.event.release.tag_name || inputs.release_tag || 'nightly' }}
 
 jobs:
   build:
@@ -171,7 +171,7 @@ jobs:
           PATHCHORD_ROLE="$ROLE" \
             PATHCHORD_DAEMON_BINARY="$PWD/package-input/pathchord-${ROLE}d" \
             PATHCHORDCTL_BINARY="$PWD/package-input/pathchordctl" \
-            make -C packaging package-deb
+            sh packaging/debian/build.sh dist
       - name: Upload Debian package
         uses: actions/upload-artifact@v7
         with:
@@ -215,15 +215,19 @@ jobs:
           docker run --rm \
             -v "$PWD:/src:ro" -v "$PWD/dist:/out" \
             -e ROLE="$ROLE" -e VERSION="$version" \
-            alpine:3.22 sh -ec '
+            alpine:3.24 sh -ec '
               apk add --no-cache alpine-sdk
               adduser -D builder
               addgroup builder abuild
               chmod 777 /out
               cp -a /src /work
               chown -R builder:builder /work
-              su builder -s /bin/sh -c "abuild-keygen -a -n >/dev/null 2>&1 && \
-                PATHCHORD_ROLE=$ROLE PATHCHORD_VERSION=$VERSION \
+              key="/home/builder/pathchord-alpine-$ROLE.rsa"
+              su builder -s /bin/sh -c "umask 077 && openssl genrsa -out $key 2048"
+              openssl rsa -in "$key" -pubout -out "$key.pub"
+              install -m 0644 "$key.pub" /etc/apk/keys/
+              install -m 0644 "$key.pub" /out/
+              su builder -s /bin/sh -c "PACKAGER_PRIVKEY=$key PATHCHORD_ROLE=$ROLE PATHCHORD_VERSION=$VERSION \
                 PATHCHORD_DAEMON_BINARY=/work/package-input/pathchord-${ROLE}d \
                 PATHCHORDCTL_BINARY=/work/package-input/pathchordctl \
                 /work/packaging/alpine/build.sh /out"
@@ -232,7 +236,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: pathchord-native-alpine-${{ matrix.role }}
-          path: dist/*.apk
+          path: |
+            dist/*.apk
+            dist/*.rsa.pub
           if-no-files-found: error
           retention-days: 14
 
@@ -324,6 +330,7 @@ jobs:
           usesh: true
           prepare: pkg install -y pkg
           run: |
+            ROLE="${{ matrix.role }}"
             PATHCHORD_ROLE="$ROLE" \
               PATHCHORD_DAEMON_BINARY="$PWD/package-input/pathchord-${ROLE}d" \
               PATHCHORDCTL_BINARY="$PWD/package-input/pathchordctl" \
@@ -339,7 +346,7 @@ jobs:
   package-windows:
     name: Windows installers
     needs: build
-    runs-on: windows-2025
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -366,8 +373,9 @@ jobs:
           Get-ChildItem $nested.FullName | Move-Item -Destination package-input -Force
           Remove-Item $nested.FullName -Recurse -Force
       - name: Install NSIS
-        shell: pwsh
-        run: choco install nsis --no-progress --yes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nsis
       - name: Build Windows installer
         shell: pwsh
         env:
