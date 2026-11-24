@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">PathChord</title>
+  <desc id="desc">Three colored paths connect two endpoints on a midnight-blue tile.</desc>
+  <rect width="128" height="128" rx="28" fill="#101B32"/>
+  <g fill="none" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M26 64L47 38H69L102 64" stroke="#50E3C2"/>
+    <path d="M26 64H102" stroke="#EEF5FF"/>
+    <path d="M26 64L59 90H81L102 64" stroke="#829EFF"/>
+  </g>
+  <circle cx="26" cy="64" r="8" fill="#EEF5FF"/>
+  <circle cx="102" cy="64" r="8" fill="#EEF5FF"/>
+  <g fill="#101B32">
+    <circle cx="26" cy="64" r="3"/>
+    <circle cx="102" cy="64" r="3"/>
+  </g>
+</svg>
