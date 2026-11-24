@@ -34,6 +34,8 @@ Name "PathChord ${APP_ROLE} ${APP_VERSION}"
 OutFile "${OUTPUT_PATH}"
 InstallDir "$PROGRAMFILES64\PathChord"
 InstallDirRegKey HKLM "${UNINSTALL_KEY}" "InstallLocation"
+!define MUI_ICON "pathchord.ico"
+!define MUI_UNICON "pathchord.ico"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "..\..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
@@ -96,6 +98,7 @@ Section "PathChord ${APP_ROLE}" SecRuntime
   WriteRegStr HKLM "Software\PathChord" "Role" "${APP_ROLE}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "PathChord ${APP_ROLE}"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayVersion" "${APP_VERSION}"
+  WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayIcon" '"$INSTDIR\uninstall.exe",0'
   WriteRegStr HKLM "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
 SectionEnd
