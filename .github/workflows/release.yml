@@ -129,7 +129,7 @@ jobs:
           done
 
       - name: Upload role packages
-        uses: actions/upload-artifact@v8
+        uses: actions/upload-artifact@v7
         with:
           name: pathchord-${{ matrix.target }}
           path: |
