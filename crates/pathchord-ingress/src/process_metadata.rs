@@ -398,10 +398,10 @@ mod native_platform {
 
     const MAX_PROCESS_NAME_BYTES: usize = 4096;
 
-    /// Windows and FreeBSD provider backed by `netsock`'s native IP Helper and
-    /// libprocstat integrations. It never invokes a shell or parses command
-    /// output; user/group identifiers remain unknown when the platform API
-    /// does not expose them to an unprivileged process.
+    /// Non-Linux provider backed by `netsock`'s native socket and process APIs.
+    /// It never invokes a shell or parses command output. User and group
+    /// identifiers remain unknown when the platform API does not expose them
+    /// to an unprivileged process.
     #[derive(Debug, Default)]
     pub struct NativeProcessMetadataProvider;
 

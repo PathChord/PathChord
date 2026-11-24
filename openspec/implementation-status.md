@@ -520,8 +520,8 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   suite and selected-role Egress permission/signal checks. Both FreeBSD role
   packages also passed native `pkg` creation, service, upgrade, rollback,
   uninstall and explicit replacement checks; see the single-role package report.
-- Process metadata is best-effort: Linux uses bounded procfs reads and Windows
-  and FreeBSD use the safe `netsock` native IP Helper/libprocstat provider.
+- Process metadata is best-effort: Linux uses bounded procfs reads and the
+  non-Linux platforms use the safe `netsock` native socket/process providers.
   Process IDs and executable names are returned where permissions allow;
   user/group identifiers remain unknown when the platform API does not expose
   them.
@@ -753,7 +753,6 @@ Earlier recorded checks include:
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
-cargo test --locked -p netlink-packet-utils
 cargo deny --all-features --locked check advisories
 cargo check --locked --workspace --all-targets --target x86_64-pc-windows-gnu
 cargo check --locked --workspace --all-targets --target x86_64-unknown-freebsd
@@ -765,18 +764,15 @@ The full workspace test run covers protocol, policy, Noise, Path, Transit,
 Ingress, Egress, CLI, real loopback Egress/Ingress TCP and UDP paths, platform
 fakes, route rollback, TUN packet flows, Web REST/SSE, persistence, reload,
 subscription normalization, and fault/retransmission cases. The dependency
-graph contains no `paste` package. A local `netlink-packet-utils` 0.5.2
-compatibility patch aliases the maintained `pastey` macro crate for the
-Netlink dependencies of `netsock`; the upstream Rust source and public API
-are preserved. CI tests the exported buffer macros separately, and
-`cargo-deny` 0.20.2 passes the same advisory check used by GitHub Actions.
+graph contains no `paste` package. `netsock` 0.9.0 uses the updated Netlink
+dependency line directly, so PathChord no longer carries a local
+`netlink-packet-utils` compatibility patch. `cargo-deny` 0.20.2 passes the
+same advisory check used by GitHub Actions.
 
 Cargo 1.100 reports an unused `netsock` dependency on Linux because the native
 provider uses it only on non-Linux platforms. Its dependency declaration stays
-unconditional: restricting it to non-Linux targets makes
-`cargo test --locked -p netlink-packet-utils` panic inside Cargo's feature
-resolver when selecting the inactive compatibility patch. The existing CI
-package test remains enabled.
+unconditional. The current `netsock` dependency is selected only for the
+non-Linux native process metadata provider.
 
 The Linux workspace run passes every non-ignored workspace test. The normal
 Transit unit run does not require an external proxy executable and leaves the

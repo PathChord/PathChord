@@ -202,7 +202,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
 ]
 
@@ -381,24 +381,6 @@ name = "base64"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
-
-[[package]]
-name = "bindgen"
-version = "0.72.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
-dependencies = [
- "bitflags 2.13.2",
- "cexpr",
- "clang-sys",
- "itertools",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash",
- "shlex 1.3.0",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "bit-set"
@@ -589,7 +571,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex 2.0.1",
+ "shlex",
 ]
 
 [[package]]
@@ -602,15 +584,6 @@ dependencies = [
  "cipher 0.5.2",
  "ctr 0.10.1",
  "ctutils",
-]
-
-[[package]]
-name = "cexpr"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
-dependencies = [
- "nom",
 ]
 
 [[package]]
@@ -694,17 +667,6 @@ dependencies = [
  "block-buffer 0.12.1",
  "crypto-common 0.2.2",
  "inout 0.2.6",
-]
-
-[[package]]
-name = "clang-sys"
-version = "1.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
-dependencies = [
- "glob",
- "libc",
- "libloading 0.8.9",
 ]
 
 [[package]]
@@ -1010,7 +972,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71958f69fb2de856c5dd51ac9377e986ca1aa5919f931bf5395a807277f889a0"
 dependencies = [
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -1406,12 +1368,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glob"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
-
-[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1502,7 +1458,7 @@ dependencies = [
  "once_cell",
  "rand",
  "ring",
- "thiserror 2.0.21",
+ "thiserror",
  "tinyvec",
  "tracing",
  "url",
@@ -1858,7 +1814,7 @@ dependencies = [
  "jni-sys",
  "log",
  "simd_cesu8",
- "thiserror 2.0.21",
+ "thiserror",
  "walkdir",
  "windows-link 0.2.1",
 ]
@@ -1979,33 +1935,12 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link 0.2.1",
-]
-
-[[package]]
-name = "libloading"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
 dependencies = [
  "cfg-if",
  "windows-link 0.2.1",
-]
-
-[[package]]
-name = "libproc"
-version = "0.14.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a54ad7278b8bc5301d5ffd2a94251c004feb971feba96c971ea4063645990757"
-dependencies = [
- "bindgen",
- "errno",
- "libc",
 ]
 
 [[package]]
@@ -2140,17 +2075,6 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "netlink-packet-core"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72724faf704479d67b388da142b186f916188505e7e0b26719019c525882eda4"
-dependencies = [
- "anyhow",
- "byteorder",
- "netlink-packet-utils",
-]
-
-[[package]]
-name = "netlink-packet-core"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d6e2daf9a8c2e21302714706860a0e6be02e03d17294ecc66b354ea7d4059dd"
@@ -2164,44 +2088,21 @@ dependencies = [
  "bitflags 2.13.2",
  "libc",
  "log",
- "netlink-packet-core 0.9.0",
+ "netlink-packet-core",
  "zerocopy",
 ]
 
 [[package]]
 name = "netlink-packet-sock-diag"
-version = "0.4.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a495cb1de50560a7cd12fdcf023db70eec00e340df81be31cedbbfd4aadd6b76"
+checksum = "55169f3ffef150fcfbeda8ab1d9766ce69e02f27f8bc1601555ec3b7a2a84377"
 dependencies = [
- "anyhow",
- "bitflags 1.3.2",
- "byteorder",
+ "bitflags 2.13.2",
  "libc",
- "netlink-packet-core 0.7.0",
- "netlink-packet-utils",
+ "netlink-packet-core",
  "smallvec",
-]
-
-[[package]]
-name = "netlink-packet-utils"
-version = "0.5.2"
-dependencies = [
- "anyhow",
- "byteorder",
- "pastey",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "netlink-sys"
-version = "0.8.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd6c30ed10fa69cc491d491b85cc971f6bdeb8e7367b7cde2ee6cc878d583fae"
-dependencies = [
- "bytes",
- "libc",
- "log",
+ "zerocopy",
 ]
 
 [[package]]
@@ -2217,20 +2118,17 @@ dependencies = [
 
 [[package]]
 name = "netsock"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744b22a1c844d6af5b27a96120fdff8b6b60b09544363d75c6d6d28baf6f8409"
+checksum = "0c10c05f32d89b6926e90f0723189c26aef93827622e98195179feb98778415b"
 dependencies = [
  "bitflags 2.13.2",
- "libproc",
- "log",
- "netlink-packet-core 0.7.0",
+ "cc",
+ "libc",
+ "netlink-packet-core",
  "netlink-packet-sock-diag",
- "netlink-packet-utils",
- "netlink-sys 0.8.8",
- "num-derive",
- "num-traits",
- "thiserror 2.0.21",
+ "netlink-sys",
+ "thiserror",
  "windows-sys 0.61.2",
 ]
 
@@ -2342,17 +2240,6 @@ name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
-
-[[package]]
-name = "num-derive"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "num-integer"
@@ -2470,12 +2357,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pastey"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
-
-[[package]]
 name = "pathchord-cli"
 version = "0.1.0"
 dependencies = [
@@ -2492,7 +2373,7 @@ dependencies = [
  "pathchord-policy",
  "pathchord-transit",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "url",
  "zeroize",
@@ -2505,7 +2386,7 @@ dependencies = [
  "noyalib-serde-yaml",
  "pathchord-policy",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
 ]
 
@@ -2524,7 +2405,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "subtle",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "url",
  "widestring",
@@ -2539,7 +2420,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -2554,7 +2435,7 @@ dependencies = [
  "pathchord-path",
  "rusqlite",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
 ]
 
@@ -2573,7 +2454,7 @@ dependencies = [
  "pathchord-path",
  "pathchord-policy",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "zeroize",
 ]
@@ -2612,7 +2493,7 @@ dependencies = [
  "smoltcp",
  "socket2",
  "subtle",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tun-rs",
  "url",
@@ -2634,7 +2515,7 @@ dependencies = [
  "pathchord-noise",
  "pathchord-policy",
  "pathchord-transit",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "zeroize",
 ]
@@ -2646,7 +2527,7 @@ dependencies = [
  "clatter",
  "orion",
  "pathchord-core",
- "thiserror 2.0.21",
+ "thiserror",
  "zeroize",
 ]
 
@@ -2659,7 +2540,7 @@ dependencies = [
  "pathchord-core",
  "pathchord-egress",
  "pathchord-noise",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
 ]
 
@@ -2674,7 +2555,7 @@ dependencies = [
  "prost",
  "regex",
  "serde",
- "thiserror 2.0.21",
+ "thiserror",
  "url",
 ]
 
@@ -2718,7 +2599,7 @@ dependencies = [
  "sha3 0.12.0",
  "shadowsocks",
  "shake",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -2743,7 +2624,7 @@ dependencies = [
  "pathchord-core",
  "pathchord-noise",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "zeroize",
 ]
@@ -2955,7 +2836,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tracing",
  "web-time",
@@ -2976,7 +2857,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.21",
+ "thiserror",
  "tinyvec",
  "tracing",
  "web-time",
@@ -3175,9 +3056,9 @@ checksum = "694798681cd69a10928204225a680ad9416b081d9e9f8718d7a61e2d134da323"
 dependencies = [
  "flume",
  "libc",
- "netlink-packet-core 0.9.0",
+ "netlink-packet-core",
  "netlink-packet-route",
- "netlink-sys 0.9.0",
+ "netlink-sys",
  "windows-sys 0.61.2",
 ]
 
@@ -3554,7 +3435,7 @@ dependencies = [
  "shadowsocks-crypto",
  "socket2",
  "spin 0.12.3",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tokio-tfo",
  "trait-variant",
@@ -3600,12 +3481,6 @@ dependencies = [
  "keccak 0.2.2",
  "sponge-cursor",
 ]
-
-[[package]]
-name = "shlex"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shlex"
@@ -3811,31 +3686,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.21",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -4130,7 +3985,7 @@ dependencies = [
  "getifaddrs",
  "ipnet",
  "libc",
- "libloading 0.9.0",
+ "libloading",
  "log",
  "nix 0.31.4",
  "route_manager",
@@ -4154,7 +4009,7 @@ dependencies = [
  "log",
  "rand",
  "sha1",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -4669,7 +4524,7 @@ dependencies = [
  "oid-registry",
  "ring",
  "rusticata-macros",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
 ]
 

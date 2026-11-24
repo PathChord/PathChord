@@ -1,6 +1,5 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["vendor/netlink-packet-utils"]
 resolver = "3"
 
 [patch.crates-io]
@@ -10,9 +9,6 @@ rustls = { path = "vendor/rustls" }
 # Hysteria2 Brutal needs per-packet pacing and loss notifications.
 # See vendor/quinn-proto/PATHCHORD-PATCH.md for the patch and scope.
 quinn-proto = { path = "vendor/quinn-proto" }
-# netsock's Netlink dependencies require the 0.5 API. Keep its source intact
-# while replacing the unmaintained paste macro dependency with pastey.
-netlink-packet-utils = { path = "vendor/netlink-packet-utils" }
 
 [workspace.package]
 version = "0.1.0"
@@ -42,7 +38,7 @@ hyper = { version = "1.12.0", default-features = false, features = ["client", "s
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 interprocess = { version = "2.4.8", default-features = false, features = ["tokio"] }
 nix = { version = "0.32.0", default-features = false, features = ["net", "socket", "uio"] }
-netsock = "0.8.0"
+netsock = "0.9.0"
 orion = { version = "0.18.1", default-features = false, features = ["zeroize"] }
 proptest = "1.12.0"
 prost = "0.14.4"
