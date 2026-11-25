@@ -467,6 +467,46 @@ mod tests {
     }
 
     #[test]
+    fn stage_records_distinguish_flow_control_and_write_timeout() {
+        let history = DiagnosticHistory::new(DiagnosticRole::Ingress).unwrap();
+        let ids = path_ids();
+        history.record_stage(
+            ids.clone(),
+            DiagnosticStage::FlowControl,
+            DiagnosticOutcome::Timeout,
+            Some(DiagnosticReason::WindowExhausted),
+            Some(100),
+        );
+        history.record(
+            ids,
+            DiagnosticDetail::PathTermination {
+                state: PathState::Failed,
+                reason: PathTerminationReason::WriteTimeout,
+                write_elapsed_ms: Some(1000),
+                heartbeat_age_ms: Some(3000),
+            },
+        );
+        let snapshot = history.snapshot();
+        assert_eq!(snapshot.records.len(), 2);
+        assert!(matches!(
+            snapshot.records[0].detail,
+            DiagnosticDetail::Stage {
+                stage: DiagnosticStage::FlowControl,
+                reason: Some(DiagnosticReason::WindowExhausted),
+                ..
+            }
+        ));
+        assert!(matches!(
+            snapshot.records[1].detail,
+            DiagnosticDetail::PathTermination {
+                reason: PathTerminationReason::WriteTimeout,
+                ..
+            }
+        ));
+        assert_ne!(snapshot.process_instance, [0; 16]);
+    }
+
+    #[test]
     fn shared_ids_correlate_independent_role_timelines() {
         let ingress = DiagnosticHistory::new(DiagnosticRole::Ingress).unwrap();
         let egress = DiagnosticHistory::new(DiagnosticRole::Egress).unwrap();
