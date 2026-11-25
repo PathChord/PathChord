@@ -959,6 +959,22 @@ impl NodeObservations {
     fn observe_target_attempt(&self, request: &TargetRequest) {
         self.target_open_attempts.fetch_add(1, Ordering::Relaxed);
         self.set_target_observation(request, "target_connect", "pending", None);
+        if let Some(history) = &self.diagnostics {
+            history.record_stage(
+                pathchord_path::diagnostics::DiagnosticIds {
+                    egress_id: None,
+                    session_id: None,
+                    path_id: None,
+                    stream_id: None,
+                    transit_proxy_id: None,
+                    attempt_id: None,
+                },
+                pathchord_path::diagnostics::DiagnosticStage::Target,
+                pathchord_path::diagnostics::DiagnosticOutcome::Success,
+                None,
+                None,
+            );
+        }
     }
 
     fn observe_target_success(&self, request: &TargetRequest) {
@@ -968,6 +984,22 @@ impl NodeObservations {
 
     fn observe_target_failure(&self, request: &TargetRequest, error: &TargetConnectError) {
         self.target_open_failures.fetch_add(1, Ordering::Relaxed);
+        if let Some(history) = &self.diagnostics {
+            history.record_stage(
+                pathchord_path::diagnostics::DiagnosticIds {
+                    egress_id: None,
+                    session_id: None,
+                    path_id: None,
+                    stream_id: None,
+                    transit_proxy_id: None,
+                    attempt_id: None,
+                },
+                pathchord_path::diagnostics::DiagnosticStage::Target,
+                pathchord_path::diagnostics::DiagnosticOutcome::Failure,
+                Some(pathchord_path::diagnostics::DiagnosticReason::Io),
+                None,
+            );
+        }
         self.set_target_observation(
             request,
             "target_connect",

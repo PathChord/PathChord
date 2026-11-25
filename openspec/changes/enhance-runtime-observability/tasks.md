@@ -8,10 +8,10 @@
 
 ## 2. Runtime coverage
 
-- [ ] 2.1 Instrument listener acceptance and platform failures, policy and fallback decisions, and DNS route, cache and resolution outcomes. Verify a rejected CONNECT can be attributed to its local decision and configuration generation.
-- [ ] 2.2 Instrument config activation, authorization decisions, subscription refresh and cache handling, adapter preparation, Transit dial and handshake, Noise and attachment, and retry backoff. Verify a failure before admission still has a queryable attempt and stage.
-- [ ] 2.3 Instrument Path selection, eligibility and freshness, directional scheduling and retransmission, queue and window pressure, and pool recovery. Verify requested, effective and actual Path counts are independently observable and a retransmission can be attributed to its chosen Path.
-- [ ] 2.4 Instrument TCP and UDP Stream and target setup, directional progress, half-close, reset, expiry, resource rejection and supervisor failures. Verify target stalls and capacity limits have distinct reasons and stable resource correlation.
+- [x] 2.1 Instrument listener acceptance and platform failures, policy and fallback decisions, and DNS route, cache and resolution outcomes. Verify a rejected CONNECT can be attributed to its local decision and configuration generation.
+- [x] 2.2 Instrument config activation, authorization decisions, subscription refresh and cache handling, adapter preparation, Transit dial and handshake, Noise and attachment, and retry backoff. Verify a failure before admission still has a queryable attempt and stage.
+- [x] 2.3 Instrument Path selection, eligibility and freshness, directional scheduling and retransmission, queue and window pressure, and pool recovery. Verify requested, effective and actual Path counts are independently observable and a retransmission can be attributed to its chosen Path.
+- [x] 2.4 Instrument TCP and UDP Stream and target setup, directional progress, half-close, reset, expiry, resource rejection and supervisor failures. Verify target stalls and capacity limits have distinct reasons and stable resource correlation.
 
 ## 3. Operator access
 
