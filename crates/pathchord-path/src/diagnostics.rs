@@ -438,6 +438,34 @@ mod tests {
         assert_eq!(expired.path_terminations[0].1, HISTORY_LIMIT as u64 + 2);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn bounded_capture_expires_and_reports_drops() {
+        let history = DiagnosticHistory::new(DiagnosticRole::Ingress).unwrap();
+        assert!(history.start_capture(Duration::from_secs(2), 1));
+        let ids = path_ids();
+        history.record_stage(
+            ids.clone(),
+            DiagnosticStage::Scheduling,
+            DiagnosticOutcome::Success,
+            None,
+            Some(1),
+        );
+        history.record_stage(
+            ids,
+            DiagnosticStage::FlowControl,
+            DiagnosticOutcome::Timeout,
+            Some(DiagnosticReason::WindowExhausted),
+            Some(2),
+        );
+        let active = history.capture_status();
+        assert!(active.active);
+        assert_eq!(active.records.len(), 1);
+        assert_eq!(active.dropped, 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!history.capture_status().active);
+        assert_eq!(history.stop_capture().records.len(), 1);
+    }
+
     #[test]
     fn shared_ids_correlate_independent_role_timelines() {
         let ingress = DiagnosticHistory::new(DiagnosticRole::Ingress).unwrap();
