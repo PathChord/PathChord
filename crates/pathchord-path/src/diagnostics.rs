@@ -108,6 +108,24 @@ pub struct DiagnosticHistory {
     history: Mutex<History>,
     producer_drops: AtomicU64,
     path_terminations: [AtomicU64; PathTerminationReason::ALL.len()],
+    capture: Mutex<CaptureState>,
+}
+
+#[derive(Default)]
+struct CaptureState {
+    active: bool,
+    expires_at: Option<Instant>,
+    records: VecDeque<DiagnosticRecord>,
+    dropped: u64,
+    max_records: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureStatus {
+    pub active: bool,
+    pub expires_at_unix_ms: Option<u64>,
+    pub records: Vec<DiagnosticRecord>,
+    pub dropped: u64,
 }
 
 #[derive(Default)]
@@ -169,6 +187,20 @@ impl DiagnosticSnapshot {
             "expired": self.expired,
             "evicted": self.evicted,
             "producer_drops": self.producer_drops,
+            "records": self.records.iter().map(|record| serde_json::json!({
+                "sequence": record.cursor.sequence,
+                "observed_at_unix_ms": unix_ms(record.observed_at),
+                "role": record.role.as_str(),
+                "ids": {
+                    "egress_id": record.ids.egress_id,
+                    "session_id": record.ids.session_id.map(|id| id.to_string()),
+                    "path_id": record.ids.path_id.map(|id| id.to_string()),
+                    "stream_id": record.ids.stream_id.map(|id| id.to_string()),
+                    "transit_proxy_id": record.ids.transit_proxy_id,
+                    "attempt_id": record.ids.attempt_id,
+                },
+                "detail": format!("{:?}", record.detail),
+            })).collect::<Vec<_>>(),
         })
     }
 }
@@ -203,7 +235,78 @@ impl DiagnosticHistory {
             history: Mutex::new(History::default()),
             producer_drops: AtomicU64::new(0),
             path_terminations: Default::default(),
+            capture: Mutex::new(CaptureState::default()),
         })
+    }
+
+    pub fn record_stage(
+        &self,
+        ids: DiagnosticIds,
+        stage: DiagnosticStage,
+        outcome: DiagnosticOutcome,
+        reason: Option<DiagnosticReason>,
+        elapsed_ms: Option<u64>,
+    ) {
+        self.record(
+            ids,
+            DiagnosticDetail::Stage {
+                stage,
+                outcome,
+                reason,
+                elapsed_ms,
+            },
+        );
+    }
+
+    pub fn start_capture(&self, duration: Duration, max_records: usize) -> bool {
+        let Ok(mut capture) = self.capture.lock() else {
+            return false;
+        };
+        if capture.active {
+            return false;
+        }
+        capture.active = true;
+        capture.expires_at = Instant::now().checked_add(duration);
+        capture.records.clear();
+        capture.dropped = 0;
+        capture.max_records = max_records.max(1);
+        true
+    }
+
+    pub fn stop_capture(&self) -> CaptureStatus {
+        let mut capture = self
+            .capture
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        capture.active = false;
+        CaptureStatus {
+            active: false,
+            expires_at_unix_ms: None,
+            records: capture.records.iter().cloned().collect(),
+            dropped: capture.dropped,
+        }
+    }
+
+    pub fn capture_status(&self) -> CaptureStatus {
+        let mut capture = self
+            .capture
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if capture.active
+            && capture
+                .expires_at
+                .is_some_and(|expires| Instant::now() >= expires)
+        {
+            capture.active = false;
+        }
+        CaptureStatus {
+            active: capture.active,
+            expires_at_unix_ms: capture
+                .expires_at
+                .map(|_| unix_ms(SystemTime::now()).unwrap_or(0)),
+            records: capture.records.iter().cloned().collect(),
+            dropped: capture.dropped,
+        }
     }
 
     pub fn record(&self, ids: DiagnosticIds, detail: DiagnosticDetail) {
@@ -215,6 +318,28 @@ impl DiagnosticHistory {
             return;
         };
         let now = Instant::now();
+        if let Ok(mut capture) = self.capture.lock() {
+            if capture.active && capture.expires_at.is_some_and(|expires| now >= expires) {
+                capture.active = false;
+            }
+            if capture.active {
+                let record = DiagnosticRecord {
+                    cursor: DiagnosticCursor {
+                        process_instance: self.process_instance,
+                        sequence: history.next_sequence.saturating_add(1),
+                    },
+                    role: self.role,
+                    observed_at: SystemTime::now(),
+                    ids: ids.clone(),
+                    detail: detail.clone(),
+                };
+                if capture.records.len() >= capture.max_records {
+                    capture.dropped = capture.dropped.saturating_add(1);
+                } else {
+                    capture.records.push_back(record);
+                }
+            }
+        }
         history.expire(now);
         if history.records.len() == HISTORY_LIMIT {
             history.records.pop_front();

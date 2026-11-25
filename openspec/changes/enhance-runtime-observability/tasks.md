@@ -16,7 +16,7 @@
 ## 3. Operator access
 
 - [x] 3.1 Add role-local management queries and CLI help, filtering, pagination and structured output. Verify equivalent query and redaction behavior through local control and authorized Web Gateway reads.
-- [ ] 3.2 Add scoped capture start, read and stop operations with authorization, audit, generation and idempotency handling. Verify duration and budget enforcement, expiry and restart, and denied changes from read-only actors.
+- [x] 3.2 Add scoped capture start, read and stop operations with authorization, audit, generation and idempotency handling. Verify duration and budget enforcement, expiry and restart, and denied changes from read-only actors.
 - [x] 3.3 Connect existing event replay and Prometheus adapters. Verify ordered terminal updates, replay gaps, counter monotonicity across eviction, histogram units and buckets, and bounded label cardinality under high resource churn.
 - [x] 3.4 Inspect outputs from both roles for blocked secret fields, target-detail authorization, and raw errors. Measure baseline and capture overhead under load and verify forwarding continues during collector backpressure.
 - [x] 3.5 Add versioned diagnostic export and coverage metadata. Check an empty filtered result, partial retention, process restart, byte-limit truncation, redaction, and offline correlation across roles.
