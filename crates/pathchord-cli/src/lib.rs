@@ -904,7 +904,7 @@ async fn run_ingress(socket: Option<PathBuf>, args: IngressArgs) -> Result<(), C
     };
     // Give startup one bounded opportunity to establish a catch-all Path.
     // Maintenance continues after listeners start even if this node stalls.
-    let _ = tokio::time::timeout(Duration::from_secs(1), data_plane.warmup()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), data_plane.bootstrap_paths()).await;
     let protected_endpoints = ProtectedEndpointSet::default();
     protected_endpoints.replace(
         collect_protected_endpoints(

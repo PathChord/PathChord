@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -39,6 +40,36 @@ impl pathchord_transit::TransitAdapter for StalledTransit {
         _: pathchord_transit::ConnectRequest,
     ) -> Result<pathchord_transit::BoxedTransitConnection, pathchord_transit::TransitError> {
         std::future::pending().await
+    }
+}
+
+struct ConcurrentTransit {
+    inner: pathchord_transit::DirectTransitAdapter,
+    egress_address: std::net::SocketAddr,
+    successful_dials: AtomicUsize,
+    refill_barrier: tokio::sync::Barrier,
+}
+
+#[async_trait::async_trait]
+impl pathchord_transit::TransitAdapter for ConcurrentTransit {
+    fn metadata(&self) -> &pathchord_transit::TransitMetadata {
+        self.inner.metadata()
+    }
+
+    fn supports_udp(&self) -> bool {
+        self.inner.supports_udp()
+    }
+
+    async fn connect(
+        &self,
+        request: pathchord_transit::ConnectRequest,
+    ) -> Result<pathchord_transit::BoxedTransitConnection, pathchord_transit::TransitError> {
+        if request.destination.port == self.egress_address.port()
+            && self.successful_dials.fetch_add(1, Ordering::Relaxed) > 0
+        {
+            self.refill_barrier.wait().await;
+        }
+        self.inner.connect(request).await
     }
 }
 
@@ -307,7 +338,7 @@ async fn retiring_a_replaced_transit_path_prevents_new_streams_from_using_it() {
         );
         plane.warmup().await;
         plane.warmup().await;
-        assert_eq!(plane.snapshot().await.ready_paths, 2);
+        assert_eq!(plane.snapshot().await.ready_paths, 3);
         let old_path = plane.session_snapshots().await[0]
             .path_transit
             .keys()
@@ -534,11 +565,36 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str, target_
         ))
         .expect("Ingress data plane"),
     );
+    if target_paths == 4 {
+        let id = TransitProxyId::in_namespace(namespace, "direct-a");
+        data_plane
+            .register_transit_adapter(
+                id.clone(),
+                Arc::new(ConcurrentTransit {
+                    inner: pathchord_transit::DirectTransitAdapter::new(
+                        id.as_str(),
+                        std::time::Duration::from_secs(2),
+                    ),
+                    egress_address,
+                    successful_dials: AtomicUsize::new(0),
+                    refill_barrier: tokio::sync::Barrier::new(target_paths as usize),
+                }),
+                pathchord_policy::TransitProxyRuntimeStatus {
+                    state: pathchord_policy::RuntimeNodeState::Ready,
+                    capabilities: BTreeSet::from([FlowProtocol::Tcp, FlowProtocol::Udp]),
+                    selection_score: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let expected_paths = target_paths as usize + 1;
     let result = tokio::time::timeout(std::time::Duration::from_secs(55), async {
         loop {
             data_plane.warmup().await;
-            if data_plane.snapshot().await.ready_paths == target_paths as usize
-                && egress.snapshot().unwrap().active_paths == target_paths as usize
+            if data_plane.snapshot().await.ready_paths == expected_paths
+                && egress.snapshot().unwrap().active_paths == expected_paths
             {
                 break;
             }
@@ -558,17 +614,14 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str, target_
             egress.snapshot().unwrap()
         );
     }
+    // New Paths can attach before the Egress actor's first status tick.
+    // Business admission requires fresh status on the configured minimum.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     if target_paths > 100 {
         // Observe several heartbeat periods before sending business traffic.
         tokio::time::sleep(std::time::Duration::from_secs(7)).await;
-        assert_eq!(
-            data_plane.snapshot().await.ready_paths,
-            target_paths as usize
-        );
-        assert_eq!(
-            egress.snapshot().unwrap().active_paths,
-            target_paths as usize
-        );
+        assert_eq!(data_plane.snapshot().await.ready_paths, expected_paths);
+        assert_eq!(egress.snapshot().unwrap().active_paths, expected_paths);
     }
     let session_snapshot = data_plane
         .session_snapshots()
@@ -708,7 +761,11 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str, target_
         );
     }
 
-    assert!(response.starts_with(b"HTTP/1.1 200"));
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
 
     let payload = b"real-pathchord-data-plane";
     client.write_all(payload).await.expect("payload send");

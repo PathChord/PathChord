@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use pathchord_core::{PathId, ProtocolLimits, SessionId, TargetEndpoint as WireTargetEndpoint};
 use pathchord_noise::{STATIC_KEY_LEN, StaticKeypair, WIRE_PROFILE_V1_PROLOGUE_PREFIX};
 use pathchord_path::diagnostics::{
@@ -316,10 +317,6 @@ impl SessionSlot {
             + BASELINE_RETRY_BASE
                 .saturating_mul(multiplier)
                 .min(BASELINE_RETRY_MAX);
-    }
-
-    async fn defer_baseline_attempt(&self) {
-        self.finish_baseline_attempt(false).await;
     }
 
     async fn reset_baseline_retry(&self) {
@@ -1478,8 +1475,12 @@ impl IngressDataPlane {
     /// Establishes the configured Egress Path pool without synthesizing a
     /// business flow. Every Egress owns one common Transit binding and one
     /// minimum; route matches only decide which already-owned Session is used.
-    pub async fn warmup(&self) {
+    pub async fn bootstrap_paths(&self) {
         let _configuration = self.configuration_gate.read().await;
+        self.bootstrap_paths_inner().await;
+    }
+
+    async fn bootstrap_paths_inner(&self) {
         let sessions: Vec<_> = self
             .sessions
             .iter()
@@ -1492,56 +1493,35 @@ impl IngressDataPlane {
                 eligible.clear();
                 eligible.extend(candidates.iter().cloned());
             }
-            let session = slot.session.lock().await.clone();
-            let max_paths = slot.autoscaler.lock().await.config().max_paths;
-            let requested = configured_path_baseline(&slot.egress);
-            let effective = requested.min(max_paths as u64) as usize;
-            let session_snapshot = session.as_ref().map(|current| current.snapshot());
-            let usable_paths = session_snapshot.as_ref().map_or(0, usable_path_count);
-            let admission_blocked = session_snapshot
+            if slot
+                .session
+                .lock()
+                .await
                 .as_ref()
-                .and_then(|snapshot| snapshot.egress_status.as_ref())
-                .is_some_and(|status| status.fresh && !status.report.admission_allowed);
+                .is_some_and(|session| !session.snapshot().closed)
+                || !slot.baseline_attempt_due().await
             {
-                let mut target = slot.path_target.lock().await;
-                target.requested = requested;
-                target.effective = effective;
-                target.current = effective;
+                continue;
             }
-            let deficit = effective.saturating_sub(usable_paths);
-            if deficit > 0
-                && !admission_blocked
-                && !candidates.is_empty()
-                && session_snapshot
-                    .as_ref()
-                    .is_none_or(|snapshot| snapshot.closed || snapshot.ready_paths < max_paths)
-                && slot.baseline_attempt_due().await
-            {
-                let index = slot
-                    .warmup_cursor
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    % candidates.len();
-                let transit = &candidates[index].0;
-                let result = if session_snapshot
-                    .as_ref()
-                    .is_none_or(|snapshot| snapshot.closed)
-                {
-                    self.ensure_session_path(
-                        &egress_id,
-                        transit,
-                        false,
-                        BACKGROUND_PATH_CONNECT_TIMEOUT.min(self.path_connect_timeout),
-                    )
-                    .await
-                    .map(|_| ())
-                } else {
-                    self.add_session_path(&egress_id, transit).await.map(|_| ())
-                };
-                slot.finish_baseline_attempt(result.is_ok()).await;
-            } else if deficit > 0 && candidates.is_empty() {
-                slot.defer_baseline_attempt().await;
+            if candidates.is_empty() {
+                slot.finish_baseline_attempt(false).await;
+                continue;
             }
+            let index = slot.warmup_cursor.fetch_add(1, Ordering::Relaxed) % candidates.len();
+            let result = self
+                .ensure_session_path(
+                    &egress_id,
+                    &candidates[index].0,
+                    BACKGROUND_PATH_CONNECT_TIMEOUT.min(self.path_connect_timeout),
+                )
+                .await;
+            slot.finish_baseline_attempt(result.is_ok()).await;
         }
+    }
+
+    pub async fn warmup(&self) {
+        let _configuration = self.configuration_gate.read().await;
+        self.bootstrap_paths_inner().await;
         // Existing Sessions still receive their low-frequency aggregate demand
         // sample and autoscaling decision after the unconditional bootstrap.
         for (egress_id, slot) in &self.sessions {
@@ -1809,62 +1789,20 @@ impl IngressDataPlane {
                 }
             }
         }
-        // A failed Path is a transport event, not a capacity sample. Replace
-        // the deficit on the next maintenance tick without waiting for the
-        // autoscaler's hysteresis window; this keeps an admitted Stream on a
-        // surviving Path while a fresh connection is established.
-        let current = slot.transit_paths.lock().await.clone();
-        let max_paths = slot.autoscaler.lock().await.config().max_paths;
         let minimum = configured_minimum_paths(&slot.egress);
-        let requested = configured_path_baseline(&slot.egress);
-        let effective = requested.min(max_paths as u64) as usize;
+        let effective = slot.path_target.lock().await.effective;
         let target = input.target_path_count.unwrap_or(effective).max(effective);
-        if session.is_some()
-            && input.hard_available
-            && input.admission_allowed
-            && input.ready_paths < effective
-            && slot.baseline_attempt_due().await
-        {
-            let deficit = effective.saturating_sub(input.ready_paths);
-            let eligible = slot.eligible_transits.lock().await.clone();
-            let available: BTreeMap<_, _> = self
-                .transit_adapters
-                .read()
-                .await
-                .keys()
-                .filter(|id| eligible.contains_key(*id))
-                .map(|id| (id.clone(), eligible[id]))
-                .collect();
-            let start = slot
-                .warmup_cursor
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut added = 0_usize;
-            let candidates = plan_transit_candidates(&available, &current, 1, start);
-            let attempted = !candidates.is_empty();
-            for transit_id in candidates {
-                if self.add_session_path(egress_id, &transit_id).await.is_ok() {
-                    added = added.saturating_add(1);
-                    if added >= deficit {
-                        break;
-                    }
-                }
-            }
-            if added > 0 {
-                slot.finish_baseline_attempt(true).await;
-                self.mark_egress(
-                    egress_id,
-                    RuntimeNodeState::Ready,
-                    session.as_ref().map_or(added as u32, |current| {
-                        current.snapshot().ready_paths as u32
-                    }),
-                )
-                .await;
-                return Ok(AutoscaleDecision::Add { count: added });
-            } else if attempted {
-                slot.finish_baseline_attempt(false).await;
+        let deficit = target.saturating_sub(input.ready_paths);
+        let below_overhead = input
+            .incremental_capacity_bps
+            .is_some_and(|capacity| capacity < input.scheduling_overhead_bps);
+        if deficit > 0 && input.hard_available && input.admission_allowed && !below_overhead {
+            let added = self.refill_session_paths(slot, target).await;
+            return Ok(if added == 0 {
+                AutoscaleDecision::Hold
             } else {
-                slot.defer_baseline_attempt().await;
-            }
+                AutoscaleDecision::Add { count: added }
+            });
         }
         {
             let mut last = slot.last_autoscale_decision.lock().await;
@@ -1876,33 +1814,14 @@ impl IngressDataPlane {
         let decision = slot.autoscaler.lock().await.evaluate(input, now_ms);
         match decision {
             AutoscaleDecision::Add { count } => {
-                let eligible = slot.eligible_transits.lock().await.clone();
-                let available: BTreeMap<_, _> = self
-                    .transit_adapters
-                    .read()
-                    .await
-                    .keys()
-                    .filter(|id| eligible.contains_key(*id))
-                    .map(|id| (id.clone(), eligible[id]))
-                    .collect();
-                let current = slot.transit_paths.lock().await.clone();
-                let start = slot
-                    .warmup_cursor
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut added = 0_usize;
-                let slots_used = session
-                    .as_ref()
-                    .map_or(0, |current| current.snapshot().ready_paths);
-                if slots_used < max_paths {
-                    for transit_id in plan_transit_candidates(&available, &current, 1, start) {
-                        if self.add_session_path(egress_id, &transit_id).await.is_ok() {
-                            added = added.saturating_add(1);
-                            if added >= count {
-                                break;
-                            }
-                        }
-                    }
-                }
+                let added = self
+                    .refill_session_paths(slot, input.ready_paths.saturating_add(count))
+                    .await;
+                return Ok(if added == 0 {
+                    AutoscaleDecision::Hold
+                } else {
+                    AutoscaleDecision::Add { count: added }
+                });
             }
             AutoscaleDecision::Drain { count } => {
                 if let Some(session) = session {
@@ -2566,7 +2485,7 @@ impl IngressDataPlane {
         egress_id: &EgressId,
         transit_id: &TransitProxyId,
     ) -> Result<Arc<IngressSessionHandle>, DataPlaneError> {
-        self.ensure_session_path(egress_id, transit_id, false, self.path_connect_timeout)
+        self.ensure_session_path(egress_id, transit_id, self.path_connect_timeout)
             .await
             .map(|(session, _)| session)
     }
@@ -2575,7 +2494,6 @@ impl IngressDataPlane {
         &self,
         egress_id: &EgressId,
         transit_id: &TransitProxyId,
-        force_new: bool,
         dial_timeout: Duration,
     ) -> Result<(Arc<IngressSessionHandle>, PathId), DataPlaneError> {
         if egress_id.namespace() != transit_id.namespace() {
@@ -2660,8 +2578,13 @@ impl IngressDataPlane {
             });
             drop(transit_paths);
             drop(draining);
-            if !force_new && let Some(path_id) = ready_path {
+            if let Some(path_id) = ready_path {
                 return Ok((Arc::clone(session), path_id));
+            }
+            if live_path_count(&session_snapshot) >= DEFAULT_MAX_SESSION_PATHS {
+                return Err(
+                    SessionRuntimeError::from(pathchord_path::MultipathError::PathLimit).into(),
+                );
             }
             let path_id = PathId::new(random_u128()?);
             let (path, attribution) = self
@@ -2673,36 +2596,8 @@ impl IngressDataPlane {
                     dial_timeout,
                 )
                 .await?;
-            let weight = slot
-                .eligible_transits
-                .lock()
-                .await
-                .get(transit_id)
-                .copied()
-                .unwrap_or(10_000)
-                .clamp(1, 10_000) as u16;
-            session
-                .add_path_observed(
-                    path,
-                    MultipathPathObservation {
-                        weight_basis_points: weight,
-                        ..MultipathPathObservation::default()
-                    },
-                    Some(attribution),
-                )
+            self.attach_session_path(slot, session, transit_id, path, attribution)
                 .await?;
-            slot.transit_paths
-                .lock()
-                .await
-                .entry(transit_id.clone())
-                .or_default()
-                .insert(path_id);
-            self.mark_egress(
-                egress_id,
-                RuntimeNodeState::Ready,
-                session.snapshot().ready_paths as u32,
-            )
-            .await;
             return Ok((Arc::clone(session), path_id));
         }
         slot.session.lock().await.take();
@@ -2717,7 +2612,6 @@ impl IngressDataPlane {
             effective,
             current: effective,
         };
-        slot.reset_baseline_retry().await;
         *slot.replication_budget_bytes.lock().await = None;
         *slot.session_policy.lock().await = None;
         let _ = self.session_multipath_config(slot).await;
@@ -2731,6 +2625,7 @@ impl IngressDataPlane {
         let (path, attribution) = self
             .dial_session_path(slot, transit_id, session_id, path_id, dial_timeout)
             .await?;
+        let endpoint = attribution.egress_endpoint_index;
         let session = Arc::new(IngressSessionHandle::start_observed(
             path,
             Some(SessionDiagnostics {
@@ -2760,25 +2655,117 @@ impl IngressDataPlane {
         transit_paths.clear();
         transit_paths.insert(transit_id.clone(), BTreeSet::from([path_id]));
         drop(transit_paths);
+        if let Some(endpoint) = endpoint {
+            slot.record_path_endpoint(path_id, endpoint).await;
+        }
+        slot.reset_baseline_retry().await;
         *slot.session.lock().await = Some(Arc::clone(&session));
         self.mark_egress(egress_id, RuntimeNodeState::Ready, 1)
             .await;
         Ok((session, path_id))
     }
 
-    async fn add_session_path(
+    async fn refill_session_paths(&self, slot: &SessionSlot, target: usize) -> usize {
+        let _dial = slot.dial_gate.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) || !slot.baseline_attempt_due().await {
+            return 0;
+        }
+        let Some(session) = slot.session.lock().await.clone() else {
+            return 0;
+        };
+        let snapshot = session.snapshot();
+        if snapshot.closed
+            || snapshot
+                .egress_status
+                .as_ref()
+                .is_some_and(|status| !status.fresh || !status.report.admission_allowed)
+        {
+            return 0;
+        }
+        let deficit = target.saturating_sub(usable_path_count(&snapshot));
+        let slots = DEFAULT_MAX_SESSION_PATHS.saturating_sub(live_path_count(&snapshot));
+        let count = refill_attempts(deficit, slots);
+        if count == 0 {
+            return 0;
+        }
+
+        let eligible = self
+            .eligible_transits_for_egress(&slot.egress)
+            .await
+            .into_iter()
+            .collect();
+        let current = slot.transit_paths.lock().await;
+        let start = slot.warmup_cursor.fetch_add(1, Ordering::Relaxed);
+        let candidates = plan_transit_candidates(&eligible, &current, count, start);
+        drop(current);
+        let dial_timeout = BACKGROUND_PATH_CONNECT_TIMEOUT.min(self.path_connect_timeout);
+        let session_id = snapshot.session_id;
+        let session = &*session;
+        let mut pending: FuturesUnordered<_> = candidates
+            .iter()
+            .map(|transit| async move {
+                let path_id = PathId::new(random_u128()?);
+                let (path, attribution) = self
+                    .dial_session_path(slot, transit, session_id, path_id, dial_timeout)
+                    .await?;
+                self.attach_session_path(slot, session, transit, path, attribution)
+                    .await
+            })
+            .collect();
+        let mut added = 0;
+        while let Some(result) = pending.next().await {
+            if result.is_ok() {
+                added += 1;
+            }
+        }
+        slot.finish_baseline_attempt(added > 0).await;
+        added
+    }
+
+    async fn attach_session_path(
         &self,
-        egress_id: &EgressId,
-        transit_id: &TransitProxyId,
-    ) -> Result<PathId, DataPlaneError> {
-        self.ensure_session_path(
-            egress_id,
-            transit_id,
-            true,
-            BACKGROUND_PATH_CONNECT_TIMEOUT.min(self.path_connect_timeout),
+        slot: &SessionSlot,
+        session: &IngressSessionHandle,
+        transit: &TransitProxyId,
+        path: pathchord_path::IngressAdmittedPath<pathchord_transit::BoxedTransitConnection>,
+        attribution: PathAttribution,
+    ) -> Result<(), DataPlaneError> {
+        let path_id = path.path_id();
+        let endpoint = attribution.egress_endpoint_index;
+        let weight = slot
+            .eligible_transits
+            .lock()
+            .await
+            .get(transit)
+            .copied()
+            .unwrap_or(10_000)
+            .clamp(1, 10_000) as u16;
+        session
+            .add_path_observed(
+                path,
+                MultipathPathObservation {
+                    weight_basis_points: weight,
+                    ..MultipathPathObservation::default()
+                },
+                Some(attribution),
+            )
+            .await?;
+        slot.transit_paths
+            .lock()
+            .await
+            .entry(transit.clone())
+            .or_default()
+            .insert(path_id);
+        if let Some(endpoint) = endpoint {
+            slot.record_path_endpoint(path_id, endpoint).await;
+        }
+        self.mark_egress(
+            &slot.egress.id,
+            RuntimeNodeState::Ready,
+            session.snapshot().ready_paths as u32,
         )
-        .await
-        .map(|(_, path_id)| path_id)
+        .await;
+        Ok(())
     }
 
     async fn dial_session_path(
@@ -2924,7 +2911,6 @@ impl IngressDataPlane {
                 PathAdmissionOutcome::Ready(path) => {
                     observe("path_admission", "success", started);
                     slot.record_endpoint_attempt(endpoint_index, true).await;
-                    slot.record_path_endpoint(path_id, endpoint_index).await;
                     return Ok((path, attribution));
                 }
                 PathAdmissionOutcome::Rejected { .. } => {
@@ -3258,6 +3244,29 @@ fn usable_path_count(snapshot: &SessionSnapshot) -> usize {
             )
         })
         .count()
+}
+
+fn live_path_count(snapshot: &SessionSnapshot) -> usize {
+    snapshot
+        .path_states
+        .values()
+        .filter(|state| {
+            matches!(
+                state,
+                pathchord_core::PathState::Active
+                    | pathchord_core::PathState::Degraded
+                    | pathchord_core::PathState::Draining
+            )
+        })
+        .count()
+}
+
+fn refill_attempts(deficit: usize, slots: usize) -> usize {
+    if deficit == 0 {
+        0
+    } else {
+        deficit.saturating_add(1).min(slots)
+    }
 }
 
 fn demand_required_path_count(
@@ -3692,6 +3701,15 @@ mod tests {
             baseline_shortfall_reason(3, 3, 3, false, false, false),
             None
         );
+    }
+
+    #[test]
+    fn refill_adds_a_single_spare_within_remaining_slots() {
+        assert_eq!(refill_attempts(0, 256), 0);
+        assert_eq!(refill_attempts(3, 256), 4);
+        assert_eq!(refill_attempts(3, 3), 3);
+        assert_eq!(refill_attempts(3, 1), 1);
+        assert_eq!(refill_attempts(3, 0), 0);
     }
 
     #[test]

@@ -182,6 +182,11 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Implemented
 
+- Established Session Path refill now launches bounded concurrent carrier
+  attempts for the current deficit plus one speculative slot. Successful
+  surplus Paths remain eligible for normal hysteretic scale-in. The loopback
+  suite verifies the refill behavior through its 128-Path Session case.
+
 - Ingress Path-pool planning and the shared Session runtime use a default
   limit of 256 Paths per Session. Egress also applies its service-wide
   admission budget. A loopback integration test established 128 authenticated
