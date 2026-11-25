@@ -17,6 +17,9 @@ const QUOTA_ZERO_WEIGHT_FLOOR_BASIS_POINTS: u128 = 1_000;
 const REPLICATION_COPY_OVERHEAD_BYTES: u64 = 128;
 pub const MAX_DEMAND_KEYS: usize = 128;
 
+/// Default local limit for the number of Paths attached to one Session.
+pub const DEFAULT_MAX_SESSION_PATHS: usize = 256;
+
 pub const DEFAULT_SESSION_REPLICATION_BUDGET_BYTES_PER_SECOND: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -44,7 +47,7 @@ pub struct MultipathConfig {
 impl Default for MultipathConfig {
     fn default() -> Self {
         Self {
-            max_paths: 8,
+            max_paths: DEFAULT_MAX_SESSION_PATHS,
             minimum_usable_paths: 1,
             traffic_class: None,
             demand_key: None,
@@ -348,6 +351,12 @@ impl MultipathSession {
             .filter(|(path_id, path)| self.path_is_schedulable_by_id(**path_id, path))
             .map(|(path_id, _)| *path_id)
             .collect()
+    }
+
+    pub(crate) fn path_is_schedulable(&self, path_id: PathId) -> bool {
+        self.paths
+            .get(&path_id)
+            .is_some_and(|path| self.path_is_schedulable_by_id(path_id, path))
     }
 
     pub(crate) fn existing_path_ids(&self) -> Vec<PathId> {

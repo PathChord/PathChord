@@ -13,11 +13,11 @@ use pathchord_path::diagnostics::{
     DiagnosticHistory, DiagnosticLevel, DiagnosticRole, DiagnosticSnapshot, PathAttribution,
 };
 use pathchord_path::{
-    AutoscaleDecision, AutoscaleInput, IngressPathAdmissionConfig, IngressSessionHandle,
-    MultipathConfig, MultipathPathObservation, OpenStreamError, OpenUdpError, PathAdmissionError,
-    PathAdmissionOutcome, PathAutoscaler, PathAutoscalerConfig, PathEconomicStatus,
-    PathQualitySnapshot, SessionDiagnostics, SessionRuntimeError, SessionSnapshot,
-    SessionUdpHandle, dial_path,
+    AutoscaleDecision, AutoscaleInput, DEFAULT_MAX_SESSION_PATHS, IngressPathAdmissionConfig,
+    IngressSessionHandle, MultipathConfig, MultipathPathObservation, OpenStreamError, OpenUdpError,
+    PathAdmissionError, PathAdmissionOutcome, PathAutoscaler, PathAutoscalerConfig,
+    PathEconomicStatus, PathQualitySnapshot, SessionDiagnostics, SessionRuntimeError,
+    SessionSnapshot, SessionUdpHandle, dial_path,
 };
 use pathchord_policy::{
     CompiledPolicy, EgressConfig, EgressId, EgressRouteCandidate, EgressRuntimeStatus, Evaluation,
@@ -248,7 +248,7 @@ impl SessionSlot {
         let min_paths = configured_minimum_paths(&egress);
         let endpoint_count = egress.endpoints.len();
         let now = Instant::now();
-        let max_paths = 8_usize.max(min_paths);
+        let max_paths = DEFAULT_MAX_SESSION_PATHS;
         let requested = configured_path_baseline(&egress);
         let effective = requested.min(max_paths as u64) as usize;
         Self {
@@ -259,7 +259,7 @@ impl SessionSlot {
             draining_paths: Mutex::new(BTreeMap::new()),
             autoscaler: Mutex::new(
                 PathAutoscaler::new(PathAutoscalerConfig {
-                    min_paths,
+                    min_paths: min_paths.min(max_paths),
                     max_paths,
                     ..PathAutoscalerConfig::default()
                 })

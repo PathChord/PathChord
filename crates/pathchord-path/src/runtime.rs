@@ -853,9 +853,11 @@ impl IngressSessionHandle {
     pub async fn wait_path_closed(&self, path_id: PathId) {
         let mut snapshots = self.snapshots.clone();
         loop {
-            let snapshot = snapshots.borrow().clone();
-            if snapshot.closed || !snapshot.ready_path_ids.contains(&path_id) {
-                return;
+            {
+                let snapshot = snapshots.borrow_and_update();
+                if snapshot.closed || !snapshot.ready_path_ids.contains(&path_id) {
+                    return;
+                }
             }
             if snapshots.changed().await.is_err() {
                 return;
@@ -1003,9 +1005,11 @@ impl EgressSessionController {
     pub async fn wait_path_closed(&self, path_id: PathId) {
         let mut snapshots = self.snapshots.clone();
         loop {
-            let snapshot = snapshots.borrow().clone();
-            if snapshot.closed || !snapshot.ready_path_ids.contains(&path_id) {
-                return;
+            {
+                let snapshot = snapshots.borrow_and_update();
+                if snapshot.closed || !snapshot.ready_path_ids.contains(&path_id) {
+                    return;
+                }
             }
             if snapshots.changed().await.is_err() {
                 return;
@@ -3312,7 +3316,7 @@ where
                 continue;
             }
             self.multipath.activate_path(path_id)?;
-            if self.multipath.ready_path_ids().contains(&path_id)
+            if self.multipath.path_is_schedulable(path_id)
                 && let Some(health) = self.path_health.get_mut(&path_id)
             {
                 health.exclusion_reason = None;

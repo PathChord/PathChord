@@ -32,10 +32,10 @@ pub use admission::{
 };
 pub use autoscale::{AutoscaleDecision, AutoscaleInput, PathAutoscaler, PathAutoscalerConfig};
 pub use multipath::{
-    DEFAULT_SESSION_REPLICATION_BUDGET_BYTES_PER_SECOND, DemandKey, MultipathConfig,
-    MultipathError, MultipathPathObservation, MultipathSession, PathEconomicStatus,
-    PathFailureOutcome, PathQualityExclusionReason, PathSchedule, ScheduleDirection,
-    StreamRetransmission,
+    DEFAULT_MAX_SESSION_PATHS, DEFAULT_SESSION_REPLICATION_BUDGET_BYTES_PER_SECOND, DemandKey,
+    MultipathConfig, MultipathError, MultipathPathObservation, MultipathSession,
+    PathEconomicStatus, PathFailureOutcome, PathQualityExclusionReason, PathSchedule,
+    ScheduleDirection, StreamRetransmission,
 };
 pub use runtime::{
     BoxedSessionStream, DemandSnapshot, EgressSessionController, EgressSessionHandle,

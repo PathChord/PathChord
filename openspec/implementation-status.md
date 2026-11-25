@@ -182,6 +182,13 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Implemented
 
+- Ingress Path-pool planning and the shared Session runtime use a default
+  limit of 256 Paths per Session. Egress also applies its service-wide
+  admission budget. A loopback integration test established 128 authenticated
+  Paths in one Session, retained all 128 across seven seconds of idle
+  heartbeat activity on both roles, and verified TCP and UDP round trips.
+  See the [Path-pool change](changes/support-hundreds-of-session-paths/proposal.md).
+
 - Ingress and Egress share JSON logging from FATAL through TRACE via
   `PATHCHORD_LOG_LEVEL`, with INFO as the default. TRACE includes frame metadata, carrier write outcomes,
   scheduling, retransmissions and flow control. Ingress Path observations retain

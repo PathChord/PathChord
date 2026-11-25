@@ -44,17 +44,27 @@ impl pathchord_transit::TransitAdapter for StalledTransit {
 
 #[tokio::test]
 async fn http_connect_crosses_transit_noise_session_and_egress() {
-    http_connect_through_egress("default", "127.0.0.1:0").await;
+    http_connect_through_egress("default", "127.0.0.1:0", 4).await;
 }
 
 #[tokio::test]
 async fn namespaced_egress_keeps_its_canonical_noise_and_enrollment_identity() {
-    http_connect_through_egress("tenant-a", "127.0.0.1:0").await;
+    http_connect_through_egress("tenant-a", "127.0.0.1:0", 4).await;
 }
 
 #[tokio::test]
 async fn direct_transit_establishes_an_ipv6_egress_session() {
-    http_connect_through_egress("default", "[::1]:0").await;
+    http_connect_through_egress("default", "[::1]:0", 4).await;
+}
+
+#[tokio::test]
+async fn maintains_128_paths_and_forwards_traffic() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(75),
+        http_connect_through_egress("default", "127.0.0.1:0", 128),
+    )
+    .await
+    .expect("large Path pool");
 }
 
 #[tokio::test]
@@ -416,7 +426,7 @@ async fn retiring_a_replaced_transit_path_prevents_new_streams_from_using_it() {
     .unwrap();
 }
 
-async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
+async fn http_connect_through_egress(namespace: &str, egress_bind: &str, target_paths: u32) {
     let ingress_key = generate_static_keypair().expect("Ingress identity");
     let egress_key = Arc::new(generate_static_keypair().expect("Egress identity"));
     let store = Arc::new(
@@ -455,7 +465,7 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
                 },
                 required_capabilities: 1,
                 supported_capabilities: 0b11,
-                max_concurrent_paths: 8,
+                max_concurrent_paths: 256,
                 capacity_bps: 1_000_000_000,
                 max_inbound_target_connections: 128,
                 remote_dns_only: false,
@@ -493,6 +503,7 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
     let mut base_config = base_policy.config().clone();
     base_config.egresses[0].capabilities.udp = true;
     base_config.egresses[0].path_pool.min_usable_paths = 3;
+    base_config.egresses[0].path_pool.target_usable_paths = Some(target_paths);
     base_config.egresses[0].endpoints.push(Endpoint {
         host: egress_address.ip().to_string(),
         port: egress_address.port(),
@@ -523,10 +534,42 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
         ))
         .expect("Ingress data plane"),
     );
-    data_plane.warmup().await;
-    data_plane.warmup().await;
-    data_plane.warmup().await;
-    assert_eq!(data_plane.snapshot().await.ready_paths, 4);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(55), async {
+        loop {
+            data_plane.warmup().await;
+            if data_plane.snapshot().await.ready_paths == target_paths as usize
+                && egress.snapshot().unwrap().active_paths == target_paths as usize
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if result.is_err() {
+        panic!(
+            "Path target {target_paths}: Ingress {:?}, Egress {:?}",
+            data_plane
+                .session_snapshots()
+                .await
+                .iter()
+                .map(|s| (s.session.ready_paths, s.target_shortfall_reason))
+                .collect::<Vec<_>>(),
+            egress.snapshot().unwrap()
+        );
+    }
+    if target_paths > 100 {
+        // Observe several heartbeat periods before sending business traffic.
+        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+        assert_eq!(
+            data_plane.snapshot().await.ready_paths,
+            target_paths as usize
+        );
+        assert_eq!(
+            egress.snapshot().unwrap().active_paths,
+            target_paths as usize
+        );
+    }
     let session_snapshot = data_plane
         .session_snapshots()
         .await
@@ -534,9 +577,15 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
         .next()
         .expect("Egress session snapshot");
     assert_eq!(session_snapshot.minimum_usable_paths, 3);
-    assert_eq!(session_snapshot.requested_target_usable_paths, 4);
-    assert_eq!(session_snapshot.effective_target_usable_paths, 4);
-    assert_eq!(session_snapshot.target_path_count, 4);
+    assert_eq!(
+        session_snapshot.requested_target_usable_paths,
+        u64::from(target_paths)
+    );
+    assert_eq!(
+        session_snapshot.effective_target_usable_paths,
+        target_paths as usize
+    );
+    assert_eq!(session_snapshot.target_path_count, target_paths as usize);
     assert_eq!(session_snapshot.target_shortfall, 0);
     assert_eq!(session_snapshot.target_shortfall_reason, None);
     assert!(session_snapshot.endpoint_states[0].failures >= 1);
@@ -630,14 +679,35 @@ async fn http_connect_through_egress(namespace: &str, egress_bind: &str) {
         .await
         .expect("CONNECT request");
     let mut response = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let connect_result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while !response.ends_with(b"\r\n\r\n") {
             assert!(response.len() < 4096, "bounded HTTP response");
             response.push(client.read_u8().await.expect("CONNECT response"));
         }
     })
-    .await
-    .expect("an unused stalled Transit must not block an existing Path");
+    .await;
+    if connect_result.is_err() {
+        let snap = data_plane.session_snapshots().await;
+        panic!(
+            "CONNECT stalled: Ingress {:?}, Egress {:?}, response {:?}",
+            snap.iter()
+                .map(|s| (
+                    s.session.ready_paths,
+                    s.session.pending_session_controls,
+                    s.session.pending_stream_opens,
+                    s.session.active_streams,
+                    s.session.egress_status.as_ref().map(|r| (
+                        r.fresh,
+                        r.age_ms,
+                        r.report.admission_allowed
+                    ))
+                ))
+                .collect::<Vec<_>>(),
+            egress.snapshot().unwrap(),
+            response
+        );
+    }
+
     assert!(response.starts_with(b"HTTP/1.1 200"));
 
     let payload = b"real-pathchord-data-plane";
