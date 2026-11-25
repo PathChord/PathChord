@@ -9,7 +9,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use pathchord_core::{PathId, ProtocolLimits, SessionId, TargetEndpoint as WireTargetEndpoint};
 use pathchord_noise::{STATIC_KEY_LEN, StaticKeypair, WIRE_PROFILE_V1_PROLOGUE_PREFIX};
-use pathchord_path::diagnostics::{DiagnosticHistory, DiagnosticRole, DiagnosticSnapshot};
+use pathchord_path::diagnostics::{
+    DiagnosticHistory, DiagnosticLevel, DiagnosticRole, DiagnosticSnapshot, PathAttribution,
+};
 use pathchord_path::{
     AutoscaleDecision, AutoscaleInput, IngressPathAdmissionConfig, IngressSessionHandle,
     MultipathConfig, MultipathPathObservation, OpenStreamError, OpenUdpError, PathAdmissionError,
@@ -564,6 +566,53 @@ impl IngressDataPlane {
                     .map_err(|_| DataPlaneError::IdentifierGeneration)?,
             ),
         })
+    }
+
+    pub fn diagnostic_history(&self) -> Arc<DiagnosticHistory> {
+        Arc::clone(&self.diagnostics)
+    }
+
+    pub fn log_listener_event(&self, event: &crate::ListenerRuntimeEvent) {
+        use crate::ListenerRuntimeEvent::*;
+        let level = match event {
+            ListenerFailed { .. } => DiagnosticLevel::Error,
+            ConnectionFailed { .. } => DiagnosticLevel::Warn,
+            ListenerStarted { .. } | ListenerStopped { .. } => DiagnosticLevel::Info,
+            _ => DiagnosticLevel::Debug,
+        };
+        self.diagnostics.log(level, "listener", || match event {
+            ListenerStarted { listener_id, .. } => serde_json::json!({"outcome":"started","listener_id":listener_id.as_str()}),
+            ListenerStopped { listener_id } => serde_json::json!({"outcome":"stopped","listener_id":listener_id.as_str()}),
+            ProtocolRejected { listener_id, .. } => serde_json::json!({"outcome":"protocol_rejected","listener_id":listener_id.as_str()}),
+            PolicyRejected { listener_id, .. } => serde_json::json!({"outcome":"policy_rejected","listener_id":listener_id.as_str()}),
+            ListenerFailed { listener_id, .. } => serde_json::json!({"outcome":"listener_failed","listener_id":listener_id.as_str()}),
+            ConnectionAccepted { listener_id, connection_id, .. } => serde_json::json!({"outcome":"accepted","listener_id":listener_id.as_str(),"connection_id":connection_id}),
+            ConnectionFailed { listener_id, connection_id, .. } => serde_json::json!({"outcome":"failed","listener_id":listener_id.as_str(),"connection_id":connection_id}),
+            ConnectionCompleted { listener_id, connection_id, stats } => serde_json::json!({
+                "outcome":"completed","listener_id":listener_id.as_str(),"connection_id":connection_id,
+                "local_to_target_bytes":stats.local_to_target_bytes,"target_to_local_bytes":stats.target_to_local_bytes
+            }),
+        });
+    }
+
+    pub fn log_subscription_refresh(&self, id: &str, outcome: &pathchord_transit::RefreshOutcome) {
+        use pathchord_transit::RefreshOutcome;
+        self.diagnostics.log(
+            if matches!(outcome, RefreshOutcome::Retained { .. }) {
+                DiagnosticLevel::Warn
+            } else {
+                DiagnosticLevel::Debug
+            },
+            "subscription_refresh",
+            || {
+                let (outcome, attempts) = match outcome {
+                    RefreshOutcome::Published { attempts, .. } => ("published", Some(*attempts)),
+                    RefreshOutcome::Retained { attempts, .. } => ("retained", Some(*attempts)),
+                    RefreshOutcome::Disabled { .. } => ("disabled", None),
+                };
+                serde_json::json!({"subscription_id":id,"outcome":outcome,"attempts":attempts})
+            },
+        );
     }
 
     pub fn diagnostic_snapshot(&self) -> DiagnosticSnapshot {
@@ -2099,6 +2148,28 @@ impl IngressDataPlane {
         Err(last_error)
     }
 
+    fn log_policy(&self, protocol: &'static str, evaluation: &Evaluation) {
+        self.diagnostics.log(DiagnosticLevel::Debug, "flow_policy", || {
+            let fields = match evaluation {
+                Evaluation::Direct { generation } => serde_json::json!({
+                    "route":"direct","generation":generation.get()
+                }),
+                Evaluation::Reject { generation, reason } => serde_json::json!({
+                    "route":"reject","generation":generation.get(),"reason":format!("{reason:?}")
+                }),
+                Evaluation::Route(RoutePlan::Egress(route)) => serde_json::json!({
+                    "route":"egress","generation":route.generation.get(),"rule":route.egress_rule_id.as_str(),
+                    "eligible_egress_count":route.candidates.len()
+                }),
+                Evaluation::Route(RoutePlan::Proxy(route)) => serde_json::json!({
+                    "route":"proxy","generation":route.generation.get(),"rule":route.proxy_rule_id.as_str(),
+                    "transit_proxy_id":route.transit_proxy_id.as_str(),"eligible_transit_count":route.candidates.len()
+                }),
+            };
+            serde_json::json!({"protocol":protocol,"decision":fields})
+        });
+    }
+
     pub async fn open_tcp(
         &self,
         context: &ConnectionContext,
@@ -2119,6 +2190,7 @@ impl IngressDataPlane {
                 .await
                 .evaluate(&policy_context, &runtime)
         };
+        self.log_policy("tcp", &evaluation);
         match evaluation {
             Evaluation::Direct { .. } => self.connect_direct(&policy_context).await,
             Evaluation::Reject { .. } => Err(DataPlaneError::PolicyRejected),
@@ -2190,6 +2262,7 @@ impl IngressDataPlane {
                 .await
                 .evaluate(&policy_context, &runtime)
         };
+        self.log_policy("udp", &evaluation);
         let route = match evaluation {
             Evaluation::Reject { .. } => return Err(DataPlaneError::PolicyRejected),
             Evaluation::Direct { .. } => {
@@ -2591,7 +2664,7 @@ impl IngressDataPlane {
                 return Ok((Arc::clone(session), path_id));
             }
             let path_id = PathId::new(random_u128()?);
-            let path = self
+            let (path, attribution) = self
                 .dial_session_path(
                     slot,
                     transit_id,
@@ -2615,7 +2688,7 @@ impl IngressDataPlane {
                         weight_basis_points: weight,
                         ..MultipathPathObservation::default()
                     },
-                    Some(transit_id.as_str().to_owned()),
+                    Some(attribution),
                 )
                 .await?;
             slot.transit_paths
@@ -2655,7 +2728,7 @@ impl IngressDataPlane {
             now.checked_sub(AUTOSCALE_DECISION_INTERVAL).unwrap_or(now);
         let session_id = SessionId::new(random_u128()?);
         let path_id = PathId::new(random_u128()?);
-        let path = self
+        let (path, attribution) = self
             .dial_session_path(slot, transit_id, session_id, path_id, dial_timeout)
             .await?;
         let session = Arc::new(IngressSessionHandle::start_observed(
@@ -2663,7 +2736,7 @@ impl IngressDataPlane {
             Some(SessionDiagnostics {
                 history: Arc::clone(&self.diagnostics),
                 egress_id: egress_id.as_str().to_owned(),
-                transit_proxy_id: Some(transit_id.as_str().to_owned()),
+                attribution: Some(attribution),
             }),
         )?);
         let weight = slot
@@ -2716,16 +2789,41 @@ impl IngressDataPlane {
         path_id: PathId,
         dial_timeout: Duration,
     ) -> Result<
-        pathchord_path::IngressAdmittedPath<pathchord_transit::BoxedTransitConnection>,
+        (
+            pathchord_path::IngressAdmittedPath<pathchord_transit::BoxedTransitConnection>,
+            PathAttribution,
+        ),
         DataPlaneError,
     > {
-        let adapter = self
-            .transit_adapters
-            .read()
-            .await
-            .get(transit_id)
-            .cloned()
-            .ok_or_else(|| DataPlaneError::TransitUnavailable(transit_id.as_str().to_owned()))?;
+        let (adapter, mut attribution) = {
+            let configs = self.transit_configs.read().await;
+            let dynamic = self.dynamic_transit_configs.read().await;
+            let adapters = self.transit_adapters.read().await;
+            let config = configs.get(transit_id).or_else(|| dynamic.get(transit_id));
+            let label = |value: &str| {
+                (!value.is_empty()
+                    && value.len() <= 256
+                    && !value.chars().any(char::is_control)
+                    && !value.contains("://"))
+                .then(|| value.to_owned())
+            };
+            let attribution = PathAttribution {
+                transit_proxy_id: Some(transit_id.as_str().to_owned()),
+                transit_proxy_name: config
+                    .and_then(|c| c.labels.get("source.name"))
+                    .and_then(|name| label(name))
+                    .or_else(|| label(transit_id.resource_name())),
+                transit_subscription_id: config
+                    .and_then(|c| c.source.as_ref())
+                    .and_then(|source| label(&source.subscription)),
+                transit_protocol: config.and_then(|c| label(&c.protocol)),
+                egress_endpoint_index: None,
+            };
+            let adapter = adapters.get(transit_id).cloned().ok_or_else(|| {
+                DataPlaneError::TransitUnavailable(transit_id.as_str().to_owned())
+            })?;
+            (adapter, attribution)
+        };
         let deadline = Instant::now() + dial_timeout;
         let responder_key = decode_key(&slot.egress.public_key)?;
         let replication_budget_bytes_per_second = self.session_replication_budget_bytes(slot).await;
@@ -2756,6 +2854,15 @@ impl IngressDataPlane {
             if remaining.is_zero() {
                 break;
             }
+            attribution.egress_endpoint_index = Some(endpoint_index);
+            let observe = |stage, outcome, started: Instant| {
+                self.diagnostics.log(if outcome == "success" { DiagnosticLevel::Debug } else { DiagnosticLevel::Warn }, "path_establishment", || serde_json::json!({
+                    "stage": stage, "outcome": outcome, "elapsed_ms":started.elapsed().as_millis() as u64,
+                    "session_id":session_id.to_string(),"path_id":path_id.to_string(),
+                    "egress_id":slot.egress.id.as_str(),"transit":attribution.fields(),
+                }));
+            };
+            let started = Instant::now();
             let io = match timeout(
                 remaining,
                 adapter.connect(ConnectRequest {
@@ -2767,13 +2874,18 @@ impl IngressDataPlane {
             )
             .await
             {
-                Ok(Ok(io)) => io,
+                Ok(Ok(io)) => {
+                    observe("transit_connect", "success", started);
+                    io
+                }
                 Ok(Err(error)) => {
+                    observe("transit_connect", "error", started);
                     slot.record_endpoint_attempt(endpoint_index, false).await;
                     last_error = Some(DataPlaneError::Transit(error));
                     continue;
                 }
                 Err(_) => {
+                    observe("transit_connect", "timeout", started);
                     slot.record_endpoint_attempt(endpoint_index, false).await;
                     last_error = Some(DataPlaneError::Transit(TransitError::Connection(
                         "Egress Path connection timed out".into(),
@@ -2785,6 +2897,7 @@ impl IngressDataPlane {
             if remaining.is_zero() {
                 break;
             }
+            let started = Instant::now();
             let outcome = match timeout(
                 remaining,
                 dial_path(io, self.identity.private(), &responder_key, &admission),
@@ -2794,11 +2907,13 @@ impl IngressDataPlane {
                 Ok(Ok(outcome)) => outcome,
                 Ok(Err(error)) => {
                     slot.record_endpoint_attempt(endpoint_index, false).await;
+                    observe("path_admission", "error", started);
                     last_error = Some(DataPlaneError::Admission(error));
                     continue;
                 }
                 Err(_) => {
                     slot.record_endpoint_attempt(endpoint_index, false).await;
+                    observe("path_admission", "timeout", started);
                     last_error = Some(DataPlaneError::Transit(TransitError::Connection(
                         "Egress Path admission timed out".into(),
                     )));
@@ -2807,11 +2922,13 @@ impl IngressDataPlane {
             };
             match outcome {
                 PathAdmissionOutcome::Ready(path) => {
+                    observe("path_admission", "success", started);
                     slot.record_endpoint_attempt(endpoint_index, true).await;
                     slot.record_path_endpoint(path_id, endpoint_index).await;
-                    return Ok(path);
+                    return Ok((path, attribution));
                 }
                 PathAdmissionOutcome::Rejected { .. } => {
+                    observe("path_admission", "rejected", started);
                     slot.record_endpoint_attempt(endpoint_index, false).await;
                     last_error = Some(DataPlaneError::AdmissionRejected);
                 }

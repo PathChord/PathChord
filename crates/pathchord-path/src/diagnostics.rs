@@ -1,8 +1,9 @@
 //! Typed runtime observations shared by Ingress and Egress.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use pathchord_core::{PathId, PathState, SessionId, StreamId};
@@ -51,7 +52,28 @@ diagnostic_codes!(DiagnosticReason {
     Cancelled => "cancelled", Unknown => "unknown",
 });
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathAttribution {
+    pub transit_proxy_id: Option<String>,
+    pub transit_proxy_name: Option<String>,
+    pub transit_subscription_id: Option<String>,
+    pub transit_protocol: Option<String>,
+    pub egress_endpoint_index: Option<usize>,
+}
+
+impl PathAttribution {
+    pub fn fields(&self) -> serde_json::Value {
+        serde_json::json!({
+            "transit_proxy_id": self.transit_proxy_id,
+            "transit_proxy_name": self.transit_proxy_name,
+            "transit_subscription_id": self.transit_subscription_id,
+            "transit_protocol": self.transit_protocol,
+            "egress_endpoint_index": self.egress_endpoint_index,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiagnosticIds {
     pub egress_id: Option<String>,
     pub session_id: Option<SessionId>,
@@ -59,6 +81,7 @@ pub struct DiagnosticIds {
     pub stream_id: Option<StreamId>,
     /// Ingress-owned. Egress has no authoritative Transit Proxy identity.
     pub transit_proxy_id: Option<String>,
+    pub attribution: Option<PathAttribution>,
     /// Scoped to the emitting process.
     pub attempt_id: Option<u64>,
 }
@@ -98,9 +121,155 @@ pub struct DiagnosticRecord {
     pub detail: DiagnosticDetail,
 }
 
+diagnostic_codes!(DiagnosticLevel {
+    Fatal => "FATAL", Error => "ERROR", Warn => "WARN", Info => "INFO",
+    Debug => "DEBUG", Trace => "TRACE",
+});
+
+struct DiagnosticLog {
+    level: Option<DiagnosticLevel>,
+    process_instance: [u8; 16],
+    sender: Option<std::sync::mpsc::SyncSender<serde_json::Value>>,
+    dropped: Arc<AtomicU64>,
+}
+
+static LOG: OnceLock<DiagnosticLog> = OnceLock::new();
+
+fn parse_log_level(value: &str) -> std::io::Result<Option<DiagnosticLevel>> {
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    DiagnosticLevel::ALL
+        .iter()
+        .copied()
+        .find(|level| value.eq_ignore_ascii_case(level.as_str()))
+        .map(Some)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PATHCHORD_LOG_LEVEL must be off, fatal, error, warn, info, debug, or trace",
+            )
+        })
+}
+
+fn log_record(
+    level: DiagnosticLevel,
+    role: DiagnosticRole,
+    process_instance: Option<[u8; 16]>,
+    event: &'static str,
+    fields: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "level": level.as_str(),
+        "event": event,
+        "role": role.as_str(),
+        "process_instance": process_instance.map(|id| format!("{:032x}", u128::from_be_bytes(id))),
+        "observed_at_unix_ms": unix_ms(SystemTime::now()),
+        "fields": fields,
+    })
+}
+
+/// Lifecycle records use the same threshold and schema as runtime records.
+/// Write them directly so the record can be delivered before process exit.
+pub fn log_service_event(
+    role: DiagnosticRole,
+    level: DiagnosticLevel,
+    event: &'static str,
+    reason: Option<&'static str>,
+) {
+    let enabled = LOG.get().map_or(level == DiagnosticLevel::Fatal, |log| {
+        log.level.is_some_and(|threshold| threshold >= level)
+    });
+    if enabled {
+        let record = log_record(
+            level,
+            role,
+            LOG.get().map(|log| log.process_instance),
+            event,
+            serde_json::json!({"reason":reason}),
+        );
+        let _ = writeln!(std::io::stderr().lock(), "{record}");
+    }
+}
+
+/// Initialize the service stderr sink before starting runtime tasks.
+pub fn configure_diagnostic_logging(role: DiagnosticRole) -> std::io::Result<()> {
+    if LOG.get().is_some() {
+        return Ok(());
+    }
+    let level = match std::env::var("PATHCHORD_LOG_LEVEL") {
+        Err(std::env::VarError::NotPresent) => Some(DiagnosticLevel::Info),
+        Ok(value) => parse_log_level(&value)?,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PATHCHORD_LOG_LEVEL must be valid UTF-8",
+            ));
+        }
+    };
+    let mut process_instance = [0; 16];
+    getrandom::fill(&mut process_instance).map_err(std::io::Error::other)?;
+    let dropped = Arc::new(AtomicU64::new(0));
+    let sender = if level.is_some() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<serde_json::Value>(4096);
+        let loss = Arc::clone(&dropped);
+        std::thread::Builder::new()
+            .name("pathchord-diagnostics".into())
+            .spawn(move || {
+                let mut reported = 0;
+                loop {
+                    let total = loss.load(Ordering::Relaxed);
+                    if total != reported
+                        && level.is_some_and(|threshold| threshold >= DiagnosticLevel::Warn)
+                    {
+                        let notice = log_record(
+                            DiagnosticLevel::Warn,
+                            role,
+                            Some(process_instance),
+                            "diagnostic_log_loss",
+                            serde_json::json!({"dropped_total":total}),
+                        );
+                        if writeln!(std::io::stderr().lock(), "{notice}").is_err() {
+                            loss.fetch_add(
+                                receiver.try_iter().take(4096).count() as u64,
+                                Ordering::Relaxed,
+                            );
+                            break;
+                        }
+                        reported = total;
+                    }
+                    match receiver.recv_timeout(Duration::from_secs(1)) {
+                        Ok(event) => {
+                            if writeln!(std::io::stderr().lock(), "{event}").is_err() {
+                                loss.fetch_add(
+                                    1 + receiver.try_iter().take(4096).count() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })?;
+        Some(sender)
+    } else {
+        None
+    };
+    let _ = LOG.set(DiagnosticLog {
+        level,
+        process_instance,
+        sender,
+        dropped,
+    });
+    Ok(())
+}
+
 const HISTORY_LIMIT: usize = 1_024;
 const HISTORY_AGE: Duration = Duration::from_secs(15 * 60);
 
+#[derive(Debug)]
 pub struct DiagnosticHistory {
     role: DiagnosticRole,
     process_instance: [u8; 16],
@@ -111,7 +280,7 @@ pub struct DiagnosticHistory {
     capture: Mutex<CaptureState>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CaptureState {
     active: bool,
     expires_at: Option<Instant>,
@@ -128,7 +297,7 @@ pub struct CaptureStatus {
     pub dropped: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct History {
     next_sequence: u64,
     records: VecDeque<(Instant, DiagnosticRecord)>,
@@ -168,6 +337,7 @@ impl DiagnosticSnapshot {
                 "session_id": record.ids.session_id.map(|id| id.to_string()),
                 "path_id": record.ids.path_id.map(|id| id.to_string()),
                 "transit_proxy_id": record.ids.transit_proxy_id,
+                "transit": record.ids.attribution.as_ref().map(PathAttribution::fields),
                 "state": if state == PathState::Closed { "closed" } else { "failed" },
                 "reason": reason.as_str(),
                 "write_elapsed_ms": write_elapsed_ms,
@@ -187,6 +357,7 @@ impl DiagnosticSnapshot {
             "expired": self.expired,
             "evicted": self.evicted,
             "producer_drops": self.producer_drops,
+            "log_drops": LOG.get().map(|log| log.dropped.load(Ordering::Relaxed)),
             "records": self.records.iter().map(|record| serde_json::json!({
                 "sequence": record.cursor.sequence,
                 "observed_at_unix_ms": unix_ms(record.observed_at),
@@ -197,6 +368,7 @@ impl DiagnosticSnapshot {
                     "path_id": record.ids.path_id.map(|id| id.to_string()),
                     "stream_id": record.ids.stream_id.map(|id| id.to_string()),
                     "transit_proxy_id": record.ids.transit_proxy_id,
+                    "transit": record.ids.attribution.as_ref().map(PathAttribution::fields),
                     "attempt_id": record.ids.attempt_id,
                 },
                 "detail": format!("{:?}", record.detail),
@@ -226,8 +398,13 @@ impl History {
 
 impl DiagnosticHistory {
     pub fn new(role: DiagnosticRole) -> Result<Self, getrandom::Error> {
-        let mut process_instance = [0; 16];
-        getrandom::fill(&mut process_instance)?;
+        let process_instance = if let Some(log) = LOG.get() {
+            log.process_instance
+        } else {
+            let mut id = [0; 16];
+            getrandom::fill(&mut id)?;
+            id
+        };
         Ok(Self {
             role,
             process_instance,
@@ -237,6 +414,31 @@ impl DiagnosticHistory {
             path_terminations: Default::default(),
             capture: Mutex::new(CaptureState::default()),
         })
+    }
+
+    pub fn log(
+        &self,
+        level: DiagnosticLevel,
+        event: &'static str,
+        fields: impl FnOnce() -> serde_json::Value,
+    ) {
+        let Some(log) = LOG
+            .get()
+            .filter(|log| log.level.is_some_and(|threshold| threshold >= level))
+        else {
+            return;
+        };
+        let Some(sender) = &log.sender else { return };
+        let value = log_record(
+            level,
+            self.role,
+            Some(self.process_instance),
+            event,
+            fields(),
+        );
+        if sender.try_send(value).is_err() {
+            log.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn record_stage(
@@ -310,6 +512,37 @@ impl DiagnosticHistory {
     }
 
     pub fn record(&self, ids: DiagnosticIds, detail: DiagnosticDetail) {
+        let level = match &detail {
+            DiagnosticDetail::PathTermination {
+                reason:
+                    PathTerminationReason::Drained
+                    | PathTerminationReason::AdministrativeClose
+                    | PathTerminationReason::SessionClosed,
+                ..
+            } => DiagnosticLevel::Info,
+            DiagnosticDetail::PathTermination { .. } => DiagnosticLevel::Warn,
+            DiagnosticDetail::SessionTermination {
+                outcome: DiagnosticOutcome::Failure,
+                ..
+            } => DiagnosticLevel::Error,
+            DiagnosticDetail::SessionTermination { .. } => DiagnosticLevel::Info,
+            DiagnosticDetail::Stage {
+                outcome: DiagnosticOutcome::Failure | DiagnosticOutcome::Timeout,
+                ..
+            } => DiagnosticLevel::Warn,
+            DiagnosticDetail::Stage { .. } => DiagnosticLevel::Debug,
+        };
+        self.log(level, "runtime_diagnostic", || {
+            serde_json::json!({
+                "egress_id": ids.egress_id,
+                "session_id": ids.session_id.map(|id| id.to_string()),
+                "path_id": ids.path_id.map(|id| id.to_string()),
+                "stream_id": ids.stream_id.map(|id| id.to_string()),
+                "transit_proxy_id": ids.transit_proxy_id,
+                "transit": ids.attribution.as_ref().map(PathAttribution::fields),
+                "detail": format!("{detail:?}"),
+            })
+        });
         if let DiagnosticDetail::PathTermination { reason, .. } = &detail {
             self.path_terminations[*reason as usize].fetch_add(1, Ordering::Relaxed);
         }
@@ -397,6 +630,30 @@ impl DiagnosticHistory {
 mod tests {
     use super::*;
 
+    #[test]
+    fn log_levels_are_case_insensitive_and_ordered_by_verbosity() {
+        let expected = [
+            DiagnosticLevel::Fatal,
+            DiagnosticLevel::Error,
+            DiagnosticLevel::Warn,
+            DiagnosticLevel::Info,
+            DiagnosticLevel::Debug,
+            DiagnosticLevel::Trace,
+        ];
+        for (index, level) in expected.iter().enumerate() {
+            let threshold = parse_log_level(&level.as_str().to_ascii_lowercase())
+                .unwrap()
+                .unwrap();
+            assert_eq!(threshold, *level);
+            assert_eq!(
+                expected.iter().filter(|event| **event <= threshold).count(),
+                index + 1
+            );
+        }
+        assert_eq!(parse_log_level("Off").unwrap(), None);
+        assert!(parse_log_level("invalid").is_err());
+    }
+
     fn path_ids() -> DiagnosticIds {
         DiagnosticIds {
             egress_id: Some("egress-a".to_owned()),
@@ -404,6 +661,7 @@ mod tests {
             path_id: Some(PathId::new(2)),
             stream_id: None,
             transit_proxy_id: None,
+            attribution: None,
             attempt_id: None,
         }
     }

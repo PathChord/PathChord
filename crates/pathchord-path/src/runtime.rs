@@ -31,8 +31,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::diagnostics::{
-    DiagnosticDetail, DiagnosticHistory, DiagnosticIds, DiagnosticOutcome, DiagnosticReason,
-    PathTerminationReason,
+    DiagnosticDetail, DiagnosticHistory, DiagnosticIds, DiagnosticLevel, DiagnosticOutcome,
+    DiagnosticReason, PathAttribution, PathTerminationReason,
 };
 
 use crate::{
@@ -378,6 +378,7 @@ pub enum PathExclusionReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathQualitySnapshot {
+    pub attribution: Option<PathAttribution>,
     pub rtt_ms: u64,
     pub jitter_ms: u64,
     pub loss_ppm: u32,
@@ -491,7 +492,7 @@ impl SessionRuntimeError {
 pub struct SessionDiagnostics {
     pub history: Arc<DiagnosticHistory>,
     pub egress_id: String,
-    pub transit_proxy_id: Option<String>,
+    pub attribution: Option<PathAttribution>,
 }
 
 pub struct IngressSessionHandle {
@@ -761,13 +762,13 @@ impl IngressSessionHandle {
         &self,
         path: IngressAdmittedPath<S>,
         observation: MultipathPathObservation,
-        transit_proxy_id: Option<String>,
+        attribution: Option<PathAttribution>,
     ) -> Result<(), SessionRuntimeError>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let mut path = ErasedAdmittedPath::from_ingress(path);
-        path.transit_proxy_id = transit_proxy_id;
+        path.attribution = attribution;
         let (reply, result) = oneshot::channel();
         self.commands
             .send(IngressCommand::AddPath {
@@ -954,7 +955,20 @@ impl EgressSessionController {
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let path = ErasedAdmittedPath::from_egress(path);
+        self.add_path_observed(path, observation, None).await
+    }
+
+    pub async fn add_path_observed<S>(
+        &self,
+        path: EgressAdmittedPath<S>,
+        observation: MultipathPathObservation,
+        attribution: Option<PathAttribution>,
+    ) -> Result<(), SessionRuntimeError>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let mut path = ErasedAdmittedPath::from_egress(path);
+        path.attribution = attribution;
         let (reply, result) = oneshot::channel();
         self.commands
             .send(IngressCommand::AddPath {
@@ -1349,7 +1363,7 @@ enum IngressCommand {
 }
 
 struct ErasedAdmittedPath {
-    transit_proxy_id: Option<String>,
+    attribution: Option<PathAttribution>,
     capabilities: u64,
     replication_budget_bytes_per_second: u64,
     session_id: SessionId,
@@ -1372,7 +1386,7 @@ impl ErasedAdmittedPath {
         let limits = records.limits();
         let (io, noise) = records.into_parts();
         Self {
-            transit_proxy_id: None,
+            attribution: None,
             capabilities,
             replication_budget_bytes_per_second,
             session_id,
@@ -1395,7 +1409,7 @@ impl ErasedAdmittedPath {
         let limits = records.limits();
         let (io, noise) = records.into_parts();
         Self {
-            transit_proxy_id: None,
+            attribution: None,
             capabilities,
             replication_budget_bytes_per_second,
             session_id,
@@ -1485,6 +1499,7 @@ struct FactoryCompletion {
     stream_id: StreamId,
     request_id: RequestId,
     result: Result<BoxedSessionStream, EgressStreamOpenError>,
+    elapsed_ms: u64,
 }
 
 enum ReaderEvent {
@@ -1524,6 +1539,8 @@ enum StreamEvent {
     },
     IoFailed {
         stream_id: StreamId,
+        operation: &'static str,
+        kind: std::io::ErrorKind,
         reason: String,
     },
     Delivered {
@@ -1628,7 +1645,7 @@ struct PendingSessionControl {
 }
 
 struct PathHealth {
-    transit_proxy_id: Option<String>,
+    attribution: Option<PathAttribution>,
     terminal_write: Option<(PathTerminationReason, Option<u64>)>,
     sender: ControlSender<PendingHeartbeat>,
     receiver: ControlReceiver,
@@ -1663,7 +1680,7 @@ struct PathHealth {
 impl PathHealth {
     fn new(now: Instant) -> Result<Self, ReliabilityError> {
         Ok(Self {
-            transit_proxy_id: None,
+            attribution: None,
             terminal_write: None,
             sender: ControlSender::new(MAX_PENDING_CONTROL_MESSAGES)?,
             receiver: ControlReceiver::new(MAX_PENDING_CONTROL_MESSAGES)?,
@@ -1820,6 +1837,9 @@ where
         let noise = Arc::new(Mutex::new(noise));
         let (read, write) = split(io);
         let writer = RecordWriter {
+            diagnostics: diagnostics
+                .as_ref()
+                .map(|context| Arc::clone(&context.history)),
             io: write,
             noise: Arc::clone(&noise),
             limits,
@@ -1984,6 +2004,7 @@ where
                     path_id: None,
                     stream_id: None,
                     transit_proxy_id: None,
+                    attribution: None,
                     attempt_id: None,
                 },
                 DiagnosticDetail::SessionTermination {
@@ -2566,6 +2587,10 @@ where
         let noise = Arc::new(Mutex::new(noise));
         let (read, write) = split(io);
         let writer = RecordWriter {
+            diagnostics: self
+                .diagnostics
+                .as_ref()
+                .map(|context| Arc::clone(&context.history)),
             io: write,
             noise: Arc::clone(&noise),
             limits,
@@ -2594,7 +2619,7 @@ where
             },
         );
         let mut health = PathHealth::new(Instant::now())?;
-        health.transit_proxy_id = path.transit_proxy_id;
+        health.attribution = path.attribution;
         health.relationship_weight_basis_points = observation.weight_basis_points;
         health.effective_capacity_bps = observation.effective_capacity_bps;
         health.congestion_window_bytes = observation.congestion_window_bytes;
@@ -2641,10 +2666,10 @@ where
         let Some(diagnostics) = &self.diagnostics else {
             return;
         };
-        let transit_proxy_id = if path_id == self.path_id {
-            diagnostics.transit_proxy_id.clone()
+        let attribution = if path_id == self.path_id {
+            diagnostics.attribution.clone()
         } else {
-            health.transit_proxy_id.clone()
+            health.attribution.clone()
         };
         diagnostics.history.record(
             DiagnosticIds {
@@ -2652,7 +2677,10 @@ where
                 session_id: Some(self.session_id),
                 path_id: Some(path_id),
                 stream_id: None,
-                transit_proxy_id,
+                transit_proxy_id: attribution
+                    .as_ref()
+                    .and_then(|node| node.transit_proxy_id.clone()),
+                attribution,
                 attempt_id: None,
             },
             DiagnosticDetail::PathTermination {
@@ -2881,6 +2909,13 @@ where
                         eligible.as_ref(),
                     )
                 })?;
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.history.log(DiagnosticLevel::Trace, "stream_retransmission", || serde_json::json!({
+                    "session_id":self.session_id.to_string(),"stream_id":stream_id.to_string(),
+                    "previous_path_id":last_path.to_string(),"path_id":plan.path_id.to_string(),
+                    "offset":offset,"attempt":plan.attempt,"bytes":plan.data.data.len(),
+                }));
+            }
             if let Err(error) = self
                 .send_raw_message_on_priority(
                     plan.path_id,
@@ -3476,6 +3511,61 @@ where
         }
     }
 
+    fn trace_frame(
+        &self,
+        path_id: PathId,
+        direction: &'static str,
+        message: &Message,
+        size: usize,
+        seq: Option<u64>,
+        priority: Option<WirePriority>,
+    ) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.history.log(DiagnosticLevel::Trace, "frame", || {
+                let detail = match message {
+                    Message::StreamData(v) => serde_json::json!({"stream_id":v.stream_id.to_string(),"offset":v.offset,"bytes":v.data.len(),"flags":v.flags}),
+                    Message::StreamWindow(v) => serde_json::json!({"stream_id":v.stream_id.to_string(),"stream_limit":v.stream_limit,"session_limit":v.session_limit}),
+                    Message::StreamAck(v) => serde_json::json!({"stream_id":v.stream_id.to_string(),"ranges":v.ranges.iter().map(|r| [r.start,r.end]).collect::<Vec<_>>()}),
+                    Message::SessionControl(v) => {
+                        let flow = session_control_flow(v, self.limits).ok().flatten();
+                        let (stream_id, association_id) = match flow {
+                            Some(SessionControlFlow::Stream(id)) => (Some(id.to_string()), None),
+                            Some(SessionControlFlow::Udp(id)) => (None, Some(id)),
+                            None => (None, None),
+                        };
+                        serde_json::json!({"sequence":v.sequence,"depends_on":v.depends_on,
+                            "inner_frame_type":v.frame_type as u64,"stream_id":stream_id,"association_id":association_id})
+                    }
+                    Message::SessionControlAck(v) | Message::ControlAck(v) => serde_json::json!({"highest_contiguous":v.highest_contiguous,"ranges":v.ranges.iter().map(|r| [r.start,r.end]).collect::<Vec<_>>()}),
+                    Message::StreamOpen(v) => serde_json::json!({"stream_id":v.stream_id.to_string(),"request_id":v.request_id.to_string(),"target_port":v.target.port}),
+                    Message::StreamOpenOk(v) => serde_json::json!({"stream_id":v.stream_id.to_string()}),
+                    Message::StreamOpenErr(v) => serde_json::json!({"stream_id":v.stream_id.to_string(),"error_class":v.error.code()}),
+                    Message::StreamFin(v) => serde_json::json!({"stream_id":v.stream_id.to_string(),"flags":v.flags}),
+                    Message::StreamRst(v) => serde_json::json!({"stream_id":v.stream_id.to_string(),"error_class":v.error.code()}),
+                    Message::StatusReport(v) => serde_json::json!({"report_sequence":v.report_seqno,"age_ms":v.sample_age_ms,
+                        "expires_after_ms":v.expires_after_ms,"admission_allowed":v.admission_allowed,
+                        "admission_reason":format!("{:?}",v.admission_reason),"wire_bps":v.current_wire_rate_bps,
+                        "capacity_bps":v.effective_capacity_bps,"active_streams":v.active_streams}),
+                    Message::PathDrain(v) => serde_json::json!({"drain_reason":v.drain_reason,"deadline_ms":v.deadline_ms}),
+                    Message::PathClose(v) => serde_json::json!({"error_class":v.error.code()}),
+                    Message::SessionClose(v) => serde_json::json!({"error_class":v.error.code()}),
+                    Message::UdpOpen(v) => serde_json::json!({"association_id":v.association_id,"target_port":v.target.port}),
+                    Message::UdpOpenOk(v) => serde_json::json!({"association_id":v.association_id,"target_port":v.target_visible_port}),
+                    Message::UdpOpenErr(v) => serde_json::json!({"association_id":v.association_id,"error_class":v.error.code()}),
+                    Message::UdpClose(v) => serde_json::json!({"association_id":v.association_id,"error_class":v.error.code()}),
+                    Message::Heartbeat(v) => serde_json::json!({"control_sequence":v.control_seq}),
+                    Message::UdpDatagram(v) => serde_json::json!({"association_id":v.association_id,"datagram_sequence":v.datagram_seq,"bytes":v.payload.len()}),
+                    _ => serde_json::Value::Null,
+                };
+                let attribution = if path_id == self.path_id { diagnostics.attribution.as_ref() } else { self.path_health.get(&path_id).and_then(|health| health.attribution.as_ref()) };
+                serde_json::json!({"session_id":self.session_id.to_string(),"path_id":path_id.to_string(),
+                    "egress_id":diagnostics.egress_id,"transit":attribution.map(PathAttribution::fields),
+                    "direction":direction,"frame_type":message.frame_type() as u64,
+                    "frame_sequence":seq,"priority":priority.map(|p| format!("{p:?}")),"payload_bytes":size,"detail":detail})
+            });
+        }
+    }
+
     async fn handle_frame(
         &mut self,
         path_id: PathId,
@@ -3485,6 +3575,14 @@ where
             return Err(SessionRuntimeError::WrongPathIdentity);
         }
         let message = Message::decode(frame.header().frame_type(), frame.payload(), self.limits)?;
+        self.trace_frame(
+            path_id,
+            "receive",
+            &message,
+            frame.payload().len(),
+            Some(frame.header().frame_seq()),
+            None,
+        );
         match message {
             Message::SessionControl(control) => self.handle_session_control(path_id, control).await,
             Message::SessionControlCancel(cancel) => {
@@ -3600,6 +3698,14 @@ where
                 }
                 SessionControlEntry::Control(control) => {
                     let inner = Message::decode(control.frame_type, &control.payload, self.limits)?;
+                    self.trace_frame(
+                        path,
+                        "apply_control",
+                        &inner,
+                        control.payload.len(),
+                        None,
+                        None,
+                    );
                     let flow_open = matches!(
                         control.frame_type,
                         FrameType::StreamOpen | FrameType::UdpOpen
@@ -3934,11 +4040,13 @@ where
         let request_id = request.request_id;
         let target = request.target;
         let task = tokio::spawn(async move {
+            let started = Instant::now();
             let result = factory.open_with_permit(target, target_permit).await;
             let _ = result_tx
                 .send(FactoryCompletion {
                     stream_id,
                     request_id,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
                     result,
                 })
                 .await;
@@ -3990,6 +4098,14 @@ where
         }
         let eligible_paths = (!cached.unrestricted_paths).then(|| cached.eligible_paths.clone());
         let traffic_class = cached.traffic_class.clone();
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.history.log(if completion.result.is_ok() { DiagnosticLevel::Debug } else { DiagnosticLevel::Warn }, "target_connect", || serde_json::json!({
+                "session_id":self.session_id.to_string(),"stream_id":completion.stream_id.to_string(),
+                "request_id":completion.request_id.to_string(),"elapsed_ms":completion.elapsed_ms,
+                "outcome":if completion.result.is_ok() {"success"} else {"error"},
+                "error_class":completion.result.as_ref().err().map(|error| error.error.code()),
+            }));
+        }
         match completion.result {
             Ok(io) => {
                 let replication_budget = FlowReplicationBudget {
@@ -4134,8 +4250,27 @@ where
                 stream_id,
                 data,
                 permit,
-            } => self.queue_stream_data(stream_id, data, permit).await?,
+            } => {
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics
+                        .history
+                        .log(DiagnosticLevel::Trace, "stream_local_read", || {
+                            serde_json::json!({
+                                "session_id": self.session_id.to_string(),
+                                "stream_id": stream_id.to_string(),
+                                "bytes": data.len(),
+                                "send_buffer_credit_bytes": self.send_budget.available_permits(),
+                            })
+                        });
+                }
+                self.queue_stream_data(stream_id, data, permit).await?;
+            }
             StreamEvent::LocalFin { stream_id } => {
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.history.log(DiagnosticLevel::Debug, "stream_local_eof", || serde_json::json!({
+                        "session_id":self.session_id.to_string(),"stream_id":stream_id.to_string(),
+                    }));
+                }
                 let should_send = self.streams.get_mut(&stream_id).is_some_and(|stream| {
                     if stream.local_fin {
                         false
@@ -4146,7 +4281,18 @@ where
                 });
                 let _ = should_send;
             }
-            StreamEvent::IoFailed { stream_id, reason } => {
+            StreamEvent::IoFailed {
+                stream_id,
+                operation,
+                kind,
+                reason,
+            } => {
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.history.log(DiagnosticLevel::Warn, "stream_local_io_error", || serde_json::json!({
+                        "session_id":self.session_id.to_string(),"stream_id":stream_id.to_string(),
+                        "operation":operation,"io_kind":format!("{kind:?}"),
+                    }));
+                }
                 let error = match self.role {
                     ActorRole::Egress { .. } => ErrorClass::TargetFailure,
                     ActorRole::Ingress => ErrorClass::PathFailure,
@@ -4155,6 +4301,11 @@ where
                     .await?;
             }
             StreamEvent::Delivered { stream_id, bytes } => {
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.history.log(DiagnosticLevel::Trace, "stream_local_write", || serde_json::json!({
+                        "session_id":self.session_id.to_string(),"stream_id":stream_id.to_string(),"bytes":bytes,
+                    }));
+                }
                 let Some(stream) = self.streams.get_mut(&stream_id) else {
                     return Ok(());
                 };
@@ -4209,6 +4360,7 @@ where
     }
 
     async fn flush_stream(&mut self, stream_id: StreamId) -> Result<(), SessionRuntimeError> {
+        let direction = self.outbound_direction();
         let next = {
             let Some(stream) = self.streams.get_mut(&stream_id) else {
                 return Ok(());
@@ -4220,6 +4372,17 @@ where
             if end > stream.remote_receive_limit
                 || self.session_sent_total + front.data.len() as u64 > self.remote_session_limit
             {
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.history.log(DiagnosticLevel::Trace, "stream_flow_control_wait", || serde_json::json!({
+                        "session_id":self.session_id.to_string(),"stream_id":stream_id.to_string(),
+                        "direction":match direction { ScheduleDirection::Upstream => "upstream", ScheduleDirection::Downstream => "downstream" },
+                        "pending_chunks":stream.pending.len(),"next_chunk_bytes":front.data.len(),
+                        "stream_end":end,"stream_limit":stream.remote_receive_limit,
+                        "session_sent":self.session_sent_total,"session_limit":self.remote_session_limit,
+                        "stream_blocked":end > stream.remote_receive_limit,
+                        "session_blocked":self.session_sent_total + front.data.len() as u64 > self.remote_session_limit,
+                    }));
+                }
                 return Ok(());
             }
             stream.pending.pop_front()
@@ -4238,18 +4401,22 @@ where
             .streams
             .get(&stream_id)
             .and_then(|stream| stream.eligible_paths.clone());
-        let path_id = match eligible.as_ref() {
-            Some(eligible) => {
-                self.multipath
-                    .schedule_existing_eligible(self.outbound_direction(), length, eligible)?
-                    .path_id
-            }
-            None => {
-                self.multipath
-                    .schedule_existing(self.outbound_direction(), length)?
-                    .path_id
-            }
+        let selection = match eligible.as_ref() {
+            Some(eligible) => self
+                .multipath
+                .schedule_existing_eligible(direction, length, eligible),
+            None => self.multipath.schedule_existing(direction, length),
         };
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.history.log(DiagnosticLevel::Trace, "path_selection", || serde_json::json!({
+                "session_id":self.session_id.to_string(),"stream_id":stream_id.to_string(),
+                "offset":chunk.offset,"bytes":length,"ready_paths":self.multipath.ready_path_count(),
+                "eligible_paths":eligible.as_ref().map(BTreeMap::len),
+                "path_id":selection.as_ref().ok().map(|selected| selected.path_id.to_string()),
+                "score":selection.as_ref().ok().map(|selected| selected.score.to_string()),
+            }));
+        }
+        let path_id = selection?.path_id;
         let traffic_class = self
             .streams
             .get(&stream_id)
@@ -4563,6 +4730,14 @@ where
             snapshot.closed_at_ms = Some(wall_clock_ms());
             snapshot.close_reason = Some(reason.to_owned());
             self.closed_streams.push_back(id);
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.history.log(DiagnosticLevel::Debug, "stream_closed", || serde_json::json!({
+                    "session_id":self.session_id.to_string(),"stream_id":id.to_string(),
+                    "state":format!("{state:?}"),"reason":reason,
+                    "bytes_sent":snapshot.bytes_sent,"bytes_received":snapshot.bytes_received,
+                    "bytes_acked":snapshot.bytes_acked,"retransmissions":snapshot.retransmissions,
+                }));
+            }
         }
         while self.closed_streams.len() > 128 {
             if let Some(id) = self.closed_streams.pop_front() {
@@ -5365,6 +5540,14 @@ where
             _ => 0,
         };
         let payload = message.encode(self.limits)?;
+        self.trace_frame(
+            path_id,
+            "send_attempt",
+            &message,
+            payload.len(),
+            (path_id == self.path_id).then_some(self.next_frame_seq),
+            Some(priority),
+        );
         let sizing_frame = PathFrame::new(
             message.frame_type(),
             FrameFlags::empty(),
@@ -5382,6 +5565,17 @@ where
             + RECORD_ENVELOPE_HEADER_LEN
             + TRANSPORT_TAG_LEN) as u64;
         if !self.status_provider.try_reserve_wire(priority, wire_bytes) {
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics
+                    .history
+                    .log(DiagnosticLevel::Trace, "wire_budget_blocked", || {
+                        serde_json::json!({
+                            "session_id":self.session_id.to_string(),"path_id":path_id.to_string(),
+                            "frame_type":message.frame_type() as u64,"wire_bytes":wire_bytes,
+                            "priority":format!("{priority:?}"),
+                        })
+                    });
+            }
             return Err(SessionRuntimeError::WireBudgetExhausted);
         }
         if path_id != self.path_id {
@@ -5486,6 +5680,11 @@ where
                 (
                     *path_id,
                     PathQualitySnapshot {
+                        attribution: if *path_id == self.path_id {
+                            self.diagnostics.as_ref().and_then(|context| context.attribution.clone())
+                        } else {
+                            health.attribution.clone()
+                        },
                         rtt_ms: health.rtt_ms,
                         jitter_ms: health.jitter_ms,
                         loss_ppm,
@@ -5828,6 +6027,7 @@ fn runtime_buffer_limit(ready: &pathchord_core::PathReady) -> Result<usize, Sess
 }
 
 struct RecordWriter<W> {
+    diagnostics: Option<Arc<DiagnosticHistory>>,
     io: W,
     noise: Arc<Mutex<NoiseTransport>>,
     limits: ProtocolLimits,
@@ -5846,12 +6046,28 @@ where
             noise.seal_frame(&frame, self.limits)?.encode()
         };
         let started = Instant::now();
-        tokio::time::timeout(PATH_WRITE_TIMEOUT, async {
+        let result = tokio::time::timeout(PATH_WRITE_TIMEOUT, async {
             self.io.write_all(&encoded).await?;
             self.io.flush().await
         })
-        .await
-        .map_err(|_| SessionRuntimeError::PathWriteTimeout {
+        .await;
+        if let Some(history) = &self.diagnostics {
+            history.log(DiagnosticLevel::Trace, "carrier_write", || {
+                let header = frame.header();
+                let (outcome, io_kind) = match &result {
+                    Ok(Ok(())) => ("success", None),
+                    Ok(Err(error)) => ("error", Some(format!("{:?}", error.kind()))),
+                    Err(_) => ("timeout", None),
+                };
+                serde_json::json!({
+                    "session_id":header.session_id().to_string(),"path_id":header.path_id().to_string(),
+                    "frame_sequence":header.frame_seq(),"frame_type":header.frame_type() as u64,
+                    "wire_bytes":encoded.len(),"elapsed_ms":started.elapsed().as_millis() as u64,
+                    "deadline_ms":PATH_WRITE_TIMEOUT.as_millis() as u64,"outcome":outcome,"io_kind":io_kind,
+                })
+            });
+        }
+        result.map_err(|_| SessionRuntimeError::PathWriteTimeout {
             elapsed_ms: started.elapsed().as_millis() as u64,
         })??;
         Ok(())
@@ -5993,6 +6209,8 @@ async fn run_stream_io(
                             drop(permits);
                             let _ = events.send(StreamEvent::IoFailed {
                                 stream_id,
+                                operation: "write",
+                                kind: error.kind(),
                                 reason: error.to_string(),
                             }).await;
                             break;
@@ -6010,6 +6228,8 @@ async fn run_stream_io(
                         if let Err(error) = write.shutdown().await {
                             let _ = events.send(StreamEvent::IoFailed {
                                 stream_id,
+                                operation: "shutdown",
+                                kind: error.kind(),
                                 reason: error.to_string(),
                             }).await;
                             break;
@@ -6042,6 +6262,8 @@ async fn stream_read_loop(
                 let _ = events
                     .send(StreamEvent::IoFailed {
                         stream_id,
+                        operation: "read",
+                        kind: error.kind(),
                         reason: error.to_string(),
                     })
                     .await;
@@ -7646,7 +7868,7 @@ mod tests {
                     Some(SessionDiagnostics {
                         history: Arc::clone(&history),
                         egress_id: "egress-test".to_owned(),
-                        transit_proxy_id: None,
+                        attribution: None,
                     }),
                 )
                 .unwrap();

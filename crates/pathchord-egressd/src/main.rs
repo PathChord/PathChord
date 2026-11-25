@@ -18,8 +18,8 @@ use pathchord_control::{
 };
 use pathchord_core::{PathReady, ProtocolLimits};
 use pathchord_egress::{
-    AuthorizationControlDispatcher, AuthorizationStore, EgressId, EgressNode, EgressNodeConfig,
-    TcpTargetConnector,
+    AuthorizationControlDispatcher, AuthorizationStore, DiagnosticLevel, DiagnosticRole, EgressId,
+    EgressNode, EgressNodeConfig, TcpTargetConnector, log_service_event,
 };
 use pathchord_noise::StaticKeypair;
 use pathchord_policy::{EgressServiceSpec, EgressWebSettings};
@@ -111,6 +111,8 @@ enum ServiceError {
     InsecureIdentityPermissions,
     #[error("identity file I/O failed: {0}")]
     IdentityIo(#[from] std::io::Error),
+    #[error("diagnostic logging failed: {0}")]
+    DiagnosticLogging(std::io::Error),
     #[error("Noise identity operation failed: {0}")]
     Noise(#[from] pathchord_noise::NoiseError),
     #[error("Egress authorization store failed: {0}")]
@@ -128,15 +130,44 @@ enum ServiceError {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     match run(Cli::parse().args).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => {
+            log_service_event(
+                DiagnosticRole::Egress,
+                DiagnosticLevel::Info,
+                "service_stopped",
+                None,
+            );
+            std::process::ExitCode::SUCCESS
+        }
         Err(error) => {
-            eprintln!("pathchord-egressd: {error}");
+            let reason = match error {
+                ServiceError::DiagnosticLogging(error)
+                    if error.kind() == std::io::ErrorKind::InvalidInput =>
+                {
+                    "invalid_log_level"
+                }
+                ServiceError::DiagnosticLogging(_) => "log_initialization_failed",
+                ServiceError::Configuration(_) | ServiceError::ConfigurationSource(_) => {
+                    "configuration_failed"
+                }
+                ServiceError::LocalServer(_) | ServiceError::WebGateway(_) => "management_failed",
+                ServiceError::EgressNode(_) => "egress_node_failed",
+                _ => "service_failed",
+            };
+            log_service_event(
+                DiagnosticRole::Egress,
+                DiagnosticLevel::Fatal,
+                "service_failed",
+                Some(reason),
+            );
             std::process::ExitCode::FAILURE
         }
     }
 }
 
 async fn run(args: EgressArgs) -> Result<(), ServiceError> {
+    pathchord_egress::configure_diagnostic_logging(DiagnosticRole::Egress)
+        .map_err(ServiceError::DiagnosticLogging)?;
     let args = resolve(args).await?;
     let restart_required = Arc::new(AtomicBool::new(false));
     let (watcher_stop, watcher_task) =
@@ -209,6 +240,8 @@ async fn run(args: EgressArgs) -> Result<(), ServiceError> {
                     "active_sessions": snapshot.active_sessions,
                     "active_streams": snapshot.active_streams,
                     "active_target_connections": snapshot.active_target_connections,
+                    "last_session_end": snapshot.last_session_end,
+                    "path_diagnostics": node.diagnostic_snapshot().map(|snapshot| snapshot.path_summary()),
                     "authorization_activity": activity,
                     "quota_remaining": snapshot.quota_remaining,
                     "traffic_multiplier_basis_points": snapshot.traffic_multiplier_basis_points,
@@ -259,6 +292,12 @@ async fn run(args: EgressArgs) -> Result<(), ServiceError> {
         None => None,
     };
 
+    log_service_event(
+        DiagnosticRole::Egress,
+        DiagnosticLevel::Info,
+        "service_ready",
+        None,
+    );
     let (shutdown, _) = watch::channel(false);
     let node_future = node.run_until_shutdown(wait_for_shutdown(shutdown.subscribe()));
     let server_future = server.run_until_shutdown(

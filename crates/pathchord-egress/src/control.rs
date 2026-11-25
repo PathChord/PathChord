@@ -354,6 +354,7 @@ impl AuthorizationControlDispatcher {
                     "streams": runtime.get("active_streams"),
                     "target_connections": runtime.get("active_target_connections")
                 },
+                "path_diagnostics": runtime.get("path_diagnostics"),
                 "authorizations": snapshot.records().count()
             }),
         )

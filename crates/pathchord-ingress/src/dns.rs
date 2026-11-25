@@ -1,3 +1,5 @@
+use pathchord_path::diagnostics::{DiagnosticHistory, DiagnosticLevel};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
@@ -138,6 +140,7 @@ pub struct DnsRuntime {
     adapters: DnsAdapters,
     inflight: Arc<Semaphore>,
     cache: Mutex<DnsCache>,
+    diagnostics: Option<Arc<DiagnosticHistory>>,
 }
 
 impl DnsRuntime {
@@ -163,11 +166,31 @@ impl DnsRuntime {
             )),
             policy,
             adapters,
+            diagnostics: None,
             inflight: Arc::new(Semaphore::new(max_inflight)),
         })
     }
 
+    pub fn with_diagnostics(mut self, diagnostics: Arc<DiagnosticHistory>) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
     pub async fn resolve(&self, wire_query: &[u8]) -> Result<Vec<u8>, DnsError> {
+        let started = Instant::now();
+        let result = self.resolve_inner(wire_query).await;
+        if let Some(history) = &self.diagnostics {
+            history.log(if result.is_ok() { DiagnosticLevel::Debug } else { DiagnosticLevel::Warn }, "dns_resolution", || serde_json::json!({
+                "route":format!("{:?}", self.policy.default_route),
+                "outcome":if result.is_ok() {"success"} else {"error"},
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "query_bytes":wire_query.len(),"response_bytes":result.as_ref().ok().map(Vec::len),
+            }));
+        }
+        result
+    }
+
+    async fn resolve_inner(&self, wire_query: &[u8]) -> Result<Vec<u8>, DnsError> {
         if wire_query.len() > MAX_DNS_MESSAGE_BYTES {
             return Err(DnsError::MalformedQuery);
         }
@@ -191,10 +214,24 @@ impl DnsRuntime {
                 .await
                 .get(&cache_key, query.metadata.id, Instant::now())
         {
+            if let Some(history) = &self.diagnostics {
+                history.log(
+                    DiagnosticLevel::Trace,
+                    "dns_cache",
+                    || serde_json::json!({"hit":true}),
+                );
+            }
             drop(permit);
             return Ok(response);
         }
 
+        if let Some(history) = &self.diagnostics {
+            history.log(
+                DiagnosticLevel::Trace,
+                "dns_cache",
+                || serde_json::json!({"hit":false}),
+            );
+        }
         let selection = self.selection()?;
         let route = selection.route();
         let adapter = self

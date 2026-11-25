@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use pathchord_cli::{IngressArgs, run_ingress_service};
+use pathchord_cli::{
+    DiagnosticLevel, DiagnosticRole, IngressArgs, log_service_event, run_ingress_service,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -23,9 +25,22 @@ async fn main() -> ExitCode {
     let Cli { socket, args } = Cli::parse();
     let result = run_ingress_service(socket, args).await;
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            log_service_event(
+                DiagnosticRole::Ingress,
+                DiagnosticLevel::Info,
+                "service_stopped",
+                None,
+            );
+            ExitCode::SUCCESS
+        }
         Err(error) => {
-            eprintln!("pathchord-ingressd: {error}");
+            log_service_event(
+                DiagnosticRole::Ingress,
+                DiagnosticLevel::Fatal,
+                "service_failed",
+                Some(error.service_failure_reason()),
+            );
             ExitCode::FAILURE
         }
     }

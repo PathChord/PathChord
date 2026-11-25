@@ -13,7 +13,9 @@ use pathchord_core::{
     TargetEndpoint,
 };
 use pathchord_noise::{StaticKeypair, WIRE_PROFILE_V1_PROLOGUE_PREFIX};
-use pathchord_path::diagnostics::{DiagnosticHistory, DiagnosticRole, DiagnosticSnapshot};
+use pathchord_path::diagnostics::{
+    DiagnosticHistory, DiagnosticLevel, DiagnosticRole, DiagnosticSnapshot, PathAttribution,
+};
 use pathchord_path::{
     AuthorizationState as PathAuthorizationState, BoxedSessionStream, BoxedUdpTargetSocket,
     EgressPathAdmissionConfig, EgressSessionController, EgressSessionHandle, EgressStatusConfig,
@@ -633,6 +635,7 @@ where
                     };
                     let task = tasks.spawn(run_path_task(
                         guard,
+                        endpoint_index,
                         stream,
                         Arc::clone(&self.config.keypair),
                         self.admission.clone(),
@@ -967,6 +970,7 @@ impl NodeObservations {
                     path_id: None,
                     stream_id: None,
                     transit_proxy_id: None,
+                    attribution: None,
                     attempt_id: None,
                 },
                 pathchord_path::diagnostics::DiagnosticStage::Target,
@@ -992,6 +996,7 @@ impl NodeObservations {
                     path_id: None,
                     stream_id: None,
                     transit_proxy_id: None,
+                    attribution: None,
                     attempt_id: None,
                 },
                 pathchord_path::diagnostics::DiagnosticStage::Target,
@@ -1327,6 +1332,7 @@ impl Drop for RunGuard<'_> {
 #[allow(clippy::too_many_arguments)]
 async fn run_path_task<C>(
     guard: PathTaskGuard,
+    endpoint_index: usize,
     stream: TcpStream,
     keypair: Arc<StaticKeypair>,
     admission: EgressPathAdmissionConfig,
@@ -1348,12 +1354,29 @@ async fn run_path_task<C>(
     let authorizer = StorePathAuthorizer {
         store: Arc::clone(&authorizations),
     };
-    let path = match tokio::time::timeout(
+    let started = Instant::now();
+    let result = tokio::time::timeout(
         admission_timeout,
         accept_path(stream, keypair.private(), &admission, &authorizer),
     )
-    .await
-    {
+    .await;
+    if let Some(history) = &observations.diagnostics {
+        history.log(if matches!(&result, Ok(Ok(PathAdmissionOutcome::Ready(_)))) { DiagnosticLevel::Debug } else { DiagnosticLevel::Warn }, "path_admission", || {
+            let (outcome, session_id, path_id) = match &result {
+                Ok(Ok(PathAdmissionOutcome::Ready(path))) => ("success", Some(path.session_id().to_string()), Some(path.path_id().to_string())),
+                Ok(Ok(PathAdmissionOutcome::Rejected { .. })) => ("rejected", None, None),
+                Ok(Err(_)) => ("error", None, None),
+                Err(_) => ("timeout", None, None),
+            };
+            serde_json::json!({"outcome":outcome,"attempt_id":token,"session_id":session_id,"path_id":path_id,
+                "egress_endpoint_index":endpoint_index,"elapsed_ms":started.elapsed().as_millis() as u64})
+        });
+    }
+    let attribution = PathAttribution {
+        egress_endpoint_index: Some(endpoint_index),
+        ..PathAttribution::default()
+    };
+    let path = match result {
         Ok(Ok(PathAdmissionOutcome::Ready(path))) => path,
         Ok(Ok(PathAdmissionOutcome::Rejected { .. })) => {
             let _ = events.send(NodeEvent::Rejected);
@@ -1414,7 +1437,7 @@ async fn run_path_task<C>(
                     .map(|history| SessionDiagnostics {
                         history: Arc::clone(history),
                         egress_id: String::from_utf8_lossy(&admission.egress_id).into_owned(),
-                        transit_proxy_id: None,
+                        attribution: Some(attribution),
                     }),
             ) {
                 Ok(handle) => handle,
@@ -1452,7 +1475,7 @@ async fn run_path_task<C>(
         }
         ClaimDecision::Existing(controller) => {
             if controller
-                .add_path(path, MultipathPathObservation::default())
+                .add_path_observed(path, MultipathPathObservation::default(), Some(attribution))
                 .await
                 .is_err()
             {

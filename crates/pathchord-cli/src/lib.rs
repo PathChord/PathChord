@@ -339,6 +339,8 @@ pub enum CliError {
     InsecureWebTokenPermissions,
     #[error("identity file I/O failed: {0}")]
     IdentityIo(#[from] std::io::Error),
+    #[error("diagnostic logging failed: {0}")]
+    DiagnosticLogging(std::io::Error),
     #[error("Noise identity operation failed: {0}")]
     Noise(#[from] pathchord_noise::NoiseError),
     #[error("Ingress data plane failed: {0}")]
@@ -564,6 +566,22 @@ fn request_id() -> Result<String, CliError> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+impl CliError {
+    pub fn service_failure_reason(&self) -> &'static str {
+        match self {
+            Self::DiagnosticLogging(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                "invalid_log_level"
+            }
+            Self::DiagnosticLogging(_) => "log_initialization_failed",
+            Self::ConfigurationLoad { .. } | Self::SharedConfiguration(_) | Self::Config(_) => {
+                "configuration_failed"
+            }
+            Self::LocalServer(_) | Self::WebGateway(_) => "management_failed",
+            _ => "service_failed",
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     let Cli {
         socket,
@@ -613,6 +631,8 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         }
     }
 }
+
+pub use pathchord_egress::{DiagnosticLevel, DiagnosticRole, log_service_event};
 
 /// Starts the Ingress service from its dedicated service executable.
 pub async fn run_ingress_service(
@@ -678,6 +698,8 @@ async fn run_enrollment(
 }
 
 async fn run_ingress(socket: Option<PathBuf>, args: IngressArgs) -> Result<(), CliError> {
+    pathchord_egress::configure_diagnostic_logging(DiagnosticRole::Ingress)
+        .map_err(CliError::DiagnosticLogging)?;
     use pathchord_config::{Role, RoleLayout, SelectedSource};
     let layout = RoleLayout::current(Role::Ingress)?;
     let selected =
@@ -873,7 +895,10 @@ async fn run_ingress(socket: Option<PathBuf>, args: IngressArgs) -> Result<(), C
         adapters = adapters
             .with_transit(Arc::clone(&remote))
             .with_egress(remote);
-        Some(Arc::new(DnsRuntime::new(dns_policy, adapters)?))
+        Some(Arc::new(
+            DnsRuntime::new(dns_policy, adapters)?
+                .with_diagnostics(data_plane.diagnostic_history()),
+        ))
     } else {
         None
     };
@@ -998,6 +1023,12 @@ async fn run_ingress(socket: Option<PathBuf>, args: IngressArgs) -> Result<(), C
         .collect();
     let mut session_timing: BTreeMap<pathchord_core::SessionId, (u64, u64, String)> =
         BTreeMap::new();
+    log_service_event(
+        DiagnosticRole::Ingress,
+        DiagnosticLevel::Info,
+        "service_ready",
+        None,
+    );
     let observation_shutdown = shutdown.subscribe();
     let observation_future = async move {
         let mut shutdown = observation_shutdown;
@@ -1013,6 +1044,7 @@ async fn run_ingress(socket: Option<PathBuf>, args: IngressArgs) -> Result<(), C
                     let Some(event) = event else {
                         return Ok(());
                     };
+                    observation_plane.log_listener_event(&event);
                     observation_handle
                         .apply_listener_event(event)
                         .map_err(|error| CliError::Observation(error.to_string()))?;
@@ -1145,6 +1177,7 @@ async fn run_ingress(socket: Option<PathBuf>, args: IngressArgs) -> Result<(), C
                                 egress_id: Some(entry.egress_id.clone()),
                                 endpoint_index: entry.path_endpoint.get(&path_id).copied(),
                                 transit_proxy_id: entry.path_transit.get(&path_id).cloned(),
+                                transit: quality.and_then(|quality| quality.attribution.clone()),
                                 state,
                                 ready_since_ms: None,
                                 last_change_at_ms: None,
@@ -1275,6 +1308,8 @@ async fn run_ingress(socket: Option<PathBuf>, args: IngressArgs) -> Result<(), C
 }
 
 async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
+    pathchord_egress::configure_diagnostic_logging(DiagnosticRole::Egress)
+        .map_err(CliError::DiagnosticLogging)?;
     let args = egress_configuration::resolve(args).await?;
     let identity = Arc::new(load_identity(&args.identity)?);
     let authorizations = Arc::new(AuthorizationStore::open(
@@ -1388,6 +1423,12 @@ async fn run_egress(args: EgressArgs) -> Result<(), CliError> {
     } else {
         None
     };
+    log_service_event(
+        DiagnosticRole::Egress,
+        DiagnosticLevel::Info,
+        "service_ready",
+        None,
+    );
     let (shutdown, _) = tokio::sync::watch::channel(false);
     let node_future = node.run_until_shutdown(wait_for_shutdown(shutdown.subscribe()));
     let server_future = server.run_until_shutdown(
@@ -1854,6 +1895,7 @@ async fn commit_subscription_refresh(
         }
         Err(outcome) => outcome,
     };
+    data_plane.log_subscription_refresh(id.as_str(), &outcome);
     if fenced && !matches!(outcome, RefreshOutcome::Published { .. }) {
         let source = pathchord_policy::SubscriptionId::new(id.as_str());
         let prepared = manager

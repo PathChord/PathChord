@@ -509,6 +509,7 @@ pub struct PathObservation {
     pub egress_id: Option<String>,
     pub endpoint_index: Option<usize>,
     pub transit_proxy_id: Option<String>,
+    pub transit: Option<pathchord_path::diagnostics::PathAttribution>,
     pub state: PathState,
     pub ready_since_ms: Option<u64>,
     pub last_change_at_ms: Option<u64>,
@@ -791,7 +792,7 @@ impl IngressObservationHandle {
         }
         for (id, path) in &paths {
             if state.paths.get(id) != Some(path) {
-                changes.push((ControlEventKind::PathChanged, id.to_string(), json!({"path_id": id.to_string(), "session_id": path.session_id.to_string(), "egress_id": path.egress_id, "transit_proxy_id": path.transit_proxy_id, "state": format!("{:?}", path.state).to_ascii_lowercase(), "ready_since_ms": path.ready_since_ms, "last_change_at_ms": path.last_change_at_ms, "rtt_ms": path.rtt_ms, "jitter_ms": path.jitter_ms, "loss_ppm": path.loss_ppm, "throughput_bps": path.throughput_bps, "upstream_throughput_bps": path.upstream_throughput_bps, "downstream_throughput_bps": path.downstream_throughput_bps, "available_capacity_bps": path.available_capacity_bps, "control_pending": path.control_pending, "control_retransmissions": path.control_retransmissions, "exclusion_reason": path.exclusion_reason})));
+                changes.push((ControlEventKind::PathChanged, id.to_string(), json!({"path_id": id.to_string(), "session_id": path.session_id.to_string(), "egress_id": path.egress_id, "transit_proxy_id": path.transit_proxy_id, "transit": path.transit.as_ref().map(|value| value.fields()), "state": format!("{:?}", path.state).to_ascii_lowercase(), "ready_since_ms": path.ready_since_ms, "last_change_at_ms": path.last_change_at_ms, "rtt_ms": path.rtt_ms, "jitter_ms": path.jitter_ms, "loss_ppm": path.loss_ppm, "throughput_bps": path.throughput_bps, "upstream_throughput_bps": path.upstream_throughput_bps, "downstream_throughput_bps": path.downstream_throughput_bps, "available_capacity_bps": path.available_capacity_bps, "control_pending": path.control_pending, "control_retransmissions": path.control_retransmissions, "exclusion_reason": path.exclusion_reason})));
             }
         }
         for id in state.paths.keys().filter(|id| !paths.contains_key(*id)) {
@@ -3357,6 +3358,7 @@ mod tests {
                     egress_id: Some("egress-a".into()),
                     endpoint_index: None,
                     transit_proxy_id: Some("transit-a".into()),
+                    transit: None,
                     state: PathState::Degraded,
                     ready_since_ms: None,
                     last_change_at_ms: None,

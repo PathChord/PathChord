@@ -528,6 +528,10 @@ impl AuthorizationSnapshot {
     }
 }
 
+pub use pathchord_path::diagnostics::{
+    DiagnosticLevel, DiagnosticRole, configure_diagnostic_logging, log_service_event,
+};
+
 #[cfg(test)]
 mod tests {
     use std::future::{Future, pending, poll_fn};

@@ -182,6 +182,15 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Implemented
 
+- Ingress and Egress share JSON logging from FATAL through TRACE via
+  `PATHCHORD_LOG_LEVEL`, with INFO as the default. TRACE includes frame metadata, carrier write outcomes,
+  scheduling, retransmissions and flow control. Ingress Path observations retain
+  the selected Transit Proxy display name, source, protocol and Egress endpoint
+  index. A local two-process TCP echo through an HTTP Transit fixture matched
+  the Egress write and Ingress receive by Session, Path and frame sequence, and
+  verified that the echo payload was absent from both logs.
+
+
 - Ingress accepts a single file or recursively loaded YAML/YML/JSON directory.
   CLI source options override `PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`, which
   override `~/.config/pathchord` or `/etc/pathchord` for root/service accounts.
