@@ -192,7 +192,7 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   admission budget. A loopback integration test established 128 authenticated
   Paths in one Session, retained all 128 across seven seconds of idle
   heartbeat activity on both roles, and verified TCP and UDP round trips.
-  See the [Path-pool change](changes/support-hundreds-of-session-paths/proposal.md).
+  See the [Path-pool change](changes/archive/2026-11-25-support-hundreds-of-session-paths/proposal.md).
 
 - Ingress and Egress share JSON logging from FATAL through TRACE via
   `PATHCHORD_LOG_LEVEL`, with INFO as the default. TRACE includes frame metadata, carrier write outcomes,
