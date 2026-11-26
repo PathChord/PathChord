@@ -630,6 +630,16 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Validation evidence
 
+On 2026-11-27, the AnyTLS official-v2 Session reuse implementation passed
+its codec and adapter tests, and its TCP plus UoT v2 interoperability test
+passed against sing-box 1.14.4 and source revision `491b845`. The implementation
+uses one active Stream per Session, a shared TCP/UoT idle pool capped at eight
+Sessions, 60-second idle reaping, default padding, and node-level padding
+updates for later Sessions. The workspace rerun passed 1,152 tests with 118
+ignored, except for one concurrent 128-Path stress test that passed when rerun
+isolated. Clippy, formatting, OpenSpec strict validation, paired requirement
+checks, and git diff checks passed.
+
 On 2026-11-27, the Transit conformance fixes passed the Linux workspace suite
 (1,152 passed, 118 ignored) after building the service binaries and rerunning
 with two test threads. The separate-process CLI smoke test also passed in

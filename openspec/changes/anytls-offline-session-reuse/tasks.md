@@ -15,4 +15,4 @@
 
 - [x] 3.1 Preserve partial frame bytes across cancelled reads and close unhealthy Sessions on parser, transport, ALERT, invalid update, or heartbeat failures. Verify errors are sanitized and failed Sessions are never reused.
 - [x] 3.2 Add sing-box 1.14.4 and current pinned source-peer tests for padding, update negotiation, Session reuse, TCP, UoT UDP, FIN, ALERT, and heartbeat behavior. Verify the release and source matrices separately.
-- [ ] 3.3 Run cargo fmt, workspace Clippy, Transit and workspace tests, OpenSpec strict validation, bilingual requirement identity checks, and git diff --check. Record local and external peer evidence separately in implementation-status.md.
+- [x] 3.3 Run cargo fmt, workspace Clippy, Transit and workspace tests, OpenSpec strict validation, bilingual requirement identity checks, and git diff --check. Record local and external peer evidence separately in implementation-status.md.

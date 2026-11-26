@@ -364,8 +364,6 @@ async fn run_session(
                     AnyTlsCommand::UpdatePaddingScheme => {
                         match AnyTlsPaddingScheme::parse(&frame.payload) {
                             Ok(scheme) => {
-                                *session.scheme.lock().expect("AnyTLS padding state") =
-                                    scheme.clone();
                                 *session
                                     .node_padding
                                     .lock()
@@ -447,7 +445,6 @@ async fn run_session(
                             AnyTlsCommand::UpdatePaddingScheme => {
                                 match AnyTlsPaddingScheme::parse(&frame.payload) {
                                     Ok(scheme) => {
-                                        *session.scheme.lock().expect("AnyTLS padding state") = scheme.clone();
                                         *session.node_padding.lock().expect("AnyTLS node padding state") = scheme;
                                     }
                                     Err(_) => session.healthy.store(false, Ordering::Release),
