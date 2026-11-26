@@ -131,6 +131,7 @@ impl Socks5TransitAdapter {
             (Some(username), Some(password))
                 if !username.is_empty()
                     && username.len() <= u8::MAX as usize
+                    && !password.is_empty()
                     && password.len() <= u8::MAX as usize =>
             {
                 Some((username.to_owned(), password.to_owned()))
@@ -412,6 +413,19 @@ mod tests {
             ("username".to_owned(), "socks-user".to_owned()),
             ("password".to_owned(), "socks-secret".to_owned()),
         ]))
+    }
+
+    #[test]
+    fn socks5_rejects_an_empty_password_during_preparation() {
+        let config = config("127.0.0.1:1080".parse().unwrap());
+        let credential = TransitCredential::new(BTreeMap::from([
+            ("username".to_owned(), "socks-user".to_owned()),
+            ("password".to_owned(), String::new()),
+        ]));
+        assert!(matches!(
+            Socks5TransitAdapter::from_config(&config, Some(&credential), Duration::from_secs(1)),
+            Err(TransitError::Unsupported(_))
+        ));
     }
 
     async fn echo_target() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {

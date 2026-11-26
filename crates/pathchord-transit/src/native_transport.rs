@@ -147,6 +147,7 @@ impl NativeTransport {
                     let mut request = uri
                         .into_client_request()
                         .map_err(|_| unsupported("WebSocket request is invalid"))?;
+                    let mut seen_headers = std::collections::BTreeSet::new();
                     for (name, value) in &transport.headers {
                         if name.eq_ignore_ascii_case("connection")
                             || name.eq_ignore_ascii_case("upgrade")
@@ -158,6 +159,9 @@ impl NativeTransport {
                         }
                         let name = HeaderName::from_bytes(name.as_bytes())
                             .map_err(|_| unsupported("WebSocket header name is invalid"))?;
+                        if !seen_headers.insert(name.as_str().to_owned()) {
+                            return Err(unsupported("WebSocket headers contain duplicate names"));
+                        }
                         let value = HeaderValue::from_str(value)
                             .map_err(|_| unsupported("WebSocket header value is invalid"))?;
                         if name == tokio_tungstenite::tungstenite::http::header::HOST {
@@ -343,6 +347,10 @@ impl NativeTransport {
 
     pub async fn connect(&self) -> Result<BoxedTransitConnection, TransitError> {
         self.connect_inner(None, None, None).await
+    }
+
+    pub(crate) fn shutdown_closes_read_side(&self) -> bool {
+        self.websocket.is_some()
     }
 
     pub(crate) async fn connect_vision(
@@ -583,5 +591,50 @@ impl AsyncWrite for WebSocketIo {
         Pin::new(&mut self.websocket)
             .poll_close(cx)
             .map_err(|_| io_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pathchord_policy::{TransitOptions, TransitProxyId, TransitTransport};
+
+    #[test]
+    fn websocket_rejects_duplicate_host_header_names() {
+        let mut config = TransitProxyConfig {
+            id: TransitProxyId::new("websocket"),
+            source: None,
+            protocol: "vmess".into(),
+            endpoint: pathchord_policy::Endpoint {
+                host: "proxy.test".into(),
+                port: 80,
+            },
+            credentials_ref: None,
+            labels: Default::default(),
+            tags: Default::default(),
+            weight: 1,
+            options: TransitOptions::default(),
+        };
+        config.options.transport = Some(TransitTransport {
+            kind: "ws".into(),
+            headers: [
+                ("Host".into(), "one.example".into()),
+                ("host".into(), "two.example".into()),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        let base = crate::tls::client_builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let result = NativeTransport::new(
+            &config,
+            &TransitCredential::default(),
+            Arc::new(base),
+            Duration::from_secs(1),
+        );
+        assert!(
+            matches!(result, Err(TransitError::Unsupported(message)) if message.contains("duplicate"))
+        );
     }
 }

@@ -6,7 +6,11 @@
 //! native adapter implements both AEAD and legacy alter-ID header profiles,
 //! modern AEAD body ciphers and explicitly configured plaintext bodies.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use aes::cipher::BlockCipherEncrypt;
@@ -22,7 +26,9 @@ use sha3::digest::{ExtendableOutput, XofReader};
 use shake::{Shake128, Shake128Reader};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
+use tokio_util::sync::PollSender;
 use zeroize::Zeroize;
 
 use crate::{
@@ -94,10 +100,20 @@ impl VmessAdapter {
             .field("uuid")
             .ok_or_else(|| unsupported("VMess UUID is missing"))?;
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| unsupported("VMess UUID is invalid"))?;
-        let security = credential
-            .field("security")
-            .map(BodyCipherKind::parse)
-            .transpose()?;
+        let security = credential.field("security");
+        let security = if config
+            .source
+            .as_ref()
+            .is_some_and(|source| source.source_type == "sing_box")
+            && security.is_none_or(|value| matches!(value, "" | "auto"))
+        {
+            Some(sing_box_default_security(
+                config.options.tls.as_ref().is_some_and(|tls| tls.enabled),
+            ))
+        } else {
+            security
+        };
+        let security = security.map(BodyCipherKind::parse).transpose()?;
         let cipher = credential
             .field("cipher")
             .map(BodyCipherKind::parse)
@@ -184,10 +200,30 @@ impl VmessAdapter {
                 .flush()
                 .await
                 .map_err(|_| protocol("VMess request header flush failed"))?;
-            Ok(spawn_duplex(stream, sealed, self.cipher, self.framing))
+            Ok(spawn_duplex(
+                stream,
+                sealed,
+                self.cipher,
+                self.framing,
+                self.transport.shutdown_closes_read_side(),
+            ))
         })
         .await
         .map_err(|_| TransitError::Connection("VMess opening timed out".to_owned()))?
+    }
+}
+
+pub(super) fn sing_box_default_security(tls: bool) -> &'static str {
+    if tls {
+        "zero"
+    } else if cfg!(any(
+        target_arch = "x86_64",
+        target_arch = "s390x",
+        target_arch = "aarch64"
+    )) {
+        "aes-128-gcm"
+    } else {
+        "chacha20-poly1305"
     }
 }
 
@@ -1000,72 +1036,130 @@ fn response_io_error(error: TransitError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
 }
 
+enum UploadCipher {
+    Plain,
+    Cfb(Box<CfbStream>),
+    Record(Box<RecordCodec>),
+}
+
+impl UploadCipher {
+    fn encode(&mut self, payload: Vec<u8>) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Plain => Ok(payload),
+            Self::Cfb(cipher) => Ok(cfb_record(cipher, &payload)),
+            Self::Record(codec) => codec.encode(&payload).map_err(response_io_error),
+        }
+    }
+
+    async fn finish(
+        &mut self,
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        preserve_read_side: bool,
+    ) -> io::Result<()> {
+        if !matches!(self, Self::Plain) {
+            writer.write_all(&self.encode(Vec::new())?).await?;
+            writer.flush().await?;
+            // The VMess marker supplies EOF for carriers whose shutdown
+            // would close both directions, such as WebSocket.
+            if preserve_read_side {
+                return Ok(());
+            }
+        }
+        writer.shutdown().await
+    }
+}
+
+enum UploadCommand {
+    Data(Vec<u8>),
+    Flush(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<()>),
+}
+
+async fn run_upload(
+    mut upstream: impl tokio::io::AsyncWrite + Unpin,
+    mut commands: mpsc::Receiver<UploadCommand>,
+    mut cipher: UploadCipher,
+    error: Arc<Mutex<Option<io::Error>>>,
+    preserve_read_side: bool,
+) {
+    let result = async {
+        while let Some(command) = commands.recv().await {
+            match command {
+                UploadCommand::Data(payload) => {
+                    upstream.write_all(&cipher.encode(payload)?).await?;
+                    upstream.flush().await?;
+                }
+                UploadCommand::Flush(reply) => {
+                    let result = upstream.flush().await;
+                    if result.is_ok() {
+                        let _ = reply.send(());
+                    } else {
+                        // Keep the acknowledgement alive until the error is visible.
+                        *error.lock().expect("VMess upload state") = result.err();
+                        return Ok(());
+                    }
+                }
+                UploadCommand::Shutdown(reply) => {
+                    let result = cipher.finish(&mut upstream, preserve_read_side).await;
+                    if result.is_ok() {
+                        let _ = reply.send(());
+                    } else {
+                        *error.lock().expect("VMess upload state") = result.err();
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        cipher.finish(&mut upstream, preserve_read_side).await
+    }
+    .await;
+    if let Err(failure) = result {
+        *error.lock().expect("VMess upload state") = Some(failure);
+    }
+}
+
 fn spawn_duplex(
     upstream: BoxedTransitConnection,
     sealed: Sealed,
     cipher_kind: BodyCipherKind,
     framing: VmessFramingOptions,
+    preserve_read_side: bool,
 ) -> BoxedTransitConnection {
     let plain_framed = sealed.command == 3;
-    let (client, server) = tokio::io::duplex(32 * 1024);
-    let read_error = Arc::new(std::sync::Mutex::new(None));
+    let (client, mut client_write) = tokio::io::simplex(32 * 1024);
+    let read_error = Arc::new(Mutex::new(None));
     let response_error = Arc::clone(&read_error);
-    let (mut client_read, mut client_write) = tokio::io::split(server);
-    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+    let (mut upstream_read, upstream_write) = tokio::io::split(upstream);
     let write_key = sealed.req_key;
     let write_iv = sealed.req_iv;
     let (resp_key, resp_iv) =
         selected_response_keys(&sealed.req_key, &sealed.req_iv, sealed.legacy);
     let resp_v = sealed.resp_v;
     let legacy = sealed.legacy;
-    tokio::spawn(async move {
-        if cipher_kind == BodyCipherKind::Plain && !plain_framed {
-            let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
-            let _ = upstream_write.shutdown().await;
-            return;
+    let cipher = match cipher_kind {
+        BodyCipherKind::Plain if !plain_framed => UploadCipher::Plain,
+        BodyCipherKind::Aes128Cfb => {
+            UploadCipher::Cfb(Box::new(CfbStream::new(&write_key, &write_iv)))
         }
-        if cipher_kind == BodyCipherKind::Aes128Cfb {
-            let mut cipher = CfbStream::new(&write_key, &write_iv);
-            let mut buffer = vec![0; MAX_RECORD];
-            while let Ok(size) = client_read.read(&mut buffer).await {
-                if size == 0
-                    || upstream_write
-                        .write_all(&cfb_record(&mut cipher, &buffer[..size]))
-                        .await
-                        .is_err()
-                    || upstream_write.flush().await.is_err()
-                {
-                    break;
-                }
-            }
-            let _ = upstream_write.shutdown().await;
-            return;
-        }
-        let mut codec = RecordCodec::new(
+        _ => UploadCipher::Record(Box::new(RecordCodec::new(
             cipher_kind,
             &write_key,
             &write_iv,
             &write_key,
             &write_iv,
             framing,
-        );
-        let mut buf = vec![0u8; MAX_RECORD];
-        while let Ok(size) = client_read.read(&mut buf).await {
-            if size == 0 {
-                break;
-            }
-            let Ok(encoded) = codec.encode(&buf[..size]) else {
-                break;
-            };
-            if upstream_write.write_all(&encoded).await.is_err()
-                || upstream_write.flush().await.is_err()
-            {
-                break;
-            }
-        }
-        let _ = upstream_write.shutdown().await;
-    });
-    tokio::spawn(async move {
+        ))),
+    };
+    let (upload, commands) = mpsc::channel(2);
+    let write_error = Arc::new(Mutex::new(None));
+    tokio::spawn(run_upload(
+        upstream_write,
+        commands,
+        cipher,
+        Arc::clone(&write_error),
+        preserve_read_side,
+    ));
+    let download = tokio::spawn(async move {
         let response_cfb =
             match read_response_header(&mut upstream_read, &resp_key, &resp_iv, resp_v, legacy)
                 .await
@@ -1128,7 +1222,7 @@ fn spawn_duplex(
                     )));
                     break;
                 };
-                if client_write.write_all(&payload).await.is_err() {
+                if payload.is_empty() || client_write.write_all(&payload).await.is_err() {
                     break;
                 }
             }
@@ -1180,7 +1274,7 @@ fn spawn_duplex(
                 )));
                 break;
             };
-            if client_write.write_all(&plain).await.is_err() {
+            if plain.is_empty() || client_write.write_all(&plain).await.is_err() {
                 break;
             }
         }
@@ -1189,12 +1283,88 @@ fn spawn_duplex(
     Box::new(VmessConnection {
         inner: client,
         read_error,
+        upload: PollSender::new(upload),
+        write_error,
+        upload_state: UploadState::Open,
+        download: download.abort_handle(),
     })
 }
 
+enum UploadState {
+    Open,
+    Flushing(oneshot::Receiver<()>),
+    Closing(oneshot::Receiver<()>),
+    Closed,
+    Failed,
+}
+
 struct VmessConnection {
-    inner: tokio::io::DuplexStream,
-    read_error: Arc<std::sync::Mutex<Option<std::io::Error>>>,
+    inner: tokio::io::ReadHalf<tokio::io::SimplexStream>,
+    read_error: Arc<Mutex<Option<io::Error>>>,
+    upload: PollSender<UploadCommand>,
+    write_error: Arc<Mutex<Option<io::Error>>>,
+    upload_state: UploadState,
+    download: tokio::task::AbortHandle,
+}
+
+impl Drop for VmessConnection {
+    fn drop(&mut self) {
+        // The peer may be silent while our upload task is draining accepted
+        // data. A dropped reader never needs to keep that carrier alive.
+        self.download.abort();
+    }
+}
+
+impl VmessConnection {
+    fn upload_error(&self) -> io::Error {
+        self.write_error
+            .lock()
+            .expect("VMess upload state")
+            .as_ref()
+            .map_or_else(
+                || io::ErrorKind::BrokenPipe.into(),
+                |error| io::Error::new(error.kind(), error.to_string()),
+            )
+    }
+
+    fn poll_upload_barrier(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let (reply, next_state) = match &mut self.upload_state {
+            UploadState::Flushing(reply) => (reply, UploadState::Open),
+            UploadState::Closing(reply) => (reply, UploadState::Closed),
+            UploadState::Open | UploadState::Closed => return Poll::Ready(Ok(())),
+            UploadState::Failed => return Poll::Ready(Err(self.upload_error())),
+        };
+        if ready!(Pin::new(reply).poll(cx)).is_err() {
+            self.upload_state = UploadState::Failed;
+            return Poll::Ready(Err(self.upload_error()));
+        }
+        self.upload_state = next_state;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_upload_command(
+        &mut self,
+        cx: &mut Context<'_>,
+        shutdown: bool,
+    ) -> Poll<io::Result<()>> {
+        let was_flushing = matches!(self.upload_state, UploadState::Flushing(_));
+        ready!(self.poll_upload_barrier(cx))?;
+        if matches!(self.upload_state, UploadState::Closed) || (was_flushing && !shutdown) {
+            return Poll::Ready(Ok(()));
+        }
+        ready!(self.upload.poll_reserve(cx)).map_err(|_| self.upload_error())?;
+        let (reply, result) = oneshot::channel();
+        let (command, state) = if shutdown {
+            (UploadCommand::Shutdown(reply), UploadState::Closing(result))
+        } else {
+            (UploadCommand::Flush(reply), UploadState::Flushing(result))
+        };
+        self.upload
+            .send_item(command)
+            .map_err(|_| self.upload_error())?;
+        self.upload_state = state;
+        self.poll_upload_barrier(cx)
+    }
 }
 
 impl tokio::io::AsyncRead for VmessConnection {
@@ -1224,25 +1394,37 @@ impl tokio::io::AsyncRead for VmessConnection {
 
 impl tokio::io::AsyncWrite for VmessConnection {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         bytes: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes)
+    ) -> Poll<io::Result<usize>> {
+        ready!(self.poll_upload_barrier(cx))?;
+        if matches!(self.upload_state, UploadState::Closed) {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if bytes.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        ready!(self.upload.poll_reserve(cx)).map_err(|_| self.upload_error())?;
+        let count = bytes.len().min(MAX_RECORD);
+        self.upload
+            .send_item(UploadCommand::Data(bytes[..count].to_vec()))
+            .map_err(|_| self.upload_error())?;
+        Poll::Ready(Ok(count))
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        self.poll_upload_command(cx, false)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        self.poll_upload_command(cx, true)
     }
 }
 
@@ -1946,7 +2128,7 @@ mod tests {
             let mut cfb = CfbStream::new(&sealed.req_key, &sealed.req_iv);
             let (upstream, mut peer) = tokio::io::duplex(8192);
             let buffered = tokio::io::BufWriter::with_capacity(8192, upstream);
-            let mut stream = spawn_duplex(Box::new(buffered), sealed, kind, framing);
+            let mut stream = spawn_duplex(Box::new(buffered), sealed, kind, framing, false);
             let payload: Vec<_> = (0..131_071).map(|index| (index % 251) as u8).collect();
             let expected_len = payload.len();
             let mut peer_task = tokio::spawn(async move {
@@ -2008,6 +2190,7 @@ mod tests {
                 sealed,
                 BodyCipherKind::Aes128Cfb,
                 VmessFramingOptions::default(),
+                false,
             );
             peer.write_all(&encrypted).await.unwrap();
             let error = timeout(Duration::from_secs(1), stream.read_u8())
@@ -2026,7 +2209,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_aead_response_errors_reach_the_caller_but_clean_eof_does_not() {
-        for mode in ["clean", "truncated", "tampered"] {
+        for mode in ["clean", "termination", "truncated", "tampered"] {
             let sealed = Sealed {
                 bytes: Vec::new(),
                 req_key: [0x21; 16],
@@ -2063,18 +2246,29 @@ mod tests {
                 sealed,
                 BodyCipherKind::Aes128Gcm,
                 VmessFramingOptions::default(),
+                false,
             );
             peer.write_all(&encrypted_length).await.unwrap();
             peer.write_all(&encrypted_header).await.unwrap();
             match mode {
-                "clean" => {
+                "clean" | "termination" => {
                     peer.write_all(&encoded).await.unwrap();
-                    peer.shutdown().await.unwrap();
+                    if mode == "termination" {
+                        peer.write_all(&codec.encode(&[]).unwrap()).await.unwrap();
+                    } else {
+                        peer.shutdown().await.unwrap();
+                    }
                     let mut output = [0; 8];
                     stream.read_exact(&mut output).await.unwrap();
                     assert_eq!(&output, b"response");
                     let mut one = [0; 1];
-                    assert_eq!(stream.read(&mut one).await.unwrap(), 0);
+                    assert_eq!(
+                        timeout(Duration::from_secs(1), stream.read(&mut one))
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        0
+                    );
                 }
                 "truncated" => {
                     peer.write_all(&encoded[..encoded.len() - 1]).await.unwrap();
@@ -2096,6 +2290,81 @@ mod tests {
                     );
                 }
                 _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_shutdown_sends_a_valid_empty_record_without_closing_the_carrier() {
+        for kind in [BodyCipherKind::Aes128Gcm, BodyCipherKind::Aes128Cfb] {
+            let sealed = Sealed {
+                bytes: Vec::new(),
+                req_key: [0x21; 16],
+                req_iv: [0x37; 16],
+                resp_v: 0x42,
+                command: 1,
+                legacy: false,
+            };
+            let framing = VmessFramingOptions::default();
+            let ending = if kind == BodyCipherKind::Aes128Cfb {
+                cfb_record(&mut CfbStream::new(&sealed.req_key, &sealed.req_iv), &[])
+            } else {
+                RecordCodec::new(
+                    kind,
+                    &sealed.req_key,
+                    &sealed.req_iv,
+                    &sealed.req_key,
+                    &sealed.req_iv,
+                    framing,
+                )
+                .encode(&[])
+                .unwrap()
+            };
+            let (upstream, mut peer) = tokio::io::duplex(512);
+            let mut stream = spawn_duplex(Box::new(upstream), sealed, kind, framing, true);
+            stream.shutdown().await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut frame = vec![0_u8; ending.len()];
+            peer.read_exact(&mut frame).await.unwrap();
+            assert_eq!(frame, ending);
+            let mut trailing = [0_u8; 1];
+            assert!(
+                timeout(Duration::from_millis(10), peer.read(&mut trailing))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_flush_and_shutdown_report_carrier_write_errors() {
+        for shutdown in [false, true] {
+            let sealed = Sealed {
+                bytes: Vec::new(),
+                req_key: [0x21; 16],
+                req_iv: [0x37; 16],
+                resp_v: 0x42,
+                command: 1,
+                legacy: false,
+            };
+            let (upstream, peer) = tokio::io::duplex(32);
+            let mut stream = spawn_duplex(
+                Box::new(upstream),
+                sealed,
+                BodyCipherKind::Aes128Gcm,
+                VmessFramingOptions::default(),
+                false,
+            );
+            stream.write_all(b"queued").await.unwrap();
+            drop(peer);
+            for _ in 0..2 {
+                let error = if shutdown {
+                    stream.shutdown().await
+                } else {
+                    stream.flush().await
+                }
+                .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
             }
         }
     }
@@ -2137,6 +2406,7 @@ mod tests {
                 sealed,
                 BodyCipherKind::Aes128Cfb,
                 VmessFramingOptions::default(),
+                false,
             );
             peer.write_all(&encrypted_length).await.unwrap();
             peer.write_all(&encrypted_header).await.unwrap();

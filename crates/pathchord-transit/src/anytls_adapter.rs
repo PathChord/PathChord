@@ -5,13 +5,16 @@
 //! here so the codec remains transport-neutral and can be tested independently.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use zeroize::Zeroizing;
@@ -235,15 +238,12 @@ async fn open_stream_relay(
                 }
                 AnyTlsCommand::Alert => return Err(protocol("AnyTLS peer rejected the stream")),
                 AnyTlsCommand::HeartRequest => {
-                    let mut response = BytesMut::new();
-                    AnyTlsFrame {
-                        command: AnyTlsCommand::HeartResponse,
-                        stream_id: 0,
-                        payload: frame.payload,
-                    }
-                    .encode(&mut response)
-                    .map_err(protocol)?;
+                    let response = heartbeat_response(frame.stream_id).map_err(protocol)?;
                     stream.write_all(&response).await.map_err(io_failure)?;
+                    stream.flush().await.map_err(io_failure)?;
+                }
+                AnyTlsCommand::Fin if frame.stream_id == STREAM_ID => {
+                    return Err(protocol("AnyTLS peer closed before SYNACK"));
                 }
                 _ => {}
             }
@@ -257,6 +257,75 @@ async fn open_stream_relay(
     }
 }
 
+fn heartbeat_response(stream_id: u32) -> Result<BytesMut, &'static str> {
+    let mut response = BytesMut::new();
+    AnyTlsFrame {
+        command: AnyTlsCommand::HeartResponse,
+        stream_id,
+        payload: bytes::Bytes::new(),
+    }
+    .encode(&mut response)?;
+    Ok(response)
+}
+
+#[derive(Clone, Copy)]
+enum RelayEnd {
+    Closed,
+    Alert,
+}
+
+struct RelayStream {
+    client: DuplexStream,
+    end: Arc<Mutex<Option<RelayEnd>>>,
+}
+
+impl AsyncRead for RelayStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if output.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let before = output.filled().len();
+        std::task::ready!(Pin::new(&mut self.client).poll_read(cx, output))?;
+        if output.filled().len() == before
+            && matches!(
+                *self.end.lock().expect("relay state"),
+                Some(RelayEnd::Alert)
+            )
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "AnyTLS peer closed the session with ALERT",
+            )));
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for RelayStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.end.lock().expect("relay state").is_some() {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        Pin::new(&mut self.client).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.client).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.client).poll_shutdown(cx)
+    }
+}
+
 fn spawn_stream_relay(
     stream: BoxedTransitConnection,
     mut input: BytesMut,
@@ -265,8 +334,9 @@ fn spawn_stream_relay(
     let (mut client_read, mut client_write) = tokio::io::split(server);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(stream);
     let (control_tx, mut control_rx) = mpsc::channel::<BytesMut>(8);
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         let mut data = vec![0_u8; MAX_FRAME_PAYLOAD];
+        let mut control_open = true;
         loop {
             tokio::select! {
                 result = client_read.read(&mut data) => {
@@ -277,8 +347,11 @@ fn spawn_stream_relay(
                     if upstream_write.write_all(&frame).await.is_err()
                         || upstream_write.flush().await.is_err() { break; }
                 }
-                control = control_rx.recv() => {
-                    let Some(control) = control else { break; };
+                control = control_rx.recv(), if control_open => {
+                    let Some(control) = control else {
+                        control_open = false;
+                        continue;
+                    };
                     if upstream_write.write_all(&control).await.is_err()
                         || upstream_write.flush().await.is_err() { break; }
                 }
@@ -294,51 +367,47 @@ fn spawn_stream_relay(
         let _ = upstream_write.write_all(&fin).await;
         let _ = upstream_write.shutdown().await;
     });
+    let end = Arc::new(Mutex::new(None));
+    let peer_end = Arc::clone(&end);
     tokio::spawn(async move {
         let mut buffer = [0_u8; 8192];
-        loop {
+        let reason = 'relay: loop {
             while let Ok(Some(frame)) = AnyTlsFrame::decode(&mut input) {
                 match frame.command {
                     AnyTlsCommand::Push if frame.stream_id == STREAM_ID => {
                         if client_write.write_all(&frame.payload).await.is_err() {
+                            // The caller dropped the stream. The writer still
+                            // owns any pending upload and its local FIN.
                             return;
                         }
                     }
                     AnyTlsCommand::HeartRequest => {
-                        let mut response = BytesMut::new();
-                        if (AnyTlsFrame {
-                            command: AnyTlsCommand::HeartResponse,
-                            stream_id: 0,
-                            payload: frame.payload,
-                        })
-                        .encode(&mut response)
-                        .is_ok()
-                        {
+                        if let Ok(response) = heartbeat_response(frame.stream_id) {
                             let _ = control_tx.send(response).await;
                         }
                     }
                     AnyTlsCommand::Fin if frame.stream_id == STREAM_ID => {
-                        let _ = client_write.shutdown().await;
-                        return;
+                        break 'relay RelayEnd::Closed;
                     }
                     AnyTlsCommand::Alert => {
-                        let _ = client_write.shutdown().await;
-                        return;
+                        break 'relay RelayEnd::Alert;
                     }
                     _ => {}
                 }
             }
             let Ok(read) = upstream_read.read(&mut buffer).await else {
-                break;
+                break RelayEnd::Closed;
             };
             if read == 0 {
-                break;
+                break RelayEnd::Closed;
             }
             input.extend_from_slice(&buffer[..read]);
-        }
+        };
+        *peer_end.lock().expect("relay state") = Some(reason);
+        writer.abort();
         let _ = client_write.shutdown().await;
     });
-    Box::new(client)
+    Box::new(RelayStream { client, end })
 }
 
 fn unsupported(message: &str) -> TransitError {
@@ -526,6 +595,69 @@ mod tests {
             result,
             Err(TransitError::Protocol(reason)) if reason == "AnyTLS peer rejected the stream"
         ));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reply_preserves_stream_id_before_and_after_synack() {
+        let (upstream, mut peer) = tokio::io::duplex(256);
+        let mut frames = BytesMut::new();
+        append_frame(&mut frames, AnyTlsCommand::HeartRequest, b"ignored");
+        append_frame(&mut frames, AnyTlsCommand::SynAck, b"");
+        append_frame(&mut frames, AnyTlsCommand::HeartRequest, b"also ignored");
+        peer.write_all(&frames).await.unwrap();
+        let _relay = open_stream_relay(Box::new(upstream)).await.unwrap();
+
+        let mut responses = [0; 14];
+        timeout(Duration::from_secs(1), peer.read_exact(&mut responses))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut responses = BytesMut::from(responses.as_slice());
+        for _ in 0..2 {
+            let response = AnyTlsFrame::decode(&mut responses).unwrap().unwrap();
+            assert_eq!(response.command, AnyTlsCommand::HeartResponse);
+            assert_eq!(response.stream_id, STREAM_ID);
+            assert!(response.payload.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_fin_and_alert_stop_writes_without_sending_fin_back() {
+        for (command, payload) in [
+            (AnyTlsCommand::Fin, b"".as_slice()),
+            (AnyTlsCommand::Alert, b"private alert".as_slice()),
+        ] {
+            let (upstream, mut peer) = tokio::io::duplex(256);
+            let mut frames = BytesMut::new();
+            append_frame(&mut frames, AnyTlsCommand::SynAck, b"");
+            append_frame(&mut frames, AnyTlsCommand::Push, b"reply");
+            append_frame(&mut frames, command, payload);
+            peer.write_all(&frames).await.unwrap();
+            let mut relay = open_stream_relay(Box::new(upstream)).await.unwrap();
+
+            let mut data = Vec::new();
+            let result = timeout(Duration::from_secs(1), relay.read_to_end(&mut data))
+                .await
+                .unwrap();
+            assert_eq!(data, b"reply");
+            if command == AnyTlsCommand::Alert {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+                assert!(!error.to_string().contains("private alert"));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                relay.write_all(b"after close").await.unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            let mut reply = Vec::new();
+            timeout(Duration::from_secs(1), peer.read_to_end(&mut reply))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(reply.is_empty());
+        }
     }
 
     #[tokio::test]

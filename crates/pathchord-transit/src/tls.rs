@@ -224,18 +224,8 @@ pub(crate) fn load_truststore(sources: &[String]) -> Result<RootCertStore, Trans
     let mut roots = RootCertStore::empty();
     for source in sources {
         if source == "system" {
-            let loaded = rustls_native_certs::load_native_certs();
-            let mut accepted = 0_usize;
-            for certificate in loaded.certs {
-                if roots.add(certificate).is_ok() {
-                    accepted += 1;
-                }
-            }
-            if accepted == 0 {
-                return Err(TransitError::Unsupported(
-                    "system TLS root store is empty or invalid".into(),
-                ));
-            }
+            let system_roots = validate_system_roots(rustls_native_certs::load_native_certs())?;
+            roots.roots.extend(system_roots.roots);
             continue;
         }
         let path = Path::new(source);
@@ -291,6 +281,25 @@ pub(crate) fn load_truststore(sources: &[String]) -> Result<RootCertStore, Trans
                 TransitError::Unsupported("TLS truststore certificate is invalid".into())
             })?;
         }
+    }
+    Ok(roots)
+}
+
+fn validate_system_roots(
+    loaded: rustls_native_certs::CertificateResult,
+) -> Result<RootCertStore, TransitError> {
+    if !loaded.errors.is_empty() || loaded.certs.is_empty() {
+        return Err(TransitError::Unsupported(
+            "system TLS root store is empty, unreadable, or invalid".into(),
+        ));
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in loaded.certs {
+        roots.add(certificate).map_err(|_| {
+            TransitError::Unsupported(
+                "system TLS root store contains an invalid certificate".into(),
+            )
+        })?;
     }
     Ok(roots)
 }
@@ -654,6 +663,23 @@ mod tests {
         let result = load_truststore(&[path.to_string_lossy().into_owned()]);
         let _ = std::fs::remove_file(path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn system_root_load_errors_reject_even_with_a_valid_certificate() {
+        let cert = rcgen::generate_simple_self_signed(vec!["root.test".into()]).unwrap();
+        let mut loaded = rustls_native_certs::CertificateResult::default();
+        loaded.certs.push(cert.cert.der().clone());
+        loaded.errors.push(rustls_native_certs::Error {
+            context: "test system root load",
+            kind: rustls_native_certs::ErrorKind::Os(
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
+            ),
+        });
+        assert!(matches!(
+            validate_system_roots(loaded),
+            Err(TransitError::Unsupported(_))
+        ));
     }
 
     #[cfg(unix)]

@@ -412,22 +412,31 @@ where
         .map_err(|_| TransitError::Connection("CONNECT request flush failed".to_owned()))?;
 
     let mut response = Vec::new();
-    while response.len() < MAX_CONNECT_RESPONSE_BYTES {
-        let mut byte = [0_u8; 1];
-        stream
-            .read_exact(&mut byte)
+    for _ in 0..MAX_CONNECT_RESPONSE_BYTES {
+        let byte = stream
+            .read_u8()
             .await
             .map_err(|_| TransitError::Protocol("CONNECT response is truncated".to_owned()))?;
-        response.push(byte[0]);
-        if response.ends_with(b"\r\n\r\n") {
-            break;
+        response.push(byte);
+        if !response.ends_with(b"\r\n\r\n") {
+            continue;
+        }
+        match connect_response_status(&response)? {
+            100 | 102..=199 => response.clear(),
+            200..=299 => return Ok(()),
+            _ => {
+                return Err(TransitError::Protocol(
+                    "CONNECT proxy rejected the tunnel".to_owned(),
+                ));
+            }
         }
     }
-    if !response.ends_with(b"\r\n\r\n") {
-        return Err(TransitError::Protocol(
-            "CONNECT response headers exceed the bound".to_owned(),
-        ));
-    }
+    Err(TransitError::Protocol(
+        "CONNECT response headers exceed the bound".to_owned(),
+    ))
+}
+
+fn connect_response_status(response: &[u8]) -> Result<u16, TransitError> {
     let first_line_end = response
         .windows(2)
         .position(|window| window == b"\r\n")
@@ -436,13 +445,15 @@ where
         .map_err(|_| TransitError::Protocol("CONNECT status line is not UTF-8".to_owned()))?;
     let mut fields = first_line.split_ascii_whitespace();
     let version = fields.next().unwrap_or_default();
-    let status = fields.next().unwrap_or_default();
-    if !version.starts_with("HTTP/1.") || status != "200" {
-        return Err(TransitError::Protocol(
-            "CONNECT proxy rejected the tunnel".to_owned(),
-        ));
-    }
-    Ok(())
+    fields
+        .next()
+        .filter(|status| {
+            matches!(version, "HTTP/1.0" | "HTTP/1.1")
+                && status.len() == 3
+                && status.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| TransitError::Protocol("CONNECT status line is invalid".to_owned()))
 }
 
 fn proxy_headers(
@@ -941,6 +952,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_accepts_final_2xx_and_preserves_immediate_tunnel_bytes() {
+        let (mut client, mut proxy) = tokio::io::duplex(1024);
+        proxy
+            .write_all(
+                b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Connected\r\n\r\nhello",
+            )
+            .await
+            .unwrap();
+        establish_connect_tunnel(
+            &mut client,
+            &Endpoint {
+                host: "target.test".into(),
+                port: 443,
+            },
+            None,
+            &BTreeMap::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut data = [0; 5];
+        client.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"hello");
+    }
+
+    #[tokio::test]
     async fn connect_response_headers_are_bounded() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_address = proxy.local_addr().unwrap();
@@ -948,10 +986,10 @@ mod tests {
             let (mut stream, _) = proxy.accept().await.unwrap();
             let mut request = [0_u8; 256];
             let _ = stream.read(&mut request).await.unwrap();
-            stream
-                .write_all(&vec![b'x'; MAX_CONNECT_RESPONSE_BYTES + 1])
-                .await
-                .unwrap();
+            let interim = b"HTTP/1.1 103 Early Hints\r\n\r\n";
+            let mut response = interim.repeat(MAX_CONNECT_RESPONSE_BYTES.div_ceil(interim.len()));
+            response.extend_from_slice(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+            stream.write_all(&response).await.unwrap();
         });
         let adapter = HttpConnectTransitAdapter::from_config(
             &config("http", proxy_address),

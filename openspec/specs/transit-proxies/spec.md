@@ -339,6 +339,9 @@ rejected at preparation. Each Mbps is 125,000 bytes per second. Omitted values
 are zero. `down_mbps` is sent as the client's receive-rate hint in the request
 `Hysteria-CC-RX`; zero means unknown, and the server may ignore the hint.
 
+Hysteria2 uses `h3` ALPN for HTTP/3 authentication. An explicit ALPN list
+containing another protocol is rejected during adapter preparation.
+
 The client uses BBR for the QUIC handshake. After authentication, a response
 `Hysteria-CC-RX: auto` keeps BBR regardless of `up_mbps`. For a numeric
 response, zero selects the configured `up_mbps`; a positive response selects
@@ -433,6 +436,8 @@ bypass and MUST be explicit.
 `https` implies enabled TLS. A Clash HTTP node with `tls: true` normalizes to
 HTTPS CONNECT. `serverName` overrides certificate/SNI identity independently
 of the connection address. Native HTTPS CONNECT permits HTTP/1.1 ALPN.
+HTTP/1 CONNECT accepts a final 2xx response after any informational responses
+other than 101. The response-header bound applies to the whole exchange.
 `certificates` contains inline PEM trust anchors added to the configured
 truststore; `clientCertificates` contains the inline client-authentication
 chain. Client private keys are resolved only from the opaque credential
@@ -539,6 +544,7 @@ performs final protocol validation.
 `clientKeyField` adds its referenced private field to the permitted set.
 Conflicting aliases are invalid. Further protocol fields remain unavailable
 until the corresponding native adapter supports them.
+TUIC uses a 10-second heartbeat interval when `heartbeat` is absent.
 
 Foreign document syntax and private credential JSON retain their source
 spellings. Supported Clash `client-fingerprint` and sing-box

@@ -554,64 +554,58 @@ impl TransitDatagram for NativeDatagram {
         Ok(())
     }
     async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
-        if matches!(self.protocol, Protocol::Vless) {
-            loop {
-                if self.received.len() >= 2 {
-                    let length =
-                        usize::from(u16::from_be_bytes([self.received[0], self.received[1]]));
-                    if self.received.len() >= length + 2 {
-                        let payload = self.received[2..length + 2].to_vec();
-                        self.received.drain(..length + 2);
-                        return Ok(payload);
+        use trojan_proto::{HostRef, ParseResult};
+
+        let mut chunk = [0; 8192];
+        loop {
+            let frame = match self.protocol {
+                Protocol::Vless => self.received.first_chunk::<2>().and_then(|length| {
+                    let end = 2 + usize::from(u16::from_be_bytes(*length));
+                    self.received.get(2..end).map(|payload| (end, payload))
+                }),
+                Protocol::Trojan => match trojan_proto::parse_udp_packet(&self.received) {
+                    ParseResult::Complete(packet) => {
+                        let source = match packet.address.host {
+                            HostRef::Ipv4(ip) => Some(IpAddr::from(ip)),
+                            HostRef::Ipv6(ip) => Some(IpAddr::from(ip)),
+                            HostRef::Domain(_) => None,
+                        };
+                        if packet.address.port == 0
+                            || packet.address.port != self.destination.port
+                            || self
+                                .destination
+                                .host
+                                .parse::<IpAddr>()
+                                .is_ok_and(|expected| source != Some(expected))
+                        {
+                            return Err(protocol(
+                                "Trojan UDP reply target does not match the association",
+                            ));
+                        }
+                        Some((packet.packet_len, packet.payload))
                     }
-                }
-                let mut chunk = [0; 8192];
-                let size = self
-                    .stream
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|_| protocol("native UDP packet read failed"))?;
-                if size == 0 {
-                    return Err(protocol("native UDP packet is truncated"));
-                }
-                self.received.extend_from_slice(&chunk[..size]);
+                    ParseResult::Incomplete(_) => None,
+                    ParseResult::Invalid(_) => {
+                        return Err(protocol("Trojan UDP packet header is invalid"));
+                    }
+                },
+            };
+            if let Some((length, payload)) = frame {
+                let payload = payload.to_vec();
+                self.received.drain(..length);
+                return Ok(payload);
             }
-        }
-        if matches!(self.protocol, Protocol::Trojan) {
-            let source = read_trojan_address(&mut self.stream).await?;
-            if source.port != self.destination.port
-                || self
-                    .destination
-                    .host
-                    .parse::<IpAddr>()
-                    .is_ok_and(|expected| source.host.parse::<IpAddr>() != Ok(expected))
-            {
-                return Err(protocol(
-                    "Trojan UDP reply target does not match the association",
-                ));
-            }
-        }
-        let length = self
-            .stream
-            .read_u16()
-            .await
-            .map_err(|_| protocol("native UDP length is truncated"))?;
-        if matches!(self.protocol, Protocol::Trojan) {
-            let mut separator = [0; 2];
-            self.stream
-                .read_exact(&mut separator)
+            // Keep consumed bytes across cancelled reads until a frame is complete.
+            let size = self
+                .stream
+                .read(&mut chunk)
                 .await
-                .map_err(|_| protocol("Trojan UDP separator is truncated"))?;
-            if separator != *b"\r\n" {
-                return Err(protocol("Trojan UDP separator is invalid"));
+                .map_err(|_| protocol("native UDP packet read failed"))?;
+            if size == 0 {
+                return Err(protocol("native UDP packet is truncated"));
             }
+            self.received.extend_from_slice(&chunk[..size]);
         }
-        let mut payload = vec![0; usize::from(length)];
-        self.stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(|_| protocol("native UDP payload is truncated"))?;
-        Ok(payload)
     }
     async fn close(mut self: Box<Self>) -> Result<(), TransitError> {
         self.stream
@@ -643,57 +637,6 @@ fn encode_trojan_address(destination: &Endpoint, packet: &mut Vec<u8>) -> Result
     }
     packet.extend_from_slice(&destination.port.to_be_bytes());
     Ok(())
-}
-
-async fn read_trojan_address(
-    stream: &mut BoxedTransitConnection,
-) -> Result<Endpoint, TransitError> {
-    let atyp = stream
-        .read_u8()
-        .await
-        .map_err(|_| protocol("Trojan UDP address is truncated"))?;
-    let host = match atyp {
-        1 => {
-            let mut ip = [0; 4];
-            stream
-                .read_exact(&mut ip)
-                .await
-                .map_err(|_| protocol("Trojan UDP address is truncated"))?;
-            std::net::Ipv4Addr::from(ip).to_string()
-        }
-        4 => {
-            let mut ip = [0; 16];
-            stream
-                .read_exact(&mut ip)
-                .await
-                .map_err(|_| protocol("Trojan UDP address is truncated"))?;
-            std::net::Ipv6Addr::from(ip).to_string()
-        }
-        3 => {
-            let length = stream
-                .read_u8()
-                .await
-                .map_err(|_| protocol("Trojan UDP domain is truncated"))?;
-            if length == 0 {
-                return Err(protocol("Trojan UDP domain is empty"));
-            }
-            let mut domain = vec![0; usize::from(length)];
-            stream
-                .read_exact(&mut domain)
-                .await
-                .map_err(|_| protocol("Trojan UDP domain is truncated"))?;
-            String::from_utf8(domain).map_err(|_| protocol("Trojan UDP domain is invalid"))?
-        }
-        _ => return Err(protocol("Trojan UDP address type is invalid")),
-    };
-    let port = stream
-        .read_u16()
-        .await
-        .map_err(|_| protocol("Trojan UDP port is truncated"))?;
-    if port == 0 {
-        return Err(protocol("Trojan UDP port is invalid"));
-    }
-    Ok(Endpoint { host, port })
 }
 
 #[cfg(test)]
@@ -829,6 +772,34 @@ mod tests {
         assert!(
             matches!(datagram.send(b"retry").await, Err(TransitError::Protocol(reason)) if reason.contains("interrupted"))
         );
+    }
+
+    #[tokio::test]
+    async fn trojan_datagram_retains_address_and_payload_across_cancelled_reads() {
+        let destination = Endpoint {
+            host: "example.test".into(),
+            port: 53,
+        };
+        let (stream, mut peer) = tokio::io::duplex(128);
+        let mut datagram =
+            NativeDatagram::new(Box::new(stream), destination.clone(), Protocol::Trojan);
+        let mut packets = bytes::BytesMut::new();
+        let address = trojan_address(&destination);
+        trojan_proto::write_udp_packet(&mut packets, &address, b"one").unwrap();
+        let first_end = packets.len();
+        trojan_proto::write_udp_packet(&mut packets, &address, b"two").unwrap();
+
+        for prefix in [&packets[..5], &packets[5..first_end - 1]] {
+            peer.write_all(prefix).await.unwrap();
+            {
+                let receive = datagram.receive();
+                tokio::pin!(receive);
+                assert!(futures_util::poll!(receive).is_pending());
+            }
+        }
+        peer.write_all(&packets[first_end - 1..]).await.unwrap();
+        assert_eq!(datagram.receive().await.unwrap(), b"one");
+        assert_eq!(datagram.receive().await.unwrap(), b"two");
     }
 
     #[tokio::test]

@@ -38,7 +38,7 @@ pub(crate) struct TuicAdapter {
     udp_relay: UdpRelay,
     udp_over_stream: bool,
     congestion: Congestion,
-    heartbeat: Option<Duration>,
+    heartbeat: Duration,
     timeout: Duration,
 }
 
@@ -131,7 +131,8 @@ impl TuicAdapter {
         let heartbeat = credential
             .field("heartbeat")
             .map(parse_duration)
-            .transpose()?;
+            .transpose()?
+            .unwrap_or(Duration::from_secs(10));
         let tls_options = config
             .options
             .tls
@@ -147,6 +148,7 @@ impl TuicAdapter {
         if tls_options.fingerprint.is_some() {
             return Err(unsupported("TUIC QUIC TLS fingerprint is unsupported"));
         }
+        crate::tls::server_name(&config.endpoint.host, Some(&tls_options))?;
         let tls = crate::tls::configure(base_tls, Some(&tls_options), Some(credential))?;
         let server_name = tls_options
             .server_name
@@ -219,19 +221,18 @@ impl TuicAdapter {
             .await
             .map_err(|_| TransitError::Connection("TUIC handshake timed out".into()))?
             .map_err(|error| TransitError::Connection(format!("TUIC handshake failed: {error}")))?;
-        let heartbeat_task = self.heartbeat.map(|interval| {
-            let heartbeat = connection.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(interval).await;
-                    if heartbeat
-                        .send_datagram(crate::tuic_codec::encode_heartbeat())
-                        .is_err()
-                    {
-                        break;
-                    }
+        let heartbeat = connection.clone();
+        let interval = self.heartbeat;
+        let heartbeat_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if heartbeat
+                    .send_datagram(crate::tuic_codec::encode_heartbeat())
+                    .is_err()
+                {
+                    break;
                 }
-            })
+            }
         });
         Ok(TuicSession {
             connection,
@@ -475,14 +476,12 @@ struct TuicStream {
 struct TuicSession {
     connection: quinn::Connection,
     _endpoint: quinn::Endpoint,
-    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    heartbeat: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for TuicSession {
     fn drop(&mut self) {
-        if let Some(task) = self.heartbeat.take() {
-            task.abort();
-        }
+        self.heartbeat.abort();
         self.connection.close(0_u32.into(), b"closed");
     }
 }
@@ -994,6 +993,43 @@ mod tests {
         assert!(parse_optional_bool(Some("")).is_err());
         assert!(parse_optional_bool(Some("TRUE")).unwrap());
         assert!(!parse_optional_bool(Some("false")).unwrap());
+    }
+
+    #[test]
+    fn checks_server_name_and_defaults_heartbeat_during_preparation() {
+        let mut node = pathchord_policy::TransitProxyConfig {
+            id: TransitProxyId::new("tuic-options"),
+            source: None,
+            protocol: "tuic".into(),
+            endpoint: PolicyEndpoint {
+                host: "127.0.0.1".into(),
+                port: 443,
+            },
+            credentials_ref: None,
+            labels: BTreeMap::new(),
+            tags: BTreeSet::new(),
+            weight: 100,
+            options: TransitOptions::default(),
+        };
+        let credential = TransitCredential::new(BTreeMap::from([
+            ("uuid".into(), "6cbf3f72-3417-4922-bde6-67820d041f25".into()),
+            ("password".into(), "fixture-password".into()),
+        ]));
+        let build = |node: &_| {
+            TuicAdapter::from_config(
+                node,
+                &credential,
+                Duration::from_secs(1),
+                crate::adapter_registry::native_tls_roots(),
+            )
+        };
+        assert_eq!(build(&node).unwrap().heartbeat, Duration::from_secs(10));
+        node.options.tls = Some(TransitTls {
+            enabled: true,
+            server_name: Some("invalid server name".into()),
+            ..Default::default()
+        });
+        assert!(matches!(build(&node), Err(TransitError::Unsupported(_))));
     }
 
     #[test]

@@ -881,6 +881,31 @@ fn vmess_json_share_retains_authentication_tls_and_transport() {
 }
 
 #[test]
+fn vmess_json_grpc_share_uses_path_only_as_the_service_name() {
+    let payload = r#"{"v":"2","ps":"VMess","add":"proxy.test","port":"443","id":"00000000-0000-0000-0000-000000000000","aid":"0","net":"grpc","type":"none","path":"custom.service"}"#;
+    let nodes = imports(
+        SubscriptionSourceType::Uri,
+        &format!("vmess://{}", base64(payload)),
+    );
+    let node = &nodes[0];
+    assert!(node.diagnostic.is_none());
+    let transport = node.config.options.transport.as_ref().unwrap();
+    assert_eq!(transport.service_name.as_deref(), Some("custom.service"));
+    assert!(transport.path.is_none());
+    assert!(
+        crate::AdapterRegistry::native(
+            Arc::new(crate::NoTransitCredentials),
+            std::time::Duration::from_secs(1),
+        )
+        .build_with_credential(
+            &node.config,
+            &crate::TransitCredential::new(node.credential.fields()),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn unknown_uri_options_are_explicit_and_do_not_poison_other_lines() {
     let nodes = imports(
         SubscriptionSourceType::Uri,
@@ -936,6 +961,55 @@ fn unknown_sing_box_fields_are_kept_for_exact_engine_validation() {
     assert_eq!(nodes[1].config.options, TransitOptions::default());
 }
 
+#[tokio::test]
+async fn sing_box_original_is_retained_after_preparation_failure_and_cache_restore() {
+    let directory = temp_directory("sing-box-original");
+    let mut config = config(SubscriptionSourceType::SingBox);
+    config.cache = Some(pathchord_policy::SubscriptionCache {
+        path: "provider.snapshot".to_owned(),
+        max_age_seconds: 3600,
+    });
+    let source = serde_json::json!({
+        "outbounds": [{
+            "type": "vmess", "tag": "original", "server": "proxy.test", "server_port": 443,
+            "uuid": "04ad65eb-ef04-4ba2-b089-6c1a4d51b4d0",
+            "tls": {"enabled": true, "utls": {"enabled": true, "fingerprint": "random"}}
+        }]
+    });
+    let available = BTreeSet::from(["vmess".to_owned()]);
+    let mut manager = SubscriptionManager::new(
+        Arc::new(ScriptedFetcher::new([Ok(
+            serde_json::to_vec(&source).unwrap()
+        )])),
+        &directory,
+        available.clone(),
+    );
+    assert!(matches!(
+        manager.refresh(&config).await,
+        RefreshOutcome::Published { .. }
+    ));
+    prepare_imported_nodes(&mut manager).await;
+    let mut restored =
+        SubscriptionManager::new(Arc::new(ScriptedFetcher::new([])), &directory, available);
+    assert!(matches!(
+        restored.load_cache(&config).await.unwrap(),
+        CacheLoadOutcome::Loaded { .. }
+    ));
+    prepare_imported_nodes(&mut restored).await;
+    for snapshot in [manager.snapshot(), restored.snapshot()] {
+        let node = snapshot.nodes.values().next().unwrap();
+        assert_eq!(
+            node.state,
+            DynamicNodeState::Unavailable(NodeUnavailableReason::AdapterUnavailable)
+        );
+        let original: Value =
+            serde_json::from_str(node.credential().original_sing_box_outbound().unwrap()).unwrap();
+        assert_eq!(original, source["outbounds"][0]);
+        assert!(!format!("{:?}", node.credential()).contains(original["uuid"].as_str().unwrap()));
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn sing_box_proxy_chain_options_remain_unavailable_without_a_native_chain_runtime() {
     let nodes = imports(
@@ -969,6 +1043,68 @@ fn simple_sing_box_socks_node_uses_the_native_adapter() {
     .unwrap();
     assert_eq!(nodes[0].state, DynamicNodeState::Active);
     assert!(nodes[0].credential.field("sing_box_outbound").is_none());
+}
+
+#[test]
+fn sing_box_preserves_tcp_only_nodes_without_enabling_udp() {
+    let nodes = imports(
+        SubscriptionSourceType::SingBox,
+        r#"{"outbounds":[
+          {"type":"socks","tag":"socket","server":"proxy.test","server_port":1080,"network":"tcp"},
+          {"type":"shadowsocks","tag":"ss","server":"proxy.test","server_port":8388,"method":"aes-128-gcm","password":"fixture","network":["tcp"]},
+          {"type":"socks","tag":"udp-only","server":"proxy.test","server_port":1080,"network":"udp"}
+        ]}"#,
+    );
+    for node in &nodes[..2] {
+        assert!(node.diagnostic.is_none());
+        assert_eq!(node.config.options.udp, Some(false));
+    }
+    assert!(nodes[2].diagnostic.is_some());
+    assert!(nodes[2].credential.field("sing_box_outbound").is_some());
+}
+
+#[test]
+fn sing_box_vmess_preserves_security_defaults_on_tls() {
+    let nodes = imports(
+        SubscriptionSourceType::SingBox,
+        r#"{"outbounds":[
+          {"type":"vmess","tag":"implicit","server":"proxy.test","server_port":443,"uuid":"fixture-uuid","tls":{"enabled":true}},
+          {"type":"vmess","tag":"auto","server":"proxy.test","server_port":443,"uuid":"fixture-uuid","security":"auto","tls":{"enabled":true}},
+          {"type":"vmess","tag":"explicit","server":"proxy.test","server_port":443,"uuid":"fixture-uuid","security":"aes-128-gcm","tls":{"enabled":true}},
+          {"type":"vmess","tag":"plain","server":"proxy.test","server_port":443,"uuid":"fixture-uuid","security":"auto"}
+        ]}"#,
+    );
+    assert!(nodes.iter().all(|node| node.diagnostic.is_none()));
+    assert_eq!(nodes[0].credential.field("security"), Some("zero"));
+    assert_eq!(nodes[1].credential.field("security"), Some("zero"));
+    assert_eq!(nodes[2].credential.field("security"), Some("aes-128-gcm"));
+    assert_eq!(
+        nodes[3].credential.field("security"),
+        Some(crate::vmess::sing_box_default_security(false))
+    );
+}
+
+#[test]
+fn sing_box_hysteria2_preserves_fixed_hopping() {
+    let nodes = imports(
+        SubscriptionSourceType::SingBox,
+        r#"{"outbounds":[
+          {"type":"hysteria2","tag":"closed","server":"proxy.test","server_ports":["2045:2046","2040:2042"],"hop_interval":"7s","password":"fixture","tls":{"enabled":true}},
+          {"type":"hysteria2","tag":"weighted","server":"proxy.test","server_ports":["2040:2042","2042:2045"],"password":"fixture","tls":{"enabled":true}},
+          {"type":"hysteria2","tag":"random","server":"proxy.test","server_ports":"2040:2042","hop_interval":"7s","hop_interval_max":"10s","password":"fixture","tls":{"enabled":true}}
+        ]}"#,
+    );
+    assert!(nodes[0].diagnostic.is_none());
+    assert_eq!(nodes[0].config.endpoint.port, 2040);
+    assert_eq!(
+        nodes[0].credential.field("server_ports"),
+        Some("2040-2042,2045-2046")
+    );
+    assert_eq!(nodes[0].credential.field("hop_interval"), Some("7s"));
+    for node in &nodes[1..] {
+        assert!(node.diagnostic.is_some());
+        assert!(node.credential.field("sing_box_outbound").is_some());
+    }
 }
 
 #[tokio::test]
@@ -1578,6 +1714,25 @@ fn auto_detects_each_document_family() {
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].diagnostic.is_none());
     }
+}
+
+#[test]
+fn auto_recognizes_clash_provider_only_documents() {
+    for text in [
+        r#"{"proxy-providers":{"provider":{"type":"http","url":"https://provider.test/nodes"}}}"#,
+        "{proxy-providers: {provider: {type: http, url: 'https://provider.test/nodes'}}}",
+        "'proxy-providers': {provider: {type: http, url: 'https://provider.test/nodes'}}",
+    ] {
+        let (format, nodes) = detect(text.as_bytes()).unwrap();
+        assert_eq!(format, "clash");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "provider");
+    }
+    let malformed = br#"{"proxy-providers":{"provider":{"url":"https://provider.test/nodes"}"#;
+    assert!(matches!(
+        detect(malformed),
+        Err(SubscriptionError::MalformedDocument { format: "clash" })
+    ));
 }
 
 #[test]

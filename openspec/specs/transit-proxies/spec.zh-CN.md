@@ -313,6 +313,8 @@ Hysteria2 `up_mbps` 和 `down_mbps` 是可选的非负整数 Mbps 值；无效�
 溢出的值在准备阶段被拒绝。每 Mbps 等于 125,000 字节每秒，缺省值为零。`down_mbps` 作为
 客户端接收速率提示在请求的 `Hysteria-CC-RX` 中发送；零表示未知，服务端可以忽略该提示。
 
+Hysteria2 使用 `h3` ALPN 进行 HTTP/3 认证。显式 ALPN 列表含有其他协议时，适配器在准备阶段拒绝该配置。
+
 QUIC 握手期间客户端使用 BBR。认证后，响应 `Hysteria-CC-RX: auto` 时，无论 `up_mbps`
 如何配置都继续使用 BBR。对于数值响应，零选择配置的 `up_mbps`，正数选择该值与配置的
 `up_mbps` 中较小的值。结果为零时继续使用 BBR，包括 `up_mbps` 缺省或为零而服务端返回
@@ -382,7 +384,9 @@ TLS 布尔值默认 `false`；truststore 默认 `["system"]`，`certificates`、
 必须是普通文件，空列表表示没有信任锚点。任一无效、超大或格式错误来源都必须原子拒绝适配器。
 `https` 隐含启用 TLS。Clash HTTP
 节点的 `tls: true` 必须规范化为 HTTPS CONNECT。`serverName` 独立于连接地址覆盖证书/SNI
-身份。原生 HTTPS CONNECT 允许 HTTP/1.1 ALPN。`certificates` 是添加到当前 truststore 的内联 PEM 信任锚；`clientCertificates` 是客户端认证证书链。客户端私钥只能从
+身份。原生 HTTPS CONNECT 允许 HTTP/1.1 ALPN。HTTP/1 CONNECT 接受最终的 2xx 响应，
+并跳过此前除 101 以外的信息响应。响应头大小上限适用于整次交换。
+`certificates` 是添加到当前 truststore 的内联 PEM 信任锚；`clientCertificates` 是客户端认证证书链。客户端私钥只能从
 `clientKeyField` 指定的 opaque credential 文档字段读取。除整个对象均为默认值外，禁用 TLS
 时指定 TLS 设置无效。`certificateSha256` 是 DER 证书的十六进制 SHA-256；匹配叶证书时认证该
 证书，匹配中间证书时以该证书为信任锚验证证书链、名称和有效期。即使设置 `insecure: true`，
@@ -452,7 +456,9 @@ h2mux 为 `2`）、padding 标志 `1`、大端 `u16` padding 长度及相应数�
 | `snell` | `psk` 或等价 `password`、`userkey`、`version` |
 
 `clientKeyField` 将引用的私有字段加入允许集合。冲突别名无效。其他协议字段在对应原生适配器
-支持前保留为不可用诊断。可以表示的 sing-box 代理节点会规范化为原生选项和凭据；包含无法表示
+支持前保留为不可用诊断。TUIC 的 `heartbeat` 缺省时使用 10 秒间隔。
+
+可以表示的 sing-box 代理节点会规范化为原生选项和凭据；包含无法表示
 字段的节点会私下保留完整 `sing_box_outbound` 文档并带诊断保持不可用。selector、URL-test、
 direct 和 block 条目不作为代理节点导入。导入文档不得触发隐式进程启动或 direct 回退。
 SS 适配器原生实现 simple-obfs 的 `obfs`、`obfs-local` 和 `simple-obfs` HTTP/TLS 模式以及

@@ -18,6 +18,7 @@ pub struct AdapterRegistry<P> {
     connect_timeout: Duration,
     tls: Arc<ClientConfig>,
     source_dir: Option<PathBuf>,
+    load_default_https_roots: bool,
 }
 
 impl<P> std::fmt::Debug for AdapterRegistry<P> {
@@ -40,7 +41,19 @@ where
             connect_timeout,
             tls,
             source_dir: None,
+            load_default_https_roots: false,
         }
+    }
+
+    /// Prepare TLS trust sources per node, including when a node is added later.
+    #[must_use]
+    pub fn native(credentials: Arc<P>, connect_timeout: Duration) -> Self {
+        let tls = crate::tls::client_builder()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        let mut registry = Self::new(credentials, connect_timeout, Arc::new(tls));
+        registry.load_default_https_roots = true;
+        registry
     }
 
     /// Resolve relative TLS truststore sources against the selected
@@ -76,20 +89,7 @@ where
         credentials: Arc<P>,
         connect_timeout: Duration,
     ) -> Result<Self, TransitError> {
-        let loaded = rustls_native_certs::load_native_certs();
-        let mut roots = RootCertStore::empty();
-        let mut accepted = 0_usize;
-        for certificate in loaded.certs {
-            if roots.add(certificate).is_ok() {
-                accepted += 1;
-            }
-        }
-        if accepted == 0 {
-            return Err(TransitError::AdapterUnavailable {
-                protocol: "https".to_owned(),
-                reason: "native TLS root store is empty",
-            });
-        }
+        let roots = crate::tls::load_truststore(&["system".to_owned()])?;
         let tls = crate::tls::client_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -99,18 +99,9 @@ where
     pub fn for_configs<'a>(
         credentials: Arc<P>,
         connect_timeout: Duration,
-        configs: impl IntoIterator<Item = &'a TransitProxyConfig>,
+        _configs: impl IntoIterator<Item = &'a TransitProxyConfig>,
     ) -> Result<Self, TransitError> {
-        if configs.into_iter().any(|config| {
-            matches!(config.protocol.as_str(), "https" | "trojan")
-                || config.options.tls.as_ref().is_some_and(|tls| tls.enabled)
-        }) {
-            return Self::with_native_roots(credentials, connect_timeout);
-        }
-        let tls = crate::tls::client_builder()
-            .with_root_certificates(RootCertStore::empty())
-            .with_no_client_auth();
-        Ok(Self::new(credentials, connect_timeout, Arc::new(tls)))
+        Ok(Self::native(credentials, connect_timeout))
     }
 
     pub async fn build(
@@ -166,6 +157,19 @@ where
         credential: &TransitCredential,
     ) -> Result<Arc<dyn TransitAdapter>, TransitError> {
         let mut normalized = config.clone();
+        if self.load_default_https_roots
+            && normalized.protocol == "https"
+            && normalized
+                .options
+                .tls
+                .as_ref()
+                .is_none_or(|options| *options == pathchord_policy::TransitTls::default())
+        {
+            normalized.options.tls = Some(pathchord_policy::TransitTls {
+                enabled: true,
+                ..Default::default()
+            });
+        }
         if normalized.protocol == "xtls" {
             if crate::vision::VisionFlow::parse(credential.field("flow"))
                 .map_err(|reason| TransitError::Unsupported(reason.to_owned()))?

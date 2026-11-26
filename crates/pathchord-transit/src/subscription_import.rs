@@ -43,6 +43,7 @@ struct Node {
     host: String,
     port: u16,
     credentials: BTreeMap<String, String>,
+    original_sing_box_outbound: Option<String>,
     options: TransitOptions,
     tags: BTreeSet<String>,
     weight: u32,
@@ -191,6 +192,8 @@ impl Node {
             },
             |d| DynamicNodeState::Unavailable(d.code),
         );
+        let mut credential = SubscriptionCredential::new(self.credentials);
+        credential.original_sing_box_outbound = self.original_sing_box_outbound;
         NormalizedNode {
             config: TransitProxyConfig {
                 id: TransitProxyId::in_namespace(
@@ -215,7 +218,7 @@ impl Node {
                 weight: self.weight.clamp(1, 1_000_000),
                 options: self.options,
             },
-            credential: SubscriptionCredential::new(self.credentials),
+            credential,
             state,
             diagnostic,
             usage: None,
@@ -312,14 +315,24 @@ fn detect(body: &[u8]) -> Result<(&'static str, Vec<Node>), SubscriptionError> {
         if value.is_array() || value.get("servers").is_some() {
             return Ok(("sip008", sip008(body)?));
         }
-        if value.get("proxies").is_some() {
+        if value.get("proxies").is_some() || value.get("proxy-providers").is_some() {
             return Ok(("clash", clash(body)?));
         }
     }
+    const CLASH_KEYS: [&str; 6] = [
+        "proxies:",
+        "proxy-providers:",
+        "'proxies':",
+        "'proxy-providers':",
+        "\"proxies\":",
+        "\"proxy-providers\":",
+    ];
     if text.lines().any(|line| {
-        line.trim_start().starts_with("proxies:")
-            || line.trim_start().starts_with("proxy-providers:")
-    }) {
+        CLASH_KEYS
+            .iter()
+            .any(|key| line.trim_start().starts_with(key))
+    }) || (text.starts_with('{') && CLASH_KEYS.iter().any(|key| text.contains(key)))
+    {
         return Ok(("clash", clash(body)?));
     }
     if text
@@ -872,7 +885,8 @@ fn sing_box_node(value: Value, index: usize) -> Node {
         value.get("type").and_then(Value::as_str),
         Some("direct" | "block" | "selector" | "urltest")
     );
-    if let Some(node) = sing_box_native_node(&value, index) {
+    if let Some(mut node) = sing_box_native_node(&value, index) {
+        node.original_sing_box_outbound = Some(value.to_string());
         return node;
     }
     let original = value.to_string();
@@ -993,11 +1007,16 @@ fn sing_box_native_node(value: &Value, index: usize) -> Option<Node> {
         node.options.udp_over_tcp = sing_box_udp_over_tcp(value)?;
     }
     if let Some(network) = fields.remove("network") {
-        let mut network_fields = Map::from_iter([("network".to_owned(), network)]);
-        let values = string_list(&mut network_fields, "network", &mut node.invalid);
-        let networks: BTreeSet<_> = values.iter().map(String::as_str).collect();
-        if networks != BTreeSet::from(["tcp", "udp"]) || values.len() != 2 {
-            return None;
+        match network {
+            Value::String(network) if network == "tcp" => node.options.udp = Some(false),
+            Value::Array(networks) if networks.len() == 1 && networks[0] == "tcp" => {
+                node.options.udp = Some(false);
+            }
+            Value::Array(networks)
+                if networks.len() == 2
+                    && networks.iter().any(|network| network == "tcp")
+                    && networks.iter().any(|network| network == "udp") => {}
+            _ => return None,
         }
     }
     let mut credential_fields = vec![];
@@ -1036,6 +1055,9 @@ fn sing_box_native_node(value: &Value, index: usize) -> Option<Node> {
         _ => unreachable!(),
     }
     credentials(&mut fields, &credential_fields, &mut node);
+    if node.protocol == "hysteria2" {
+        sing_box_hysteria2_hopping(&mut fields, &mut node)?;
+    }
     if node.protocol == "tuic" {
         for field in ["zero_rtt_handshake", "udp_over_stream"] {
             if let Some(value) = flag(&mut fields, field, &mut node.invalid) {
@@ -1143,6 +1165,18 @@ fn sing_box_native_node(value: &Value, index: usize) -> Option<Node> {
         }
         node.options.tls = Some(options);
     }
+    if node.protocol == "vmess"
+        && node
+            .credentials
+            .get("security")
+            .is_none_or(|security| security.is_empty() || security == "auto")
+    {
+        let tls = node.options.tls.as_ref().is_some_and(|tls| tls.enabled);
+        node.credentials.insert(
+            "security".to_owned(),
+            crate::vmess::sing_box_default_security(tls).to_owned(),
+        );
+    }
     if let Some(value) = fields.remove("transport") {
         let mut transport = value.as_object()?.clone();
         let kind = text(&mut transport, "type", &mut node.invalid).unwrap_or_default();
@@ -1187,6 +1221,53 @@ fn sing_box_native_node(value: &Value, index: usize) -> Option<Node> {
         return None;
     }
     Some(node)
+}
+
+fn sing_box_hysteria2_hopping(fields: &mut Map<String, Value>, node: &mut Node) -> Option<()> {
+    let ranges = match fields.remove("server_ports") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(range)) => vec![Value::String(range)],
+        Some(Value::Array(ranges)) if ranges.len() <= 512 => ranges,
+        _ => return None,
+    };
+    let hop_interval = match fields.remove("hop_interval") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(interval)) if !ranges.is_empty() => Some(interval),
+        _ => return None,
+    };
+    if ranges.is_empty() {
+        return Some(());
+    }
+    let mut ports = Vec::with_capacity(ranges.len());
+    for range in &ranges {
+        let (start, end) = range.as_str()?.split_once(':')?;
+        let start = start.parse::<u16>().ok()?;
+        let end = end.parse::<u16>().ok()?;
+        if start == 0 || end < start {
+            return None;
+        }
+        ports.push((start, end));
+    }
+    ports.sort_unstable();
+    if ports.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+        // A port included in more than one upstream range has extra weight.
+        // The native adapter samples uniformly from the union.
+        return None;
+    }
+    if node.port == 0 && !fields.contains_key("realm") {
+        node.port = ports[0].0;
+    }
+    let ports = ports
+        .into_iter()
+        .map(|(start, end)| format!("{start}-{end}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    node.credentials.insert("server_ports".to_owned(), ports);
+    if let Some(hop_interval) = hop_interval {
+        node.credentials
+            .insert("hop_interval".to_owned(), hop_interval);
+    }
+    Some(())
 }
 
 fn sing_box_udp_over_tcp(value: Value) -> Option<Option<u8>> {
@@ -1821,7 +1902,7 @@ fn vmess_uri(payload: &str, index: usize) -> Node {
         host.clear();
     }
     if network != "tcp" && network != "none" {
-        let service_name = (network == "grpc").then(|| path.clone()).flatten();
+        let service_name = if network == "grpc" { path.take() } else { None };
         node.options.transport = Some(TransitTransport {
             kind: network,
             path,

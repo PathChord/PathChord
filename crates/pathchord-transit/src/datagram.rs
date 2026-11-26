@@ -1,7 +1,7 @@
 //! Bounded native UDP transports for direct, SOCKS5, and Shadowsocks routes.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use shadowsocks::ProxySocket;
@@ -181,7 +181,7 @@ async fn authenticate_socks(
     credentials: Option<&(String, String)>,
 ) -> Result<(), TransitError> {
     if credentials.is_some_and(|(username, password)| {
-        username.is_empty() || username.len() > 255 || password.len() > 255
+        !(1..=255).contains(&username.len()) || !(1..=255).contains(&password.len())
     }) {
         return Err(TransitError::Unsupported(
             "SOCKS5 UDP credentials are invalid".to_owned(),
@@ -356,22 +356,25 @@ impl TransitDatagram for SocksDatagram {
     async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
         let mut packet = vec![0; 65_536];
         let mut control = [0; 1];
-        let length = tokio::select! {
-            _ = self.control.read(&mut control) => return Err(connection("SOCKS5 UDP control connection closed")),
-            received = self.socket.recv(&mut packet) => received.map_err(|_| connection("SOCKS5 UDP receive failed"))?,
-        };
-        if length < 4 || packet[..3] != [0, 0, 0] {
-            return Err(protocol(
-                "SOCKS5 UDP reserved or fragment header is invalid",
-            ));
+        loop {
+            let length = tokio::select! {
+                _ = self.control.read(&mut control) => return Err(connection("SOCKS5 UDP control connection closed")),
+                received = self.socket.recv(&mut packet) => received.map_err(|_| connection("SOCKS5 UDP receive failed"))?,
+            };
+            if length >= 3 && packet[2] != 0 {
+                continue;
+            }
+            if length < 4 || packet[..2] != [0, 0] {
+                return Err(protocol("SOCKS5 UDP reserved header is invalid"));
+            }
+            let (source, offset) = decode_packet_address(&packet[3..length])?;
+            if !matches_destination(&self.destination, &source) {
+                return Err(protocol(
+                    "SOCKS5 UDP response source does not match its target",
+                ));
+            }
+            return Ok(packet[3 + offset..length].to_vec());
         }
-        let (source, offset) = decode_packet_address(&packet[3..length])?;
-        if !matches_destination(&self.destination, &source) {
-            return Err(protocol(
-                "SOCKS5 UDP response source does not match its target",
-            ));
-        }
-        Ok(packet[3 + offset..length].to_vec())
     }
 
     async fn close(mut self: Box<Self>) -> Result<(), TransitError> {
@@ -414,6 +417,50 @@ impl ReplayWindow {
     }
 }
 
+#[derive(Debug, Default)]
+struct ServerSessions {
+    current: Option<ServerSession>,
+    previous: Option<ServerSession>,
+}
+
+#[derive(Debug)]
+struct ServerSession {
+    id: u64,
+    replay: ReplayWindow,
+    last_seen: Instant,
+}
+
+impl ServerSessions {
+    fn accept(&mut self, id: u64, packet: u64, now: Instant) -> bool {
+        // SIP022 permits keeping the current and previous server sessions.
+        // Keep independent replay state and retain a recently active previous session.
+        if let Some(session) = [&mut self.current, &mut self.previous]
+            .into_iter()
+            .filter_map(Option::as_mut)
+            .find(|session| session.id == id)
+        {
+            if !session.replay.accept(packet) {
+                return false;
+            }
+            session.last_seen = now;
+            return true;
+        }
+        if self.previous.as_ref().is_some_and(|session| {
+            now.saturating_duration_since(session.last_seen) < Duration::from_secs(60)
+        }) {
+            return false;
+        }
+        let mut replay = ReplayWindow::default();
+        replay.accept(packet);
+        self.previous = self.current.replace(ServerSession {
+            id,
+            replay,
+            last_seen: now,
+        });
+        true
+    }
+}
+
 #[derive(Debug)]
 struct ShadowsocksDatagram {
     socket: ProxySocket<shadowsocks::net::UdpSocket>,
@@ -421,9 +468,8 @@ struct ShadowsocksDatagram {
     destination: Endpoint,
     aead_2022: bool,
     client_session_id: u64,
-    server_session_id: Option<u64>,
+    server_sessions: ServerSessions,
     packet_id: u64,
-    replay: ReplayWindow,
 }
 
 pub(crate) async fn ss_connect_udp(
@@ -450,9 +496,8 @@ pub(crate) async fn ss_connect_udp(
         destination: destination.clone(),
         aead_2022: server.method().is_aead_2022(),
         client_session_id: u64::from_be_bytes(identifier),
-        server_session_id: None,
+        server_sessions: ServerSessions::default(),
         packet_id: 0,
-        replay: ReplayWindow::default(),
     }))
 }
 
@@ -497,16 +542,16 @@ impl TransitDatagram for ShadowsocksDatagram {
             let control = control
                 .ok_or_else(|| protocol("Shadowsocks 2022 UDP response lacks session metadata"))?;
             if control.client_session_id != self.client_session_id
-                || self
-                    .server_session_id
-                    .is_some_and(|id| id != control.server_session_id)
-                || !self.replay.accept(control.packet_id)
+                || !self.server_sessions.accept(
+                    control.server_session_id,
+                    control.packet_id,
+                    Instant::now(),
+                )
             {
                 return Err(protocol(
                     "Shadowsocks 2022 UDP response session or packet identity is invalid",
                 ));
             }
-            self.server_session_id = Some(control.server_session_id);
         }
         packet.truncate(length);
         Ok(packet)
@@ -600,7 +645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socks_udp_rejects_fragmented_relay_responses() {
+    async fn socks_udp_discards_fragmented_datagrams_and_keeps_the_association() {
         timeout(Duration::from_secs(5), async {
             let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = tcp.local_addr().unwrap();
@@ -617,6 +662,10 @@ mod tests {
                 let mut packet = [0; 128];
                 let (length, source) = udp.recv_from(&mut packet).await.unwrap();
                 packet[2] = 1;
+                packet[length - 1] = b'!';
+                udp.send_to(&packet[..length], source).await.unwrap();
+                packet[2] = 0;
+                packet[length - 1] = b'd';
                 udp.send_to(&packet[..length], source).await.unwrap();
                 let _ = control.read(&mut [0]).await;
             });
@@ -635,10 +684,7 @@ mod tests {
             .await
             .unwrap();
             datagram.send(b"fragmented").await.unwrap();
-            assert!(matches!(
-                datagram.receive().await,
-                Err(TransitError::Protocol(_))
-            ));
+            assert_eq!(datagram.receive().await.unwrap(), b"fragmented");
             datagram.close().await.unwrap();
             server.await.unwrap();
         })
@@ -676,7 +722,7 @@ mod tests {
                 config.set_addr(socket.local_addr().unwrap());
                 let server = tokio::spawn(async move {
                     let mut packet = vec![0; 65_536];
-                    for packet_id in 1..=2 {
+                    for server_session_id in [1234, 1235] {
                         let (length, peer, target, _, control) =
                             socket.recv_from_with_ctrl(&mut packet).await.unwrap();
                         assert_eq!(
@@ -684,8 +730,8 @@ mod tests {
                             Address::DomainNameAddress("remote-only.invalid".into(), 53)
                         );
                         let mut response = control.unwrap_or_default();
-                        response.server_session_id = 1234;
-                        response.packet_id = packet_id;
+                        response.server_session_id = server_session_id;
+                        response.packet_id = 1;
                         socket
                             .send_to_with_ctrl(peer, &target, &response, &packet[..length])
                             .await
@@ -724,6 +770,23 @@ mod tests {
         assert!(window.accept(80));
         assert!(!window.accept(4));
         assert!(window.accept(79));
+    }
+
+    #[test]
+    fn server_session_rotation_preserves_replay_state_for_both_sessions() {
+        let mut sessions = ServerSessions::default();
+        let start = Instant::now();
+        assert!(sessions.accept(1, 10, start));
+        assert!(sessions.accept(2, 10, start));
+        assert!(!sessions.accept(1, 10, start));
+        assert!(!sessions.accept(2, 10, start));
+        assert!(!sessions.accept(3, 10, start));
+
+        let delayed = start + Duration::from_secs(40);
+        assert!(sessions.accept(1, 9, delayed));
+        assert!(!sessions.accept(3, 10, delayed + Duration::from_secs(59)));
+        assert!(sessions.accept(3, 10, delayed + Duration::from_secs(60)));
+        assert!(!sessions.accept(2, 10, delayed + Duration::from_secs(60)));
     }
 
     #[tokio::test]

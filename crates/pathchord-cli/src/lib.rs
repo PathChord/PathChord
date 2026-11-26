@@ -777,10 +777,10 @@ async fn run_ingress(socket: Option<PathBuf>, args: IngressArgs) -> Result<(), C
     std::fs::create_dir_all(&data_dir)?;
     let credentials = Arc::new(FileTransitCredentialProvider::new(&credentials_dir)?);
     let source_dir = base.to_owned();
-    let adapter_registry = AdapterRegistry::with_native_roots(
+    let adapter_registry = AdapterRegistry::native(
         Arc::clone(&credentials),
         pathchord_ingress::DEFAULT_PATH_CONNECT_TIMEOUT,
-    )?
+    )
     .with_source_dir(source_dir);
     let adapter_registry = Arc::new(adapter_registry);
     for proxy in &policy_config.transit_proxies {

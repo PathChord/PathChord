@@ -312,6 +312,8 @@ impl SubscriptionFetcher for HttpSubscriptionFetcher {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionCredential {
     fields: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_sing_box_outbound: Option<String>,
 }
 
 impl fmt::Debug for SubscriptionCredential {
@@ -328,13 +330,25 @@ impl Drop for SubscriptionCredential {
         for value in self.fields.values_mut() {
             value.zeroize();
         }
+        self.original_sing_box_outbound.zeroize();
     }
 }
 
 impl SubscriptionCredential {
     #[must_use]
     pub fn new(fields: BTreeMap<String, String>) -> Self {
-        Self { fields }
+        Self {
+            fields,
+            original_sing_box_outbound: None,
+        }
+    }
+
+    /// Original foreign node definition retained with the private credentials.
+    #[must_use]
+    pub fn original_sing_box_outbound(&self) -> Option<&str> {
+        self.original_sing_box_outbound
+            .as_deref()
+            .or_else(|| self.field("sing_box_outbound"))
     }
 
     #[must_use]
@@ -461,7 +475,7 @@ impl ValidatedTransitAdapter {
     pub fn same_connection(&self, other: &Self) -> bool {
         self.config == other.config
             && self.source_fingerprint == other.source_fingerprint
-            && self.credential == other.credential
+            && self.credential.fields == other.credential.fields
     }
 }
 
@@ -500,7 +514,7 @@ impl AdmittedNode {
             && node.config == self.original.config
             && node.source_subscription == self.original.source_subscription
             && node.source_fingerprint == self.original.source_fingerprint
-            && node.credential == self.original.credential
+            && node.credential.fields == self.original.credential.fields
     }
 
     fn revoke(&self) {
@@ -752,7 +766,7 @@ impl PreparedSubscriptionRefresh {
                         DynamicNodeState::Active | DynamicNodeState::Pending
                     ) && candidate.diagnostic.is_none()
                         && candidate.config == previous.config
-                        && candidate.credential == previous.credential
+                        && candidate.credential.fields == previous.credential.fields
                         && previous.source_fingerprint == self.source_fingerprint
                 });
                 (!unchanged).then(|| id.clone())

@@ -143,6 +143,9 @@ pub enum RoutePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     GlobalFallback,
+    /// An ordinary ProxyRule matched, but every matching ready node lacks the
+    /// requested native capability. The rule must not fall through to Direct.
+    OrdinaryProxyCapability,
     /// A rule without an explicit traffic policy admitted more than one
     /// Transit relationship for this flow.
     MissingTrafficPolicy,
@@ -699,8 +702,15 @@ impl CompiledPolicy {
                     generation: self.generation,
                 };
             }
-            if let Some(route) = self.ordinary_proxy_candidate(&compiled.rule, context, runtime) {
-                return Evaluation::Route(RoutePlan::Proxy(route));
+            match self.ordinary_proxy_candidate(&compiled.rule, context, runtime) {
+                Ok(Some(route)) => return Evaluation::Route(RoutePlan::Proxy(route)),
+                Ok(None) => {}
+                Err(reason) => {
+                    return Evaluation::Reject {
+                        generation: self.generation,
+                        reason,
+                    };
+                }
             }
         }
 
@@ -804,12 +814,13 @@ impl CompiledPolicy {
         rule: &ProxyRule,
         context: &PolicyContext,
         runtime: &RuntimeCatalog,
-    ) -> Option<ProxyRoutePlan> {
+    ) -> Result<Option<ProxyRoutePlan>, RejectReason> {
         let selected = match &rule.select {
             ProxySelection::Any => None,
             ProxySelection::Selector(selector) => Some(selector),
-            ProxySelection::Direct => return None,
+            ProxySelection::Direct => return Ok(None),
         };
+        let mut unsupported_udp = false;
         let mut candidates: Vec<_> = self
             .transit_proxy_configs(runtime)
             .filter_map(|proxy| {
@@ -817,7 +828,19 @@ impl CompiledPolicy {
                     return None;
                 }
                 let status = runtime.transit_proxy(&proxy.id)?;
-                if !ordinary_proxy_is_usable(rule, selected, proxy, status, context.protocol) {
+                if !status.state.admits_new_work()
+                    || !selector_matches(&rule.require, proxy, status, context.protocol)
+                    || !selected.is_none_or(|selector| {
+                        selector_matches(selector, proxy, status, context.protocol)
+                    })
+                {
+                    return None;
+                }
+                let is_udp = context.protocol == FlowProtocol::Udp;
+                if !status.capabilities.contains(&context.protocol)
+                    || (is_udp && proxy.options.udp == Some(false))
+                {
+                    unsupported_udp |= is_udp;
                     return None;
                 }
                 Some((proxy, weighted_score(proxy.weight, status.selection_score)))
@@ -828,8 +851,14 @@ impl CompiledPolicy {
                 .cmp(left_score)
                 .then_with(|| left_proxy.id.cmp(&right_proxy.id))
         });
-        let (proxy, selection_score) = candidates.first()?;
-        Some(ProxyRoutePlan {
+        let Some((proxy, selection_score)) = candidates.first() else {
+            return if unsupported_udp {
+                Err(RejectReason::OrdinaryProxyCapability)
+            } else {
+                Ok(None)
+            };
+        };
+        Ok(Some(ProxyRoutePlan {
             generation: self.generation,
             proxy_rule_id: rule.id.clone(),
             transit_proxy_id: proxy.id.clone(),
@@ -838,7 +867,7 @@ impl CompiledPolicy {
                 .into_iter()
                 .map(|(proxy, _)| proxy.id.clone())
                 .collect(),
-        })
+        }))
     }
 
     fn transit_proxy_configs<'a>(
@@ -930,27 +959,20 @@ fn transit_binding_is_usable(
             .all(|tag| !proxy.tags.contains(tag) && !status.tags.contains(tag))
 }
 
-fn ordinary_proxy_is_usable(
-    rule: &ProxyRule,
-    selected: Option<&Selector>,
-    proxy: &TransitProxyConfig,
-    status: &TransitProxyRuntimeStatus,
-    protocol: FlowProtocol,
-) -> bool {
-    status.state.admits_new_work()
-        && status.capabilities.contains(&protocol)
-        && selector_matches(&rule.require, proxy, status)
-        && selected.is_none_or(|selector| selector_matches(selector, proxy, status))
-}
-
 fn selector_matches(
     selector: &Selector,
     proxy: &TransitProxyConfig,
     status: &TransitProxyRuntimeStatus,
+    protocol: FlowProtocol,
 ) -> bool {
     labels_match(&selector.labels, &proxy.labels, &status.labels)
         && tags_match(&selector.tags, &proxy.tags, &status.tags)
-        && selector.capabilities.is_subset(&status.capabilities)
+        && selector.capabilities.iter().all(|capability| {
+            // Ordinary UDP capability is checked after the selectors so the
+            // route can reject a matched node that cannot provide it.
+            (*capability == FlowProtocol::Udp && protocol == FlowProtocol::Udp)
+                || status.capabilities.contains(capability)
+        })
 }
 
 fn labels_match(
@@ -1496,6 +1518,42 @@ spec: {action: direct}
             ordinary.evaluate(&udp, &runtime),
             Evaluation::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn unsupported_ordinary_udp_does_not_fall_through_to_direct() {
+        let mut udp = context();
+        udp.protocol = FlowProtocol::Udp;
+        let mut runtime = RuntimeCatalog::default();
+        runtime.set_transit_proxy(
+            TransitProxyId::new("tcp-only"),
+            ready_proxy(&[FlowProtocol::Tcp], 1),
+        );
+        let udp_selector = Selector {
+            labels: BTreeMap::from([("region".into(), "local".into())]),
+            capabilities: BTreeSet::from([FlowProtocol::Udp]),
+            ..Default::default()
+        };
+        for select in [ProxySelection::Any, ProxySelection::Selector(udp_selector)] {
+            let policy = compile(PolicyConfig {
+                transit_proxies: vec![proxy("tcp-only", &[("region", "local")], &[], 100)],
+                proxy_rules: vec![ProxyRule {
+                    id: RuleId::new("ordinary-udp"),
+                    matches: FlowMatch::default(),
+                    require: Selector::default(),
+                    select,
+                }],
+                fallback: Some(FallbackAction::Direct),
+                ..PolicyConfig::default()
+            });
+            assert!(matches!(
+                policy.evaluate(&udp, &runtime),
+                Evaluation::Reject {
+                    reason: RejectReason::OrdinaryProxyCapability,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

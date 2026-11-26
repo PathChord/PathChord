@@ -630,6 +630,17 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Validation evidence
 
+On 2026-11-27, the Transit conformance fixes passed the Linux workspace suite
+(1,152 passed, 118 ignored) after building the service binaries and rerunning
+with two test threads. The separate-process CLI smoke test also passed in
+isolation after a startup timeout in the preceding workspace run. The complete
+sing-box suite passed 69 cases each against 1.14.4 and `491b845`. After the
+final HTTP/1 CONNECT response changes, its targeted case passed against both
+peers. Regression tests cover ordinary UDP routing, Egress DNS admission,
+partial Trojan UDP reads, Shadowsocks 2022 session rotation, VMess carrier
+errors, and subscription and TLS preparation. See the
+[baseline audit](changes/archive/2026-11-17-support-sing-box-dae-transit-protocols/research/2026-11-26-transit-conformance-audit.md).
+
 On 2026-11-26, the Transit protocol fixes passed the Linux workspace suite
 (1,132 passed, 118 ignored). The focused sing-box matrix passed 20 cases each
 against release 1.14.4 and source revision `491b845`, built with `with_quic`

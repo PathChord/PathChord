@@ -464,6 +464,10 @@ impl Hysteria2Adapter {
         }
         if tls_options.alpn.is_empty() {
             tls_options.alpn.push("h3".into());
+        } else if tls_options.alpn.iter().any(|value| value != "h3") {
+            return Err(TransitError::Unsupported(
+                "Hysteria2 HTTP/3 requires h3 ALPN".into(),
+            ));
         }
         let server_name = tls_options
             .server_name
@@ -815,7 +819,7 @@ impl Hysteria2Fragments {
     ) -> Result<Option<Vec<u8>>, TransitError> {
         const MAX_INCOMPLETE: usize = 16;
         const MAX_AGE: Duration = Duration::from_secs(10);
-        if packet.fragment_count == 0 || packet.fragment_id >= packet.fragment_count {
+        if packet.fragment_count == 0 {
             return Err(TransitError::Protocol(
                 "Hysteria2 UDP fragment index is invalid".into(),
             ));
@@ -824,9 +828,12 @@ impl Hysteria2Fragments {
             .retain(|_, assembly| now.saturating_duration_since(assembly.created) < MAX_AGE);
         self.order.retain(|id| self.packets.contains_key(id));
         if packet.fragment_count == 1 {
-            self.packets.remove(&packet.packet_id);
-            self.order.retain(|id| *id != packet.packet_id);
             return Ok(Some(packet.payload));
+        }
+        if packet.fragment_id >= packet.fragment_count {
+            return Err(TransitError::Protocol(
+                "Hysteria2 UDP fragment index is invalid".into(),
+            ));
         }
         let id = packet.packet_id;
         if !self.packets.contains_key(&id) {
@@ -1265,6 +1272,10 @@ mod tests {
         assert_eq!(fragments.push(fragment(1, 0, 3, b"a"), now).unwrap(), None);
         assert_eq!(fragments.push(fragment(1, 0, 3, b"a"), now).unwrap(), None);
         assert_eq!(
+            fragments.push(fragment(1, 7, 1, b"single"), now).unwrap(),
+            Some(b"single".to_vec())
+        );
+        assert_eq!(
             fragments.push(fragment(1, 1, 3, b"b"), now).unwrap(),
             Some(b"abc".to_vec())
         );
@@ -1395,6 +1406,45 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn validates_http3_alpn_during_preparation() {
+        let mut config = pathchord_policy::TransitProxyConfig {
+            id: TransitProxyId::new("hy2"),
+            source: None,
+            protocol: "hysteria2".into(),
+            endpoint: PolicyEndpoint {
+                host: "127.0.0.1".into(),
+                port: 443,
+            },
+            credentials_ref: None,
+            labels: BTreeMap::new(),
+            tags: BTreeSet::new(),
+            weight: 100,
+            options: TransitOptions::default(),
+        };
+        let credential =
+            TransitCredential::new(BTreeMap::from([("password".into(), "secret".into())]));
+        for (alpn, valid) in [
+            (vec![], true),
+            (vec!["h3"], true),
+            (vec!["h2"], false),
+            (vec!["h2", "h3"], false),
+        ] {
+            config.options.tls = Some(pathchord_policy::TransitTls {
+                enabled: true,
+                alpn: alpn.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            });
+            let result = Hysteria2Adapter::from_config(
+                &config,
+                &credential,
+                Duration::from_secs(1),
+                crate::adapter_registry::native_tls_roots(),
+            );
+            assert_eq!(result.is_ok(), valid);
         }
     }
 

@@ -18,13 +18,13 @@ use pathchord_path::{
     IngressSessionHandle, MultipathConfig, MultipathPathObservation, OpenStreamError, OpenUdpError,
     PathAdmissionError, PathAdmissionOutcome, PathAutoscaler, PathAutoscalerConfig,
     PathEconomicStatus, PathQualitySnapshot, SessionDiagnostics, SessionRuntimeError,
-    SessionSnapshot, SessionUdpHandle, dial_path,
+    SessionSnapshot, dial_path,
 };
 use pathchord_policy::{
     CompiledPolicy, EgressConfig, EgressId, EgressRouteCandidate, EgressRuntimeStatus, Evaluation,
-    FlowProtocol, PolicyContext, ProxyRoutePlan, RoutePlan, RuntimeCatalog, RuntimeNodeState,
-    Selector, TrafficPolicy, TrafficPolicyId, TransitProxyConfig, TransitProxyId,
-    TransitProxyRuntimeStatus, ValidatedPolicySnapshot,
+    FlowProtocol, PolicyContext, ProxyRoutePlan, RejectReason, RoutePlan, RuntimeCatalog,
+    RuntimeNodeState, Selector, TrafficPolicy, TrafficPolicyId, TransitCandidate,
+    TransitProxyConfig, TransitProxyId, TransitProxyRuntimeStatus, ValidatedPolicySnapshot,
 };
 use pathchord_transit::{
     AdapterRegistry, ConnectRequest, DirectTransitAdapter, Endpoint as TransitEndpoint,
@@ -2183,6 +2183,10 @@ impl IngressDataPlane {
         };
         self.log_policy("udp", &evaluation);
         let route = match evaluation {
+            Evaluation::Reject {
+                reason: RejectReason::OrdinaryProxyCapability,
+                ..
+            } => return Err(DataPlaneError::NoUsableRoute),
             Evaluation::Reject { .. } => return Err(DataPlaneError::PolicyRejected),
             Evaluation::Direct { .. } => {
                 let adapter =
@@ -3014,6 +3018,7 @@ impl DnsRouteAdapter for DataPlaneDnsAdapter {
                 egress_selector,
                 servers,
             } => {
+                self.data_plane.refresh_runtime().await;
                 let egress_id = self
                     .select_egress(&namespace, &egress_selector)
                     .await
@@ -3027,31 +3032,46 @@ impl DnsRouteAdapter for DataPlaneDnsAdapter {
                     .data_plane
                     .eligible_transits_for_egress(&slot.egress)
                     .await;
-                let Some((transit_id, weight)) = candidates.first().cloned() else {
-                    return Err(DnsAdapterError::Unavailable);
-                };
                 {
                     let mut eligible = slot.eligible_transits.lock().await;
                     eligible.clear();
-                    eligible.extend(candidates);
-                    eligible.insert(transit_id.clone(), weight);
+                    eligible.extend(candidates.iter().cloned());
                 }
-                let session = self
+                let candidate = EgressRouteCandidate {
+                    egress_id,
+                    transit_proxies: candidates
+                        .into_iter()
+                        .map(|(id, relationship_weight)| TransitCandidate {
+                            id,
+                            relationship_weight,
+                            selection_score: 0,
+                        })
+                        .collect(),
+                };
+                let (session, eligible) = self
                     .data_plane
-                    .ensure_session(&egress_id, &transit_id)
+                    .candidate_paths(slot, &candidate)
                     .await
                     .map_err(|_| DnsAdapterError::Unavailable)?;
                 let target = dns_target(servers.first().ok_or(DnsAdapterError::Unavailable)?);
-                session
-                    .exchange_datagram(target, request.wire_query, MAX_DNS_MESSAGE_BYTES)
+                let multipath_config = self.data_plane.session_multipath_config(slot).await;
+                let mut association = session
+                    .open_udp_routed_with_config(target, eligible, multipath_config)
                     .await
-                    .map_err(|error| match error {
-                        pathchord_path::SessionUdpError::ResponseTooLarge => {
-                            DnsAdapterError::ResponseTooLarge
-                        }
-                        pathchord_path::SessionUdpError::Unavailable
-                        | pathchord_path::SessionUdpError::Exchange => DnsAdapterError::Unavailable,
-                    })
+                    .map_err(|_| DnsAdapterError::Unavailable)?;
+                association
+                    .send(request.wire_query)
+                    .await
+                    .map_err(|_| DnsAdapterError::Unavailable)?;
+                let response = association
+                    .receive()
+                    .await
+                    .ok_or(DnsAdapterError::Unavailable)?;
+                let _ = association.close().await;
+                if response.len() > MAX_DNS_MESSAGE_BYTES {
+                    return Err(DnsAdapterError::ResponseTooLarge);
+                }
+                Ok(response)
             }
             DnsRouteSelection::Transit {
                 namespace,
@@ -3122,11 +3142,12 @@ impl DataPlaneDnsAdapter {
             .iter()
             .find(|(id, config)| {
                 id.namespace() == namespace
+                    && config.capabilities.udp
                     && runtime.egress(id).is_some_and(|status| {
                         matches!(
                             status.state,
                             RuntimeNodeState::Ready | RuntimeNodeState::Degraded
-                        ) && status.usable_paths > 0
+                        ) && status.usable_paths >= config.path_pool.min_usable_paths
                             && selector_matches_egress(selector, config, status)
                     })
             })
@@ -3875,6 +3896,177 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn egress_dns_requires_the_session_path_minimum_and_fresh_status() {
+        use pathchord_core::{FrameType, Message, PathReady};
+        use pathchord_path::{
+            AuthorizationState, CompleteFrameTransport, EgressPathAdmissionConfig,
+            PathAuthorization, accept_path,
+        };
+
+        for minimum in [2, 1] {
+            let ingress_id = b"ingress-test".to_vec();
+            let egress_id = EgressId::new("edge");
+            let transit_id = TransitProxyId::new("tcp-only");
+            let ingress_key = pathchord_noise::generate_static_keypair().unwrap();
+            let egress_key = pathchord_noise::generate_static_keypair().unwrap();
+            let limits = ProtocolLimits::default();
+            let session_id = SessionId::new(1);
+            let path_id = PathId::new(2);
+            let capabilities = TCP_CAPABILITY | UDP_CAPABILITY;
+            let identity = [WIRE_PROFILE_V1_PROLOGUE_PREFIX, b"edge"].concat();
+            let ingress_admission = IngressPathAdmissionConfig {
+                egress_identity: identity.clone(),
+                egress_id: b"edge".to_vec(),
+                ingress_id: ingress_id.clone(),
+                session_id,
+                path_id,
+                offered_capabilities: capabilities,
+                required_capabilities: capabilities,
+                replication_budget_bytes_per_second: 0,
+                local_limits: limits,
+            };
+            let egress_admission = EgressPathAdmissionConfig {
+                egress_identity: identity,
+                egress_id: b"edge".to_vec(),
+                required_capabilities: capabilities,
+                supported_capabilities: capabilities,
+                max_replication_budget_bytes_per_second: 0,
+                local_limits: limits,
+                ready_limits: PathReady {
+                    max_frame_payload: 4096,
+                    max_control_payload: 1024,
+                    max_session_buffering: 65536,
+                },
+            };
+            let authorization = PathAuthorization {
+                ingress_id,
+                public_key: *ingress_key.public(),
+                state: AuthorizationState::Enabled,
+                generation: 1,
+            };
+            let (client, server) = tokio::io::duplex(8192);
+            let (client, server) = tokio::join!(
+                dial_path(
+                    client,
+                    ingress_key.private(),
+                    egress_key.public(),
+                    &ingress_admission,
+                ),
+                accept_path(
+                    server,
+                    egress_key.private(),
+                    &egress_admission,
+                    &authorization
+                ),
+            );
+            let PathAdmissionOutcome::Ready(client) = client.unwrap() else {
+                panic!("Ingress must establish the Path");
+            };
+            let PathAdmissionOutcome::Ready(server) = server.unwrap() else {
+                panic!("Egress must establish the Path");
+            };
+            let session = Arc::new(IngressSessionHandle::start(client).unwrap());
+            let policy_id = TrafficPolicyId::new("edge-policy");
+            let policy = ValidatedPolicySnapshot::new(
+                Generation::new(1),
+                PolicyConfig {
+                    egresses: vec![EgressConfig {
+                        id: egress_id.clone(),
+                        endpoints: vec![pathchord_policy::Endpoint {
+                            host: "127.0.0.1".into(),
+                            port: 9,
+                        }],
+                        public_key: URL_SAFE_NO_PAD.encode(egress_key.public()),
+                        labels: BTreeMap::new(),
+                        capabilities: pathchord_policy::Capabilities {
+                            tcp: true,
+                            udp: true,
+                        },
+                        path_pool: pathchord_policy::EgressPathPoolConfig {
+                            min_usable_paths: minimum,
+                            target_usable_paths: None,
+                        },
+                        admission: Default::default(),
+                        transit: Default::default(),
+                        traffic_policy: Some(policy_id.clone()),
+                    }],
+                    transit_proxies: vec![TransitProxyConfig {
+                        id: transit_id.clone(),
+                        source: None,
+                        protocol: "direct".into(),
+                        endpoint: pathchord_policy::Endpoint {
+                            host: String::new(),
+                            port: 1,
+                        },
+                        credentials_ref: None,
+                        labels: BTreeMap::new(),
+                        tags: BTreeSet::new(),
+                        weight: 100,
+                        options: Default::default(),
+                    }],
+                    traffic_policies: vec![TrafficPolicy {
+                        id: policy_id,
+                        scheduler: Scheduler::EffectiveCapacityWeighted,
+                        session_replication_budget_bps: 0,
+                        class_replication_budget_bps: None,
+                        retransmission_replication: RetransmissionReplication::Disabled,
+                        classes: BTreeMap::new(),
+                    }],
+                    fallback: Some(FallbackAction::Reject),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let plane = Arc::new(
+                IngressDataPlane::new(IngressDataPlaneConfig::new(
+                    "ingress-test",
+                    ingress_key,
+                    policy,
+                ))
+                .unwrap(),
+            );
+            let slot = &plane.sessions[&egress_id];
+            *slot.session.lock().await = Some(session);
+            slot.transit_paths
+                .lock()
+                .await
+                .insert(transit_id, BTreeSet::from([path_id]));
+            plane
+                .mark_egress(&egress_id, RuntimeNodeState::Ready, 1)
+                .await;
+
+            let adapter = plane.dns_route_adapter();
+            let mut peer = server.into_transport();
+            let unexpected_open = async {
+                loop {
+                    let frame = peer.receive_frame().await.unwrap().unwrap();
+                    if let Message::SessionControl(control) =
+                        Message::decode(frame.header().frame_type(), frame.payload(), limits)
+                            .unwrap()
+                        && control.frame_type == FrameType::UdpOpen
+                    {
+                        panic!("UDP opened with minimum {minimum} and no fresh Egress status");
+                    }
+                }
+            };
+            tokio::select! {
+                result = adapter.exchange(DnsRouteRequest {
+                    selection: DnsRouteSelection::Egress {
+                        namespace: egress_id.namespace().into(),
+                        egress_selector: Selector::default(),
+                        servers: vec![pathchord_policy::Endpoint {
+                            host: "dns.test".into(),
+                            port: 53,
+                        }],
+                    },
+                    wire_query: b"query".to_vec(),
+                }) => assert_eq!(result, Err(DnsAdapterError::Unavailable)),
+                () = unexpected_open => unreachable!(),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn explicit_direct_fallback_connects_without_a_session() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("target");
@@ -3940,7 +4132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicitly_disabled_udp_is_not_admitted_as_an_ordinary_proxy_route() {
+    async fn explicitly_disabled_proxy_udp_never_uses_direct_fallback() {
         let id = TransitProxyId::new("tcp-only-direct");
         let policy = ValidatedPolicySnapshot::new(
             Generation::new(1),
@@ -3968,7 +4160,7 @@ mod tests {
                     require: Selector::default(),
                     select: ProxySelection::Any,
                 }],
-                fallback: Some(FallbackAction::Reject),
+                fallback: Some(FallbackAction::Direct),
                 ..Default::default()
             },
         )
@@ -3983,7 +4175,7 @@ mod tests {
             plane
                 .open_udp(&context("127.0.0.1:9".parse().unwrap()))
                 .await,
-            Err(DataPlaneError::PolicyRejected)
+            Err(DataPlaneError::NoUsableRoute)
         ));
     }
 
