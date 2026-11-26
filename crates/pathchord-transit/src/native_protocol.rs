@@ -103,6 +103,17 @@ impl NativeProtocolAdapter {
         } else {
             None
         };
+        if trojan_go_encryption.is_some()
+            && config
+                .options
+                .transport
+                .as_ref()
+                .is_none_or(|transport| transport.kind == "tcp")
+        {
+            return Err(unsupported(
+                "Trojan-Go Shadowsocks encryption over original TCP is unsupported",
+            ));
+        }
         let (transport_config, packet_encoding, vision) = match &authentication {
             Authentication::Vless(_, flow) => {
                 let (config, xudp) = vless_transport_config(config, *flow)?;
@@ -707,6 +718,37 @@ mod tests {
             tags: Default::default(),
             weight: 1,
             options: Default::default(),
+        }
+    }
+
+    #[test]
+    fn native_credentials_reject_trojan_go_encryption_over_original_tcp() {
+        let mut config = node("trojan", 443);
+        let credential = TransitCredential::new(BTreeMap::from([
+            ("password".into(), "fixture-password".into()),
+            ("trojan_go_ss_method".into(), "aes-128-gcm".into()),
+            ("trojan_go_ss_password".into(), "fixture-ss-password".into()),
+        ]));
+        let tls = crate::adapter_registry::native_tls_roots();
+        for transport in [None, Some("tcp"), Some("ws")] {
+            config.options.transport = transport.map(|kind| pathchord_policy::TransitTransport {
+                kind: kind.into(),
+                ..Default::default()
+            });
+            let result = NativeProtocolAdapter::from_config(
+                &config,
+                &credential,
+                Duration::from_secs(1),
+                Arc::clone(&tls),
+            );
+            if transport == Some("ws") {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TransitError::Unsupported(reason)) if reason.contains("original TCP")
+                ));
+            }
         }
     }
 

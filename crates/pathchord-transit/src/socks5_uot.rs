@@ -1,4 +1,4 @@
-//! sing-box UDP-over-TCP framing carried inside an authenticated SOCKS tunnel.
+//! sing-box UDP-over-TCP framing for byte-stream proxy connections.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -16,6 +16,12 @@ pub(crate) fn request_host(version: u8) -> &'static str {
         2 => "sp.v2.udp-over-tcp.arpa",
         _ => unreachable!("version is checked by the adapter constructor"),
     }
+}
+
+pub(crate) fn encode_v2_connect_request(destination: &Endpoint) -> Result<Vec<u8>, TransitError> {
+    let mut request = vec![1]; // connected association
+    request.extend_from_slice(&encode_address(destination, false)?);
+    Ok(request)
 }
 
 pub(crate) struct UotDatagram {
@@ -40,12 +46,10 @@ impl UotDatagram {
         destination: Endpoint,
         version: u8,
     ) -> Result<BoxedTransitDatagram, TransitError> {
-        validate_destination(&destination)?;
         let legacy_header = match version {
             1 => Some(encode_address(&destination, true)?),
             2 => {
-                let mut request = vec![1]; // connected association
-                request.extend_from_slice(&encode_address(&destination, false)?);
+                let request = encode_v2_connect_request(&destination)?;
                 stream.write_all(&request).await.map_err(|_| {
                     TransitError::Connection("UDP-over-TCP request write failed".into())
                 })?;
@@ -60,7 +64,23 @@ impl UotDatagram {
                 ));
             }
         };
-        Ok(Box::new(Self {
+        Ok(Box::new(Self::new(stream, destination, legacy_header)))
+    }
+
+    /// Use an established stream after the v2 connect request has been sent.
+    pub(crate) fn from_v2_stream(
+        stream: BoxedTransitConnection,
+        destination: Endpoint,
+    ) -> BoxedTransitDatagram {
+        Box::new(Self::new(stream, destination, None))
+    }
+
+    fn new(
+        stream: BoxedTransitConnection,
+        destination: Endpoint,
+        legacy_header: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
             stream,
             destination,
             legacy_header,
@@ -68,7 +88,7 @@ impl UotDatagram {
             pending_write: Vec::new(),
             written: 0,
             failed: false,
-        }))
+        }
     }
 
     async fn read_until(&mut self, length: usize) -> Result<(), TransitError> {

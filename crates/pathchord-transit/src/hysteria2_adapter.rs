@@ -497,7 +497,7 @@ impl Hysteria2Adapter {
         })
     }
 
-    async fn connect_session(&self) -> Result<quinn::Connection, TransitError> {
+    async fn connect_session(&self) -> Result<Hysteria2Session, TransitError> {
         let address = timeout(
             self.connect_timeout,
             tokio::net::lookup_host((self.endpoint.host.as_str(), self.endpoint.port)),
@@ -568,35 +568,39 @@ impl Hysteria2Adapter {
         .await
         .map_err(|_| TransitError::Connection("Hysteria2 QUIC handshake timed out".into()))?
         .map_err(|_| TransitError::Connection("Hysteria2 QUIC handshake failed".into()))?;
-        // Keep the endpoint alive until the QUIC connection closes without
-        // leaking it for the lifetime of the process.
-        let keepalive = connection.clone();
-        tokio::spawn(async move {
-            keepalive.closed().await;
-            drop(endpoint);
-        });
-        Ok(connection)
+        Ok(Hysteria2Session {
+            connection,
+            _endpoint: endpoint,
+            http3: None,
+        })
     }
 
-    async fn authenticate(&self, connection: &quinn::Connection) -> Result<bool, TransitError> {
-        let result = timeout(self.connect_timeout, self.authenticate_inner(connection))
+    async fn authenticate(&self, session: &mut Hysteria2Session) -> Result<bool, TransitError> {
+        let result = timeout(self.connect_timeout, self.authenticate_inner(session))
             .await
             .map_err(|_| TransitError::Connection("Hysteria2 authentication timed out".into()))
             .and_then(|result| result);
         if result.is_err() {
-            connection.close(0_u32.into(), b"");
+            session.connection.close(0_u32.into(), b"");
         }
         result
     }
 
     async fn authenticate_inner(
         &self,
-        connection: &quinn::Connection,
+        session: &mut Hysteria2Session,
     ) -> Result<bool, TransitError> {
-        let h3_connection = h3_quinn::Connection::new(connection.clone());
-        let (_driver, mut sender) = h3::client::new(h3_connection)
+        let h3_connection = h3_quinn::Connection::new(session.connection.clone());
+        let (mut driver, mut sender) = h3::client::new(h3_connection)
             .await
             .map_err(|_| TransitError::Protocol("Hysteria2 HTTP/3 setup failed".into()))?;
+        // The HTTP/3 driver owns the critical streams. Keep a request sender
+        // with it because dropping the last sender closes the H3 connection.
+        let keep_sender = sender.clone();
+        session.http3 = Some(tokio::spawn(async move {
+            let _sender = keep_sender;
+            driver.wait_idle().await;
+        }));
         let auth = AuthHeaders {
             password: self.password.clone(),
             receive_bps: self.receive_bps,
@@ -640,7 +644,8 @@ impl Hysteria2Adapter {
             ServerReceiveRate::BytesPerSecond(rate) => rate,
         };
         if send_bps != 0 {
-            let controller = connection
+            let controller = session
+                .connection
                 .congestion_state()
                 .into_any()
                 .downcast::<brutal::BrutalController>()
@@ -664,10 +669,11 @@ impl TransitAdapter for Hysteria2Adapter {
         request: ConnectRequest,
     ) -> Result<BoxedTransitConnection, TransitError> {
         crate::validate_destination(&request.destination)?;
-        let connection = self.connect_session().await?;
-        self.authenticate(&connection).await?;
+        let mut session = self.connect_session().await?;
+        self.authenticate(&mut session).await?;
         let destination = format_destination(&request.destination);
-        let (mut send, recv) = connection
+        let (mut send, recv) = session
+            .connection
             .open_bi()
             .await
             .map_err(|_| TransitError::Connection("Hysteria2 TCP stream open failed".into()))?;
@@ -680,6 +686,8 @@ impl TransitAdapter for Hysteria2Adapter {
         Ok(Box::new(Hysteria2Stream {
             send,
             recv,
+            session: Some(session),
+            drain_timeout: self.connect_timeout.min(Duration::from_secs(2)),
             response_done: false,
             response_buffer: Vec::new(),
             leftover: Vec::new(),
@@ -701,8 +709,8 @@ impl TransitAdapter for Hysteria2Adapter {
             ));
         }
         crate::validate_destination(&request.destination)?;
-        let connection = self.connect_session().await?;
-        if !self.authenticate(&connection).await? {
+        let mut session = self.connect_session().await?;
+        if !self.authenticate(&mut session).await? {
             return Err(TransitError::Unsupported(
                 "Hysteria2 server did not advertise UDP relay".into(),
             ));
@@ -712,7 +720,7 @@ impl TransitAdapter for Hysteria2Adapter {
             TransitError::Connection("Hysteria2 session id generation failed".into())
         })?;
         Ok(Box::new(Hysteria2Datagram {
-            connection,
+            session,
             session_id: u32::from_be_bytes(id_bytes),
             packet_id: 0,
             destination: format_destination(&request.destination),
@@ -730,17 +738,53 @@ fn format_destination(endpoint: &TransitEndpoint) -> String {
     }
 }
 
+struct Hysteria2Session {
+    connection: quinn::Connection,
+    _endpoint: Endpoint,
+    http3: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Hysteria2Session {
+    fn drop(&mut self) {
+        self.connection.close(0_u32.into(), b"closed");
+        if let Some(driver) = &self.http3 {
+            driver.abort();
+        }
+    }
+}
+
 struct Hysteria2Stream {
     send: SendStream,
     recv: RecvStream,
+    session: Option<Hysteria2Session>,
+    drain_timeout: Duration,
     response_done: bool,
     response_buffer: Vec<u8>,
     leftover: Vec<u8>,
     leftover_pos: usize,
 }
 
+impl Drop for Hysteria2Stream {
+    fn drop(&mut self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // Quinn queues FIN without waiting for acknowledgement. Keep the
+        // session alive briefly so a connection close cannot discard that FIN
+        // or the data queued ahead of it.
+        let _ = self.send.finish();
+        let acknowledgement = self.send.stopped();
+        let session = self.session.take();
+        let drain_timeout = self.drain_timeout;
+        runtime.spawn(async move {
+            let _ = timeout(drain_timeout, acknowledgement).await;
+            drop(session);
+        });
+    }
+}
+
 struct Hysteria2Datagram {
-    connection: quinn::Connection,
+    session: Hysteria2Session,
     session_id: u32,
     packet_id: u16,
     destination: String,
@@ -875,7 +919,7 @@ impl crate::TransitDatagram for Hysteria2Datagram {
         self.packet_id = self.packet_id.wrapping_add(1);
         let header = crate::hysteria2_codec::encode_udp_message(&packet)
             .map_err(|message| TransitError::Unsupported(message.into()))?;
-        let max = self.connection.max_datagram_size().ok_or_else(|| {
+        let max = self.session.connection.max_datagram_size().ok_or_else(|| {
             TransitError::Unsupported("Hysteria2 peer does not accept QUIC datagrams".into())
         })?;
         let part_size = max
@@ -896,7 +940,8 @@ impl crate::TransitDatagram for Hysteria2Datagram {
                 packet.payload = payload[start..end].to_vec();
                 let encoded = crate::hysteria2_codec::encode_udp_message(&packet)
                     .map_err(|message| TransitError::Unsupported(message.into()))?;
-                self.connection
+                self.session
+                    .connection
                     .send_datagram_wait(Bytes::from(encoded))
                     .await
                     .map_err(|_| {
@@ -911,7 +956,7 @@ impl crate::TransitDatagram for Hysteria2Datagram {
 
     async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
         loop {
-            let encoded = self.connection.read_datagram().await.map_err(|_| {
+            let encoded = self.session.connection.read_datagram().await.map_err(|_| {
                 TransitError::Connection("Hysteria2 UDP datagram receive failed".into())
             })?;
             let packet = crate::hysteria2_codec::decode_udp_message(&encoded)
@@ -925,11 +970,6 @@ impl crate::TransitDatagram for Hysteria2Datagram {
                 return Ok(payload);
             }
         }
-    }
-
-    async fn close(self: Box<Self>) -> Result<(), TransitError> {
-        self.connection.close(0u32.into(), b"closed");
-        Ok(())
     }
 }
 
@@ -1518,27 +1558,26 @@ mod tests {
                 let (mut adapter, request, _closed, task) =
                     mock_h3_auth(rate, udp, status, Duration::ZERO).await;
                 adapter.send_bps = client_rate;
-                let conn = adapter.connect_session().await.unwrap();
-                let target = || {
+                let mut session = adapter.connect_session().await.unwrap();
+                let target = |conn: &quinn::Connection| {
                     conn.congestion_state()
                         .into_any()
                         .downcast::<brutal::BrutalController>()
                         .unwrap()
                         .target()
                 };
-                assert_eq!(target(), 0);
-                let result = adapter.authenticate(&conn).await;
+                assert_eq!(target(&session.connection), 0);
+                let result = adapter.authenticate(&mut session).await;
                 assert_eq!(
                     request.await.unwrap(),
                     ("fixture-password".into(), "875000".into())
                 );
                 if succeeds {
                     assert_eq!(result.unwrap(), udp == Some("true"));
-                    assert_eq!(target(), expected_rate);
-                    conn.close(0_u32.into(), b"");
+                    assert_eq!(target(&session.connection), expected_rate);
                 } else {
                     assert!(result.is_err(), "rate {rate:?}, status {status}");
-                    assert!(conn.close_reason().is_some());
+                    assert!(session.connection.close_reason().is_some());
                 }
                 task.abort();
             }
@@ -1551,14 +1590,14 @@ mod tests {
     async fn stalled_h3_authentication_times_out_and_closes_connection() {
         let (mut adapter, request, _closed, task) =
             mock_h3_auth(Some("0"), Some("true"), 233, Duration::from_secs(5)).await;
-        let conn = adapter.connect_session().await.unwrap();
+        let mut session = adapter.connect_session().await.unwrap();
         adapter.connect_timeout = Duration::from_millis(150);
         assert!(matches!(
-            adapter.authenticate(&conn).await,
+            adapter.authenticate(&mut session).await,
             Err(TransitError::Connection(_))
         ));
         assert_eq!(request.await.unwrap().1, "875000");
-        assert!(conn.close_reason().is_some());
+        assert!(session.connection.close_reason().is_some());
         task.abort();
     }
 
@@ -1729,13 +1768,13 @@ mod tests {
                 let adapter = Hysteria2Adapter::from_config(
                     &config, &credentials, Duration::from_secs(3), crate::adapter_registry::native_tls_roots()
                 ).unwrap();
-                let connection = adapter.connect_session().await.unwrap();
-                adapter.authenticate(&connection).await.unwrap();
-                let controller = connection.congestion_state().into_any()
+                let mut session = adapter.connect_session().await.unwrap();
+                adapter.authenticate(&mut session).await.unwrap();
+                let controller = session.connection.congestion_state().into_any()
                     .downcast::<brutal::BrutalController>().unwrap();
                 assert_eq!(controller.target(), expected_bps,
                     "server_mbps={server_mbps}, auto={auto}, client_mbps={client_mbps}");
-                connection.close(0_u32.into(), b"done");
+                drop(session);
                 server.kill().await.unwrap();
                 server.wait().await.unwrap();
             }
@@ -1854,15 +1893,17 @@ mod tests {
                 let adapter = Hysteria2Adapter::from_config(
                     &config, &credentials, Duration::from_secs(5), crate::adapter_registry::native_tls_roots()
                 ).unwrap();
-                let connection = adapter.connect_session().await.unwrap();
-                adapter.authenticate(&connection).await.unwrap();
+                let mut session = adapter.connect_session().await.unwrap();
+                adapter.authenticate(&mut session).await.unwrap();
+                let connection = session.connection.clone();
                 let controller = connection.congestion_state().into_any()
                     .downcast::<brutal::BrutalController>().unwrap();
                 assert_eq!(controller.target(), 125_000);
                 let (mut send, recv) = connection.open_bi().await.unwrap();
                 send.write_all(&crate::hysteria2_codec::encode_tcp_request(&destination.to_string(), &[]).unwrap()).await.unwrap();
                 let mut stream = Hysteria2Stream {
-                    send, recv, response_done: false, response_buffer: Vec::new(),
+                    send, recv, session: Some(session), drain_timeout: Duration::from_secs(2),
+                    response_done: false, response_buffer: Vec::new(),
                     leftover: Vec::new(), leftover_pos: 0,
                 };
                 dropping.store(induce_loss, Ordering::Relaxed);
@@ -2061,6 +2102,9 @@ mod tests {
             let mut payload = vec![0_u8; 64 * 1024];
             stream.read_exact(&mut payload).await.unwrap();
             stream.write_all(&payload).await.unwrap();
+            let mut tail = Vec::new();
+            stream.read_to_end(&mut tail).await.unwrap();
+            assert_eq!(tail, b"upload before shutdown");
         });
         let mut config = pathchord_policy::TransitProxyConfig {
             id: TransitProxyId::new("hysteria2-test"),
@@ -2126,6 +2170,9 @@ mod tests {
         let mut echoed = vec![0_u8; upload.len()];
         stream.read_exact(&mut echoed).await.unwrap();
         assert_eq!(echoed, upload);
+        stream.write_all(b"upload before shutdown").await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
         target_task.await.unwrap();
         let udp_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_address = udp_target.local_addr().unwrap();

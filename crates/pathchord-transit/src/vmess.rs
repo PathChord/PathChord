@@ -62,7 +62,7 @@ impl VmessAdapter {
         timeout: Duration,
         tls: Arc<rustls::ClientConfig>,
     ) -> Result<Self, TransitError> {
-        let mut allowed = vec!["uuid", "security", "alter_id"];
+        let mut allowed = vec!["uuid", "security", "cipher", "alter_id"];
         if config
             .options
             .transport
@@ -94,8 +94,20 @@ impl VmessAdapter {
             .field("uuid")
             .ok_or_else(|| unsupported("VMess UUID is missing"))?;
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| unsupported("VMess UUID is invalid"))?;
-        let security = credential.field("security").unwrap_or("aes-128-gcm");
-        let cipher = BodyCipherKind::parse(security)?;
+        let security = credential
+            .field("security")
+            .map(BodyCipherKind::parse)
+            .transpose()?;
+        let cipher = credential
+            .field("cipher")
+            .map(BodyCipherKind::parse)
+            .transpose()?;
+        if let (Some(security), Some(cipher)) = (security, cipher)
+            && security != cipher
+        {
+            return Err(unsupported("VMess security and cipher aliases conflict"));
+        }
+        let cipher = security.or(cipher).unwrap_or(BodyCipherKind::Aes128Gcm);
         let framing =
             config
                 .options
@@ -1752,6 +1764,56 @@ mod tests {
         let mut decoded = bytes[16..].to_vec();
         CfbStream::new(&cmd_key(uuid.as_bytes()), &iv).apply(&mut decoded, true);
         assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn native_credentials_accept_equivalent_vmess_cipher_aliases() {
+        let config = TransitProxyConfig {
+            id: pathchord_policy::TransitProxyId::new("vmess-cipher-alias"),
+            source: None,
+            protocol: "vmess".into(),
+            endpoint: pathchord_policy::Endpoint {
+                host: "127.0.0.1".into(),
+                port: 443,
+            },
+            credentials_ref: None,
+            labels: BTreeMap::new(),
+            tags: BTreeSet::new(),
+            weight: 1,
+            options: Default::default(),
+        };
+        let tls = crate::adapter_registry::native_tls_roots();
+        let build = |aliases: &[(&str, &str)]| {
+            let mut fields =
+                BTreeMap::from([("uuid".into(), "6cbf3f72-3417-4922-bde6-67820d041f25".into())]);
+            fields.extend(
+                aliases
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string())),
+            );
+            VmessAdapter::from_config(
+                &config,
+                &TransitCredential::new(fields),
+                Duration::from_secs(1),
+                Arc::clone(&tls),
+            )
+        };
+        for aliases in [
+            &[("cipher", "chacha20-poly1305")][..],
+            &[
+                ("security", "chacha20-ietf-poly1305"),
+                ("cipher", "CHACHA20-POLY1305"),
+            ][..],
+        ] {
+            assert_eq!(
+                build(aliases).unwrap().cipher,
+                BodyCipherKind::ChaCha20Poly1305
+            );
+        }
+        assert!(matches!(
+            build(&[("security", "aes-128-gcm"), ("cipher", "none")]),
+            Err(TransitError::Unsupported(reason)) if reason.contains("aliases conflict")
+        ));
     }
 
     #[test]

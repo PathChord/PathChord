@@ -152,8 +152,7 @@ impl AnyTlsAdapter {
             }
             stream.write_all(&initial).await.map_err(io_failure)?;
             stream.flush().await.map_err(io_failure)?;
-            wait_synack(&mut stream).await?;
-            Ok(spawn_stream_relay(stream))
+            open_stream_relay(stream).await
         })
         .await
         .map_err(|_| TransitError::Connection("AnyTLS session timed out".to_owned()))?
@@ -184,69 +183,27 @@ impl TransitAdapter for AnyTlsAdapter {
         if !self.udp_enabled {
             return Err(unsupported("AnyTLS UDP is disabled"));
         }
-        let target = anytls_address(&request.destination)?;
-        let mut request_payload = BytesMut::new();
-        request_payload.extend_from_slice(&[1]);
-        target.encode(&mut request_payload).map_err(protocol)?;
+        // The peer can require the UoT connect request before sending SYNACK.
+        let request_payload = crate::uot::encode_v2_connect_request(&request.destination)?;
         let stream = self
             .open(
                 &Endpoint {
-                    host: "sp.v2.udp-over-tcp.arpa".into(),
+                    host: crate::uot::request_host(2).into(),
                     port: 0,
                 },
-                Some(request_payload.freeze()),
+                Some(request_payload.into()),
             )
             .await?;
-        Ok(Box::new(AnyTlsDatagram { stream }))
-    }
-}
-
-struct AnyTlsDatagram {
-    stream: BoxedTransitConnection,
-}
-
-impl std::fmt::Debug for AnyTlsDatagram {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("AnyTlsDatagram(..)")
-    }
-}
-
-#[async_trait]
-impl crate::TransitDatagram for AnyTlsDatagram {
-    async fn send(&mut self, payload: &[u8]) -> Result<(), TransitError> {
-        if payload.len() > u16::MAX as usize {
-            return Err(unsupported("AnyTLS UDP payload exceeds u16 length"));
-        }
-        self.stream
-            .write_all(&(payload.len() as u16).to_be_bytes())
-            .await
-            .map_err(io_failure)?;
-        self.stream.write_all(payload).await.map_err(io_failure)?;
-        self.stream.flush().await.map_err(io_failure)
-    }
-
-    async fn receive(&mut self) -> Result<Vec<u8>, TransitError> {
-        let mut length = [0_u8; 2];
-        self.stream
-            .read_exact(&mut length)
-            .await
-            .map_err(io_failure)?;
-        let mut payload = vec![0_u8; u16::from_be_bytes(length) as usize];
-        self.stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(io_failure)?;
-        Ok(payload)
-    }
-
-    async fn close(mut self: Box<Self>) -> Result<(), TransitError> {
-        self.stream.shutdown().await.map_err(io_failure)
+        Ok(crate::uot::UotDatagram::from_v2_stream(
+            stream,
+            request.destination,
+        ))
     }
 }
 
 fn anytls_address(endpoint: &Endpoint) -> Result<AnyTlsAddress, TransitError> {
     if endpoint.host.is_empty()
-        || (endpoint.port == 0 && endpoint.host != "sp.v2.udp-over-tcp.arpa")
+        || (endpoint.port == 0 && endpoint.host != crate::uot::request_host(2))
     {
         return Err(unsupported("AnyTLS destination is invalid"));
     }
@@ -259,7 +216,9 @@ fn anytls_address(endpoint: &Endpoint) -> Result<AnyTlsAddress, TransitError> {
     Ok(AnyTlsAddress::Domain(endpoint.host.clone(), endpoint.port))
 }
 
-async fn wait_synack(stream: &mut BoxedTransitConnection) -> Result<(), TransitError> {
+async fn open_stream_relay(
+    mut stream: BoxedTransitConnection,
+) -> Result<BoxedTransitConnection, TransitError> {
     let mut input = BytesMut::new();
     let mut buffer = [0_u8; 8192];
     loop {
@@ -268,7 +227,12 @@ async fn wait_synack(stream: &mut BoxedTransitConnection) -> Result<(), TransitE
         }
         if let Some(frame) = AnyTlsFrame::decode(&mut input).map_err(protocol)? {
             match frame.command {
-                AnyTlsCommand::SynAck if frame.stream_id == STREAM_ID => return Ok(()),
+                AnyTlsCommand::SynAck if frame.stream_id == STREAM_ID => {
+                    if !frame.payload.is_empty() {
+                        return Err(protocol("AnyTLS peer rejected the stream"));
+                    }
+                    return Ok(spawn_stream_relay(stream, input));
+                }
                 AnyTlsCommand::Alert => return Err(protocol("AnyTLS peer rejected the stream")),
                 AnyTlsCommand::HeartRequest => {
                     let mut response = BytesMut::new();
@@ -293,7 +257,10 @@ async fn wait_synack(stream: &mut BoxedTransitConnection) -> Result<(), TransitE
     }
 }
 
-fn spawn_stream_relay(stream: BoxedTransitConnection) -> BoxedTransitConnection {
+fn spawn_stream_relay(
+    stream: BoxedTransitConnection,
+    mut input: BytesMut,
+) -> BoxedTransitConnection {
     let (client, server) = tokio::io::duplex(MAX_FRAME_PAYLOAD * 2);
     let (mut client_read, mut client_write) = tokio::io::split(server);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(stream);
@@ -328,17 +295,9 @@ fn spawn_stream_relay(stream: BoxedTransitConnection) -> BoxedTransitConnection 
         let _ = upstream_write.shutdown().await;
     });
     tokio::spawn(async move {
-        let mut input = BytesMut::new();
         let mut buffer = [0_u8; 8192];
-        while let Ok(read) = upstream_read.read(&mut buffer).await {
-            if read == 0 {
-                break;
-            }
-            input.extend_from_slice(&buffer[..read]);
-            loop {
-                let Ok(Some(frame)) = AnyTlsFrame::decode(&mut input) else {
-                    break;
-                };
+        loop {
+            while let Ok(Some(frame)) = AnyTlsFrame::decode(&mut input) {
                 match frame.command {
                     AnyTlsCommand::Push if frame.stream_id == STREAM_ID => {
                         if client_write.write_all(&frame.payload).await.is_err() {
@@ -369,6 +328,13 @@ fn spawn_stream_relay(stream: BoxedTransitConnection) -> BoxedTransitConnection 
                     _ => {}
                 }
             }
+            let Ok(read) = upstream_read.read(&mut buffer).await else {
+                break;
+            };
+            if read == 0 {
+                break;
+            }
+            input.extend_from_slice(&buffer[..read]);
         }
         let _ = client_write.shutdown().await;
     });
@@ -388,7 +354,6 @@ fn io_failure(error: std::io::Error) -> TransitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TransitDatagram;
     use pathchord_policy::{Endpoint as PolicyEndpoint, TransitOptions, TransitProxyId};
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -550,10 +515,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nonempty_synack_is_a_redacted_open_error() {
+        let (upstream, mut peer) = tokio::io::duplex(256);
+        let mut response = BytesMut::new();
+        append_frame(&mut response, AnyTlsCommand::SynAck, b"private peer error");
+        peer.write_all(&response).await.unwrap();
+
+        let result = open_stream_relay(Box::new(upstream)).await;
+        assert!(matches!(
+            result,
+            Err(TransitError::Protocol(reason)) if reason == "AnyTLS peer rejected the stream"
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_complete_and_partial_frames_read_with_synack() {
+        let (upstream, mut peer) = tokio::io::duplex(256);
+        let mut response = BytesMut::new();
+        append_frame(&mut response, AnyTlsCommand::SynAck, b"");
+        append_frame(&mut response, AnyTlsCommand::Push, b"first");
+        let split = response.len() + 3;
+        append_frame(&mut response, AnyTlsCommand::Push, b"second");
+        append_frame(&mut response, AnyTlsCommand::Fin, b"");
+        let remainder = response.split_off(split);
+        peer.write_all(&response).await.unwrap();
+
+        let mut relay = open_stream_relay(Box::new(upstream)).await.unwrap();
+        let mut first = [0; 5];
+        timeout(Duration::from_secs(1), relay.read_exact(&mut first))
+            .await
+            .expect("the complete buffered frame needs no further socket reads")
+            .unwrap();
+        assert_eq!(&first, b"first");
+        peer.write_all(&remainder).await.unwrap();
+        let mut rest = Vec::new();
+        timeout(Duration::from_secs(1), relay.read_to_end(&mut rest))
+            .await
+            .expect("the partial buffered frame should resume")
+            .unwrap();
+        assert_eq!(rest, b"second");
+    }
+
+    fn append_frame(output: &mut BytesMut, command: AnyTlsCommand, payload: &'static [u8]) {
+        AnyTlsFrame {
+            command,
+            stream_id: STREAM_ID,
+            payload: bytes::Bytes::from_static(payload),
+        }
+        .encode(output)
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn buffered_relay_flushes_the_tail_after_two_maximum_frames() {
         let (upstream, mut peer) = tokio::io::duplex(16 * 1024);
         let buffered = tokio::io::BufWriter::with_capacity(16 * 1024, upstream);
-        let stream = spawn_stream_relay(Box::new(buffered));
+        let stream = spawn_stream_relay(Box::new(buffered), BytesMut::new());
         let peer_task = tokio::spawn(async move {
             let mut input = BytesMut::new();
             let mut buffer = [0_u8; 8192];
@@ -602,9 +619,13 @@ mod tests {
     #[tokio::test]
     async fn anytls_udp_over_tcp_uses_bounded_length_frames() {
         let (client, mut peer) = tokio::io::duplex(1024);
-        let mut datagram = AnyTlsDatagram {
-            stream: Box::new(client),
-        };
+        let mut datagram = crate::uot::UotDatagram::from_v2_stream(
+            Box::new(client),
+            Endpoint {
+                host: "127.0.0.1".into(),
+                port: 53,
+            },
+        );
         datagram.send(b"request").await.unwrap();
         let mut header = [0_u8; 2];
         peer.read_exact(&mut header).await.unwrap();
@@ -612,9 +633,30 @@ mod tests {
         let mut request = [0_u8; 7];
         peer.read_exact(&mut request).await.unwrap();
         assert_eq!(&request, b"request");
-        peer.write_all(&5_u16.to_be_bytes()).await.unwrap();
-        peer.write_all(b"reply").await.unwrap();
-        assert_eq!(datagram.receive().await.unwrap(), b"reply");
+        // Ingress cancels a pending receive when another send is ready.
+        for partial in [b"\x00".as_slice(), b"\x05re".as_slice()] {
+            peer.write_all(partial).await.unwrap();
+            tokio::select! {
+                biased;
+                result = datagram.receive() => panic!("incomplete UDP frame returned {result:?}"),
+                () = std::future::ready(()) => {}
+            }
+        }
+        peer.write_all(b"ply\x00\x04next").await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), datagram.receive())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"reply"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(1), datagram.receive())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"next"
+        );
         assert!(
             datagram
                 .send(&vec![0_u8; u16::MAX as usize + 1])

@@ -630,6 +630,15 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Validation evidence
 
+On 2026-11-26, the Transit protocol fixes passed the Linux workspace suite
+(1,132 passed, 118 ignored). The focused sing-box matrix passed 20 cases each
+against release 1.14.4 and source revision `491b845`, built with `with_quic`
+and `with_utls`. It covers Hysteria2 HTTP/3 lifetime after authentication,
+TCP tail delivery on close, UDP port hopping, AnyTLS TCP and UDP, and the
+SOCKS5, Shadowsocks, and TUIC UoT callers. Local regressions cover AnyTLS
+rejections and partial frames, VMess credential aliases, and rejection of
+Trojan-Go Shadowsocks encryption over original TCP.
+
 On 2026-11-23, the Transit subscription test suite passed 96 tests on Linux,
 including import replay of six sanitized excerpts from one supplied
 subscription. The excerpts cover inline Clash, versioned SIP008, sing-box,
