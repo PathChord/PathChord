@@ -19,6 +19,6 @@ depend() {
 
 start_pre() {
 	checkpath --directory --owner pathchord:pathchord --mode 0700 /var/lib/pathchord-ingress
-	checkpath --directory --owner pathchord:pathchord --mode 0700 /run/pathchord
+	checkpath --directory --owner pathchord:pathchord --mode 0750 /run/pathchord
 	checkpath --directory --owner pathchord:pathchord --mode 0700 /var/lib/pathchord-ingress/credentials
 }

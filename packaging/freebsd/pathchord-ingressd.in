@@ -27,7 +27,7 @@ pathchord_ingressd_precmd()
 {
 	install -d -o "${pathchord_ingressd_user}" -g "${pathchord_ingressd_user}" -m 0700 "${pathchord_ingressd_data_dir}"
 	install -d -o "${pathchord_ingressd_user}" -g "${pathchord_ingressd_user}" -m 0700 "${pathchord_ingressd_credentials_dir}"
-	install -d -o "${pathchord_ingressd_user}" -g "${pathchord_ingressd_user}" -m 0700 /var/run/pathchord
+	install -d -o "${pathchord_ingressd_user}" -g "${pathchord_ingressd_user}" -m 0750 /var/run/pathchord
     rm -f /var/run/pathchord/.restart-ingress
 }
 

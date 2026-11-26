@@ -86,9 +86,13 @@ state. To change roles, remove the existing package explicitly and install the
 other; upgrade, rollback and removal preserve operator configuration and keys.
 
 Both Unix profiles use the local non-login `pathchord` account. Only the selected
-role's private roots are created. State and runtime directories are `0700`,
-configuration directories are `root:pathchord` with mode `0750`, and control
-sockets and locks are `0600`. Run `pathchordctl` as root or `pathchord`.
+role's private roots are created. State directories use `0700`, and control
+locks use `0600`. Configuration directories are `root:pathchord` with mode
+`0750`. The runtime directory uses `0750` and the control socket uses `0660`,
+both owned by `pathchord:pathchord`. Membership in the `pathchord` group grants
+local service administration. On Linux, run `sudo usermod -aG pathchord USER`.
+On FreeBSD, run `sudo pw groupmod pathchord -m USER`. Start a new login session
+before using `pathchordctl` as the added user.
 Ingress credentials live in `/var/lib/pathchord-ingress/credentials`, or
 `/var/db/pathchord-ingress/credentials` on FreeBSD, outside the resource tree.
 

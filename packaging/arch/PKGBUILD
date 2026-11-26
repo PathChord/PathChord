@@ -37,5 +37,5 @@ package() {
     install -Dm0644 "packaging/arch/$pkgname.service" "$pkgdir/usr/lib/systemd/system/$pkgname.service"
     install -Dm0644 packaging/arch/pathchord.sysusers "$pkgdir/usr/lib/sysusers.d/pathchord.conf"
     install -d "$pkgdir/usr/lib/tmpfiles.d"
-    printf 'd /etc/pathchord/%s 0750 root pathchord - -\nd /var/lib/pathchord-%s 0700 pathchord pathchord - -\nd /run/pathchord 0700 pathchord pathchord - -\n' "$role" "$role" > "$pkgdir/usr/lib/tmpfiles.d/pathchord.conf"
+    printf 'd /etc/pathchord/%s 0750 root pathchord - -\nd /var/lib/pathchord-%s 0700 pathchord pathchord - -\nd /run/pathchord 0750 pathchord pathchord - -\n' "$role" "$role" > "$pkgdir/usr/lib/tmpfiles.d/pathchord.conf"
 }

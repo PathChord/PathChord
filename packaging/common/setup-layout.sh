@@ -18,7 +18,7 @@ if [ "$role" = ingress ]; then
     install -d -o pathchord -g pathchord -m 0700 "$state_root/pathchord-ingress/credentials"
     chown -R pathchord:pathchord "$state_root/pathchord-ingress/credentials"
 fi
-install -d -o pathchord -g pathchord -m 0700 "$runtime_root"
+install -d -o pathchord -g pathchord -m 0750 "$runtime_root"
 for endpoint in "$runtime_root/$role.sock" "$runtime_root/$role.sock.lock"; do
     if [ -e "$endpoint" ]; then
         chown pathchord:pathchord "$endpoint"

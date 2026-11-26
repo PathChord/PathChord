@@ -46,7 +46,7 @@ getent passwd pathchord
 [ -x /usr/bin/pathchordctl ]
 [ "$(stat -c '%U:%G:%a' "/var/lib/pathchord-$role")" = 'pathchord:pathchord:700' ]
 [ "$(stat -c '%U:%G:%a' "/etc/pathchord/$role")" = 'root:pathchord:750' ]
-[ "$(stat -c '%U:%G:%a' /run/pathchord)" = 'pathchord:pathchord:700' ]
+[ "$(stat -c '%U:%G:%a' /run/pathchord)" = 'pathchord:pathchord:750' ]
 [ -f /usr/share/man/man1/pathchord.1.gz ]
 gzip -t /usr/share/man/man1/pathchord.1.gz
 "/usr/bin/$package" --version

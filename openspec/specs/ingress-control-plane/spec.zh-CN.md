@@ -123,6 +123,20 @@ Ingress SHALL 区分资源限制、目标失败和策略失败。资源限制结
 - **WHEN** 客户端创建带有效 User-Agent 的订阅，随后 Ingress 重启
 - **THEN** 后续控制读取和刷新保留该值
 
+### Requirement: Unix control socket group access
+
+Unix 控制服务 SHALL 将控制 socket 权限设为 `0660`，其生命周期锁仅所有者可访问。Unix 软件包服务 SHALL 使用 `pathchord:pathchord` 作为控制 socket 和运行目录的所有者及属组，并将运行目录权限设为 `0750`。获得 socket 访问权的调用者 SHALL 通过现有本地适配器获得本地管理权限。私有状态目录 SHALL 仅所有者可访问。
+
+#### Scenario: A local operator is a service group member
+
+- **WHEN** `pathchord` 组内操作者在新的登录会话中对 Unix 软件包服务运行 `pathchordctl`
+- **THEN** 操作者可以连接控制 socket 并执行本地管理操作，无需提升权限。
+
+#### Scenario: A local operator is outside the service group
+
+- **WHEN** `pathchord` 组外的非特权操作者尝试连接 Unix 软件包的控制 socket
+- **THEN** 操作系统拒绝访问。
+
 ## Detailed contract
 
 本文档定义用于操作 Ingress 的本地控制平面，以及供前端使用的可选 Web 网关。它独立于

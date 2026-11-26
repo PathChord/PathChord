@@ -45,7 +45,7 @@ chmod 0750 "$stage/etc/pathchord/$role"
 cat > "$stage/usr/lib/tmpfiles.d/pathchord.conf" <<EOF
 d /etc/pathchord/$role 0750 root pathchord - -
 d /var/lib/pathchord-$role 0700 pathchord pathchord - -
-d /run/pathchord 0700 pathchord pathchord - -
+d /run/pathchord 0750 pathchord pathchord - -
 EOF
 cat > "$stage/DEBIAN/control" <<EOF
 Package: $package_name

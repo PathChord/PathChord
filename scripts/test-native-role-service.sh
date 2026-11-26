@@ -71,7 +71,7 @@ ready() {
     fi
     active_service
     su -s /bin/sh -c "pathchordctl --socket $endpoint status" pathchord
-    [ "$(stat -c '%U:%G:%a' "$endpoint")" = 'pathchord:pathchord:600' ]
+    [ "$(stat -c '%U:%G:%a' "$endpoint")" = 'pathchord:pathchord:660' ]
     pid=$(service_pid)
     [ "$(awk '/^Uid:/ {print $2}' "/proc/$pid/status")" = "$(id -u pathchord)" ]
     [ "$(awk '/^CapEff:/ {print $2}' "/proc/$pid/status")" = "$expected_capabilities" ]

@@ -26,7 +26,7 @@ start_precmd="pathchord_egressd_precmd"
 pathchord_egressd_precmd()
 {
 	install -d -o "${pathchord_egressd_user}" -g "${pathchord_egressd_user}" -m 0700 "${pathchord_egressd_data_dir}"
-	install -d -o "${pathchord_egressd_user}" -g "${pathchord_egressd_user}" -m 0700 /var/run/pathchord
+	install -d -o "${pathchord_egressd_user}" -g "${pathchord_egressd_user}" -m 0750 /var/run/pathchord
     rm -f /var/run/pathchord/.restart-egress
 }
 

@@ -27,8 +27,10 @@ Enable only the selected service in `/etc/rc.conf` with
 `pathchord_ingressd_enable="YES"` or `pathchord_egressd_enable="YES"`.
 For Egress, provision `/var/db/pathchord-egress/egress.key.json` and update its
 loopback bind in `egress.yaml` before service startup. The rc.d wrappers use
-`/var/run/pathchord/<role>.sock`; private state and runtime directories are
-`0700`, and socket endpoints are owner-only. Ingress credential JSON is stored
+`/var/run/pathchord/<role>.sock`. Private state directories use `0700`. The
+runtime directory uses `0750` and the socket uses `0660`, both owned by
+`pathchord:pathchord`. Add a trusted operator to the group with
+`sudo pw groupmod pathchord -m USER` and start a new login session. Ingress credential JSON is stored
 in `/var/db/pathchord-ingress/credentials` outside its resource tree.
 
 The assembler and ports recipe require native FreeBSD package tools. A Linux

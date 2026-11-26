@@ -55,9 +55,9 @@ fn command_json(arguments: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("CLI JSON response")
 }
 
-fn assert_private_owner(path: &Path) {
+fn assert_owner_and_mode(path: &Path, mode: u32) {
     let metadata = std::fs::metadata(path).unwrap();
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(metadata.permissions().mode() & 0o777, mode);
     assert_eq!(metadata.uid(), nix::unistd::Uid::effective().as_raw());
 }
 
@@ -139,8 +139,8 @@ async fn separate_cli_processes_enroll_and_forward_http_and_udp_through_a_transi
         let egress_key = directory.0.join("egress.json");
         let ingress_public = command_json(&["keygen", "--identity-file", ingress_key.to_str().unwrap()]);
         let egress_public = command_json(&["keygen", "--identity-file", egress_key.to_str().unwrap()]);
-        assert_private_owner(&ingress_key);
-        assert_private_owner(&egress_key);
+        assert_owner_and_mode(&ingress_key, 0o600);
+        assert_owner_and_mode(&egress_key, 0o600);
         let egress_port = unused_port();
         let proxy_port = unused_port();
         let egress_socket = directory.0.join("e.sock");
@@ -152,7 +152,7 @@ async fn separate_cli_processes_enroll_and_forward_http_and_udp_through_a_transi
         )).unwrap();
         let mut egress = spawn(&["egress", "--config", egress_config.to_str().unwrap(), "--identity", egress_key.to_str().unwrap()], &directory.0);
         wait_for_socket(&egress_socket, &mut egress).await;
-        assert_private_owner(&egress_socket);
+        assert_owner_and_mode(&egress_socket, 0o660);
         let enrolled = command_json(&["--config", egress_config.to_str().unwrap(), "enroll", "add",
             "--ingress-id", "entry", "--public-key", ingress_public["public_key"].as_str().unwrap()]);
         assert_eq!(enrolled["ok"], true);
@@ -247,7 +247,7 @@ spec: {{action: reject}}
         ).unwrap();
         let mut ingress = spawn(&["ingress", "--config-dir", config_path.to_str().unwrap(), "--identity", ingress_key.to_str().unwrap()], &directory.0);
         wait_for_socket(&ingress_socket, &mut ingress).await;
-        assert_private_owner(&ingress_socket);
+        assert_owner_and_mode(&ingress_socket, 0o660);
         assert_eq!(command_json(&["--config-dir", config_path.to_str().unwrap(), "get", "status"])["ok"], true);
 
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();

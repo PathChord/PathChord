@@ -260,7 +260,9 @@ until test -S control.sock; do
   sleep 0.05
 done
 pathchordctl -o json --socket "$work/control.sock" status > status.json
-for file in identity authorizations.db control.sock; do
+test "$(stat -f %Lp control.sock)" = 660
+test "$(stat -f %Su control.sock)" = pathchord
+for file in identity authorizations.db; do
   test "$(stat -f %Lp "$file")" = 600
   test "$(stat -f %Su "$file")" = pathchord
   printf '%s mode=%s owner=%s\n' "$file" "$(stat -f %Lp "$file")" "$(stat -f %Su "$file")"
@@ -283,7 +285,7 @@ printf 'sqlite_native=true private_files=true sigterm_exit=0 socket_removed=true
     if expected not in result.stdout:
         raise RuntimeError("native service permission/signal checks omitted their completion marker")
     return {"ok": True, "service_account": "pathchord", "umask": "0077",
-            "identity_mode": "0600", "sqlite_mode": "0600", "control_socket_mode": "0600",
+            "identity_mode": "0600", "sqlite_mode": "0600", "control_socket_mode": "0660",
             "sigterm_exit": 0, "control_socket_removed": True}
 
 

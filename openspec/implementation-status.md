@@ -182,6 +182,12 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Implemented
 
+- Packaged Unix services grant local control access to members of the
+  `pathchord` group through a `0750` runtime directory and a `0660`
+  socket. On Arch Linux, a group member queried the installed Ingress as
+  an unprivileged user and a nonmember was denied. The private state
+  directory and socket lock retained owner-only permissions.
+
 - Established Session Path refill now launches bounded concurrent carrier
   attempts for the current deficit plus one speculative slot. Successful
   surplus Paths remain eligible for normal hysteretic scale-in. The loopback

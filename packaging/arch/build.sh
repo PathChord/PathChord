@@ -25,7 +25,7 @@ cp "$work/src/common/$template" "$work/src/common/role.yaml"
 cat > "$work/src/common/pathchord.tmpfiles" <<EOF
 d /etc/pathchord/$role 0750 root pathchord - -
 d /var/lib/pathchord-$role 0700 pathchord pathchord - -
-d /run/pathchord 0700 pathchord pathchord - -
+d /run/pathchord 0750 pathchord pathchord - -
 EOF
 cat > "$work/PKGBUILD" <<'EOF'
 pkgname=__PACKAGE__

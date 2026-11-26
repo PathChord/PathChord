@@ -72,8 +72,11 @@ pathchord-ingressd --config examples/ingress-subscriptions.yaml
 再安装另一角色；升级、回滚和卸载保留用户配置及私钥。
 
 两个 Unix 安装配置都使用本机非登录账号 `pathchord`，只创建所选角色的私有根。
-状态和运行目录权限为 `0700`，配置目录由 `root:pathchord` 拥有、权限为 `0750`，
-控制 socket 及其锁权限为 `0600`。以 root 或 `pathchord` 运行 `pathchordctl`。
+状态目录权限为 `0700`，控制锁权限为 `0600`。配置目录由 `root:pathchord` 拥有，
+权限为 `0750`。运行目录和控制 socket 由 `pathchord:pathchord` 拥有，权限分别为
+`0750` 和 `0660`。`pathchord` 组成员获得本机服务管理权限。Linux 上执行
+`sudo usermod -aG pathchord USER`，FreeBSD 上执行 `sudo pw groupmod pathchord -m USER`。
+加入组的用户需要重新登录，再运行 `pathchordctl`。
 Ingress 凭据位于资源树外的 `/var/lib/pathchord-ingress/credentials`；FreeBSD 使用
 `/var/db/pathchord-ingress/credentials`。
 

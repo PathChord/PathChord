@@ -8,11 +8,13 @@ combined `pathchord` package. Remove the existing package explicitly before
 changing roles; private operator configuration, identities and state are retained.
 
 Both Unix profiles use the local non-login `pathchord` account. Only the selected
-role's state and credential directories are prepared. Private state and runtime
-directories are `0700`; configuration directories are `root:pathchord`, mode
-`0750`, and control sockets and locks are `0600`. Use root or the service account
-for `pathchordctl`. Role names identify separate deployments and do not require
-two service accounts on one machine.
+role's state and credential directories are prepared. Private state directories
+use `0700` and control locks use `0600`. Configuration directories are
+`root:pathchord` with mode `0750`. The runtime directory uses `0750` and the
+control socket uses `0660`, both owned by `pathchord:pathchord`. The
+`pathchord` group grants local service administration. On Linux, add a trusted
+operator with `sudo usermod -aG pathchord USER`, then start a new login session.
+On FreeBSD, use `sudo pw groupmod pathchord -m USER`.
 
 ## Package layout
 

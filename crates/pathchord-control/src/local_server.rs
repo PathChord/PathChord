@@ -88,7 +88,7 @@ where
             identity: SocketIdentity::from_metadata(&metadata),
             _lock: lock,
         };
-        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
         {
             return Err(LocalServerError::Io(error));
         }
@@ -732,7 +732,7 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600);
+        assert_eq!(mode, 0o660);
         let mut client = UnixStream::connect(&path).await.expect("connect");
         let request = request("status.get", &["status:read"], json!({}));
         let (server_result, ()) = tokio::join!(server.serve_once(), async {

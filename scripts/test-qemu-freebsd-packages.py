@@ -33,7 +33,7 @@ pkg info -l "$name"
 getent passwd pathchord
 [ "$(stat -f '%Su:%Sg:%Lp' "/var/db/pathchord-$role")" = 'pathchord:pathchord:700' ]
 [ "$(stat -f '%Su:%Sg:%Lp' "/usr/local/etc/pathchord/$role")" = 'root:pathchord:750' ]
-[ "$(stat -f '%Su:%Sg:%Lp' /var/run/pathchord)" = 'pathchord:pathchord:700' ]
+[ "$(stat -f '%Su:%Sg:%Lp' /var/run/pathchord)" = 'pathchord:pathchord:750' ]
 [ -f /usr/local/share/man/man1/pathchord.1 ]
 state="/var/db/pathchord-$role"
 config="/usr/local/etc/pathchord/$role/$role.yaml"
@@ -79,7 +79,7 @@ ready() {
     done
     if [ "$is_ready" != true ]; then service "$name" onestatus || true; cat "$state/service.log"; tail -40 /var/log/messages; exit 1; fi
     env SHELL=/bin/sh su -m pathchord -c "pathchordctl --socket $endpoint status"
-    [ "$(stat -f '%Su:%Sg:%Lp' "$endpoint")" = 'pathchord:pathchord:600' ]
+    [ "$(stat -f '%Su:%Sg:%Lp' "$endpoint")" = 'pathchord:pathchord:660' ]
     if [ "$role" = egress ] && [ -e "$state/native-enrollment.fixture" ]; then
         pathchordctl -o json --socket "$endpoint" enroll get --ingress-id lifecycle-fixture > /tmp/pathchord-enrollment.json
         grep -q lifecycle-fixture /tmp/pathchord-enrollment.json
