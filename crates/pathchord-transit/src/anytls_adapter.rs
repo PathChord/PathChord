@@ -4,24 +4,31 @@
 //! one bounded stream at a time. The session handshake and frame relay are kept
 //! here so the codec remains transport-neutral and can be tested independently.
 
-use std::collections::BTreeMap;
-use std::io;
 use std::net::IpAddr;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
+#[cfg(test)]
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::sync::mpsc;
+#[cfg(test)]
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 use crate::anytls_codec::{
-    AnyTlsAddress, AnyTlsCommand, AnyTlsFrame, AnyTlsSettings, MAX_FRAME_PAYLOAD,
-    authentication_record,
+    AnyTlsAddress, AnyTlsCommand, AnyTlsFrame, AnyTlsPaddingScheme, AnyTlsSettings,
+    MAX_FRAME_PAYLOAD, authentication_record,
 };
 use crate::native_transport::NativeTransport;
 use crate::{
@@ -30,6 +37,9 @@ use crate::{
 };
 
 const STREAM_ID: u32 = 1;
+const MAX_IDLE_SESSIONS: usize = 8;
+const IDLE_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
 const MAX_HANDSHAKE_BYTES: usize = 128 * 1024;
 
 pub(crate) struct AnyTlsAdapter {
@@ -38,6 +48,8 @@ pub(crate) struct AnyTlsAdapter {
     transport: NativeTransport,
     udp_enabled: bool,
     timeout: Duration,
+    sessions: Arc<AsyncMutex<Vec<SessionHandle>>>,
+    padding: Arc<Mutex<AnyTlsPaddingScheme>>,
 }
 
 impl std::fmt::Debug for AnyTlsAdapter {
@@ -100,6 +112,8 @@ impl AnyTlsAdapter {
             transport,
             udp_enabled: config.options.udp != Some(false),
             timeout,
+            sessions: Arc::new(AsyncMutex::new(Vec::new())),
+            padding: Arc::new(Mutex::new(AnyTlsPaddingScheme::default_scheme())),
         })
     }
 
@@ -110,56 +124,407 @@ impl AnyTlsAdapter {
     ) -> Result<BoxedTransitConnection, TransitError> {
         let destination = anytls_address(destination)?;
         timeout(self.timeout, async {
-            let mut stream = self.transport.connect().await?;
-            let auth = authentication_record(&self.password, &[]).map_err(protocol)?;
-            stream.write_all(&auth).await.map_err(io_failure)?;
-
-            let mut initial = BytesMut::new();
-            let settings = AnyTlsSettings(BTreeMap::from([
-                ("v".to_owned(), "2".to_owned()),
-                ("client".to_owned(), "pathchord".to_owned()),
-            ]));
-            AnyTlsFrame {
-                command: AnyTlsCommand::Settings,
-                stream_id: 0,
-                payload: settings.encode().map_err(protocol)?,
-            }
-            .encode(&mut initial)
-            .map_err(protocol)?;
-            AnyTlsFrame {
-                command: AnyTlsCommand::Syn,
-                stream_id: STREAM_ID,
-                payload: bytes::Bytes::new(),
-            }
-            .encode(&mut initial)
-            .map_err(protocol)?;
-            let mut destination_payload = BytesMut::new();
-            destination
-                .encode(&mut destination_payload)
-                .map_err(protocol)?;
-            AnyTlsFrame {
-                command: AnyTlsCommand::Push,
-                stream_id: STREAM_ID,
-                payload: destination_payload.freeze(),
-            }
-            .encode(&mut initial)
-            .map_err(protocol)?;
-            if let Some(payload) = eager_payload {
-                AnyTlsFrame {
-                    command: AnyTlsCommand::Push,
-                    stream_id: STREAM_ID,
-                    payload,
-                }
-                .encode(&mut initial)
-                .map_err(protocol)?;
-            }
-            stream.write_all(&initial).await.map_err(io_failure)?;
-            stream.flush().await.map_err(io_failure)?;
-            open_stream_relay(stream).await
+            let session = self.acquire_session().await?;
+            let (reply, result) = oneshot::channel();
+            session
+                .sender
+                .send(SessionCommand::Open {
+                    destination,
+                    eager_payload,
+                    reply,
+                })
+                .await
+                .map_err(|_| TransitError::Connection("AnyTLS Session is closed".into()))?;
+            result
+                .await
+                .map_err(|_| TransitError::Connection("AnyTLS Session open cancelled".into()))?
         })
         .await
         .map_err(|_| TransitError::Connection("AnyTLS session timed out".to_owned()))?
     }
+
+    async fn acquire_session(&self) -> Result<SessionHandle, TransitError> {
+        let now = std::time::Instant::now();
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|session| {
+            session.healthy.load(Ordering::Acquire)
+                && !(session.idle.load(Ordering::Acquire)
+                    && now.duration_since(*session.last_idle.lock().expect("AnyTLS idle"))
+                        >= IDLE_SESSION_TIMEOUT)
+        });
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.idle.load(Ordering::Acquire))
+            .cloned()
+        {
+            session.idle.store(false, Ordering::Release);
+            return Ok(session);
+        }
+        drop(sessions);
+        let mut stream = self.transport.connect().await?;
+        let scheme = self.padding.lock().expect("AnyTLS padding state").clone();
+        let padding_size = scheme
+            .rules(0)
+            .iter()
+            .find_map(|rule| AnyTlsPaddingScheme::sample_size(*rule).ok().flatten())
+            .unwrap_or(0);
+        let mut padding = vec![0u8; padding_size];
+        if !padding.is_empty() {
+            getrandom::fill(&mut padding)
+                .map_err(|_| protocol("AnyTLS padding randomness failed"))?;
+        }
+        let auth = authentication_record(&self.password, &padding).map_err(protocol)?;
+        stream.write_all(&auth).await.map_err(io_failure)?;
+        let (sender, receiver) = mpsc::channel(2);
+        let session = SessionHandle {
+            sender,
+            idle: Arc::new(AtomicBool::new(false)),
+            healthy: Arc::new(AtomicBool::new(true)),
+            last_idle: Arc::new(Mutex::new(std::time::Instant::now())),
+            scheme: Arc::new(Mutex::new(scheme)),
+            pool: Arc::downgrade(&self.sessions),
+            node_padding: Arc::clone(&self.padding),
+        };
+        let mut sessions = self.sessions.lock().await;
+        sessions.push(session.clone());
+        let mut idle: Vec<_> = sessions
+            .iter()
+            .filter(|candidate| candidate.idle.load(Ordering::Acquire))
+            .cloned()
+            .collect();
+        idle.sort_by_key(|candidate| *candidate.last_idle.lock().expect("AnyTLS idle"));
+        while idle.len() > MAX_IDLE_SESSIONS {
+            let evicted = idle.remove(0);
+            evicted.healthy.store(false, Ordering::Release);
+            sessions.retain(|candidate| !Arc::ptr_eq(&candidate.healthy, &evicted.healthy));
+        }
+        drop(sessions);
+        let worker_session = session.clone();
+        tokio::spawn(async move {
+            run_session(stream, receiver, worker_session).await;
+        });
+        Ok(session)
+    }
+}
+
+#[derive(Clone)]
+struct SessionHandle {
+    sender: mpsc::Sender<SessionCommand>,
+    idle: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+    last_idle: Arc<Mutex<std::time::Instant>>,
+    scheme: Arc<Mutex<AnyTlsPaddingScheme>>,
+    pool: std::sync::Weak<AsyncMutex<Vec<SessionHandle>>>,
+    node_padding: Arc<Mutex<AnyTlsPaddingScheme>>,
+}
+
+enum SessionCommand {
+    Open {
+        destination: AnyTlsAddress,
+        eager_payload: Option<bytes::Bytes>,
+        reply: oneshot::Sender<Result<BoxedTransitConnection, TransitError>>,
+    },
+}
+
+async fn run_session(
+    mut upstream: BoxedTransitConnection,
+    mut commands: mpsc::Receiver<SessionCommand>,
+    session: SessionHandle,
+) {
+    let mut packet_count = 0_u32;
+    loop {
+        let command = if session.idle.load(Ordering::Acquire) {
+            match timeout(IDLE_SESSION_TIMEOUT, commands.recv()).await {
+                Ok(command) => command,
+                Err(_) => {
+                    session.healthy.store(false, Ordering::Release);
+                    break;
+                }
+            }
+        } else {
+            commands.recv().await
+        };
+        let Some(SessionCommand::Open {
+            destination,
+            eager_payload,
+            reply,
+        }) = command
+        else {
+            break;
+        };
+        let (client, server) = tokio::io::duplex(MAX_FRAME_PAYLOAD * 2);
+        let (mut client_read, mut client_write) = tokio::io::split(server);
+        let mut initial = BytesMut::new();
+        let mut address = BytesMut::new();
+        if packet_count == 0 {
+            let settings = AnyTlsSettings::official_client(
+                &session.scheme.lock().expect("AnyTLS padding scheme"),
+            );
+            if (AnyTlsFrame {
+                command: AnyTlsCommand::Settings,
+                stream_id: 0,
+                payload: match settings.encode() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        session.healthy.store(false, Ordering::Release);
+                        let _ = reply.send(Err(protocol(error)));
+                        break;
+                    }
+                },
+            })
+            .encode(&mut initial)
+            .is_err()
+            {
+                session.healthy.store(false, Ordering::Release);
+                let _ = reply.send(Err(protocol("AnyTLS settings encoding failed")));
+                break;
+            }
+        }
+        if destination.encode(&mut address).is_err()
+            || (AnyTlsFrame {
+                command: AnyTlsCommand::Syn,
+                stream_id: STREAM_ID,
+                payload: bytes::Bytes::new(),
+            })
+            .encode(&mut initial)
+            .is_err()
+            || (AnyTlsFrame {
+                command: AnyTlsCommand::Push,
+                stream_id: STREAM_ID,
+                payload: address.freeze(),
+            })
+            .encode(&mut initial)
+            .is_err()
+        {
+            session.healthy.store(false, Ordering::Release);
+            let _ = reply.send(Err(protocol("AnyTLS Stream request encoding failed")));
+            break;
+        }
+        if let Some(payload) = eager_payload
+            && (AnyTlsFrame {
+                command: AnyTlsCommand::Push,
+                stream_id: STREAM_ID,
+                payload,
+            })
+            .encode(&mut initial)
+            .is_err()
+        {
+            session.healthy.store(false, Ordering::Release);
+            let _ = reply.send(Err(protocol("AnyTLS Stream payload encoding failed")));
+            break;
+        }
+        packet_count = packet_count.saturating_add(1);
+        if write_session_packet(&mut upstream, &initial, &session.scheme, packet_count)
+            .await
+            .is_err()
+        {
+            session.healthy.store(false, Ordering::Release);
+            let _ = reply.send(Err(protocol("AnyTLS Stream request write failed")));
+            break;
+        }
+        let mut input = BytesMut::new();
+        let mut up_buf = [0u8; 8192];
+        let mut down_buf = [0u8; 8192];
+        let mut opened = false;
+        while !opened {
+            let size = match upstream.read(&mut down_buf).await {
+                Ok(0) | Err(_) => {
+                    session.healthy.store(false, Ordering::Release);
+                    let _ = reply.send(Err(protocol("AnyTLS peer closed before SYNACK")));
+                    return;
+                }
+                Ok(n) => n,
+            };
+            input.extend_from_slice(&down_buf[..size]);
+            'frames: loop {
+                let frame = match AnyTlsFrame::decode(&mut input) {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break 'frames,
+                    Err(_) => {
+                        session.healthy.store(false, Ordering::Release);
+                        let _ = reply.send(Err(protocol("AnyTLS invalid frame")));
+                        return;
+                    }
+                };
+                match frame.command {
+                    AnyTlsCommand::SynAck if frame.stream_id == STREAM_ID => {
+                        if !frame.payload.is_empty() {
+                            session.healthy.store(false, Ordering::Release);
+                            let _ = reply.send(Err(protocol("AnyTLS peer rejected the stream")));
+                            return;
+                        }
+                        opened = true;
+                        break;
+                    }
+                    AnyTlsCommand::HeartRequest => {
+                        if let Ok(response) = heartbeat_response(frame.stream_id) {
+                            let _ = upstream.write_all(&response).await;
+                        }
+                    }
+                    AnyTlsCommand::UpdatePaddingScheme => {
+                        match AnyTlsPaddingScheme::parse(&frame.payload) {
+                            Ok(scheme) => {
+                                *session.scheme.lock().expect("AnyTLS padding state") =
+                                    scheme.clone();
+                                *session
+                                    .node_padding
+                                    .lock()
+                                    .expect("AnyTLS node padding state") = scheme;
+                            }
+                            Err(_) => {
+                                session.healthy.store(false, Ordering::Release);
+                                let _ =
+                                    reply.send(Err(protocol("AnyTLS padding update is invalid")));
+                                return;
+                            }
+                        }
+                    }
+                    AnyTlsCommand::ServerSettings => {
+                        let settings = match AnyTlsSettings::decode(&frame.payload) {
+                            Ok(settings) => settings,
+                            Err(_) => {
+                                session.healthy.store(false, Ordering::Release);
+                                let _ =
+                                    reply.send(Err(protocol("AnyTLS server settings are invalid")));
+                                return;
+                            }
+                        };
+                        if settings
+                            .protocol_version()
+                            .ok()
+                            .is_some_and(|version| version < 2)
+                        {
+                            session.healthy.store(false, Ordering::Release);
+                            let _ = reply.send(Err(protocol(
+                                "AnyTLS server protocol version is unsupported",
+                            )));
+                            return;
+                        }
+                    }
+                    AnyTlsCommand::Alert => {
+                        session.healthy.store(false, Ordering::Release);
+                        let _ = reply.send(Err(protocol("AnyTLS peer sent ALERT")));
+                        return;
+                    }
+                    AnyTlsCommand::Waste => {}
+                    _ => {}
+                }
+            }
+        }
+        let _ = reply.send(Ok(Box::new(client)));
+        loop {
+            tokio::select! {
+                result = client_read.read(&mut up_buf) => {
+                    let Ok(size) = result else { break; }; if size == 0 { let mut fin=BytesMut::new(); let _=(AnyTlsFrame{command:AnyTlsCommand::Fin,stream_id:STREAM_ID,payload:bytes::Bytes::new()}).encode(&mut fin); let _=upstream.write_all(&fin).await; let _=upstream.flush().await; break; }
+                    let mut frame=BytesMut::new(); if (AnyTlsFrame{command:AnyTlsCommand::Push,stream_id:STREAM_ID,payload:bytes::Bytes::copy_from_slice(&up_buf[..size])}).encode(&mut frame).is_err() { break; } packet_count = packet_count.saturating_add(1); if write_session_packet(&mut upstream, &frame, &session.scheme, packet_count).await.is_err() { session.healthy.store(false, Ordering::Release); break; }
+                }
+                result = upstream.read(&mut down_buf) => {
+                    let Ok(size)=result else { session.healthy.store(false, Ordering::Release); break; }; if size==0 { session.healthy.store(false, Ordering::Release); break; } input.extend_from_slice(&down_buf[..size]);
+                    loop {
+                        let frame = match AnyTlsFrame::decode(&mut input) {
+                            Ok(Some(frame)) => frame,
+                            Ok(None) => break,
+                            Err(_) => {
+                                session.healthy.store(false, Ordering::Release);
+                                break;
+                            }
+                        };
+                        match frame.command {
+                            AnyTlsCommand::Push if frame.stream_id == STREAM_ID => {
+                                if client_write.write_all(&frame.payload).await.is_err() {
+                                    break;
+                                }
+                            }
+                            AnyTlsCommand::Fin if frame.stream_id == STREAM_ID => {
+                                let _ = client_write.shutdown().await;
+                                break;
+                            }
+                            AnyTlsCommand::HeartRequest => {
+                                if let Ok(resp) = heartbeat_response(frame.stream_id) {
+                                    let _ = upstream.write_all(&resp).await;
+                                }
+                            }
+                            AnyTlsCommand::UpdatePaddingScheme => {
+                                match AnyTlsPaddingScheme::parse(&frame.payload) {
+                                    Ok(scheme) => {
+                                        *session.scheme.lock().expect("AnyTLS padding state") = scheme.clone();
+                                        *session.node_padding.lock().expect("AnyTLS node padding state") = scheme;
+                                    }
+                                    Err(_) => session.healthy.store(false, Ordering::Release),
+                                }
+                            }
+                            AnyTlsCommand::ServerSettings => {
+                                if AnyTlsSettings::decode(&frame.payload)
+                                    .ok()
+                                    .and_then(|settings| settings.protocol_version().ok())
+                                    .is_none_or(|version| version < 2)
+                                {
+                                    session.healthy.store(false, Ordering::Release);
+                                }
+                            }
+                            AnyTlsCommand::Alert => {
+                                session.healthy.store(false, Ordering::Release);
+                                let _ = client_write.shutdown().await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if session.healthy.load(Ordering::Acquire) {
+            session.idle.store(true, Ordering::Release);
+            *session.last_idle.lock().expect("AnyTLS idle") = std::time::Instant::now();
+            if let Some(pool) = session.pool.upgrade() {
+                let mut sessions = pool.lock().await;
+                let mut idle = sessions
+                    .iter()
+                    .filter(|candidate| candidate.idle.load(Ordering::Acquire))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                idle.sort_by_key(|candidate| *candidate.last_idle.lock().expect("AnyTLS idle"));
+                while idle.len() > MAX_IDLE_SESSIONS {
+                    let evicted = idle.remove(0);
+                    evicted.healthy.store(false, Ordering::Release);
+                    sessions.retain(|candidate| !Arc::ptr_eq(&candidate.healthy, &evicted.healthy));
+                }
+            }
+        }
+        continue;
+    }
+    session.healthy.store(false, Ordering::Release);
+}
+
+async fn write_session_packet(
+    upstream: &mut BoxedTransitConnection,
+    data: &[u8],
+    scheme: &Arc<Mutex<AnyTlsPaddingScheme>>,
+    packet: u32,
+) -> Result<(), TransitError> {
+    let scheme = scheme.lock().expect("AnyTLS padding scheme").clone();
+    let target = scheme
+        .rules(packet)
+        .iter()
+        .find_map(|rule| AnyTlsPaddingScheme::sample_size(*rule).ok().flatten())
+        .unwrap_or(0);
+    let mut output = BytesMut::from(data);
+    let mut remaining = target.saturating_sub(output.len());
+    while remaining >= 7 {
+        let size = remaining.saturating_sub(7).min(MAX_FRAME_PAYLOAD);
+        let mut waste = BytesMut::new();
+        AnyTlsFrame {
+            command: AnyTlsCommand::Waste,
+            stream_id: 0,
+            payload: bytes::Bytes::from(vec![0; size]),
+        }
+        .encode(&mut waste)
+        .map_err(protocol)?;
+        output.extend_from_slice(&waste);
+        remaining = target.saturating_sub(output.len());
+    }
+    upstream.write_all(&output).await.map_err(io_failure)?;
+    upstream.flush().await.map_err(io_failure)
 }
 
 #[async_trait]
@@ -219,6 +584,8 @@ fn anytls_address(endpoint: &Endpoint) -> Result<AnyTlsAddress, TransitError> {
     Ok(AnyTlsAddress::Domain(endpoint.host.clone(), endpoint.port))
 }
 
+#[cfg(test)]
+#[cfg(test)]
 async fn open_stream_relay(
     mut stream: BoxedTransitConnection,
 ) -> Result<BoxedTransitConnection, TransitError> {
@@ -268,17 +635,23 @@ fn heartbeat_response(stream_id: u32) -> Result<BytesMut, &'static str> {
     Ok(response)
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
+#[cfg(test)]
 enum RelayEnd {
     Closed,
     Alert,
 }
 
+#[cfg(test)]
+#[cfg(test)]
 struct RelayStream {
     client: DuplexStream,
     end: Arc<Mutex<Option<RelayEnd>>>,
 }
 
+#[cfg(test)]
+#[cfg(test)]
 impl AsyncRead for RelayStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -305,6 +678,8 @@ impl AsyncRead for RelayStream {
     }
 }
 
+#[cfg(test)]
+#[cfg(test)]
 impl AsyncWrite for RelayStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -326,6 +701,8 @@ impl AsyncWrite for RelayStream {
     }
 }
 
+#[cfg(test)]
+#[cfg(test)]
 fn spawn_stream_relay(
     stream: BoxedTransitConnection,
     mut input: BytesMut,

@@ -1113,3 +1113,10 @@ guest and ran as `pathchord`; native results and artifact hashes are in the
 The plain host GCC/LLD target failure described in older validation notes still
 applies when target-specific SDK wrappers are not selected; Rust's target
 standard library alone does not supply system headers or libraries.
+
+On 2026-11-27, the AnyTLS official-v2 implementation began with the bounded
+padding codec and node-level single-active-Stream Session pool. The codec and
+adapter focused tests passed, and AnyTLS TCP/UoT interoperability passed
+against sing-box 1.14.4 and source revision `491b845`. Full Session reuse,
+padding-update, and multi-operation soak evidence remains part of the active
+OpenSpec change.
