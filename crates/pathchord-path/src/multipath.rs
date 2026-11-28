@@ -676,7 +676,9 @@ impl MultipathSession {
                 },
             ));
         }
-        if self.ready_path_count() > 0 {
+        // Health ticks visit every Path. A healthy Session already has the
+        // desired state, so it needs no pool-wide readiness scan per Path.
+        if self.lifecycle.session_state() != SessionState::Active && self.ready_path_count() > 0 {
             self.lifecycle.transition_session(SessionState::Active)?;
         }
         Ok(())
