@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::stream::{self, StreamExt};
 use pathchord_core::{PathId, ProtocolLimits, SessionId, TargetEndpoint as WireTargetEndpoint};
 use pathchord_noise::{STATIC_KEY_LEN, StaticKeypair, WIRE_PROFILE_V1_PROLOGUE_PREFIX};
 use pathchord_path::diagnostics::{
@@ -44,6 +44,7 @@ use crate::{
 pub const DEFAULT_PATH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ORDINARY_PROXY_ATTEMPTS: usize = 8;
 const MAX_EGRESS_DIAL_ATTEMPTS: usize = 4;
+const MAX_CONCURRENT_REFILL_HANDSHAKES: usize = 16;
 const BACKGROUND_PATH_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TCP_CAPABILITY: u64 = 1;
 const UDP_CAPABILITY: u64 = 1 << 1;
@@ -2705,17 +2706,21 @@ impl IngressDataPlane {
         let dial_timeout = BACKGROUND_PATH_CONNECT_TIMEOUT.min(self.path_connect_timeout);
         let session_id = snapshot.session_id;
         let session = &*session;
-        let mut pending: FuturesUnordered<_> = candidates
-            .iter()
+        // Keep the original pass deadline. Starting every Noise handshake at
+        // once can exhaust that deadline before the Session can service its Paths.
+        let deadline = Instant::now() + dial_timeout;
+        let mut pending = stream::iter(candidates.iter())
+            .take_while(|_| std::future::ready(Instant::now() < deadline))
             .map(|transit| async move {
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 let path_id = PathId::new(random_u128()?);
                 let (path, attribution) = self
-                    .dial_session_path(slot, transit, session_id, path_id, dial_timeout)
+                    .dial_session_path(slot, transit, session_id, path_id, remaining)
                     .await?;
                 self.attach_session_path(slot, session, transit, path, attribution)
                     .await
             })
-            .collect();
+            .buffer_unordered(MAX_CONCURRENT_REFILL_HANDSHAKES);
         let mut added = 0;
         while let Some(result) = pending.next().await {
             if result.is_ok() {
