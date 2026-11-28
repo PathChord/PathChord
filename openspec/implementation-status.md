@@ -20,7 +20,7 @@ loopback evidence covers IPv4, IPv6, hostname candidates, different ports,
 HTTP CONNECT, and UDP. Windows and FreeBSD native suite and host integration
 results are recorded below, separately from cross-build and deployed evidence.
 
-The [pathchordctl interaction redesign](changes/redesign-pathchordctl-interaction/)
+The [pathchordctl interaction redesign](changes/archive/2026-11-24-redesign-pathchordctl-interaction/)
 adds role-aware source and socket resolution, human and structured output, and
 local configuration inspection and managed YAML editing. The enrollment CLI
 uses Egress authorization preconditions while Ingress edits its local Egress
