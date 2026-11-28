@@ -12,7 +12,7 @@ For prebuilt FreeBSD artifacts, run the assembler on a native `pkg(8)` host:
 PATHCHORD_ROLE=egress \
 PATHCHORD_DAEMON_BINARY=/path/to/x86_64-unknown-freebsd/pathchord-egressd \
 PATHCHORDCTL_BINARY=/path/to/x86_64-unknown-freebsd/pathchordctl \
-PATHCHORD_VERSION=0.1.0 packaging/freebsd/build.sh dist
+packaging/freebsd/build.sh dist
 ```
 
 The ports recipe uses `@sample`. The prebuilt assembler also ships only a

@@ -1,7 +1,16 @@
 # Build explicitly with PATHCHORD_ROLE=ingress or PATHCHORD_ROLE=egress.
 case "${PATHCHORD_ROLE:-}" in ingress) role=ingress; other=egress;; egress) role=egress; other=ingress;; *) echo 'set PATHCHORD_ROLE to ingress or egress' >&2; return 2;; esac
 pkgname=pathchord-${role}d
-pkgver=0.1.0
+pkgver=${PATHCHORD_VERSION:-}
+if [ -z "$pkgver" ]; then
+    _version_script="$(dirname -- "${BASH_SOURCE[0]}")/../version.sh"
+    if [ ! -x "$_version_script" ]; then
+        echo 'set PATHCHORD_VERSION when building a standalone recipe' >&2
+        return 2
+    fi
+    pkgver=$("$_version_script") || return 2
+fi
+case "$pkgver" in ''|[!0-9]*|*[!0-9A-Za-z.+_]*) echo 'invalid package version' >&2; return 2 ;; esac
 pkgrel=1
 pkgdesc="PathChord $role runtime and local management client"
 arch=('x86_64' 'aarch64' 'armv7h' 'riscv64')

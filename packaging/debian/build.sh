@@ -5,8 +5,7 @@ root_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 # shellcheck source=../common/package-role.sh
 . "$root_dir/packaging/common/package-role.sh"
 output_dir=${1:-"$root_dir/dist"}
-version=${PATHCHORD_VERSION:-$("$root_dir/packaging/version.sh")}
-case "$version" in ''|*[!0-9A-Za-z.+:~_-]*) exit 2 ;; esac
+version=$("$root_dir/packaging/version.sh")
 deb_arch=${PATHCHORD_DEB_ARCH:-}
 if [ -z "$deb_arch" ]; then
     if command -v dpkg >/dev/null; then deb_arch=$(dpkg --print-architecture)

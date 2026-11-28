@@ -85,6 +85,10 @@ opposite role is rejected before changing the installed service or private
 state. To change roles, remove the existing package explicitly and install the
 other; upgrade, rollback and removal preserve operator configuration and keys.
 
+Native package builds read the version from the checkout's root `Cargo.toml`.
+CI can set `PATHCHORD_VERSION` to override the package version. See the
+[package build instructions](../../packaging/README.md#package-version).
+
 Both Unix profiles use the local non-login `pathchord` account. Only the selected
 role's private roots are created. State directories use `0700`, and control
 locks use `0600`. Configuration directories are `root:pathchord` with mode

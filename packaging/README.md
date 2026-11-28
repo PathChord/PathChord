@@ -51,9 +51,29 @@ Use `ROLE=egress` and build `pathchord-egressd` plus `pathchordctl` for the
 other deployment. A Unix assembler may also be invoked with
 `PATHCHORD_ROLE=ingress` or `PATHCHORD_ROLE=egress`. Set
 `PATHCHORD_DAEMON_BINARY` and `PATHCHORDCTL_BINARY` for prebuilt target
-artifacts; the opposite daemon is never required. `PATHCHORD_VERSION` overrides
-the Cargo workspace version. The matching native tools are `dpkg-deb`, `abuild`,
-`makepkg`, FreeBSD `pkg`, and Windows PowerShell/NSIS.
+artifacts. The native tools are `dpkg-deb`, `abuild`, `makepkg`, FreeBSD
+`pkg`, and Windows PowerShell/NSIS.
+
+### Package version
+
+Builds from a checkout read `[workspace.package].version` in the root
+`Cargo.toml`. To give a CI package a different version, set `PATHCHORD_VERSION`
+in the build environment. An explicit Make `VERSION` or PowerShell `-Version`
+takes precedence for that invocation. Use a version accepted by the target
+package manager. After building the role binaries, these commands print the
+default version and build an Arch package with a CI version.
+
+```sh
+make -C packaging version
+PATHCHORD_VERSION=0.1.2.7 make -C packaging ROLE=ingress package-arch
+```
+
+The GitHub release workflow accepts the Actions variable `PATHCHORD_VERSION`.
+With the variable unset, the workflow reads the checked-out source's Cargo
+version. Assembling prebuilt binaries changes package metadata and
+preserves the supplied binaries. When using a standalone source recipe outside
+the checkout, supply the version of an existing `v<version>` source tag so the
+recipe can fetch its archive.
 
 For Alpine, build static musl binaries and use a temporary test signing key or
 the release signing identity appropriate to the build. Install the public key

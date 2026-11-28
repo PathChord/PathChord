@@ -71,6 +71,9 @@ pathchord-ingressd --config examples/ingress-subscriptions.yaml
 安装相反角色时，会在更改现有服务或私有状态之前拒绝操作。更换角色应显式卸载当前包后
 再安装另一角色；升级、回滚和卸载保留用户配置及私钥。
 
+构建原生软件包时，默认从当前源码根目录的 `Cargo.toml` 读取版本。CI 可以设置
+`PATHCHORD_VERSION` 覆盖软件包版本。用法见[打包说明](../../packaging/README.md#package-version)。
+
 两个 Unix 安装配置都使用本机非登录账号 `pathchord`，只创建所选角色的私有根。
 状态目录权限为 `0700`，控制锁权限为 `0600`。配置目录由 `root:pathchord` 拥有，
 权限为 `0750`。运行目录和控制 socket 由 `pathchord:pathchord` 拥有，权限分别为

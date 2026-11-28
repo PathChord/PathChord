@@ -6,7 +6,7 @@ param(
     [string] $Target = 'x86_64-pc-windows-msvc',
     [string] $Cargo = 'cargo',
     [string] $MakeNSIS = 'makensis',
-    [string] $Version = '',
+    [string] $Version = $env:PATHCHORD_VERSION,
     [string] $DaemonBinary = '',
     [string] $CtlBinary = '',
     [string] $OutputDirectory = '',
@@ -16,14 +16,9 @@ $ErrorActionPreference = 'Stop'
 $Role = $Role.ToLowerInvariant()
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $name = "pathchord-${Role}d"
-if ([string]::IsNullOrWhiteSpace($Version)) {
-    $manifest = Get-Content -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -Raw
-    $match = [regex]::Match($manifest, '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"')
-    if (-not $match.Success) { throw 'Could not read workspace version.' }
-    $Version = $match.Groups[1].Value
-}
+$Version = & (Join-Path $PSScriptRoot 'version.ps1') -Version $Version
 if (-not $SkipBuild -and [string]::IsNullOrWhiteSpace($DaemonBinary)) {
-    & $Cargo build --locked --release --bin $name --bin pathchordctl --target $Target
+    & $Cargo build --manifest-path (Join-Path $repoRoot 'Cargo.toml') --locked --release --bin $name --bin pathchordctl --target $Target
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed.' }
 }
 if ([string]::IsNullOrWhiteSpace($DaemonBinary)) { $DaemonBinary = "target\$Target\release\$name.exe" }

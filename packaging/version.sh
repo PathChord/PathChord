@@ -1,18 +1,26 @@
 #!/bin/sh
-# Print the workspace version used by every native package recipe.
+# Print the package version for this checkout or prebuilt binary assembly.
 set -eu
 
-root_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-awk '
-  /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
-  /^\[/ { in_workspace_package = 0 }
-  in_workspace_package && $1 == "version" {
-    value = $0
-    sub(/^[^=]*=[[:space:]]*/, "", value)
-    gsub(/[[:space:]"]/, "", value)
-    print value
-    found = 1
-    exit
-  }
-  END { if (!found) exit 1 }
-' "$root_dir/Cargo.toml"
+version=${PATHCHORD_VERSION:-}
+if [ -z "$version" ]; then
+    root_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+    version=$(awk '
+        /^[[:space:]]*\[workspace\.package\][[:space:]]*(#.*)?$/ { workspace = 1; next }
+        /^[[:space:]]*\[/ { workspace = 0 }
+        workspace && /^[[:space:]]*version[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            quote = substr($0, 1, 1)
+            if (quote != "\"" && quote != sprintf("%c", 39)) exit
+            end = index(substr($0, 2), quote)
+            if (end && substr($0, end + 2) ~ /^[[:space:]]*(#.*)?$/) print substr($0, 2, end - 1)
+            exit
+        }
+    ' "$root_dir/Cargo.toml")
+fi
+case "$version" in
+    ''|[!0-9]*|*[!0-9A-Za-z.+:~_-]*)
+        echo 'invalid or missing package version; check PATHCHORD_VERSION or [workspace.package].version' >&2
+        exit 2 ;;
+esac
+printf '%s\n' "$version"

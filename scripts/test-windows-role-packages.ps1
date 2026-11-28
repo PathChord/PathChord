@@ -73,7 +73,7 @@ function Installer-Inputs {
         $inputs["bin/$name"] = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $BinDirectory $name)).Hash
     }
     foreach ($name in @('LICENSE', 'packaging/common/default-config.yaml', 'packaging/common/pathchord.1',
-        'packaging/windows/build.ps1', 'packaging/windows/pathchord.nsi', 'packaging/windows/install-service.ps1',
+        'packaging/windows/version.ps1', 'packaging/windows/build.ps1', 'packaging/windows/pathchord.nsi', 'packaging/windows/install-service.ps1',
         'packaging/windows/egress.yaml', 'packaging/windows/pathchord-ingressd.xml', 'packaging/windows/pathchord-egressd.xml')) {
         $inputs[$name] = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $RepoRoot $name)).Hash
     }

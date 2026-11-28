@@ -17,7 +17,15 @@ SetCompressor /SOLID lzma
 !endif
 !define DAEMON_NAME "pathchord-${APP_ROLE}d"
 !ifndef APP_VERSION
-  !define APP_VERSION "0.1.0"
+  !tempfile VERSION_FILE
+  !ifdef NSIS_WIN32_MAKENSIS
+    !system 'powershell -NoProfile -ExecutionPolicy Bypass -File "version.ps1" > "${VERSION_FILE}"' = 0
+  !else
+    !system 'sh "../version.sh" > "${VERSION_FILE}"' = 0
+  !endif
+  !define /file APP_VERSION "${VERSION_FILE}"
+  !delfile "${VERSION_FILE}"
+  !undef VERSION_FILE
 !endif
 !ifndef DAEMON_BINARY_PATH
   !error "DAEMON_BINARY_PATH is required"

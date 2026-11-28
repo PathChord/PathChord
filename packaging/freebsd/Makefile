@@ -2,7 +2,18 @@
 .error Set PATHCHORD_ROLE=ingress or PATHCHORD_ROLE=egress
 .endif
 PORTNAME=       pathchord-${PATHCHORD_ROLE}d
-DISTVERSION?=   0.1.0
+.if !defined(DISTVERSION)
+.if !empty(PATHCHORD_VERSION)
+DISTVERSION=    ${PATHCHORD_VERSION}
+.elif exists(${.PARSEDIR}/../version.sh)
+DISTVERSION!=   sh ${.PARSEDIR:Q}/../version.sh
+.else
+.error Set PATHCHORD_VERSION when building a standalone port
+.endif
+.endif
+.if empty(DISTVERSION:M[0-9]*) || !empty(DISTVERSION:C/[0-9A-Za-z.+_-]//g)
+.error Invalid package version
+.endif
 CATEGORIES=     net security
 USE_GITHUB=     yes
 GH_ACCOUNT=     KagurazakaNyaa

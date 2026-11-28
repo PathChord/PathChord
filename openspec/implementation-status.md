@@ -1,6 +1,6 @@
 # PathChord implementation status
 
-Status snapshot: 2026-11-18.
+Status snapshot: 2026-11-28.
 
 This document records the current implementation and validation state. Final
 architecture remains under `docs/design/`; behavioral contracts live under
@@ -629,6 +629,11 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   protocol-specific interoperability fixtures.
 
 ## Validation evidence
+
+On 2026-11-28, native packages resolved their version from the Cargo
+workspace or a CI override. Local Debian and Arch package metadata contained
+`0.1.1-1` for the checkout and `0.1.2.7-1` for the explicit override.
+Version-resolution checks run on pushes and pull requests.
 
 On 2026-11-27, the AnyTLS official-v2 Session reuse implementation passed
 its codec and adapter tests, and its TCP plus UoT v2 interoperability test
