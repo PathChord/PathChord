@@ -235,6 +235,66 @@ HTTP(S) provider 展开 SHALL 每次刷新最多 32 个引用、深度 3、正�
 - **WHEN** 订阅的有效 User-Agent 改变
 - **THEN** 旧来源节点进入排空，使用旧值获取的缓存和进行中的内容不得作为新来源发布
 
+### Requirement: AnyTLS v2 session reuse and padding
+
+AnyTLS 适配器 SHALL 实现官方 v2 settings、填充协商、heartbeat、Stream 生命周期和
+Session 复用行为，每个 Session 同时只允许一个活跃 Stream。
+
+#### Scenario: A new Session sends the official preface
+
+- **WHEN** 适配器使用节点当前的填充方案创建 TLS Session
+- **THEN** 按照 AnyTLS v2 要求的顺序发送带填充的认证、包含客户端标识和填充摘要的 v2 settings，以及首个 Stream 的设置
+
+#### Scenario: A healthy Stream is closed
+
+- **WHEN** 唯一的活跃 Stream 发送或收到正常 FIN，且所属 Session 的事件循环仍然健康
+- **THEN** 适配器释放 Stream 租约，并将 Session 放回该节点的空闲池
+
+#### Scenario: An idle Session is available
+
+- **WHEN** TCP 或 UoT v2 UDP 请求需要 AnyTLS Session，且节点有健康的空闲 Session
+- **THEN** 适配器租用最近释放的空闲 Session，在其上打开一个新 Stream，无需建立新的 TLS 连接
+
+#### Scenario: The idle pool is full
+
+- **WHEN** 释放健康的 Session 将超过节点的空闲池上限
+- **THEN** 适配器淘汰最早进入空闲池的 Session，最多保留八个空闲 Session
+
+#### Scenario: An idle Session expires
+
+- **WHEN** 空闲 Session 已连续 60 秒未使用
+- **THEN** 适配器在其可被再次租用前关闭并移除它
+
+#### Scenario: The server updates padding
+
+- **WHEN** Session 收到有效的 cmdUpdatePaddingScheme
+- **THEN** 适配器验证并原子发布该方案供后续 Session 使用，当前 Session 继续使用创建时采用的方案
+
+#### Scenario: The server rejects a Stream
+
+- **WHEN** SYNACK 含有错误 payload
+- **THEN** 当前请求以脱敏的协议错误失败，适配器丢弃该 Session 且不重试该请求
+
+#### Scenario: A peer closes a Stream
+
+- **WHEN** Session 收到活跃 Stream 的 FIN
+- **THEN** Stream 的读取端关闭，适配器不回送 FIN，仅在写入端和事件循环保持健康时才将 Session 放回空闲池
+
+#### Scenario: A peer sends ALERT
+
+- **WHEN** Session 收到 ALERT
+- **THEN** 活跃 Stream 和 Session 以脱敏的连接错误失败，该 Session 从空闲池移除，后续请求创建新的 Session
+
+#### Scenario: A heartbeat is received
+
+- **WHEN** Session 收到带任意 Stream ID 的 cmdHeartRequest
+- **THEN** Session 回复具有相同 Stream ID 且 payload 为空的 cmdHeartResponse
+
+#### Scenario: A UoT v2 request uses the pool
+
+- **WHEN** 打开 UoT v2 UDP association
+- **THEN** 适配器使用与 TCP 共享的池租用或创建 AnyTLS Session，打开一个 Stream，并在等待成功的 SYNACK 前发送 UoT v2 请求
+
 ## Detailed contract
 
 本文档定义节点连接语义、订阅规范化、provider 展开及用量元数据。
@@ -254,7 +314,7 @@ HTTP(S) provider 展开 SHALL 每次刷新最多 32 个引用、深度 3、正�
 | `vless` | 带类型化 TLS/传输校验的 TCP、TLS、WebSocket/WSS、HTTP、HTTPUpgrade、gRPC、QUIC 和 Meek 字节传输 | 扩展传输与 flow 选项 |
 | `vmess` | TCP、TLS、WebSocket/WSS、HTTP、HTTPUpgrade、gRPC、QUIC、Meek、AES-128-GCM、ChaCha20-Poly1305 或 AES-128-CFB 正文记录、显式 `none`/`zero` 明文正文、单目标 UDP、有界 legacy 或 AEAD `alter_id` 握手 | 支持的 multiplex 和扩展选项按下文校验 |
 | `trojan` | TLS 封装的 TCP、WebSocket/WSS、HTTP、HTTPUpgrade、gRPC 和 QUIC 字节传输，以及支持原始/TCP、WebSocket、gRPC 和 HTTPUpgrade 别名的 Trojan-Go 分享链接 | 由于参考服务端对短加密流的请求嗅探不可靠，Trojan-Go 原始/TCP 加 SS 加密不可用；其他不支持的 Trojan-Go 选项产生类型化诊断 |
-| `anytls` | TLS 流、认证、settings、SYN/SYNACK、PUSH/FIN、heartbeat 帧及有界 UDP-over-TCP 数据报 | 原生帧契约之外的扩展 session 选项 |
+| `anytls` | TLS 上的 AnyTLS v2、填充协商、可复用的单 Stream Session 及有界 UoT v2 UDP 数据报 | 单个 Session 内的并发 Stream 及其他不支持的扩展选项 |
 | `hysteria2` | 原生 QUIC/TLS + HTTP/3 认证、到 IPv4 或 IPv6 目标的 TCP/UDP relay、有界 UDP 分片与重组、Salamander、Gecko 或无混淆传输、有界 server-port 跳转及协商的 BBR/Brutal 速率 | TLS 指纹和其他不支持的扩展选项 |
 | `tuic` | 原生 QUIC/TLS-exporter TCP CONNECT、native DATAGRAM、QUIC stream UDP relay 或 UDP-over-stream、cubic/NewReno/BBR 拥塞控制和 heartbeat | TLS 指纹、0-RTT 及其他不支持的扩展选项 |
 | `vless` + `tls.reality` | 使用 X25519 ClientHello proof、证书 proof 校验及 dae Chrome 133、iOS 14、Safari 16、Edge 85、QQ 11.1、Firefox 120 指纹 profile 的原生 VLESS over REALITY TLS | 其他指纹、证书 pin、自定义信任根和不支持的外层传输产生类型化不可用诊断 |
@@ -343,6 +403,23 @@ TLS、Host、path、经过验证的头、配置的证书及 pin 校验，以及�
 `mux=0`。UDP 默认使用 Shadowsocks 数据报传输；显式选择 UDP-over-TCP 时经过配置的 TCP
 插件。不支持的 mux 数量、传输模式和未消费的
 选项会被拒绝。
+
+#### AnyTLS v2
+
+每个 AnyTLS 节点拥有一个由 TCP 和 UoT v2 UDP 共享的池。每个 TLS Session 同时承载
+一个活跃 Stream。Stream 正常结束后，健康的 Session 返回池中。池优先借出最近释放的
+健康 Session。超过八个时，淘汰最早释放的 Session。Session 空闲满 60 秒时关闭。
+空闲 Session 继续处理对端控制帧。
+
+在打开首个 Stream 前，Session 发送带填充的认证记录和 `cmdSettings`，其中包含协议版本
+2、客户端标识以及创建 Session 时采用的填充方案的小写 MD5 摘要。初始方案为官方默认方案。
+写入端按有界的分包规则使用 waste 帧进行填充。适配器验证 `cmdServerSettings`，并将有效的
+`cmdUpdatePaddingScheme` 更新原子应用于后续 Session。打开 Stream 时发送 SYN 和目标
+地址，随后等待成功的 SYNACK。UoT v2 还会在等待 SYNACK 前发送 association 请求。
+
+收到对端 FIN 时结束 Stream，无需回送 FIN。解析或传输失败、无效的 settings 或填充更新、
+heartbeat 回复失败、ALERT 和失败的 SYNACK 都会使 Session 退出。适配器报告错误时不泄露
+对端的错误 payload，也不重试失败的请求。
 
 ### 类型化连接选项
 

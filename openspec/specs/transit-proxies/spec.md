@@ -238,6 +238,67 @@ Subscription HTTP requests SHALL use the configured per-source User-Agent, or `c
 - **WHEN** a subscription's effective User-Agent changes
 - **THEN** old-source nodes drain and cached or in-flight content obtained using the previous value cannot publish as the new source
 
+### Requirement: AnyTLS v2 session reuse and padding
+
+AnyTLS adapters SHALL implement the official v2 settings, padding negotiation,
+heartbeat, Stream lifecycle, and reusable Session behavior while preserving one
+active Stream per Session.
+
+#### Scenario: A new Session sends the official preface
+
+- **WHEN** the adapter creates a TLS Session with the node's current padding scheme
+- **THEN** it sends padded authentication, version-2 settings with a client identity and padding digest, and the first Stream settings in the order required by AnyTLS v2
+
+#### Scenario: A healthy Stream is closed
+
+- **WHEN** the only active Stream sends or receives a normal FIN and its Session event loop remains healthy
+- **THEN** the adapter releases the Stream lease and puts the Session into the node's idle pool
+
+#### Scenario: An idle Session is available
+
+- **WHEN** a TCP or UoT v2 UDP request needs an AnyTLS Session and the node has a healthy idle Session
+- **THEN** the adapter leases the newest idle Session, opens one new Stream on it, and creates no new TLS connection
+
+#### Scenario: The idle pool is full
+
+- **WHEN** releasing a healthy Session would exceed the node's idle pool limit
+- **THEN** the adapter evicts the oldest idle Session and retains at most eight idle Sessions
+
+#### Scenario: An idle Session expires
+
+- **WHEN** an idle Session has remained unused for 60 seconds
+- **THEN** the adapter closes and removes it before it can be leased
+
+#### Scenario: The server updates padding
+
+- **WHEN** the Session receives a valid cmdUpdatePaddingScheme
+- **THEN** the adapter validates and atomically publishes the scheme for later Sessions while the current Session continues with its captured scheme
+
+#### Scenario: The server rejects a Stream
+
+- **WHEN** a SYNACK contains an error payload
+- **THEN** the current request fails with a sanitized protocol error and the Session is discarded without retrying the request
+
+#### Scenario: A peer closes a Stream
+
+- **WHEN** the Session receives FIN for the active Stream
+- **THEN** the Stream becomes read-closed, no reciprocal FIN is sent, and the Session returns to the idle pool only after its writer and event loop remain healthy
+
+#### Scenario: A peer sends ALERT
+
+- **WHEN** the Session receives ALERT
+- **THEN** the active Stream and Session fail with a sanitized connection error, the Session is removed from the idle pool, and later requests create a new Session
+
+#### Scenario: A heartbeat is received
+
+- **WHEN** the Session receives cmdHeartRequest with any Stream ID
+- **THEN** it replies with an empty cmdHeartResponse carrying that same Stream ID
+
+#### Scenario: A UoT v2 request uses the pool
+
+- **WHEN** a UoT v2 UDP association is opened
+- **THEN** it leases or creates an AnyTLS Session using the same pool as TCP, opens one Stream, and sends the UoT v2 request before waiting for successful SYNACK
+
 ## Detailed contract
 
 This document defines node connection semantics, subscription normalization,
@@ -258,7 +319,7 @@ NOT be interpreted as support for the same outbound node protocol.
 | `vless` | TCP, TLS, WebSocket/WSS, HTTP, HTTPUpgrade, gRPC, QUIC and Meek byte transports with typed TLS/transport validation | Extended transport and flow options |
 | `vmess` | TCP, TLS, WebSocket/WSS, HTTP, HTTPUpgrade, gRPC, QUIC, Meek, AES-128-GCM, ChaCha20-Poly1305 or AES-128-CFB body records, explicit `none`/`zero` plaintext bodies, single-target UDP, bounded legacy or AEAD `alter_id` headers | Supported multiplex and extended options are validated as described below |
 | `trojan` | TLS-wrapped TCP, WebSocket/WSS, HTTP, HTTPUpgrade, gRPC and QUIC byte transports, plus supported Trojan-Go share links with original/TCP and WebSocket, gRPC and HTTPUpgrade aliases | Trojan-Go original/TCP with SS encryption is unavailable because the reference server's request sniffing is not reliable for short encrypted streams; unsupported Trojan-Go options produce typed diagnostics |
-| `anytls` | TLS stream, authentication, settings, SYN/SYNACK, PUSH/FIN, heartbeat frames, and bounded UDP-over-TCP datagrams | Multiplexed session options outside the native frame contract |
+| `anytls` | AnyTLS v2 over TLS, negotiated padding, reusable single-Stream Sessions, and bounded UoT v2 UDP datagrams | Concurrent Streams within one Session and other unsupported extended options |
 | `hysteria2` | Native QUIC/TLS + HTTP/3 authentication, TCP/UDP relay to IPv4 or IPv6 targets, bounded UDP fragmentation and reassembly, Salamander, Gecko or un-obfuscated transport, bounded server-port hopping, and negotiated BBR/Brutal rates | TLS fingerprints and other unsupported extended options |
 | `tuic` | Native QUIC/TLS-exporter TCP CONNECT, native DATAGRAM, QUIC-stream UDP relay or UDP-over-stream, cubic/NewReno/BBR congestion control and heartbeat | TLS fingerprints, 0-RTT and other unsupported extended options |
 | `vless` + `tls.reality` | Native VLESS over REALITY TLS with X25519 ClientHello proof, certificate proof validation and dae Chrome 133, iOS 14, Safari 16, Edge 85, QQ 11.1 and Firefox 120 fingerprint profiles | Other fingerprints, certificate pins, custom trust roots and unsupported outer transports produce typed unavailable diagnostics |
@@ -381,6 +442,29 @@ certificate and pin checks, and the default single-stream mux or explicit
 `mux=0`. UDP uses the Shadowsocks datagram transport unless UDP-over-TCP
 is explicitly selected, in which case it traverses the configured TCP plugin.
 Unsupported mux counts, transport modes and unconsumed options are rejected.
+
+#### AnyTLS v2
+
+Each AnyTLS node owns a pool shared by TCP and UoT v2 UDP. Each TLS Session
+carries one active Stream at a time. Healthy Sessions return to the pool on
+normal Stream completion. The pool leases the most recently released healthy
+Session, evicts the oldest when it would exceed eight entries, and closes
+Sessions after 60 seconds of idle time. Idle Sessions continue to handle peer
+control frames.
+
+Before opening the first Stream, a Session sends the padded authentication
+record and `cmdSettings` with protocol version 2, a client identity, and the
+lowercase MD5 digest of the captured padding scheme. The initial scheme is the
+official default. The writer applies its bounded packet rules using waste frames.
+The adapter validates `cmdServerSettings` and atomically adopts valid
+`cmdUpdatePaddingScheme` updates for future Sessions. Each open sends SYN
+and the destination, then waits for successful SYNACK. UoT v2 also sends the
+association request before waiting for SYNACK.
+
+Peer FIN ends the Stream without a reciprocal FIN. Parser or transport failure,
+invalid settings or padding updates, heartbeat response failure, ALERT, and
+failed SYNACK retire the Session. The adapter reports errors without exposing
+peer error payloads and does not retry the failed request.
 
 ### Typed connection options
 

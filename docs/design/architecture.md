@@ -170,6 +170,11 @@ PathChord adapter is implemented and do not own PathChord authorization or Noise
 [Transit Proxy contract](../../openspec/specs/transit-proxies/spec.md) defines supported document
 families, private engine ownership, provider expansion, and accounting facts.
 
+An AnyTLS Transit Proxy reuses healthy TLS Sessions for TCP and UoT v2 UDP
+through a pool scoped to the node, with one active Stream per AnyTLS Session.
+This transport state is independent of the PathChord Session and its per-Path
+Noise state. The Transit Proxy contract defines the pool and failure semantics.
+
 ## 9. Metadata
 
 Nodes have separated namespaces:

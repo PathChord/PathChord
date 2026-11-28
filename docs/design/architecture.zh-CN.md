@@ -139,6 +139,10 @@ Egress 的有效容量是全局 scheduler/resource 估计值，受配置 wire �
 保持不可用，且不拥有 PathChord 授权或 Noise 状态。[Transit Proxy 契约](../../openspec/specs/transit-proxies/spec.zh-CN.md)定义受支持
 文档类型、provider 展开及用量事实。
 
+AnyTLS Transit Proxy 通过节点范围内的池为 TCP 和 UoT v2 UDP 复用健康的 TLS Session，
+每个 AnyTLS Session 同时承载一个活跃 Stream。这些传输状态独立于 PathChord Session
+及其每条 Path 的 Noise 状态。池和失败语义由 Transit Proxy 契约定义。
+
 ## 9. 元数据
 
 节点使用相互分离的命名空间：
