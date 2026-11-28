@@ -46,6 +46,7 @@ const MAX_SESSION_STREAMS: usize = 256;
 const MAX_DEMAND_KEYS: usize = crate::multipath::MAX_DEMAND_KEYS;
 const COMMAND_QUEUE_CAPACITY: usize = 64;
 const FRAME_QUEUE_CAPACITY: usize = 64;
+const MAX_READER_EVENTS_PER_TURN: usize = 16;
 const STREAM_EVENT_QUEUE_CAPACITY: usize = 256;
 const STREAM_COMMAND_QUEUE_CAPACITY: usize = 64;
 const FRAME_OVERHEAD_RESERVE: usize = 64;
@@ -2030,6 +2031,9 @@ where
         let mut retransmission_tick = tokio::time::interval(MIN_RETRANSMISSION_TIMEOUT);
         retransmission_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         retransmission_tick.tick().await;
+        // Drain a bounded FIFO batch before snapshotting and revisiting health
+        // timers, so queued acknowledgements can suppress needless retries.
+        let mut reader_events = Vec::with_capacity(MAX_READER_EVENTS_PER_TURN);
         loop {
             tokio::select! {
                 _ = tokio::task::yield_now(), if self.business_ready() => {},
@@ -2045,39 +2049,43 @@ where
                         None => self.commands = None,
                     }
                 }
-                frame = self.frames.recv() => {
-                    match frame {
-                        Some(ReaderEvent::Frame { path_id, frame }) => {
-                            // A reader can have queued frames before its Path
-                            // was failed by a different event.
-                            if !self.path_health.contains_key(&path_id) {
-                                continue;
+                count = self.frames.recv_many(&mut reader_events, MAX_READER_EVENTS_PER_TURN) => {
+                    if count == 0 {
+                        return Err(SessionRuntimeError::PathClosed);
+                    }
+                    for event in reader_events.drain(..) {
+                        match event {
+                            ReaderEvent::Frame { path_id, frame } => {
+                                // A reader can have queued frames before its Path
+                                // was failed by a different event.
+                                if !self.path_health.contains_key(&path_id) {
+                                    continue;
+                                }
+                                match self.handle_frame(path_id, frame).await {
+                                    Ok(true) => return Ok(()),
+                                    Ok(false) => {},
+                                    Err(error) => self.handle_runtime_error(error, Some(path_id)).await?,
+                                }
                             }
-                            match self.handle_frame(path_id, frame).await {
-                                Ok(true) => return Ok(()),
-                                Ok(false) => {},
-                                Err(error) => self.handle_runtime_error(error, Some(path_id)).await?,
+                            ReaderEvent::Closed { path_id } => {
+                                if self.remote_closing { return Ok(()); }
+                                if self.retire_path(path_id, false, PathTerminationReason::PeerEof, None).await? {
+                                    let retained = self.retained_outbound_bytes();
+                                    return if retained == 0 {
+                                        Err(SessionRuntimeError::PathClosed)
+                                    } else {
+                                        Err(SessionRuntimeError::UnacknowledgedData { bytes: retained })
+                                    };
+                                }
+                            }
+                            ReaderEvent::Failed { path_id, error } => {
+                                if self.remote_closing { return Ok(()); }
+                                let reason = if matches!(&error, SessionRuntimeError::Io(_)) { PathTerminationReason::ReadError } else { PathTerminationReason::ProtocolError };
+                                if self.retire_path(path_id, false, reason, None).await? {
+                                    return Err(error);
+                                }
                             }
                         }
-                        Some(ReaderEvent::Closed { path_id }) => {
-                            if self.remote_closing { return Ok(()); }
-                            if self.retire_path(path_id, false, PathTerminationReason::PeerEof, None).await? {
-                                let retained = self.retained_outbound_bytes();
-                                return if retained == 0 {
-                                    Err(SessionRuntimeError::PathClosed)
-                                } else {
-                                    Err(SessionRuntimeError::UnacknowledgedData { bytes: retained })
-                                };
-                            }
-                        }
-                        Some(ReaderEvent::Failed { path_id, error }) => {
-                            if self.remote_closing { return Ok(()); }
-                            let reason = if matches!(&error, SessionRuntimeError::Io(_)) { PathTerminationReason::ReadError } else { PathTerminationReason::ProtocolError };
-                            if self.retire_path(path_id, false, reason, None).await? {
-                                return Err(error);
-                            }
-                        }
-                        None => return Err(SessionRuntimeError::PathClosed),
                     }
                 }
                 event = self.stream_events.recv() => {
