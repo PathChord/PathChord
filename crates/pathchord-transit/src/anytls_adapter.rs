@@ -446,10 +446,20 @@ impl Session {
     async fn wait_for_lease(&mut self, pool: &Weak<SessionPool>) -> Option<OpenRequest> {
         let deadline = Instant::now() + IDLE_SESSION_TIMEOUT;
         let mut lease = pool.upgrade()?.release(deadline);
-        let request = tokio::time::timeout_at(deadline, &mut lease)
-            .await
-            .ok()
-            .and_then(Result::ok);
+        let request = tokio::time::timeout_at(deadline, async {
+            loop {
+                tokio::select! {
+                    biased;
+                    frame = self.reader.next() => {
+                        handle_control(&self.writer, &self.node_padding, frame.ok()?).await.ok()?;
+                    }
+                    request = &mut lease => return request.ok(),
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
         drop(lease);
         if let Some(pool) = pool.upgrade() {
             pool.idle
@@ -678,6 +688,17 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // Only one TLS connection can reach sing-box. Both TCP and UoT must use it.
+        let forwarder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adapter_port = forwarder.local_addr().unwrap().port();
+        let forwarding = tokio::spawn(async move {
+            let (mut client, _) = forwarder.accept().await.unwrap();
+            drop(forwarder);
+            let mut server = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+        });
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_address = target.local_addr().unwrap();
         let target_task = tokio::spawn(async move {
@@ -697,7 +718,7 @@ mod tests {
             protocol: "anytls".into(),
             endpoint: PolicyEndpoint {
                 host: "127.0.0.1".into(),
-                port,
+                port: adapter_port,
             },
             credentials_ref: None,
             labels: BTreeMap::new(),
@@ -754,6 +775,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while adapter.sessions.idle.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TCP released its healthy TLS session");
         let udp_target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_address = udp_target.local_addr().unwrap();
         let udp_task = tokio::spawn(async move {
@@ -776,6 +804,10 @@ mod tests {
         udp_task.await.unwrap();
         peer.kill().await.unwrap();
         peer.wait().await.unwrap();
+        timeout(Duration::from_secs(5), forwarding)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     fn test_request() -> (
@@ -863,6 +895,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(tail.is_empty());
+        assert!(pool.lease(test_request().0).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_answers_idle_heartbeat_reuses_new_stream_id_and_discards_idle_eof() {
+        let (upstream, mut peer) = tokio::io::duplex(1024);
+        let (pool, result) = start_session(Box::new(upstream));
+        read_open(&mut peer, 1).await;
+        let mut frames = BytesMut::new();
+        append_frame(&mut frames, AnyTlsCommand::SynAck, b"");
+        append_frame(&mut frames, AnyTlsCommand::Fin, b"");
+        encode_frame(&mut frames, AnyTlsCommand::HeartRequest, 77, Bytes::new()).unwrap();
+        peer.write_all(&frames).await.unwrap();
+        let mut first = result.await.unwrap().unwrap();
+        assert_eq!(
+            first.read_u8().await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        let heartbeat = read_peer_frame(&mut peer).await;
+        assert_eq!(
+            (heartbeat.command, heartbeat.stream_id),
+            (AnyTlsCommand::HeartResponse, 77)
+        );
+        assert!(heartbeat.payload.is_empty());
+        let (request, result) = test_request();
+        assert!(pool.lease(request).is_ok());
+        read_open(&mut peer, 2).await;
+        let mut frames = BytesMut::new();
+        // A late FIN for the old stream must not close the new one.
+        append_frame(&mut frames, AnyTlsCommand::Fin, b"");
+        encode_frame(&mut frames, AnyTlsCommand::SynAck, 2, Bytes::new()).unwrap();
+        peer.write_all(&frames).await.unwrap();
+        drop(result.await.unwrap().unwrap());
+        let fin = read_peer_frame(&mut peer).await;
+        assert_eq!((fin.command, fin.stream_id), (AnyTlsCommand::Fin, 2));
+        let mut heartbeat = BytesMut::new();
+        encode_frame(
+            &mut heartbeat,
+            AnyTlsCommand::HeartRequest,
+            78,
+            Bytes::new(),
+        )
+        .unwrap();
+        peer.write_all(&heartbeat).await.unwrap();
+        assert_eq!(
+            read_peer_frame(&mut peer).await.command,
+            AnyTlsCommand::HeartResponse
+        );
+        assert_eq!(pool.idle.lock().unwrap().len(), 1);
+        drop(peer);
+        timeout(Duration::from_secs(1), async {
+            while !pool.idle.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the peer EOF removes the idle session");
         assert!(pool.lease(test_request().0).is_err());
     }
 
