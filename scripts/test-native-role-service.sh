@@ -74,11 +74,19 @@ ready() {
     [ "$(stat -c '%U:%G:%a' "$endpoint")" = 'pathchord:pathchord:660' ]
     pid=$(service_pid)
     [ "$(awk '/^Uid:/ {print $2}' "/proc/$pid/status")" = "$(id -u pathchord)" ]
-    [ "$(awk '/^CapEff:/ {print $2}' "/proc/$pid/status")" = "$expected_capabilities" ]
+    capabilities=$(awk '/^CapEff:/ {print $2}' "/proc/$pid/status")
+    if [ "$role" = egress ] && [ "$expected_capabilities" = 0000000000000000 ]; then
+        # The rollback package may predate support for privileged Path ports.
+        case "$capabilities" in 0000000000000000|0000000000000400) ;; *) exit 1 ;; esac
+    else
+        [ "$capabilities" = "$expected_capabilities" ]
+    fi
     grep '^Uid:\|^Gid:\|^Groups:\|^CapEff:\|^CapBnd:' "/proc/$pid/status"
     if [ "$ID" != alpine ]; then
-        [ "$(awk '/^CapBnd:/ {print $2}' "/proc/$pid/status")" = "$expected_capabilities" ]
-        if [ "$expected_capabilities" = 0000000000000000 ]; then [ ! -e "/proc/$pid/root/dev/net/tun" ]; fi
+        [ "$(awk '/^CapBnd:/ {print $2}' "/proc/$pid/status")" = "$capabilities" ]
+        if [ "$role" = egress ] || [ "$expected_capabilities" = 0000000000000000 ]; then
+            [ ! -e "/proc/$pid/root/dev/net/tun" ]
+        fi
         systemctl show "$service" -p User -p CapabilityBoundingSet -p PrivateDevices
     fi
 }
@@ -102,8 +110,22 @@ fi
 sha256sum -c /tmp/pathchord-active-config.sha256
 ready
 install_package "$newer"
+if [ "$role" = egress ]; then expected_capabilities=0000000000000400; fi
 ready
 [ "$(service_pid)" != "$before" ]
+if [ "$role" = egress ]; then
+    stop_service
+    cp -p "$config" /tmp/pathchord-native-egress.yaml
+    sed -i 's/127\.0\.0\.1:7443/127.0.0.1:443/' "$config"
+    start_service
+    ready
+    pathchordctl -o json --socket "$endpoint" status | grep -Fq '127.0.0.1:443'
+    stop_service
+    cp -p /tmp/pathchord-native-egress.yaml "$config"
+    start_service
+    ready
+    expected_capabilities=0000000000000000
+fi
 before=$(service_pid)
 install_package "$older"
 ready

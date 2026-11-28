@@ -100,14 +100,16 @@ before using `pathchordctl` as the added user.
 Ingress credentials live in `/var/lib/pathchord-ingress/credentials`, or
 `/var/db/pathchord-ingress/credentials` on FreeBSD, outside the resource tree.
 
-Default systemd services have no capabilities and restrict device access.
+Systemd services restrict device access. Ingress starts without capabilities
+by default. Packaged Linux Egress services grant `CAP_NET_BIND_SERVICE` so the
+service can bind a privileged Path listener such as TCP 443.
 Only when configuring transparent/TUN listeners, install
 `/usr/share/pathchord/systemd/transparent.conf` as
 `/etc/systemd/system/pathchord-ingressd.service.d/transparent.conf` and restart
 Ingress. Add the adjacent `ebpf.conf` for eBPF after mounting bpffs and preparing
 the required kernel and tools. The [package instructions](../../packaging/README.md#service-isolation-and-optional-ingress-privileges)
-describe Alpine OpenRC capability setup. Egress needs no TUN device or
-network-administration capability.
+describe Alpine OpenRC capability setup. Egress uses ordinary sockets for
+forwarding and needs no TUN device or network-administration capability.
 
 Windows installs only the selected service definition and restricts that role's
 config, data, credentials and logs to its virtual service account, SYSTEM and

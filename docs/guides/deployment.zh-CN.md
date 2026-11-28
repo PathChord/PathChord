@@ -83,12 +83,15 @@ pathchord-ingressd --config examples/ingress-subscriptions.yaml
 Ingress 凭据位于资源树外的 `/var/lib/pathchord-ingress/credentials`；FreeBSD 使用
 `/var/db/pathchord-ingress/credentials`。
 
-systemd 默认服务无 capability 且限制设备访问。仅在配置透明/TUN listener 时，才把
+systemd 服务限制设备访问。Ingress 默认不授予 capability。Linux Egress 软件包授予
+`CAP_NET_BIND_SERVICE`，使服务可以绑定 TCP 443 等特权 Path 监听端口。
+仅在配置透明/TUN listener 时，才把
 `/usr/share/pathchord/systemd/transparent.conf` 安装为
 `/etc/systemd/system/pathchord-ingressd.service.d/transparent.conf` 并重启 Ingress。
 使用 eBPF 时另加相邻的 `ebpf.conf`，预先挂载 bpffs 并准备所需内核与工具。
 [软件包说明](../../packaging/README.md#service-isolation-and-optional-ingress-privileges)
-介绍了 Alpine OpenRC 的 capability 配置。Egress 不需要 TUN 设备或网络管理 capability。
+介绍了 Alpine OpenRC 的 capability 配置。Egress 使用普通 socket 转发流量，无需 TUN
+设备或网络管理 capability。
 
 Windows 只安装所选角色服务定义，把本角色配置、数据、凭据和日志权限限制为其虚拟服务
 账号、SYSTEM 和 Administrators。使用 Windows TUN 前，应为所选 Ingress 账号准备原生

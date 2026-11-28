@@ -90,10 +90,11 @@ uninstall so retained private files do not become owned by a reused UID.
 
 ## Service isolation and optional Ingress privileges
 
-Systemd profiles have empty capability sets and private device namespaces by
-default. Egress requires neither TUN access nor network-administration
-capabilities. An OpenRC Egress runs directly as the unprivileged `pathchord`
-account without a privileged namespace launcher.
+Systemd profiles use private device namespaces. Ingress has an empty capability
+set by default. The Linux Egress services for systemd and OpenRC grant
+`CAP_NET_BIND_SERVICE` to the `pathchord` process so it can bind a privileged
+Path listener such as TCP 443. Egress uses ordinary sockets for forwarding and
+requires neither TUN access nor network-administration capabilities.
 
 To configure Linux transparent/TUN listeners, install the Ingress-only drop-in:
 

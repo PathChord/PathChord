@@ -62,7 +62,8 @@ def main():
             run(['sudo', '-n', 'cp', str(source.resolve()), str(fixture / source.name)])
         process = subprocess.Popen(['sudo', '-n', 'systemd-nspawn', '--quiet', '--boot', '--register=no',
                                     '--settings=no', '--private-network', '--machine', name,
-                                    '--capability=CAP_BPF,CAP_PERFMON,CAP_NET_ADMIN,CAP_NET_RAW', '--directory', str(rootfs)],
+                                    '--capability=CAP_BPF,CAP_PERFMON,CAP_NET_ADMIN,CAP_NET_RAW,CAP_NET_BIND_SERVICE',
+                                    '--directory', str(rootfs)],
                                    stdin=subprocess.DEVNULL, stdout=console, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
@@ -118,8 +119,9 @@ def main():
                 shlex.quote(fixture + path.name) for path in (args.older, args.newer, args.opposite))).splitlines(),
             'validation': ['native package lifecycle', 'native systemd start/control/upgrade/rollback/stop',
                            'single-role payload and opposite-role rejection', 'shared local service account',
-                           'empty capabilities and private devices'] +
-                          (['enrolled authorization survives upgrade/rollback'] if args.role == 'egress' else []),
+                           'private devices and role-specific capability sets'] +
+                          (['privileged Path listener', 'enrolled authorization survives upgrade/rollback']
+                           if args.role == 'egress' else []),
         }
         (output / 'package-evidence.json').write_text(json.dumps(metadata, indent=2) + '\n')
         guest('shutdown', 'systemctl poweroff', timeout=30)
