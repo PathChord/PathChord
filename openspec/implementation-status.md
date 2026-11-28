@@ -635,6 +635,36 @@ workspace or a CI override. Local Debian and Arch package metadata contained
 `0.1.1-1` for the checkout and `0.1.2.7-1` for the explicit override.
 Version-resolution checks run on pushes and pull requests.
 
+On 2026-11-28, Linux regressions verified that a pending Egress target dial
+occupies the last admission slot, that CNAME-bearing NXDOMAIN responses need
+an SOA and expire with the cached records, and that a SOCKS5 UDP association
+learns the source port only after validating the datagram. The release workflow
+pins one source commit for all binary and native-package builds.
+
+The AnyTLS regression suite exercises the production Session reader, including
+a PUSH buffered behind SYNACK, peer FIN without a reciprocal FIN, idle
+heartbeat replies, and idle peer EOF. A Linux sing-box 1.14.4 fixture permits
+one TLS carrier and verifies sequential TCP and UoT UDP round trips on it.
+
+On the 128-Path Linux loopback fixture, traces captured two stalled CONNECT
+requests transmitting the unacknowledged control 18 and 19 times, respectively,
+on one Path per request. In a separate delayed-delivery run, carrier writes
+completed in under 1 ms, while Egress decoded the first two records about
+six seconds later with its reader queue full. Required retries now rotate
+across available Paths even with zero
+optional replication budget. A two-Path regression delays delivery on one
+carrier and verifies a single target dial and successful echo on recovery.
+
+Path refill starts up to 16 simultaneous handshakes within the existing pass
+deadline. Path owners watch carrier attachment and retirement. The Session
+actor processes up to 16 queued reader events per turn, samples global Egress
+status once per reporting tick, and retries an outstanding heartbeat before
+adding another probe. A delayed-ACK regression checks retransmission and
+cumulative acknowledgement. The final 128-Path TCP/UDP fixture passed four
+runs in concurrently running pairs and four more with each pair pinned to one
+logical CPU. All runs retained the original three-second CONNECT deadline.
+The final Linux workspace suite passed 1,162 tests with 118 ignored.
+
 On 2026-11-27, the AnyTLS official-v2 Session reuse implementation passed
 its codec and adapter tests, and its TCP plus UoT v2 interoperability test
 passed against sing-box 1.14.4 and source revision `491b845`. The implementation
@@ -1128,10 +1158,3 @@ guest and ran as `pathchord`; native results and artifact hashes are in the
 The plain host GCC/LLD target failure described in older validation notes still
 applies when target-specific SDK wrappers are not selected; Rust's target
 standard library alone does not supply system headers or libraries.
-
-On 2026-11-27, the AnyTLS official-v2 implementation began with the bounded
-padding codec and node-level single-active-Stream Session pool. The codec and
-adapter focused tests passed, and AnyTLS TCP/UoT interoperability passed
-against sing-box 1.14.4 and source revision `491b845`. Full Session reuse,
-padding-update, and multi-operation soak evidence remains part of the active
-OpenSpec change.
