@@ -1,4 +1,5 @@
 # PathChord 架构
+
 [English](architecture.md) | **简体中文**
 
 ## 1. 范围

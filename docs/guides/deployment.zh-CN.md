@@ -1,4 +1,5 @@
 # PathChord 部署与本地操作
+
 [English](deployment.md) | **简体中文**
 
 本指南介绍本地代理设置、Linux 特权监听器，以及 Ingress/Egress 的显式登记。请先阅读[配置指南](configuration.zh-CN.md)以选择资源和路由。服务行为要求由[部署规范](../../openspec/specs/deployment/spec.zh-CN.md)定义。
@@ -150,8 +151,9 @@ pathchord-egressd --egress-id exit --identity egress.key.json \
 
 一个 Egress 进程拥有多个公共 Path listener 时，可以重复使用 `--bind`。相同的列表也可以在
 `EgressService` 中写成 `spec.binds`。Ingress 使用一份 Egress 资源及有序的 `spec.endpoints` 列表，
-表达不同的 IPv4、IPv6、域名或端口候选；所有项都使用相同、已经核验的 Egress ID 和公钥。单个
-`--bind` 以及旧的 `address`/`port` 形式仍可用于单 endpoint 部署。
+表达不同的 IPv4、IPv6、域名或端口候选。所有项都使用相同、已经核验的 Egress ID 和公钥。
+部署单个端点时，在 Egress 上指定一个 `--bind`，在 Ingress 的 `Egress` 资源中使用
+`spec.host` 和 `spec.port`。
 
 在 Egress 主机上登记独立核验过的 Ingress 公钥。CLI 从所选服务读取 Egress ID 和当前授权代次。
 也可以显式传入 `--egress-id` 和 `--expected-generation`。代次冲突后请先检查再重试。
@@ -162,16 +164,21 @@ pathchordctl --socket /tmp/pathchord-egress.sock enroll add \
   --ingress-id entry --public-key INGRESS_PUBLIC_KEY
 ```
 
-在 `examples/ingress-egress.yaml` 中，把 `REPLACE_WITH_EGRESS_PUBLIC_KEY` 替换为 Egress 公钥。
-示例包含回环、IPv6 和域名 endpoint 候选；本地部署时只保留可达的候选，或替换为 Egress 实际
-暴露的公共端点。跨机器部署必须设置可达的 Egress binds/endpoints，并保留相同的、已经显式核验的
-公钥和规范 Egress ID。在另一个独立终端中启动 Ingress：
+在 Ingress 主机上，把 [ingress-egress.yaml](../../examples/ingress-egress.yaml) 复制为
+`ingress.yaml`，将 `REPLACE_WITH_EGRESS_PUBLIC_KEY` 替换为独立核验过的 Egress 公钥。
+上面的回环部署只需保留 `127.0.0.1:9443` 端点。跨机器部署时，设置可达的 Egress 监听地址和
+对应端点，并保留相同的 Egress ID 和已核验的公钥。在独立终端中验证完整配置文件并启动 Ingress。
 
 ```sh
-pathchordctl -C /path/to/ingress config create -f examples/ingress-egress.yaml
+pathchordctl --config ingress.yaml config validate
 pathchord-ingressd --socket /tmp/pathchord-ingress.sock \
   --ingress-id entry --identity ingress.key.json \
-  --config-dir /path/to/ingress
+  --config ingress.yaml
+```
+
+另开终端，在 Ingress 主机上查看服务状态，在 Egress 主机上查看登记列表。
+
+```sh
 pathchordctl --socket /tmp/pathchord-ingress.sock get status
 pathchordctl --socket /tmp/pathchord-egress.sock enroll list
 ```

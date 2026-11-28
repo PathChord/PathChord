@@ -22,9 +22,7 @@ v1 schema SHALL 暴露 Egress aggregate wire capacity 和全局入站目标连�
 - **WHEN** 管理员提交了包含用户编写 `status` 字段的资源
 - **THEN** 验证拒绝该资源，上一份已发布快照继续生效
 
-#### Detailed contract
-
-##### 原生配置名称和字段迁移
+#### 原生配置名称和字段迁移
 
 PathChord 自有资源键 MUST 使用 lower camelCase。资源引用 MUST 使用 `Ref` 后缀并保留
 namespace 解析；`egressId` 表示协议身份，不表示资源引用。时间、速率和字节上限必须标明单位。
@@ -358,7 +356,7 @@ minimum 默认 1；省略 target 时请求 minimum 加一；显式 target 不额
 - **WHEN** Egress 声明 `admission.requiredCapabilities: [tcp, udp]`
 - **THEN** 保留旧 capability requirement 的公共 Egress 能力检查，不增加按流或原生 UDP Transit 限制
 
-#### Detailed contract
+#### Path 池字段、默认值和限制
 
 | Egress `spec` 下的字段 | 类型 | 默认值和含义 |
 |---|---|---|
@@ -493,18 +491,11 @@ metadata:
   name: default
 items:
   - apiVersion: pathchord.io/v1
-    kind: Egress
+    kind: FallbackPolicy
     metadata:
-      name: jp-1
-      labels:
-        region: jp
+      name: default-fallback
     spec:
-      host: egress.example.net
-      port: 443
-      publicKey: <curve25519-public-key>
-      capabilities:
-        tcp: true
-        udp: true
+      action: reject
 ```
 
 每个资源对象必须恰好包含 `apiVersion`、`kind`、`metadata` 和 `spec`。`kind: List` 是唯一的
@@ -517,15 +508,14 @@ items:
 `metadata.annotations` 是可选且有界的字符串映射。`metadata.uid`、`metadata.generation` 和
 `metadata.resourceVersion` 由服务端生成，不能由用户写入。运行时 `status` 只读，并由控制面单独暴露。
 
-支持的 kind 为 `Egress`、`TransitProxy`、`Subscription`、`EgressRule`、`ProxyRule`、
-`TrafficPolicy`、`Listener`、`DNSPolicy`、`FallbackPolicy`、`GeoSiteDatabase`、`GeoIpDatabase`、
-`EgressService` 和 `NodeProbePolicy`。
-后两者是角色专用的服务资源：`EgressService` 为一个 Egress 进程选择身份、监听器、授权存储和服务限制；
-`NodeProbePolicy` 配置可选的有界 Transit 节点探测。Ingress 消费 `NodeProbePolicy` 和完整策略图；
-Egress 消费只含一个 `EgressService` 的 Egress 专用来源。Ingress 和 Egress 来源不能视为同一资源包。
-一个 namespace 中同一 `(kind, name)`
-最多只能有一个对象。完整配置必须恰好包含一个 DNSPolicy 和一个 FallbackPolicy；其余资源按引用和
-路由验证决定是否需要。没有 Listener 的 List 可以作为库快照存在，但不能启动 Ingress。
+每个配置来源只属于一个角色。每个 namespace 内的 `(kind, metadata.name)` 必须唯一。
+
+| 角色 | 该角色使用的资源 | 数量要求 |
+|---|---|---|
+| Ingress | `DNSPolicy`、`FallbackPolicy` | 整个资源图中各恰好一个 |
+| Ingress | `IngressService`、`NodeProbePolicy` | 整个资源图中各至多一个 |
+| Ingress | `Listener`、`Egress`、`TransitProxy`、`Subscription`、`EgressRule`、`ProxyRule`、`TrafficPolicy`、`GeoSiteDatabase`、`GeoIpDatabase` | 按引用及路由规则验证。库快照可省略 Listener，启动 Ingress 服务至少需要一个 Listener。 |
+| Egress | `EgressService` | 整个来源恰好一个，任何其他资源种类均须拒绝 |
 
 加载器按 `(namespace, kind, name)` 解析引用，验证完整对象图，然后发布一个不可变代次。同名对象的
 期望 spec 原子替换；删除会从后续快照移除对象，并排空不再有有效引用的资源。验证或持久化失败时，
@@ -609,7 +599,7 @@ mutation 写入。导入的 source、observed、quota 和 billing 值均由运�
 `binds` 是 1..=32 个唯一 SocketAddr 的有序列表，两种形式互斥。
 Ingress Path-pool 数量、per-Ingress stream 配额和 Path 安全上限不属于 EgressService 字段，不得写入
 该资源。
-资源中的相对路径相对于所选配置来源解析。一个 Egress 进程最多选择一个此类资源。
+资源中的相对路径相对于所选配置来源解析。一个 Egress 进程必须从该来源选择恰好一个此类资源。
 缺少 `egressId` 时使用资源名。身份、授权库和控制 socket 路径从角色目录布局解析默认值。
 `remoteDnsOnly` 默认 false。设为 true 且存在原始主机名时，Egress 对 TCP 和 UDP 使用自身系统
 解析器解析该名称，不使用 Ingress 提供的地址候选。没有主机名的字面 IP 仍是有效目标。
@@ -723,7 +713,13 @@ namespace 中。归一化后重复的引用无效。同一字段中的值为 OR�
 `targetGeoIps` 和 `targetPorts`。
 
 EgressRule 的 spec 在 `egressRef`、`egressSelector` 或 `mode: none` 中选择一个。selector 至少一个条件；
-mode none 是普通 Proxy 模式，不得创建 Session。EgressRule 不接受 requirements、Transit selector、策略覆盖或业务类别字段；选定 Egress 的绑定提供公共 Transit 候选、Path-pool minimum 和基线，以及 TrafficPolicy。绑定没有准入 Transit 时继续下一条 EgressRule，不得隐式选择任意 Proxy。ProxyRule 的 `require` 使用相同 label/tag/capability 选择器语义过滤普通 Proxy；select 默认 any，也可以使用 `proxy: direct`；proxy 与 select 互斥。EgressRule 和 ProxyRule 均可用 `catchAll` 显式标记全匹配规则；全匹配规则不得同时提供 `match`。
+mode none 是普通 Proxy 模式，不得创建 Session。EgressRule 不接受 requirements、Transit selector、策略覆盖或业务类别字段；选定 Egress 的绑定提供公共 Transit 候选、Path-pool minimum 和基线，以及 TrafficPolicy。绑定没有准入 Transit 时继续下一条 EgressRule，不得隐式选择任意 Proxy。
+
+ProxyRule 的 `require` 使用相同的 label/tag/capability 选择器语义过滤普通 Proxy。`select` 默认是
+`any`，也可指定选择器。将符合条件的候选节点按加权分数降序排列，同分时按规范 ID 升序排列，先尝试第一项。
+准入前的失败重试遵循[普通 Proxy 故障转移契约](../configuration/spec.zh-CN.md#requirement-bounded-ordinary-proxy-pre-admission-failover)。
+规则也可使用 `proxy: direct` 选择 direct 适配器。`proxy` 与 `select` 互斥。
+EgressRule 和 ProxyRule 均可用 `catchAll` 显式标记全匹配规则；全匹配规则不得同时提供 `match`。
 规则求值必须确定、有界且无 I/O，编译器必须拒绝未知字段、无界表达式和无效引用，编译失败保留上一快照。
 
 ### TrafficPolicy
@@ -763,7 +759,7 @@ TCP/UDP 数据包设置现有 TPROXY 策略路由所需的标记；透明 listen
 
 ### DNSPolicy 和 FallbackPolicy
 
-必须恰好有一个 DNSPolicy 和一个 FallbackPolicy。DNSPolicy 的字段和默认值见平台和 DNS 规范，Fake-IP 禁止。
+完整 Ingress 资源图必须恰好有一个 DNSPolicy 和一个 FallbackPolicy。DNSPolicy 的字段和默认值见平台和 DNS 规范，Fake-IP 禁止。
 
 ```yaml
 apiVersion: pathchord.io/v1
@@ -796,7 +792,7 @@ Ingress 接受一个资源文件或一棵目录树；Egress 接受包含一个 E
 
 每个来源独立解析，包括 YAML 多文档流和 `kind: List`，然后验证完整的合并资源图。资源可以
 引用其他文件中的对象。必须在整个集合内拒绝重复资源身份；文件名顺序不得实现“后文件覆盖
-前文件”的语义。合并资源图仍必须恰好包含一个 DNSPolicy 和一个 FallbackPolicy。运行时数据和
+前文件”的语义。合并后的 Ingress 资源图必须恰好包含一个 DNSPolicy 和一个 FallbackPolicy。运行时数据和
 私有凭据 JSON 必须放在资源树外，或使用非资源文件扩展名。
 规范化资源图由资源身份和显式规则顺序决定；把未变更的资源移到其他来源文件不得要求重启。
 

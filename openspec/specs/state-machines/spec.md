@@ -142,7 +142,7 @@ The Ingress owner SHALL maintain one authenticated Path pool per Egress relation
 - **WHEN** an Egress requires two usable Paths and a failure leaves one authenticated non-draining ready Path
 - **THEN** the Session is degraded, new Streams and UDP Associations are denied, existing work can continue on the remaining Path, and bounded recovery attempts restore the common minimum
 
-#### Scenario: Only draining Paths remain
+#### Scenario: Draining Paths do not count toward the pool minimum
 
 - **WHEN** a Session has only authenticated draining Paths
 - **THEN** existing work follows drain deadlines, new business admission is denied, and no draining Path counts toward the minimum for new admission

@@ -611,4 +611,3 @@ rules. A DNS route or resolver that becomes unavailable does not change the
 configured route. All limits are enforced before allocation, and resource
 exhaustion returns a typed local/resource error rather than silently dropping
 TCP bytes or creating an untracked flow.
-

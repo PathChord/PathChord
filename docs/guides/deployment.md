@@ -1,4 +1,5 @@
 # PathChord deployment and local operation
+
 **English** | [简体中文](deployment.zh-CN.md)
 
 This guide walks through local proxy setup, privileged Linux listeners, and explicit Ingress/Egress enrollment. Start with the [configuration guide](configuration.md) to choose resources and routing. Required service behavior is defined by the [deployment specification](../../openspec/specs/deployment/spec.md).
@@ -186,8 +187,8 @@ pathchord-egressd --egress-id exit --identity egress.key.json \
 listeners. The same list can be authored as `spec.binds` in an `EgressService`.
 Use one Ingress `Egress` resource with an ordered `spec.endpoints` list for
 different IPv4, IPv6, hostname, or port candidates; all entries use the same
-verified Egress ID and public key. A single `--bind` and the older
-`address`/`port` form remain valid for one-endpoint deployments.
+verified Egress ID and public key. For a single endpoint, set one `--bind`
+on Egress and use `spec.host` and `spec.port` in the Ingress `Egress` resource.
 
 On Egress, enroll the independently verified Ingress public key. The CLI
 reads the Egress ID and current authorization generation from the selected
@@ -200,19 +201,24 @@ pathchordctl --socket /tmp/pathchord-egress.sock enroll add \
   --ingress-id entry --public-key INGRESS_PUBLIC_KEY
 ```
 
-In `examples/ingress-egress.yaml`, replace `REPLACE_WITH_EGRESS_PUBLIC_KEY`
-with the Egress public key. The example contains loopback, IPv6, and hostname
-endpoint candidates; keep only reachable candidates for a local deployment or
-replace them with the public endpoints exposed by Egress. Cross-machine
-deployments MUST set reachable Egress binds/endpoints and keep the same
-explicitly verified key and canonical Egress ID. Start Ingress in a separate
-terminal:
+On Ingress, copy [ingress-egress.yaml](../../examples/ingress-egress.yaml) to
+`ingress.yaml` and replace `REPLACE_WITH_EGRESS_PUBLIC_KEY` with the independently
+verified Egress public key. For the loopback Egress above, keep only the
+`127.0.0.1:9443` endpoint. For separate machines, configure a reachable Egress
+bind and matching endpoint, keeping the same Egress ID and verified key.
+Validate the complete file and start Ingress in its own terminal.
 
 ```sh
-pathchordctl -C /path/to/ingress config create -f examples/ingress-egress.yaml
+pathchordctl --config ingress.yaml config validate
 pathchord-ingressd --socket /tmp/pathchord-ingress.sock \
   --ingress-id entry --identity ingress.key.json \
-  --config-dir /path/to/ingress
+  --config ingress.yaml
+```
+
+In another terminal, check Ingress status on the Ingress host and list
+enrollments on the Egress host.
+
+```sh
 pathchordctl --socket /tmp/pathchord-ingress.sock get status
 pathchordctl --socket /tmp/pathchord-egress.sock enroll list
 ```

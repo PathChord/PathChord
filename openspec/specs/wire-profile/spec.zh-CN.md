@@ -475,16 +475,25 @@ sample_age_ms                varint
 expires_after_ms             varint, positive
 ~~~
 
-`connected` MUST 等价于 `service_state != down`。`admission_allowed` 为真时
-`admission_reason` MUST 为 `none`。比率使用 basis points，不使用浮点数。
+`connected` MUST 等价于 `service_state != down`。`admission_allowed` 为真当且仅当
+`admission_reason` 为 NONE（0）。接收方 MUST 拒绝在禁止准入时给出 NONE、或在允许准入时给出非零原因的报告。
+比率使用 basis points，不使用浮点数。
 `effective_capacity_bps` 仅在 `unknown` 或 `stale` 状态下可以为零；复制 allowance
 不得超过配置容量。当 sample_age_ms > expires_after_ms 时，Ingress MUST 将报告视为
 过期；过期报告不能准入新流，也不能触发缩容。报告按 report_seqno 顺序应用，重复或
 更旧的报告忽略。省略容量、准入、服务状态、利用率、序列或新鲜度字段的状态 payload
 不是 v1 payload，与本 profile 不互操作。
 
-准入原因注册表为：`none`、`resource_limit`、`connection_limit`、`bandwidth_limit`、
-`administrative_drain`、`authorization_failure`。
+准入原因的稳定线码如下。
+
+| 编码 | 名称 |
+|---:|---|
+| 0 | NONE |
+| 1 | RESOURCE_LIMIT |
+| 2 | CONNECTION_LIMIT |
+| 3 | BANDWIDTH_LIMIT |
+| 4 | ADMINISTRATIVE_DRAIN |
+| 5 | AUTHORIZATION_FAILURE |
 
 #### TCP Stream
 
@@ -596,4 +605,3 @@ Path 使用独立传输状态，并 MUST 在 `PATH_READY` 之前拒绝 prologue 
 
 本文档不产生 IANA 操作。profile 中的私有注册表由 PathChord 维护者负责；新增分配
 MUST 使用新的版本化 profile，并明确更新一致性测试向量。
-

@@ -168,4 +168,3 @@ devices. One cancellation tree supervises every adapter and joins them before
 route restoration, so the CLI does not reproduce platform lifecycle logic.
 
 Platform adapters own operating-system-specific packaging, service integration, socket behavior, and routing behavior. Linux transparent routing supports IPv4 and IPv6. Tokio task supervision and cancellation must handle Path churn without leaking tasks or resources. SQLite transactions preserve authorization consistency during concurrent status queries and enrollment operations. The frame codec bounds allocation by protocol limits, and the rule compiler enforces bounded evaluation cost.
-

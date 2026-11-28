@@ -16,11 +16,24 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 ```
 
-For documentation changes, also run `openspec validate --all --strict --no-interactive`, `git diff --check`, and `rg -n '^#{1,6} ' README.md README.zh-CN.md docs openspec AGENTS.md`. Verify local links and anchors, language switches, paired requirement/scenario identities, and preservation of technical examples and registries after moving or restructuring documents.
+For documentation changes, run these checks from the repository root.
+
+```sh
+markdownlint-cli2
+python3 scripts/check-doc-contracts.py
+python3 scripts/check-doc-examples.py
+openspec validate --all --strict --no-interactive
+git diff --check
+rg -n '^#{1,6} ' README.md README.zh-CN.md docs openspec AGENTS.md
+```
+
+Verify local links and anchors, language switches, paired requirement/scenario identities, and preservation of technical examples and registries after moving or restructuring documents.
+
+For a complete configuration in a fenced `yaml` block, put `# pathchord-check: ingress` or `# pathchord-check: egress` on the first line inside the fence. The example check passes the block to the corresponding role's configuration validator.
 
 Ingress configuration source precedence is command line, then
 `PATHCHORD_CONFIG` / `PATHCHORD_CONFIG_DIR`, then the account default:
-`~/.config/pathchord` for regular users and `/etc/pathchord` for root/service
+`~/.config/pathchord/ingress` for regular users and `/etc/pathchord/ingress` for root/service
 accounts. Directory resource files form one validated graph; do not add
 last-file-wins semantics or a working-directory default fallback.
 

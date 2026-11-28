@@ -1,4 +1,5 @@
 # PathChord architecture
+
 **English** | [简体中文](architecture.zh-CN.md)
 
 ## 1. Scope

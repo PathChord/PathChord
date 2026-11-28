@@ -362,12 +362,12 @@ SESSION_ATTACH_OK:
 ~~~text
 authorization_generation  varint
 replication_budget_bytes_per_second  varint
+~~~
 
 The requested attachment budget is a bounded byte rate. Egress MAY return a
 lower effective value, including zero. Both peers apply the returned effective
 value as one Session hard ceiling shared by every Path; it is not a rule or
 TrafficClass identifier.
-~~~
 
 SESSION_ATTACH_REJECT:
 
@@ -518,7 +518,9 @@ expires_after_ms             varint, positive
 
 `connected` MUST be equivalent to `service_state != down`: `connected=0` iff
 `service_state=down`, and every other service state MUST use `connected=1`.
-`admission_allowed` MUST be true exactly when `admission_reason=none`.
+`admission_allowed` MUST be true exactly when `admission_reason` is NONE (0).
+A receiver MUST reject a report that denies admission with NONE or allows
+admission with a nonzero reason.
 Ratios are basis points, not floating-point values. `effective_capacity_bps`
 may be zero only for `unknown` or `stale` capacity. The replication allowance
 MUST NOT exceed the configured capacity. Ingress treats a report as stale when

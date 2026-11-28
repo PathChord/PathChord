@@ -10,7 +10,9 @@ PathChord 为本地应用程序提供常规代理语义，同时在 Ingress 与�
 
 本仓库包含设计基线、`wire-profile-v1` 协议契约、Kubernetes 风格配置契约，以及可运行的 Rust 实现。Ingress 可以绑定 HTTP、SOCKS5、Linux 透明模式和 TUN 监听器，维护持久化控制状态，刷新由订阅提供的 Transit Proxy，并通过经过认证的 Session/Path 运行时承载 TCP/UDP 流量。Egress 提供经过认证的 Path 监听器和授权控制面；可选的 REST/SSE Web Gateway 由两个控制面共享。
 
-当前工作优先完善 Linux、Windows 和 FreeBSD 上的普通 HTTP 转发、CONNECT、SOCKS4/4a/5、Linux 透明接管与 TUN 监听器。HTTP 使用消息编解码器处理流式正文、持久连接请求和 Upgrade；SOCKS5 还提供 UDP ASSOCIATE。监听器名称 `socks` 可作为规范名称 `socks5` 的别名。`type: mixed` 在一个 TCP 端口上提供 HTTP 和 SOCKS，并通过协商的 relay 端点提供 SOCKS5 UDP ASSOCIATE。Windows 和 FreeBSD 的显式监听器与本地控制已通过各自记录的原生 QEMU 验证矩阵。通用监听器回归测试由现有 Rust CI 任务执行。透明 TCP/UDP 接管与 TUN 数据包流已经接入相同的策略和 Session/Path 数据面。Linux 特权路由、真实 TUN 设备与可选 eBPF 检查具有独立的 QEMU 主机证据。原生平台和软件包结果、主机版本及验证边界记录在下方链接的实现状态中。Linux TPROXY 还接受 `backend: ebpf` 以启用绑定接口的 TC classifier；普通 `tproxy` 后端仍是默认和回退路径。平台验证、共享运行时缺口及后续适配器工作见[进行中的 OpenSpec 变更](#进行中的变更)；已记录的能力和验证依据见[实现状态](openspec/implementation-status.md)。
+Linux、Windows 和 FreeBSD 均支持 HTTP、SOCKS4/4a/5 和 Mixed 显式监听器。HTTP 支持转发、CONNECT、流式正文、持久连接和 Upgrade。SOCKS5 支持 UDP ASSOCIATE。`socks` 是 `socks5` 的别名。使用 `type: mixed` 可在同一个 TCP 端口上提供 HTTP 和 SOCKS。Windows 和 FreeBSD 的显式监听器与本地控制已通过各自的原生 QEMU 测试。
+
+Linux 的 TPROXY、REDIRECT 和 TUN 已通过特权 QEMU 测试，覆盖真实 TUN 设备和可选的 eBPF 接管。TPROXY 默认使用 `tproxy` 后端，也可在指定接口上使用 `backend: ebpf`。FreeBSD 会拒绝透明监听器和 TUN 监听器。Windows 已有 TUN 适配器，Wintun 打包和原生 TUN 验证仍待完成。主机版本、软件包结果和验证范围见[实现状态](openspec/implementation-status.md)。
 
 节点导入支持自动识别、Clash/Mihomo provider、SIP008、URI/Base64 列表、sing-box JSON，以及
 所支持的 Surge/Quantumult X/Loon 节点行。原生传输支持类型化 TLS 设置、VLESS/Trojan 的
@@ -44,6 +46,7 @@ direct/SOCKS5/Shadowsocks UDP（包括 SS2022）
 
 - [配置指南](docs/guides/configuration.zh-CN.md)
 - [部署与本地操作](docs/guides/deployment.zh-CN.md)
+- [运行时可观测性与诊断](docs/guides/observability.zh-CN.md)
 - [原生软件包](packaging/README.md)
 - [监控部署](monitoring/README.md)
 
@@ -58,6 +61,7 @@ direct/SOCKS5/Shadowsocks UDP（包括 SS2022）
 - [v1 线协议 profile](openspec/specs/wire-profile/spec.zh-CN.md)
 - [配置模型](openspec/specs/configuration/spec.zh-CN.md)
 - [配置 schema](openspec/specs/configuration-schema/spec.zh-CN.md)
+- [Geosite 与 GeoIP 路由](openspec/specs/geodata-routing/spec.zh-CN.md)
 - [平台与 DNS](openspec/specs/platform-and-dns/spec.zh-CN.md)
 - [状态机](openspec/specs/state-machines/spec.zh-CN.md)
 - [Ingress 控制面](openspec/specs/ingress-control-plane/spec.zh-CN.md)
@@ -71,7 +75,7 @@ direct/SOCKS5/Shadowsocks UDP（包括 SS2022）
 
 ### 进行中的变更
 
-OpenSpec 当前没有进行中的变更。已完成的工作见[变更归档](openspec/changes/archive/)。
+运行 `openspec list` 查看进行中的变更。已完成的提案、任务和调研记录见[变更归档](openspec/changes/archive/)。
 
 ## OpenSpec 工作流
 
@@ -80,11 +84,10 @@ OpenSpec 当前没有进行中的变更。已完成的工作见[变更归档](op
 ```sh
 openspec list --specs
 openspec list
-openspec status --change organize-documentation-with-openspec
 openspec validate --all --strict --no-interactive
 ```
 
-使用 `openspec new change <name>` 创建范围明确的变更，然后编写提案、设计和任务清单。
+使用 `openspec new change <name>` 创建范围明确的变更。编写提案、设计和任务清单时，将相同的名称传给 `openspec status --change <name>` 查看进度。
 改变行为时，在 `specs/<capability>/spec.md` 中编写英文规范增量；只实现、验证或整理已有
 契约的工作，在 `.openspec.yaml` 中使用 `skip_specs: true`。
 [OpenSpec 项目配置](openspec/config.yaml)记录各类产物的规则。
@@ -138,5 +141,16 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 cargo run -p pathchordctl -- --help
 ```
+
+在仓库根目录运行文档检查。示例检查会通过 Cargo 运行 `pathchordctl`。
+
+```sh
+npx --yes markdownlint-cli2@0.24.2
+python3 scripts/check-doc-contracts.py
+python3 scripts/check-doc-examples.py
+openspec validate --all --strict --no-interactive
+```
+
+完整 YAML 示例的验证标记见[仓库指南](AGENTS.md#build-test-and-development-commands)。
 
 工作区在 dev/test profile 中关闭 rustc 增量产物，以便已配置的 `RUSTC_WRAPPER=sccache` 复用完整编译单元。仓库不强制机器专属 wrapper；是否使用 sccache 由本地 Cargo 配置决定。

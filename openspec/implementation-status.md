@@ -10,8 +10,8 @@ this snapshot records evidence rather than a second implementation plan.
 
 The multi-endpoint Egress change is implemented in the local runtime. Egress
 Service accepts ordered `binds` with the singular `bind` shorthand, and the
-Ingress Egress resource accepts ordered `endpoints` with the legacy
-`address`/`port` shorthand. One Egress identity, authorization store, Session
+Ingress Egress resource accepts ordered `endpoints` or the single-endpoint
+`host`/`port` shorthand. One Egress identity, authorization store, Session
 pool, wire budget, and target-connection limit are shared across listeners;
 each Path selects and retains its endpoint with bounded pre-admission failover.
 Local control observations expose bounded listener and endpoint ordinals while
@@ -30,7 +30,7 @@ cross-checks for the CLI and Egress compile their platform-specific paths.
 Native package lifecycle and deployed interoperability evidence are recorded
 separately.
 
-## Current focus
+## Runtime and platform overview
 
 The [geosite and geoip routing change](changes/archive/2026-11-17-support-geosite-geoip-routing/)
 adds local V2Fly geodata databases, named-set rule matching and atomic dataset
@@ -48,14 +48,14 @@ with the updated Egress completed while Paths were replaced. See the change's
 research record for dataset hashes. These bounded tests are not prolonged
 throughput or native-platform evidence.
 
-The unreleased v1 session/resource contract is now implemented through the
+The v1 Session and resource contract is implemented through the
 wire, lifecycle, scheduling, Egress-resource, TLS, and local-control slices.
 The implementation uses the finalized v1 registry without PathRebind or
 TrafficClass wire extensions; Session attachment negotiates a mandatory
 replication cap, ACKs are checked against emitted intervals, and a validated
 future ACK closes the whole Session before fresh-Session recovery. Lifecycle
 events are owned by the Session/Path owner, Transit relationships can carry
-multiple independent Paths, rule demand is bounded and EWMA-sampled, and
+multiple independent Paths, directional demand is aggregated per Session, and
 candidate failover stops at target admission. Egress target reservations,
 global capacity/admission status, actual global wire-budget enforcement with
 residual optional replication, resource-limit errors, passive capacity
@@ -107,9 +107,10 @@ records the Unix package hosts; the
 [final Windows package report](changes/archive/2026-11-18-validate-native-packages/research/2026-11-18-windows-package-final.md)
 records both Windows role profiles and their service identities.
 
-The scheduling slice now has deterministic coverage for independent mixed-flow
-replication budgets, reserved control/retransmission priority, directional
-autoscale inputs, rule-union Path planning, and Egress capacity hysteresis.
+Each Session captures its Egress TrafficPolicy. Streams and UDP Associations
+sharing that Session draw from one replication allowance per sending direction.
+Required control and retransmissions take priority over optional copies.
+Deterministic tests cover directional autoscaling and Egress capacity hysteresis.
 Egress target opens (TCP and UDP) share one bounded active-plus-pending
 reservation pool; local control saturation returns a typed resource-limit
 response. Relative truststore sources are resolved from the selected config
@@ -148,8 +149,8 @@ formatting, Clippy, strict OpenSpec validation, and documentation diff/link
 checks. Native-platform, external-peer, and production probe calibration
 evidence remain separate and are not inferred from these local checks.
 
-Earlier local validation of the v1 contract, before the current uncommitted
-proxy-compatibility work:
+The initial local v1 validation recorded these results before the later
+proxy interoperability runs.
 
 - `cargo fmt --all -- --check` passed.
 - Locked workspace Clippy with `-D warnings` passed; on Linux Cargo reports
@@ -177,8 +178,9 @@ job.
 TPROXY, REDIRECT, transparent UDP interception, and TUN integration are wired
 into the Ingress platform runtime with configuration, rollback, protected
 endpoint handling, source restrictions, and bounded TCP/UDP flow supervision.
-Privileged route/TUN host validation and Wintun packaging remain separate
-acceptance work. SOCKS5 UDP forwarding remains in the current scope.
+The privileged Linux QEMU matrix passed route ownership, TUN forwarding and
+optional eBPF checks. Wintun packaging and native Windows TUN validation
+remain pending. FreeBSD rejects transparent and TUN listeners during preflight.
 
 ## Implemented
 
@@ -208,17 +210,17 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   the Egress write and Ingress receive by Session, Path and frame sequence, and
   verified that the echo payload was absent from both logs.
 
-
 - Ingress accepts a single file or recursively loaded YAML/YML/JSON directory.
-  CLI source options override `PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`, which
-  override `~/.config/pathchord` or `/etc/pathchord` for root/service accounts.
+  CLI source options override `PATHCHORD_CONFIG`/`PATHCHORD_CONFIG_DIR`. The
+  Unix account default is `~/.config/pathchord/ingress` for regular users and
+  `/etc/pathchord/ingress` for root or service accounts.
   Files form one validated graph with global references and duplicate checks.
   Directory changes and atomic replacement reload the complete candidate;
   invalid candidates retain the last good snapshot.
   Resource identities and references retain their namespace through policy,
   DNS, subscriptions, credentials, runtime slots, reload, and management views.
-  Wire Egress identities and TrafficClass names use canonical resource names;
-  opaque credential references retain their original values. Supplied inactive
+  Wire Egress identities use canonical resource names. Opaque credential
+  references retain their original values. Supplied inactive
   DNS routes are validated without panicking, capability booleans default
   independently, and omitted rule matches express catch-all intent.
   Owner journal/pin components use stable bounded digests where needed, and
@@ -246,11 +248,10 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   `PATH_READY` over a real byte stream. Egress bounds the complete admission
   exchange to ten seconds by default, with an explicit positive runtime override
   capped at sixty seconds. Timeout and authorization cleanup release its permit.
-  Both peers retain the complete known capability intersection and enforce TCP,
-  UDP, and TrafficClass admission; subsequent Paths must match the Session set.
-  Capability selection uses the already registered `PATH_READY_CAPABILITIES`
-  message. Update both endpoints together: older implementations can reject that
-  message without the class bit or omit required selections in plain `PATH_READY`.
+  Egress returns the intersection of the peers' `TCP_STREAM` and `UDP_SESSION`
+  capability bits in `PATH_READY_CAPABILITIES`. Ingress rejects attachment when
+  a required capability is missing. Later Paths must match the Session's
+  negotiated set.
 - The Session runtime supports TCP and UDP Streams, multiple Paths, a common
   Egress Session Path pool, DATA/ACK/WINDOW/FIN/RST, bounded reordering and buffers,
   Path drain/close, bounded timer retransmission, cross-Path re-framing, and
@@ -521,7 +522,7 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   allowance in addition to their local limits, so connection churn cannot
   exhaust history and terminate Ingress.
 
-## Remaining explicit-listener work
+## Platform and explicit-listener validation
 
 - The deployment guide and example configurations cover direct,
   subscription, and authenticated Egress use. Separate CLI-process smoke
@@ -568,20 +569,14 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Shared implementation gaps
 
-- A Session containing flows admitted by different TrafficPolicies keeps an
-  independent bounded replication budget per Stream/Association while the
-  negotiated Session replication cap remains the hard ceiling. Required
-  control and ordinary retransmission reserve the aggregate wire budget before
-  optional copies; aggregate Egress wire accounting still needs prolonged load
-  evidence and cross-machine validation.
+- Aggregate Egress wire accounting still needs prolonged load and
+  cross-machine validation.
 - Congestion-window, incremental-capacity, and scheduling-overhead measurements
   are optional scheduler inputs. No platform source supplies them by default;
   they remain unknown rather than being inferred from idle throughput.
-- Some management detail fields, including listener-independent connection
-  timing, Path admission timestamps and Transit identity, Session admission
-  timestamps have no runtime producer. The API exposes unavailable values as
-  null; they still need typed producers before the full observability contract
-  is met.
+- Session admission generation and Path ready and last-change timestamps lack
+  runtime producers and appear as null in local queries. Ingress publishes
+  the selected Transit Proxy ID for each Path when its attribution is available.
 - Subscription enable/disable/delete and source replacement use a control/data
   plane visibility barrier. Successful mutations block new selection before the
   worker drains old imported nodes; stale refreshes and publications are
@@ -606,10 +601,11 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   dashboard. `scripts/monitoring-smoke.sh` performs a real scrape and checks
   the Prometheus and Grafana APIs; snapshot byte totals remain declared gauges,
   not lifetime counters.
-- The local Docker deployment baseline records the default Path autoscaler
-  values (`min=1`, `max=4`, scale-out 8000 bp, scale-in 3500 bp, samples
-  3/3/6, cooldown 30 s) and NodeProbePolicy defaults (30 s interval, 5 s
-  timeout, concurrency 8, window 32, batch 128). The smoke uses a smaller
+- The 2026-11-17 local Docker baseline recorded the standalone Path autoscaler
+  defaults (`min=1`, `max=4`, scale-out 8000 bp, scale-in 3500 bp, samples
+  3/3/6, cooldown 30 s). Ingress Session pools now use the 256-Path runtime
+  ceiling described above. The recorded NodeProbePolicy defaults were a 30 s
+  interval, 5 s timeout, concurrency 8, window 32 and batch 128. The smoke uses a smaller
   one-second probe policy, observes a real `up` RTT sample, and verifies the
   authenticated observation snapshot. These are deployment regression values,
   explicitly not production capacity or SLO measurements.
@@ -631,8 +627,15 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Validation evidence
 
+The 2026-11-28 documentation and CLI verification on Linux passed 1,163
+workspace tests with 118 ignored. A local Ingress and Egress completed
+enrollment, returned JSON status and produced separate diagnostic exports for
+the two roles. Markdown lint passed for 41 files. The role configuration
+validator accepted seven shipped examples and both complete configuration
+examples from the English and Chinese specifications.
+
 On 2026-11-28, Rust 1.100.1 built both role daemons and `pathchordctl` on
-Linux. The workspace suite passed 1,162 tests with 118 ignored. The refreshed
+Linux. That earlier workspace run passed 1,162 tests with 118 ignored. The refreshed
 lockfile includes `hickory-proto` 0.26.4. `cargo audit` checked 457 packages
 with zero findings. All workspace targets passed cross-checks for x86_64
 Windows GNU, FreeBSD and Linux musl. The uTLS and Gecko test tools use Brotli
@@ -685,7 +688,8 @@ adding another probe. A delayed-ACK regression checks retransmission and
 cumulative acknowledgement. The final 128-Path TCP/UDP fixture passed four
 runs in concurrently running pairs and four more with each pair pinned to one
 logical CPU. All runs retained the original three-second CONNECT deadline.
-The final Linux workspace suite passed 1,162 tests with 118 ignored.
+The Linux workspace run for those stress-test changes passed 1,162 tests
+with 118 ignored.
 
 On 2026-11-27, the AnyTLS official-v2 Session reuse implementation passed
 its codec and adapter tests, and its TCP plus UoT v2 interoperability test

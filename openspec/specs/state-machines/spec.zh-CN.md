@@ -142,7 +142,7 @@ Ingress owner SHALL 为每个 Egress 关系维护一个认证 Path 池，不依�
 - **WHEN** Egress 要求两条可用 Path，但故障后只剩一条认证且非排空的 ready Path
 - **THEN** Session 进入 degraded，拒绝新的 Stream 和 UDP Association，已有工作可继续使用剩余 Path，并进行有界恢复尝试
 
-#### Scenario: Only draining Paths remain
+#### Scenario: Draining Paths do not count toward the pool minimum
 
 - **WHEN** Session 只剩认证的 draining Path
 - **THEN** 已有工作遵循排空截止时间，新业务被拒绝，排空 Path 不计入新准入最小值
@@ -424,12 +424,23 @@ score(path) = relationship_weight
 必要控制和普通重传优先于可选业务复制；每个发送方的可选副本 MUST NOT 超过其剩余 outbound Session allowance，
 上下行分别受同一已接受的标量上限约束。
 
-自动扩缩容MUST 使用滞回：只有当聚合容量低于需求或 Session target 超过活跃数量，并持续达到配置的
-连续采样窗口时才能增加 Path；只有当容量富余持续达到另一个非零窗口，且移除所有选中排空候选后剩余的
-非排空可用 Path 仍满足公共 Egress 最小值时才能移除 Path。缩容前MUST 进入 `DRAINING`。当新增容量低于
-调度开销时MUST 排除 Path，并在观测中暴露原因。
-状态变化或探测失败后MUST 重置反向计数器。阈值和窗口MAY 配置，但这些守卫、滞回、排空动作和预算计费规则
-具有规范性。
+设 `R` 为配置请求的基线（显式指定的目标，省略时取公共最小值加一），`H` 为当前运行时或协商的
+Path 硬上限，则有效基线为 `B = min(R, H)`。当前需求目标为
+`min(H, max(B, directional capacity need))`，按当前观测重新计算。硬上限阻止达到 `R` 时，
+该缺口必须可观测，配置和公共最小值保持原值。硬上限低于公共最小值时，沿用原有的准入不足处理规则。
+
+自动扩缩容 MUST 使用滞回。聚合容量低于需求或当前目标大于可用 Path 数量，且持续达到配置的连续采样窗口时，
+可以增加 Path。补充基线和恢复故障 Path 可以独立于业务连接、提前于容量不足窗口启动，但 MUST 遵守有界尝试与退避、
+授权、准入、候选资格及排除规则、正在进行的 attach 和硬上限。仅凭空闲需求为零，不得排除符合条件的基线 Path 或生成容量测量值。
+
+容量富余持续达到独立的非零低利用率窗口、恢复已稳定且冷却结束后，才可以缩容。
+每次决策最多移除一条 Path，且 MUST 先进入 `DRAINING`。排除所有选定排空的 Path 后，
+剩余可用 Path 必须满足有效基线和公共准入最小值，并有足够容量承载当前各方向的需求。
+硬故障、授权、信任、管理或资源限制要求的状态转换保留原有优先级，可使 Path 池低于请求的基线。
+
+已知新增容量低于调度开销时 MUST 排除该 Path，并在观测中暴露有界原因。
+未知容量不得记录为测得的零值，也不得阻止有界的基线维护。扩缩容状态转换或探测失败后 MUST 重置反向计数器。
+阈值和窗口可以配置。这些守卫、滞回、排空动作和预算记账规则均具有规范性。
 
 ### 转换影响和失败原因
 

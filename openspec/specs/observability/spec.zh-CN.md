@@ -402,7 +402,6 @@ pathchord_session_target_shortfall
 
 四个 Path-planning gauge 对同一份当前 live Session 快照求和，排除 closed/retired Session 历史；live 集合为空时为零。它们表示当前状态而非生命周期计数器，不增加标签。Egress 不推荐 Path 数；Ingress 所有请求基线和当前 demand target。这些值属于本地观测，不会加入认证的 Egress `STATUS_REPORT`。
 
-
 服务应提供以下指标族：
 
 ```text

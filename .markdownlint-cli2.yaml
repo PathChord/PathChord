@@ -1,0 +1,14 @@
+globs:
+  - "README*.md"
+  - "AGENTS.md"
+  - "docs/**/*.md"
+  - "openspec/**/*.md"
+  - "packaging/**/*.md"
+  - "monitoring/**/*.md"
+ignores:
+  - "openspec/changes/archive/**"
+config:
+  MD004: false  # Retain the bullet style of the source document.
+  MD013: false  # Protocol layouts, commands and bilingual prose have variable line lengths.
+  MD048: false  # Both backtick and tilde fences occur in protocol documents.
+  MD060: false  # Table padding is editorial; column counts are still checked.

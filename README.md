@@ -16,25 +16,20 @@ Proxies, and route TCP/UDP flows through authenticated Session/Path runtimes.
 Egress exposes the authenticated Path listener and authorization control plane;
 the optional REST/SSE Web Gateway is shared by both control planes.
 
-Current work prioritizes ordinary HTTP forwarding, CONNECT, SOCKS4/4a/5, Linux
-transparent interception, and TUN listeners on Linux, Windows, and FreeBSD.
-HTTP uses a message codec for streaming bodies, persistent requests, and
-Upgrade; SOCKS5 also provides UDP ASSOCIATE. The
-`socks` listener spelling is accepted as an alias for canonical `socks5`.
-`type: mixed` serves HTTP and SOCKS on one TCP port, including SOCKS5 UDP
-ASSOCIATE through its negotiated relay endpoint.
-Windows and FreeBSD explicit listeners and local control have passed their
-recorded native QEMU validation matrices. Portable listener regressions run in
-the existing Rust CI job. Transparent TCP/UDP interception and TUN packet flows
-use the same policy and Session/Path data plane. Linux privileged routing,
-real TUN devices and optional eBPF checks have separate QEMU host evidence.
-Native platform and package results, host versions and validation limits are
-recorded in the implementation status linked below.
-Linux TPROXY also accepts `backend: ebpf` for an interface-bound TC classifier;
-the ordinary `tproxy` backend remains the default and fallback.
-See the [active OpenSpec changes](#active-changes) for pending platform,
-runtime, and adapter work and the [implementation status](openspec/implementation-status.md)
-for recorded capabilities and validation evidence.
+Linux, Windows, and FreeBSD support explicit HTTP, SOCKS4/4a/5 and Mixed
+listeners. HTTP supports forwarding, CONNECT, streaming bodies, persistent
+requests and Upgrade. SOCKS5 supports UDP ASSOCIATE. The `socks` spelling is
+an alias for `socks5`. Use `type: mixed` to serve HTTP and SOCKS on one TCP
+port. Explicit listeners and local control passed native QEMU tests on Windows
+and FreeBSD.
+
+On Linux, TPROXY, REDIRECT and TUN passed privileged QEMU tests, including
+real TUN devices and optional eBPF interception. TPROXY defaults to the
+`tproxy` backend and also supports `backend: ebpf` on a selected interface.
+FreeBSD rejects transparent and TUN listeners. Windows has a TUN adapter,
+with Wintun packaging and native TUN validation still pending. See the
+[implementation status](openspec/implementation-status.md) for host versions,
+package results and validation limits.
 
 Node imports support automatic detection, Clash/Mihomo providers, SIP008,
 URI/Base64 lists, sing-box JSON, and supported Surge/Quantumult X/Loon node
@@ -74,6 +69,7 @@ versions; planning artifacts and the implementation-status snapshot use English.
 
 - [Configuration guide](docs/guides/configuration.md)
 - [Deployment and local operation](docs/guides/deployment.md)
+- [Runtime observability and diagnostics](docs/guides/observability.md)
 - [Native packages](packaging/README.md)
 - [Monitoring deployment](monitoring/README.md)
 
@@ -88,6 +84,7 @@ versions; planning artifacts and the implementation-status snapshot use English.
 - [Wire profile v1](openspec/specs/wire-profile/spec.md)
 - [Configuration model](openspec/specs/configuration/spec.md)
 - [Configuration schema](openspec/specs/configuration-schema/spec.md)
+- [Geosite and GeoIP routing](openspec/specs/geodata-routing/spec.md)
 - [Platform and DNS](openspec/specs/platform-and-dns/spec.md)
 - [State machines](openspec/specs/state-machines/spec.md)
 - [Ingress control plane](openspec/specs/ingress-control-plane/spec.md)
@@ -101,7 +98,8 @@ versions; planning artifacts and the implementation-status snapshot use English.
 
 ### Active changes
 
-OpenSpec currently lists no active changes. See the [change archive](openspec/changes/archive/) for completed work.
+Run `openspec list` to see active changes. Completed proposals, tasks and
+research are in the [change archive](openspec/changes/archive/).
 
 ## OpenSpec workflow
 
@@ -110,12 +108,12 @@ Use OpenSpec to discover the existing contracts and current changes:
 ```sh
 openspec list --specs
 openspec list
-openspec status --change organize-documentation-with-openspec
 openspec validate --all --strict --no-interactive
 ```
 
-Start a focused change with `openspec new change <name>`, then author its
-proposal, design, and task checklist. Changes to behavior include canonical
+Start a focused change with `openspec new change <name>`. Use that same name
+with `openspec status --change <name>` to check the proposal, design, and
+task checklist as you write them. Changes to behavior include canonical
 English deltas under `specs/<capability>/spec.md`; work that only implements,
 validates, or reorganizes an existing contract uses `skip_specs: true` in
 `.openspec.yaml`. The [OpenSpec project configuration](openspec/config.yaml)
@@ -181,5 +179,18 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 cargo run -p pathchordctl -- --help
 ```
+
+Run the documentation checks from the repository root. The example check uses
+Cargo to run `pathchordctl`.
+
+```sh
+npx --yes markdownlint-cli2@0.24.2
+python3 scripts/check-doc-contracts.py
+python3 scripts/check-doc-examples.py
+openspec validate --all --strict --no-interactive
+```
+
+The [repository guidelines](AGENTS.md#build-test-and-development-commands) explain
+how to mark complete YAML examples for validation.
 
 The workspace disables rustc incremental artifacts in dev/test profiles so a configured `RUSTC_WRAPPER=sccache` can reuse complete compilation units. The repository does not require a machine-specific wrapper; local Cargo configuration decides whether sccache is available.

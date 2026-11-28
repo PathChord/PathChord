@@ -120,7 +120,7 @@ Ingress SHALL 为每个已配置 Egress 维护一个 Session 槽位；即使没�
 - **WHEN** 公共最小值为 1，请求基线为 3，且仍有 2 条可用 Path
 - **THEN** Ingress 继续尽力恢复基线，不会只因缺少第三条 Path 而降级或拒绝新业务
 
-#### Detailed contract
+#### 维护空闲 Path 基线
 
 Egress 的 `pathPool.minUsablePaths` 是基于数量的公共准入最小值。
 `pathPool.targetUsablePaths` 是请求的稳态可用 Path 基线；省略时解析为 minimum 加一，
@@ -164,7 +164,7 @@ Ingress SHALL 为每个 Session 根据 Egress 请求的可用 Path 基线和最�
 - **WHEN** 扩大的 Session 需求降低，并且剩余容量持续超过稳定窗口
 - **THEN** Ingress 在现有冷却和排空守卫下逐步向有效基线排空富余 Path，不保留历史需求峰值
 
-#### Detailed contract
+#### 计算 Session 的 Path 目标数量
 
 令 `R` 为 Egress 配置解析出的请求基线，`H` 为当前硬运行时 Path 上限。有效基线为
 `B = min(R, H)`。当前物理 target 覆盖有效基线和上行/下行容量需求中的较大值，并受 `H` 限制。
@@ -202,7 +202,7 @@ Path 池及一份不可变 TrafficPolicy。
 - **WHEN** Session 有两条合格、已认证且可用的 Path，另有一条 Path 正在排空
 - **THEN** 最小值和基线的可用数量为 2，维护不得将排空 Path 用于支持另一条计划性排空
 
-#### Detailed contract
+#### 可用 Path 的计数规则
 
 准入、基线维护和计划缩容共用同一数量定义：处于 `ACTIVE` 或 `DEGRADED`、符合资格、已独立
 认证且未排空的 ready Path 数。连接中、关闭、失败、不合格和排空的 Path SHALL NOT 满足任一门槛。
@@ -344,6 +344,7 @@ Egress endpoint 主机名 SHALL 由所选 Transit Adapter 按配置端口解析�
 [配置来源](../configuration-schema/spec.zh-CN.md#配置来源)。
 
 ```yaml
+# pathchord-check: ingress
 apiVersion: pathchord.io/v1
 kind: List
 metadata:
@@ -357,10 +358,6 @@ items:
         region: jp
     spec:
       endpoints:
-        - host: egress-v4.example.net
-          port: 7443
-        - host: egress-v6.example.net
-          port: 8443
         - host: egress.example.net
           port: 443
       publicKey: <curve25519-public-key>
@@ -380,6 +377,35 @@ items:
           tags: [quota-exhausted]
       trafficPolicyRef: jp-default
   - apiVersion: pathchord.io/v1
+    kind: TrafficPolicy
+    metadata:
+      name: jp-default
+    spec:
+      scheduler: effectiveCapacityWeighted
+  - apiVersion: pathchord.io/v1
+    kind: TransitProxy
+    metadata:
+      name: jp-direct
+      labels:
+        region: jp
+    spec:
+      protocol: direct
+  - apiVersion: pathchord.io/v1
+    kind: EgressRule
+    metadata:
+      name: route-via-jp
+    spec:
+      order: 10
+      catchAll: true
+      egressRef: jp-1
+  - apiVersion: pathchord.io/v1
+    kind: Listener
+    metadata:
+      name: local-mixed
+    spec:
+      type: mixed
+      bind: 127.0.0.1:7890
+  - apiVersion: pathchord.io/v1
     kind: DNSPolicy
     metadata:
       name: default-dns
@@ -398,6 +424,8 @@ items:
 资源引用使用 `metadata.name`（例如 `egressRef: jp-1`），不再使用集合内部的 `id` 字段。控制面发布后生成 `metadata.generation` 和只读 `status`。
 
 ### 静态 Egress 拓扑
+
+以下资源可替换上例中的 `jp-1`，为同一个 Egress 声明三个端点。
 
 ```yaml
 apiVersion: pathchord.io/v1
@@ -419,6 +447,18 @@ spec:
   capabilities:
     tcp: true
     udp: true
+  pathPool:
+    minUsablePaths: 2
+    targetUsablePaths: 3
+  admission:
+    requiredCapabilities: [tcp]
+  transit:
+    require:
+      labels:
+        region: jp
+    reject:
+      tags: [quota-exhausted]
+  trafficPolicyRef: jp-default
 ```
 
 ### 动态 Transit Proxy 数据

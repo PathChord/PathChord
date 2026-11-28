@@ -120,7 +120,7 @@ Ingress SHALL maintain one Session slot per configured Egress, best-effort maint
 - **WHEN** the common minimum is one, the requested baseline is three, and two usable Paths remain
 - **THEN** Ingress continues best-effort baseline recovery without degrading service or denying new business solely because the third Path is missing
 
-#### Detailed contract
+#### Maintaining the idle Path baseline
 
 Egress `pathPool.minUsablePaths` is the common count-based admission
 minimum. `pathPool.targetUsablePaths` sets the requested steady-state usable-Path
@@ -173,7 +173,7 @@ Ingress SHALL derive one bounded target Path count per Session from the Egress's
 - **WHEN** an expanded Session's demand subsides and surplus persists through the scale-in stabilization window
 - **THEN** Ingress gradually drains excess Paths toward the effective baseline under the existing cooldown and drain guards instead of retaining its historical demand peak
 
-#### Detailed contract
+#### Calculating the Session Path target
 
 Let `R` be the requested baseline resolved from Egress configuration and
 `H` the current hard runtime Path ceiling. The effective baseline is
@@ -219,7 +219,7 @@ All Streams and UDP Associations in one Session SHALL share the Path eligibility
 - **WHEN** a Session has two eligible authenticated usable Paths and another Path is draining
 - **THEN** the usable count for its minimum and baseline is two and maintenance does not use the draining Path to justify another planned drain
 
-#### Detailed contract
+#### Counting usable Paths
 
 The count shared by minimum admission, baseline maintenance, and planned
 scale-in is the number of eligible independently authenticated ready Paths in
@@ -374,6 +374,7 @@ see [configuration sources](../configuration-schema/spec.md#configuration-source
 for directory discovery, defaults, limits, and reload semantics.
 
 ```yaml
+# pathchord-check: ingress
 apiVersion: pathchord.io/v1
 kind: List
 metadata:
@@ -406,6 +407,35 @@ items:
           tags: [quota-exhausted]
       trafficPolicyRef: jp-default
   - apiVersion: pathchord.io/v1
+    kind: TrafficPolicy
+    metadata:
+      name: jp-default
+    spec:
+      scheduler: effectiveCapacityWeighted
+  - apiVersion: pathchord.io/v1
+    kind: TransitProxy
+    metadata:
+      name: jp-direct
+      labels:
+        region: jp
+    spec:
+      protocol: direct
+  - apiVersion: pathchord.io/v1
+    kind: EgressRule
+    metadata:
+      name: route-via-jp
+    spec:
+      order: 10
+      catchAll: true
+      egressRef: jp-1
+  - apiVersion: pathchord.io/v1
+    kind: Listener
+    metadata:
+      name: local-mixed
+    spec:
+      type: mixed
+      bind: 127.0.0.1:7890
+  - apiVersion: pathchord.io/v1
     kind: DNSPolicy
     metadata:
       name: default-dns
@@ -427,6 +457,8 @@ never collection-local `id` fields. `metadata.generation` and a read-only
 
 ### Static Egress topology
 
+The following resource can replace `jp-1` in the example above to declare three endpoints for the same Egress.
+
 ```yaml
 apiVersion: pathchord.io/v1
 kind: Egress
@@ -447,6 +479,18 @@ spec:
   capabilities:
     tcp: true
     udp: true
+  pathPool:
+    minUsablePaths: 2
+    targetUsablePaths: 3
+  admission:
+    requiredCapabilities: [tcp]
+  transit:
+    require:
+      labels:
+        region: jp
+    reject:
+      tags: [quota-exhausted]
+  trafficPolicyRef: jp-default
 ```
 
 ### Dynamic Transit Proxy data

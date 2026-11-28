@@ -22,9 +22,7 @@ The v1 schema SHALL expose Egress aggregate wire capacity and global inbound tar
 - **WHEN** an administrator supplies a resource containing an authored `status` field
 - **THEN** validation rejects the resource and leaves the previously published snapshot active
 
-#### Detailed contract
-
-##### Canonical native naming and field migration
+#### Canonical native naming and field migration
 
 PathChord-owned resource keys MUST use lower camelCase. Resource references
 MUST use the `Ref` suffix and retain namespace resolution; `egressId` remains
@@ -384,7 +382,7 @@ Each Ingress-side Egress SHALL accept optional `pathPool.minUsablePaths` and `pa
 - **WHEN** an Egress authors `admission.requiredCapabilities: [tcp, udp]`
 - **THEN** the same common Egress capability eligibility checks apply as the retired capability requirement, without adding per-flow or native-UDP Transit restrictions
 
-#### Detailed contract
+#### Path pool fields, defaults, and limits
 
 | Field relative to Egress `spec` | Type | Default and meaning |
 |---|---|---|
@@ -532,18 +530,11 @@ metadata:
   name: default
 items:
   - apiVersion: pathchord.io/v1
-    kind: Egress
+    kind: FallbackPolicy
     metadata:
-      name: jp-1
-      labels:
-        region: jp
+      name: default-fallback
     spec:
-      host: egress.example.net
-      port: 443
-      publicKey: <curve25519-public-key>
-      capabilities:
-        tcp: true
-        udp: true
+      action: reject
 ```
 
 Every resource object MUST contain exactly `apiVersion`, `kind`, `metadata`,
@@ -563,20 +554,15 @@ bounded string maps. `metadata.uid`, `metadata.generation`, and
 authored. Runtime `status` is read-only and is exposed separately by the
 control plane.
 
-The supported resource kinds are `Egress`, `TransitProxy`, `Subscription`,
-`EgressRule`, `ProxyRule`, `TrafficPolicy`, `Listener`,
-`DNSPolicy`, `FallbackPolicy`, `GeoSiteDatabase`, `GeoIpDatabase`,
-`EgressService`, and `NodeProbePolicy`. The last two are role-specific service resources: `EgressService` selects the
-Egress identity, listener, authorization store, and service limits for one
-Egress process; `NodeProbePolicy` configures the optional bounded Transit node
-probe. Ingress consumes `NodeProbePolicy` and the complete policy graph;
-Egress consumes an Egress-only source containing exactly one `EgressService`.
-Ingress and Egress sources MUST NOT be treated as one shared resource bundle.
-A namespace MUST contain at most one object
-for each `(kind, metadata.name)`. A complete configuration MUST contain exactly
-one `DNSPolicy` and one `FallbackPolicy`; all other kinds are optional subject
-to reference and routing validation. A `List` with no listener is valid as a
-library snapshot but cannot start an Ingress service.
+Each configuration source belongs to one role. Within each namespace, every
+`(kind, metadata.name)` MUST be unique.
+
+| Role | Resources consumed by the role | Cardinality |
+|---|---|---|
+| Ingress | `DNSPolicy`, `FallbackPolicy` | Exactly one of each in the complete graph. |
+| Ingress | `IngressService`, `NodeProbePolicy` | At most one of each in the complete graph. |
+| Ingress | `Listener`, `Egress`, `TransitProxy`, `Subscription`, `EgressRule`, `ProxyRule`, `TrafficPolicy`, `GeoSiteDatabase`, `GeoIpDatabase` | Subject to reference and routing validation. A library snapshot may omit Listeners. Ingress service startup requires at least one Listener. |
+| Egress | `EgressService` | Exactly one in the entire source. Any other resource kind MUST be rejected. |
 
 The loader resolves references by `(namespace, kind, name)`, validates the
 complete object graph, then publishes one immutable generation. Applying an
@@ -689,8 +675,8 @@ restart.
 are mutually exclusive. Ingress Path-pool counts, per-Ingress stream quotas,
 and Path safety ceilings are not EgressService fields and MUST NOT be authored
 on this resource. Paths in the resource are resolved
-relative to the selected configuration source. An Egress process selects at
-most one such resource. The resource name supplies the default Egress ID.
+relative to the selected configuration source. An Egress process MUST select exactly one
+such resource from its source. The resource name supplies the default Egress ID.
 The identity, authorization database, and control socket paths default to
 the role layout.
 `remoteDnsOnly` defaults to false. When true and an original hostname is
@@ -859,9 +845,10 @@ If the binding has no admitted Transit Proxy, the next Egress rule is
 considered; evaluation does not silently fall through to an arbitrary Proxy.
 
 `ProxyRule` objects select an ordinary Proxy. `select` is `any` or a selector; the
-default is `any`. `any` chooses uniformly among the highest-scoring usable
-Proxies after filtering by selector and weight; ties are broken by ascending
-canonical ID. A rule may instead set `proxy: direct`, which selects the direct
+default is `any`. Eligible candidates are ordered by descending weighted score,
+then by ascending canonical ID for equal scores. The first candidate is tried
+first. Pre-admission retries follow the [ordinary Proxy failover contract](../configuration/spec.md#requirement-bounded-ordinary-proxy-pre-admission-failover).
+A rule may instead set `proxy: direct`, which selects the direct
 Transit adapter without a third-party node; `proxy` and `select` are mutually
 exclusive. `require` is a Proxy selector with the same label/tag/capability
 matching semantics as the documented selector. `catchAll` explicitly marks
@@ -940,7 +927,7 @@ share the same credentials, source restrictions, and listener identity.
 
 `kind: DNSPolicy` is defined normatively in [platform-and-dns.md](../platform-and-dns/spec.md).
 DNS is independent from Egress selection and exactly one DNSPolicy object MUST
-be present, even when its route is `local`. Fake-IP is forbidden. The fallback
+be present in the complete Ingress graph, even when its route is `local`. Fake-IP is forbidden. The fallback
 resource has this shape:
 
 ```yaml
@@ -987,7 +974,7 @@ and `kind: List`; the complete combined resource graph is then validated.
 Resources may reference objects in other files. Duplicate resource identities
 are rejected across the whole bundle; filename order MUST NOT implement a
 last-file-wins override. Exactly one DNSPolicy and one FallbackPolicy remain
-required in the combined graph. Runtime data and private credential JSON MUST
+required in the combined Ingress graph. Runtime data and private credential JSON MUST
 be kept outside the resource tree or use a non-resource file extension.
 Resource identity and explicit rule order determine the normalized graph;
 moving unchanged resources between source files MUST NOT require a restart.
