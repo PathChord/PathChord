@@ -3217,7 +3217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_vmess_alter_id_interoperates_with_sing_box() {
         timeout(
             Duration::from_secs(60),
@@ -3245,7 +3245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_vmess_tcp_interoperates_with_sing_box() {
         let binary =
             PathBuf::from(std::env::var_os("PATHCHORD_TEST_SING_BOX").expect("reference engine"));
@@ -3539,7 +3539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_vmess_tls_websocket_and_udp_interoperate_with_sing_box() {
         let binary =
             PathBuf::from(std::env::var_os("PATHCHORD_TEST_SING_BOX").expect("reference engine"));

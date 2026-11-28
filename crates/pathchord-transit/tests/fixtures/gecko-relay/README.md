@@ -1,10 +1,8 @@
 # Gecko relay interoperability fixture
 
-This test-only relay uses the sing-quic version pinned by sing-box 1.14.4 to
-decode and encode Gecko packets around a plain Hysteria2 server. It accepts
-large UDP datagrams in its own buffer, so the test also covers Gecko padding
-sizes above the sing-box QUIC server's receive-buffer limit. It is not a
-runtime or release dependency.
+This test-only relay uses the sing-quic version pinned by sing-box 1.14.6 to
+decode and encode Gecko packets around a plain Hysteria2 server. Its UDP
+receive buffer lets the loopback test exchange 2048-byte Gecko datagrams.
 
 From this directory, build the relay and run the optional test from the
 workspace root:

@@ -226,8 +226,9 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
   Long subscription names preserve independent generated-node ownership, while
   older cache IDs remain readable and drain on the next successful refresh.
 
-- The eight-crate Rust workspace uses the pinned Rust 1.100.0 toolchain,
-  builds on Linux, and cross-checks for Windows GNU and FreeBSD x86_64.
+- The 13-crate Rust workspace pins Rust 1.100.1 for development and CI. Its
+  minimum Rust version is 1.100.0. The workspace builds on Linux and supports
+  Windows GNU and FreeBSD x86_64 cross-checks.
   Core frame/message codecs, state machines, bounded reliability buffers,
   wire vectors, and UDP/Path lifecycle payloads are implemented.
 - Native single-role package recipes cover Debian, Alpine, Arch Linux, FreeBSD,
@@ -630,6 +631,27 @@ acceptance work. SOCKS5 UDP forwarding remains in the current scope.
 
 ## Validation evidence
 
+On 2026-11-28, Rust 1.100.1 built both role daemons and `pathchordctl` on
+Linux. The workspace suite passed 1,162 tests with 118 ignored. The refreshed
+lockfile includes `hickory-proto` 0.26.4. `cargo audit` checked 457 packages
+with zero findings. All workspace targets passed cross-checks for x86_64
+Windows GNU, FreeBSD and Linux musl. The uTLS and Gecko test tools use Brotli
+1.3.0 and `klauspost/compress` 1.20.5. Both built with Go 1.27.4.
+`govulncheck` found no reachable advisories, and all seven normalized uTLS
+ClientHellos matched the captured fixtures.
+
+The sing-box 1.14.6 suite passed 70 tests, including the independent Gecko
+relay. Direct TCP and UDP round trips passed with fixed 1452-byte Gecko
+datagrams. Three direct handshakes timed out at 2048 bytes, while the
+independent relay exchanged datagrams of that size. The Mihomo 1.19.34,
+Xray 26.11.9 and V2Fly 5.53.0 suites passed all 22 tests.
+
+The local Docker smoke used the new Ingress binary with Prometheus 3.13.5 LTS
+and Grafana 13.3.2. The authenticated scrape reported `up=1`, the missing
+target alert fired after Ingress stopped, and Grafana queried the provisioned
+data source and loaded the dashboard. A separate volume upgrade preserved a
+Prometheus 2.55.1 sample timestamp and a Grafana 11.3.0 folder UID and title.
+
 On 2026-11-28, native packages resolved their version from the Cargo
 workspace or a CI override. Local Debian and Arch package metadata contained
 `0.1.1-1` for the checkout and `0.1.2.7-1` for the explicit override.
@@ -868,8 +890,8 @@ fakes, route rollback, TUN packet flows, Web REST/SSE, persistence, reload,
 subscription normalization, and fault/retransmission cases. The dependency
 graph contains no `paste` package. `netsock` 0.9.0 uses the updated Netlink
 dependency line directly, so PathChord no longer carries a local
-`netlink-packet-utils` compatibility patch. `cargo-deny` 0.20.2 passes the
-same advisory check used by GitHub Actions.
+`netlink-packet-utils` compatibility patch. The workspace lockfile passes the
+CI advisory check with `cargo-deny` 0.22.2.
 
 Cargo 1.100 reports an unused `netsock` dependency on Linux because the native
 provider uses it only on non-Linux platforms. Its dependency declaration stays
@@ -1149,8 +1171,8 @@ unchanged resources moved between files. The CLI process smoke test uses a
 directory bundle while conflicting environment sources are present, proving
 the command-line override is effective.
 
-The current FreeBSD cross build exported headers and libraries from the native
-FreeBSD 15.1 guest to `/data/pathchord-qemu/freebsd-build/sysroot`, then used
+The 2026-11-17 FreeBSD validation run exported headers and libraries from
+the FreeBSD 15.1 guest to `/data/pathchord-qemu/freebsd-build/sysroot`, then used
 Clang/Clang++ and LLD 23 with Rust 1.100.0 to build all workspace targets and
 test executables. The resulting executables were uploaded back to that FreeBSD
 guest and ran as `pathchord`; native results and artifact hashes are in the

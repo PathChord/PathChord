@@ -637,7 +637,7 @@ mod tests {
     use tokio::process::Command;
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_anytls_tcp_and_udp_interoperate_with_sing_box() {
         let binary =
             PathBuf::from(std::env::var_os("PATHCHORD_TEST_SING_BOX").expect("reference peer"));

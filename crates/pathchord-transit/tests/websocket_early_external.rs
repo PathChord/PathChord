@@ -471,7 +471,7 @@ async fn round_trip(protocol: Protocol, placement: Placement, tls: bool, limit: 
 macro_rules! interop_test {
     ($name:ident, $protocol:expr, $placement:expr, $tls:expr) => {
         #[tokio::test]
-        #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+        #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
         async fn $name() {
             let limits = if matches!($protocol, Protocol::Trojan) {
                 [56, 2048]
@@ -554,7 +554,7 @@ interop_test!(
 );
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn sing_box_trojan_rejects_early_data_shorter_than_the_password_digest() {
     for placement in [
         Placement::Path,

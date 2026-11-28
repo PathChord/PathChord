@@ -38,19 +38,19 @@ impl SubscriptionFetcher for FixtureSubscription {
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn revoked_subscription_blocks_new_selection_while_mux_stream_drains() {
     revoked_subscription_drains("h2mux").await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn revoked_subscription_blocks_new_selection_while_yamux_stream_drains() {
     revoked_subscription_drains("yamux").await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn revoked_subscription_blocks_new_selection_while_smux_stream_drains() {
     revoked_subscription_drains("smux").await;
 }
@@ -103,37 +103,37 @@ async fn revoked_subscription_drains(mux_protocol: &str) {
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn h2mux_interoperates_with_vless_vmess_and_trojan() {
     multiplex_protocol_matrix("h2mux", false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn yamux_interoperates_with_vless_vmess_and_trojan() {
     multiplex_protocol_matrix("yamux", false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn smux_interoperates_with_vless_vmess_and_trojan() {
     multiplex_protocol_matrix("smux", false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn padded_h2mux_interoperates_with_vless_vmess_and_trojan() {
     multiplex_protocol_matrix("h2mux", true).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn padded_yamux_interoperates_with_vless_vmess_and_trojan() {
     multiplex_protocol_matrix("yamux", true).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn padded_smux_interoperates_with_vless_vmess_and_trojan() {
     multiplex_protocol_matrix("smux", true).await;
 }
@@ -202,43 +202,43 @@ async fn multiplex_protocol_matrix(mux_protocol: &str, padding: bool) {
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn h2mux_reuses_one_shadowsocks_connection_for_tcp_and_udp() {
     multiplex_reuses_connection("h2mux", false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn yamux_reuses_one_shadowsocks_connection_for_tcp_and_udp() {
     multiplex_reuses_connection("yamux", false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn smux_reuses_one_shadowsocks_connection_for_tcp_and_udp() {
     multiplex_reuses_connection("smux", false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn padded_h2mux_reuses_one_shadowsocks_connection_for_tcp_and_udp() {
     multiplex_reuses_connection("h2mux", true).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn padded_yamux_reuses_one_shadowsocks_connection_for_tcp_and_udp() {
     multiplex_reuses_connection("yamux", true).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn padded_smux_reuses_one_shadowsocks_connection_for_tcp_and_udp() {
     multiplex_reuses_connection("smux", true).await;
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn smux_fin_matches_sing_box_full_close_semantics() {
     timeout(Duration::from_secs(15), async {
         let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

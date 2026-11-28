@@ -20,18 +20,18 @@ blake2 = "0.11.0"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
-h2 = "=0.4.20"
+h2 = "=0.4.21"
 http = "1"
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http2"] }
 hyper-util.workspace = true
 trojan-proto = "=0.18.0"
-sha2 = "0.11.1"
+sha2 = "0.11.2"
 sha3 = "0.12.0"
 shake = "0.1.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 hmac = "0.13.0"
-crc32fast = "1.5.5"
+crc32fast = "1.5.6"
 md-5 = "0.11.0"
 hkdf = "0.13.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }

@@ -175,9 +175,10 @@ The [deployment guide](deployment.md) explains credential-file setup. The [Trans
 For Hysteria2 Gecko, optional private credential fields
 `gecko_min_packet_size` and `gecko_max_packet_size` select the long-header
 fragment padding range; omitted or zero values use 512 and 1200 bytes. The
-peer must accept the chosen wire size. In local tests, sing-box 1.14.4 peers
-could exchange fixed 1452-byte Gecko packets but their 2048-byte setting did
-not complete a handshake; an independent sing-quic relay did accept 2048.
+peer must accept the chosen wire size. On Linux loopback, PathChord exchanged
+TCP and UDP traffic with sing-box 1.14.6 using fixed 1452-byte Gecko datagrams.
+With both endpoints set to 2048 bytes, the direct QUIC handshake timed out.
+An independent sing-quic relay accepted fixed 2048-byte Gecko datagrams.
 The chosen size must also fit the network path. On Linux, PathChord's QUIC
 socket disables IP fragmentation; with a 1500-byte MTU and no additional
 encapsulation, UDP payloads above 1472 bytes over IPv4 or 1452 bytes over IPv6

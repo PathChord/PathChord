@@ -1676,7 +1676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_hysteria2_tcp_interoperates_with_sing_box() {
         for obfs in ["salamander", "gecko"] {
             tokio::time::timeout(
@@ -1689,7 +1689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_hysteria2_custom_gecko_sizes_interoperate_with_sing_box() {
         for sizes in [(700, 700), (800, 1400), (1452, 1452)] {
             timeout(
@@ -1721,7 +1721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_hysteria2_receive_rate_hint_interoperates_with_sing_box() {
         for ignore_client_bandwidth in [false, true] {
             tokio::time::timeout(
@@ -1742,7 +1742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_hysteria2_brutal_tcp_udp_and_obfuscation_interoperate_with_sing_box() {
         for obfs in ["salamander", "gecko"] {
             timeout(
@@ -1763,7 +1763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_hysteria2_sing_box_upload_negotiation_matrix() {
         timeout(Duration::from_secs(30), async {
             for (server_mbps, auto, client_mbps, expected_bps) in [
@@ -1832,7 +1832,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_hysteria2_brutal_paces_and_retransmits_with_sing_box() {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1991,7 +1991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn native_hysteria2_rejects_invalid_sing_box_auth() {
         timeout(Duration::from_secs(20), async {
             {

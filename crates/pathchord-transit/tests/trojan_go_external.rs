@@ -1,7 +1,7 @@
 //! Imported Trojan-go links against independent local servers.
 //!
 //! `PATHCHORD_TEST_TROJAN_GO` selects a full-featured Trojan-Go v0.10.6 for TCP/WS;
-//! `PATHCHORD_TEST_SING_BOX` selects sing-box 1.14.4 for dae gRPC/HTTPUpgrade.
+//! `PATHCHORD_TEST_SING_BOX` selects the sing-box executable for dae gRPC/HTTPUpgrade.
 
 use std::{collections::BTreeSet, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
@@ -85,6 +85,7 @@ impl Directory {
             std::process::id(),
             u64::from_ne_bytes(suffix)
         ));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -289,7 +290,7 @@ async fn imported_trojan_go_encrypted_websocket_roundtrip() {
 }
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn imported_trojan_go_dae_grpc_and_httpupgrade_roundtrip_with_sing_box() {
     timeout(Duration::from_secs(30), async {
         for (transport, server, options) in [

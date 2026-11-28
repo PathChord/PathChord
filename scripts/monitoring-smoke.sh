@@ -47,8 +47,10 @@ import socket
 
 for port in (13000, 18081, 18090, 19090):
     with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("127.0.0.1", port))
+            sock.listen()
         except OSError:
             raise SystemExit(f"monitoring smoke requires free loopback port {port}")
 PY
@@ -132,14 +134,18 @@ for _ in $(seq 1 120); do
 done
 curl --fail --silent -H "Authorization: Bearer $token" http://127.0.0.1:18090/metrics >/dev/null
 
+# A fresh Grafana database runs its schema migrations before it serves requests.
 for _ in $(seq 1 120); do
-	grafana_health=$(curl --fail --silent http://127.0.0.1:13000/api/health 2>/dev/null || true)
+	grafana_health=$(curl --fail --silent --max-time 2 http://127.0.0.1:13000/api/health 2>/dev/null || true)
 	if printf '%s' "$grafana_health" | jq -e '.database == "ok"' >/dev/null 2>&1; then
 		break
 	fi
-	sleep 0.25
+	sleep 1
 done
-printf '%s' "$grafana_health" | jq -e '.database == "ok"' >/dev/null
+if ! printf '%s' "$grafana_health" | jq -e '.database == "ok"' >/dev/null; then
+	echo 'Timed out waiting for the Grafana database to become ready' >&2
+	exit 1
+fi
 for _ in $(seq 1 120); do
 	dashboard=$(curl --fail --silent -u admin:pathchord-local http://127.0.0.1:13000/api/dashboards/uid/pathchord-overview 2>/dev/null || true)
 	if printf '%s' "$dashboard" | jq -e '.dashboard.uid == "pathchord-overview" and ([.dashboard.panels[].title] | index("Transit node health") != null)' >/dev/null 2>&1; then

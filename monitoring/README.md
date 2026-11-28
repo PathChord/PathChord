@@ -23,6 +23,11 @@ Prometheus and Grafana with Docker Compose, waits for the target scrape, checks
 Prometheus rules and queries, checks the Grafana health/datasource/dashboard
 APIs, and waits for the configured local TCP probe to produce an observation.
 
+When upgrading a deployment that uses the Grafana 11 data volume, back up
+the Grafana database before starting Grafana 13. Grafana migrates dashboards
+and folders to unified storage on startup. Restoring that backup lets you
+roll back to Grafana 11. [Grafana migration guide](https://grafana.com/docs/grafana/latest/upgrade-guide/upgrade-v13/upgrade-v13.0/#unified-storage-for-folders-and-dashboards)
+
 For an interactive stack, create a state directory containing a token, then
 start the stack after starting PathChord with the same token:
 

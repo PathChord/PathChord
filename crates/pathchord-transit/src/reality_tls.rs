@@ -1503,14 +1503,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn reality_vless_vision_interoperates_with_sing_box_for_both_shares() {
         let binary = std::env::var_os("PATHCHORD_TEST_SING_BOX").expect("sing-box executable");
         external_reality_roundtrips(binary, false).await;
     }
 
     #[tokio::test]
-    #[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+    #[ignore = "requires PATHCHORD_TEST_SING_BOX"]
     async fn sing_box_reality_combined_decoy_flight_boundary() {
         let binary = std::env::var_os("PATHCHORD_TEST_SING_BOX").expect("sing-box executable");
         let mut selected = None;

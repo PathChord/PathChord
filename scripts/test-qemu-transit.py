@@ -2,7 +2,7 @@
 """Verify native TCP/UDP adapters between two independent QEMU Linux guests.
 
 Requires a static musl cross_machine_probe example and a test-only sing-box
-1.14.4 executable. All credentials are generated for this disposable lab.
+1.14.6 executable. All credentials are generated for this disposable lab.
 """
 
 from __future__ import annotations
@@ -99,8 +99,8 @@ def main():
         if not binary.is_file():
             parser.error(f"missing executable: {binary}")
     version = run([str(arguments.sing_box.resolve()), "version"], capture_output=True).stdout
-    if "sing-box version 1.14.4" not in version:
-        parser.error("this matrix is pinned to the test-only sing-box 1.14.4 peer")
+    if "sing-box version 1.14.6" not in version.splitlines():
+        parser.error("this matrix is pinned to the test-only sing-box 1.14.6 peer")
     if not 0 <= arguments.delay_ms <= 1000:
         parser.error("delay must be between 0 and 1000 milliseconds")
     output = arguments.output.resolve() if arguments.output else new_run_directory("transit")

@@ -20,7 +20,7 @@ use tokio::{
 const UUID: &str = "6cbf3f72-3417-4922-bde6-67820d041f25";
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn sing_box_http_transport_relays_tcp_and_udp() {
     for (protocol, tls) in [
         ("vless", false),

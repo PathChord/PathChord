@@ -20,7 +20,7 @@ const UUID: &str = "6cbf3f72-3417-4922-bde6-67820d041f25";
 const PASSWORD: &str = "tuic-stream-fixture-password";
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to sing-box 1.14.4"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn tuic_udp_over_stream_interoperates_with_sing_box() {
     timeout(Duration::from_secs(25), async {
         let cert = rcgen::generate_simple_self_signed(vec!["tuic-stream.test".into()]).unwrap();

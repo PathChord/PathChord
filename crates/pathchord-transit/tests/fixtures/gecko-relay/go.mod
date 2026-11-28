@@ -2,20 +2,22 @@ module pathchord-gecko-test
 
 go 1.25.0
 
-require github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4
+toolchain go1.27.4
+
+require github.com/sagernet/sing-quic v0.7.2-0.20261126024618-6fa4bb84d0bd
 
 require (
-	github.com/andybalholm/brotli v1.0.6 // indirect
+	github.com/andybalholm/brotli v1.3.0 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/huin/goupnp v1.2.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
-	github.com/klauspost/compress v1.17.9 // indirect
+	github.com/klauspost/compress v1.20.5 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
 	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 // indirect
 	github.com/libp2p/go-netroute v0.2.1 // indirect
 	github.com/metacubex/utls v1.8.7 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/sagernet/quic-go v0.61.0-sing-box-mod.12 // indirect
+	github.com/sagernet/quic-go v0.61.0-sing-box-mod.15 // indirect
 	github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20250911091902-df9299821621 // indirect

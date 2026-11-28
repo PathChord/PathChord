@@ -17,7 +17,7 @@ use tokio::{
 };
 
 #[tokio::test]
-#[ignore = "requires PATHCHORD_TEST_SING_BOX pointing to a sing-box 1.14.4 server"]
+#[ignore = "requires PATHCHORD_TEST_SING_BOX"]
 async fn shadowsocks_udp_over_tcp_interoperates_with_sing_box() {
     for cipher in ["aes-128-gcm", "aes-192-gcm"] {
         timeout(Duration::from_secs(20), exercise(cipher))

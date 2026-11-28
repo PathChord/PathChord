@@ -172,7 +172,8 @@ artifact overrides.
 
 ## Development
 
-Development uses the pinned Rust 1.100.0 toolchain with rustfmt and Clippy.
+Development and CI use Rust 1.100.1 with rustfmt and Clippy. The workspace
+requires Rust 1.100.0 or later.
 
 ```sh
 cargo fmt --all -- --check

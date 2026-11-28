@@ -130,7 +130,7 @@ Arch Linux（`.pkg.tar.*`）、FreeBSD（`.pkg`）和 Windows NSIS（`.exe`）�
 
 ## 开发
 
-开发使用固定版本的 Rust 1.100.0 工具链，并包含 rustfmt 和 Clippy。
+开发和 CI 使用 Rust 1.100.1，包含 rustfmt 和 Clippy。工作区要求 Rust 1.100.0 或更高版本。
 
 ```sh
 cargo fmt --all -- --check

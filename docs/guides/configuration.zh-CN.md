@@ -155,8 +155,9 @@ IP 集合任一匹配即可选路，应使用多条有序规则。`targetHosts` 
 
 Hysteria2 Gecko 可使用私有凭据中的可选字段 `gecko_min_packet_size` 和
 `gecko_max_packet_size` 选择长头分片的填充范围；字段缺省或为零时分别使用 512 和 1200 字节。
-对端需要接受所选的线上包长。本地测试中 sing-box 1.14.4 对端可以交换固定 1452 字节的
-Gecko 包，但其 2048 字节设置无法完成握手；独立 sing-quic relay 可以接受 2048 字节。
+对端需要接受所选的线上包长。在 Linux 回环测试中，PathChord 通过固定 1452 字节的 Gecko
+数据报与 sing-box 1.14.6 收发 TCP 和 UDP 流量。两端都设为 2048 字节时，直连对端的 QUIC
+握手超时。独立的 sing-quic relay 可以接收固定 2048 字节的 Gecko 数据报。
 所选包长还必须适合网络路径。Linux 上 PathChord 的 QUIC socket 禁止 IP 分片；在 MTU 为
 1500 字节且没有额外封装时，IPv4 的 UDP 载荷超过 1472 字节或 IPv6 的 UDP 载荷超过
 1452 字节就无法装入一个 IP 包。这类 Gecko 分片可能被丢弃，表现为握手超时。隧道或更小的
