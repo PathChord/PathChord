@@ -3,6 +3,11 @@
 /dist/
 /build/
 
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
 # Local browser and tool artifacts
 /.playwright-cli/
 /output/
