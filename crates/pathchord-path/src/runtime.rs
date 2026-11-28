@@ -496,6 +496,7 @@ pub struct SessionDiagnostics {
 }
 
 pub struct IngressSessionHandle {
+    attached_paths: watch::Receiver<BTreeSet<PathId>>,
     commands: mpsc::Sender<IngressCommand>,
     snapshots: watch::Receiver<SessionSnapshot>,
     task: Option<JoinHandle<Result<SessionSnapshot, SessionRuntimeError>>>,
@@ -579,11 +580,13 @@ impl IngressSessionHandle {
                 target_open_slots: None,
             },
         )?;
+        let attached_paths = actor.attached_paths.subscribe();
         let task = tokio::spawn(actor.run());
         Ok(Self {
             commands,
             snapshots,
             task: Some(task),
+            attached_paths,
             stream_capacity,
         })
     }
@@ -851,18 +854,11 @@ impl IngressSessionHandle {
     }
 
     pub async fn wait_path_closed(&self, path_id: PathId) {
-        let mut snapshots = self.snapshots.clone();
-        loop {
-            {
-                let snapshot = snapshots.borrow_and_update();
-                if snapshot.closed || !snapshot.ready_path_ids.contains(&path_id) {
-                    return;
-                }
-            }
-            if snapshots.changed().await.is_err() {
-                return;
-            }
-        }
+        let _ = self
+            .attached_paths
+            .clone()
+            .wait_for(|paths| !paths.contains(&path_id))
+            .await;
     }
 
     #[must_use]
@@ -935,6 +931,7 @@ pub struct EgressSessionHandle {
 
 #[derive(Clone)]
 pub struct EgressSessionController {
+    attached_paths: watch::Receiver<BTreeSet<PathId>>,
     commands: mpsc::Sender<IngressCommand>,
     snapshots: watch::Receiver<SessionSnapshot>,
 }
@@ -1003,18 +1000,11 @@ impl EgressSessionController {
     }
 
     pub async fn wait_path_closed(&self, path_id: PathId) {
-        let mut snapshots = self.snapshots.clone();
-        loop {
-            {
-                let snapshot = snapshots.borrow_and_update();
-                if snapshot.closed || !snapshot.ready_path_ids.contains(&path_id) {
-                    return;
-                }
-            }
-            if snapshots.changed().await.is_err() {
-                return;
-            }
-        }
+        let _ = self
+            .attached_paths
+            .clone()
+            .wait_for(|paths| !paths.contains(&path_id))
+            .await;
     }
 
     #[must_use]
@@ -1255,9 +1245,11 @@ impl EgressSessionHandle {
                 target_open_slots,
             },
         )?;
+        let attached_paths = actor.attached_paths.subscribe();
         let task = tokio::spawn(actor.run());
         Ok(Self {
             controller: EgressSessionController {
+                attached_paths,
                 commands,
                 snapshots,
             },
@@ -1728,6 +1720,7 @@ struct PendingUdpSend {
 }
 
 struct SessionActor<W> {
+    attached_paths: watch::Sender<BTreeSet<PathId>>,
     diagnostics: Option<SessionDiagnostics>,
     session_control_sender: ControlSender<PendingSessionControl>,
     next_session_control: u64,
@@ -1897,6 +1890,7 @@ where
             reader_task: Some(reader_task),
             frame_tx,
             frames,
+            attached_paths: watch::Sender::new(BTreeSet::from([path_id])),
             extra_paths: HashMap::new(),
             multipath,
             path_health,
@@ -2630,6 +2624,9 @@ where
         health.incremental_capacity_bps = observation.incremental_capacity_bps;
         health.scheduling_overhead_bps = observation.scheduling_overhead_bps;
         self.path_health.insert(path_id, health);
+        self.attached_paths.send_modify(|paths| {
+            paths.insert(path_id);
+        });
         for cached in self
             .egress_requests
             .values_mut()
@@ -2752,6 +2749,9 @@ where
             let _ = path.writer_task.await;
             let _ = path.reader_task.await;
         }
+        self.attached_paths.send_modify(|paths| {
+            paths.remove(&path_id);
+        });
         self.retired_path_states.insert(
             path_id,
             if drained {
@@ -5863,6 +5863,7 @@ where
         {
             let _ = self.multipath.mark_path_closed(path_id);
         }
+        self.attached_paths.send_modify(BTreeSet::clear);
         for (path_id, health) in std::mem::take(&mut self.path_health) {
             let (reason, elapsed) = health
                 .terminal_write
@@ -7768,11 +7769,26 @@ mod tests {
         assert_eq!(&first, b"before-drain");
 
         ingress.drain_path(PathId::new(2)).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                ingress.wait_path_closed(PathId::new(2)),
+            )
+            .await
+            .is_err(),
+            "a draining Path still owns its carrier"
+        );
         stream.write_all(b"after-drain").await.unwrap();
         let mut second = [0_u8; 11];
         stream.read_exact(&mut second).await.unwrap();
         assert_eq!(&second, b"after-drain");
         ingress.close_path(PathId::new(2)).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            egress_controller.wait_path_closed(PathId::new(2)),
+        )
+        .await
+        .expect("the Egress Path owner observes carrier retirement");
         assert_eq!(ingress.snapshot().ready_paths, 1);
 
         stream.write_all(b"after-failure").await.unwrap();
