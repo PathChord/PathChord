@@ -3270,8 +3270,14 @@ where
                 active.push(*path_id);
             }
 
+            // Retransmitting an outstanding probe already provides liveness
+            // traffic. Avoid creating additional probes while its ACK is late.
             if now.duration_since(health.last_heartbeat_sent) >= HEARTBEAT_INTERVAL
                 && health.sender.pending_len() < MAX_PENDING_CONTROL_MESSAGES
+                && !health
+                    .sender
+                    .pending()
+                    .any(|(_, probe)| probe.attempts < MAX_RETRANSMISSION_ATTEMPTS)
             {
                 let sequence = health.sender.enqueue(PendingHeartbeat {
                     first_sent_at: now,
@@ -8137,6 +8143,59 @@ mod tests {
         assert!(ingress.snapshot().path_quality[&PathId::new(0x5678)].loss_ppm > 0);
         ingress.shutdown().await.unwrap();
         egress.wait().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_heartbeat_acks_do_not_multiply_probes() {
+        let (path, mut peer) = admitted_pair().await;
+        let ingress = IngressSessionHandle::start(path).unwrap();
+        for expected in [0, 0, 0, 0, 1] {
+            let frame = tokio::time::timeout(
+                HEARTBEAT_INTERVAL + MIN_RETRANSMISSION_TIMEOUT,
+                peer.transport_mut().receive_frame(),
+            )
+            .await
+            .expect("a Path must continue to send liveness probes")
+            .unwrap()
+            .unwrap();
+            let message = Message::decode(
+                frame.header().frame_type(),
+                frame.payload(),
+                ProtocolLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                message,
+                Message::Heartbeat(Heartbeat {
+                    control_seq: expected
+                })
+            );
+        }
+        let limits = peer.transport_mut().limits();
+        let ack = Message::ControlAck(ControlAck {
+            highest_contiguous: 1,
+            ranges: Vec::new(),
+        });
+        let frame = PathFrame::new(
+            ack.frame_type(),
+            FrameFlags::empty(),
+            peer.session_id(),
+            peer.path_id(),
+            peer.transport_mut().transport.next_send_nonce().unwrap(),
+            ack.encode(limits).unwrap(),
+            limits,
+        )
+        .unwrap();
+        peer.transport_mut().send_frame(frame).await.unwrap();
+        tokio::time::timeout(MIN_RETRANSMISSION_TIMEOUT, async {
+            while ingress.snapshot().path_quality[&peer.path_id()].control_pending > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late cumulative ACK must release both sequences");
+        drop(peer);
+        drop(ingress);
     }
 
     #[tokio::test(start_paused = true)]
