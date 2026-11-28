@@ -19,17 +19,18 @@ concurrency:
 
 jobs:
   source:
-    name: Resolve package version
+    name: Resolve package source
     runs-on: ubuntu-24.04
     outputs:
+      commit: ${{ steps.source.outputs.commit }}
       version: ${{ steps.source.outputs.version }}
     steps:
-      - name: Check out source commit
+      - name: Resolve requested tag or event commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
           persist-credentials: false
-      - name: Read package version
+      - name: Pin source commit and package version
         id: source
         env:
           PATHCHORD_VERSION: ${{ vars.PATHCHORD_VERSION }}
@@ -38,9 +39,11 @@ jobs:
           case "$version" in
             ''|[!0-9]*|*[!0-9A-Za-z.+_-]*) echo 'invalid package version' >&2; exit 2 ;;
           esac
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
+    needs: source
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -78,7 +81,7 @@ jobs:
       - name: Check out source commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
 
       - name: Install Rust target
@@ -172,7 +175,7 @@ jobs:
       - name: Check out source commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
       - name: Download Linux binaries
         uses: actions/download-artifact@v8
@@ -215,7 +218,7 @@ jobs:
       - name: Check out source commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
       - name: Download Linux binaries
         uses: actions/download-artifact@v8
@@ -277,7 +280,7 @@ jobs:
       - name: Check out source commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
       - name: Download Linux binaries
         uses: actions/download-artifact@v8
@@ -331,7 +334,7 @@ jobs:
       - name: Check out source commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
       - name: Download FreeBSD binaries
         uses: actions/download-artifact@v8
@@ -380,7 +383,7 @@ jobs:
       - name: Check out source commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.source.outputs.commit }}
           persist-credentials: false
       - name: Download Windows binaries
         uses: actions/download-artifact@v8
