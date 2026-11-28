@@ -665,9 +665,6 @@ async fn run_udp_association(
                     report.rejected_requests = report.rejected_requests.saturating_add(1);
                     continue;
                 }
-                if pinned_source.is_none() {
-                    pinned_source = Some(source);
-                }
                 let datagram = match decode_udp_datagram(&buffer[..length]) {
                     Ok(datagram) => datagram,
                     Err(SocksUdpHeaderError::Fragmented) => {
@@ -680,6 +677,7 @@ async fn run_udp_association(
                         continue;
                     }
                 };
+                pinned_source.get_or_insert(source);
                 report.udp_datagrams_received = report.udp_datagrams_received.saturating_add(1);
                 report.udp_bytes_received = report
                     .udp_bytes_received
@@ -1131,6 +1129,10 @@ mod tests {
             b"socks-udp",
         )
         .unwrap();
+        let other_port = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut fragmented = request.clone();
+        fragmented[2] = 1;
+        other_port.send_to(&fragmented, relay).await.unwrap();
         client.send_to(&request, relay).await.unwrap();
         let mut response = vec![0_u8; 128];
         let (length, _) =
@@ -1142,13 +1144,11 @@ mod tests {
         assert_eq!(response.payload, b"socks-udp");
         assert_eq!(response.target.port, target_address.port());
 
-        let mut fragmented = request.clone();
-        fragmented[2] = 1;
-        client.send_to(&fragmented, relay).await.unwrap();
         drop(control);
         shutdown.send(()).unwrap();
         let report = task.await.unwrap().unwrap();
         assert_eq!(report.udp_associations, 1);
+        assert_eq!(report.fragmented_datagrams_rejected, 1);
         assert_eq!(report.udp_datagrams_received, 1);
         assert_eq!(report.udp_datagrams_sent, 1);
         echo.await.unwrap();
