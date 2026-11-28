@@ -224,12 +224,19 @@ async fn configured_obfs_does_not_wrap_or_open_tcp_for_udp() {
             CipherKind::AES_256_GCM,
         )
         .unwrap();
-        let socket = ProxySocket::bind(Context::new_shared(ServerType::Server), &ss_config)
-            .await
-            .unwrap();
-        let address = socket.local_addr().unwrap();
-        // A listener at the same port detects any unintended TCP/plugin use.
-        let tcp = TcpListener::bind(address).await.unwrap();
+        // TCP and UDP have independent ephemeral port allocators. Keep both
+        // sockets once we find a port that can also watch for stray TCP dials.
+        let (socket, tcp, address) = loop {
+            let socket = ProxySocket::bind(Context::new_shared(ServerType::Server), &ss_config)
+                .await
+                .unwrap();
+            let address = socket.local_addr().unwrap();
+            match TcpListener::bind(address).await {
+                Ok(tcp) => break (socket, tcp, address),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("cannot bind TCP observer: {error}"),
+            }
+        };
         let backend = tokio::spawn(async move {
             let mut packet = vec![0; 4096];
             for _ in 0..4 {
