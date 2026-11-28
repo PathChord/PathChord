@@ -139,7 +139,6 @@ pub struct EgressNode<C> {
     next_path_token: AtomicU64,
     session_status: EgressStatusConfig,
     status_provider: Arc<NodeStatusProvider>,
-    target_slots: Arc<Semaphore>,
 }
 
 impl<C> std::fmt::Debug for EgressNode<C> {
@@ -219,10 +218,10 @@ where
             runtime: Arc::clone(&runtime),
             observations: Arc::clone(&observations),
             status: session_status,
+            target_slots: Arc::new(Semaphore::new(config.max_inbound_target_connections)),
             wire_budget,
             estimator: Mutex::new(CapacityEstimator::new(now)),
         });
-        let target_slots = Arc::new(Semaphore::new(config.max_inbound_target_connections));
         Ok(Self {
             listeners,
             local_addr,
@@ -238,7 +237,6 @@ where
             next_path_token: AtomicU64::new(1),
             session_status,
             status_provider,
-            target_slots,
         })
     }
 
@@ -263,15 +261,18 @@ where
         mut self,
         status: EgressStatusConfig,
     ) -> Result<Self, EgressNodeError> {
-        if status.capacity_bps == 0 || status.max_inbound_target_connections == 0 {
+        if status.capacity_bps == 0
+            || !(1..=Semaphore::MAX_PERMITS).contains(&status.max_inbound_target_connections)
+        {
             return Err(EgressNodeError::InvalidConfig(
-                "status capacity and per-Ingress limits must be non-zero",
+                "status capacity or target-connection limit is out of range",
             ));
         }
         self.session_status = status;
-        Arc::get_mut(&mut self.status_provider)
-            .expect("status provider is not shared before starting the node")
-            .status = status;
+        let provider = Arc::get_mut(&mut self.status_provider)
+            .expect("status provider is not shared before starting the node");
+        provider.status = status;
+        provider.target_slots = Arc::new(Semaphore::new(status.max_inbound_target_connections));
         Ok(self)
     }
 
@@ -644,7 +645,6 @@ where
                         Arc::clone(&self.connector),
                         Arc::clone(&self.observations),
                         Arc::clone(&active_targets),
-                        Arc::clone(&self.target_slots),
                         self.session_status,
                         self.config.remote_dns_only,
                         Arc::clone(&self.status_provider),
@@ -858,11 +858,11 @@ fn validate_config(config: &EgressNodeConfig) -> Result<(), EgressNodeError> {
         ));
     }
     if config.capacity_bps == 0
-        || config.max_inbound_target_connections == 0
+        || !(1..=Semaphore::MAX_PERMITS).contains(&config.max_inbound_target_connections)
         || config.traffic_multiplier_basis_points == 0
     {
         return Err(EgressNodeError::InvalidConfig(
-            "status capacity, target-connection limit, and traffic multiplier must be non-zero",
+            "status capacity, target-connection limit, or traffic multiplier is out of range",
         ));
     }
     if config.required_capabilities & config.supported_capabilities != config.required_capabilities
@@ -1064,6 +1064,7 @@ struct NodeStatusProvider {
     runtime: Arc<Mutex<NodeRuntimeState>>,
     observations: Arc<NodeObservations>,
     status: EgressStatusConfig,
+    target_slots: Arc<Semaphore>,
     wire_budget: Arc<WireBudget>,
     estimator: Mutex<CapacityEstimator>,
 }
@@ -1196,7 +1197,9 @@ impl EgressStatusProvider for NodeStatusProvider {
         });
         let active_targets = self.observations.active_targets.load(Ordering::Relaxed);
         let maximum_connections = self.status.max_inbound_target_connections.max(1) as u64;
-        let utilization = active_targets
+        let available_slots = self.target_slots.available_permits() as u64;
+        let utilization = maximum_connections
+            .saturating_sub(available_slots)
             .saturating_mul(10_000)
             .checked_div(maximum_connections)
             .unwrap_or(0)
@@ -1220,7 +1223,7 @@ impl EgressStatusProvider for NodeStatusProvider {
             .checked_div(self.status.capacity_bps.max(1))
             .unwrap_or(0)
             .min(10_000) as u16;
-        let admission_allowed = active_targets < maximum_connections
+        let admission_allowed = available_slots > 0
             && !matches!(capacity_state, CapacityState::Stale)
             && bandwidth_utilization < 10_000;
         EgressStatusSample {
@@ -1235,7 +1238,7 @@ impl EgressStatusProvider for NodeStatusProvider {
                 AdmissionReason::None
             } else if bandwidth_utilization >= 10_000 {
                 AdmissionReason::BandwidthLimit
-            } else if active_targets >= maximum_connections {
+            } else if available_slots == 0 {
                 AdmissionReason::ConnectionLimit
             } else {
                 AdmissionReason::ResourceLimit
@@ -1341,7 +1344,6 @@ async fn run_path_task<C>(
     connector: Arc<C>,
     observations: Arc<NodeObservations>,
     active_targets: Arc<AtomicU64>,
-    target_slots: Arc<Semaphore>,
     session_status: EgressStatusConfig,
     remote_dns_only: bool,
     status_provider: Arc<NodeStatusProvider>,
@@ -1409,6 +1411,7 @@ async fn run_path_task<C>(
     {
         return;
     }
+    let target_slots = Arc::clone(&status_provider.target_slots);
     let factory = ConnectorStreamFactory {
         connector,
         observations: Arc::clone(&observations),
@@ -1430,7 +1433,7 @@ async fn run_path_task<C>(
                 },
                 session_status,
                 status_provider,
-                Arc::clone(&target_slots),
+                target_slots,
                 observations
                     .diagnostics
                     .as_ref()
@@ -2094,7 +2097,11 @@ mod tests {
         }
     }
 
-    struct RejectConnector;
+    #[derive(Default)]
+    struct RejectConnector {
+        started: tokio::sync::Notify,
+        finish: tokio::sync::Notify,
+    }
 
     #[derive(Clone, Default)]
     struct RecordingConnector(Arc<Mutex<Vec<TargetRequest>>>);
@@ -2279,6 +2286,7 @@ mod tests {
                 max_inbound_target_connections: 10,
                 ..EgressStatusConfig::default()
             },
+            target_slots: Arc::new(Semaphore::new(10)),
             wire_budget: Arc::new(WireBudget::new(80_000).unwrap()),
             estimator: Mutex::new(estimator),
         };
@@ -2489,6 +2497,8 @@ mod tests {
             &self,
             _request: TargetRequest,
         ) -> Result<BoxedTargetConnection, TargetConnectError> {
+            self.started.notify_one();
+            self.finish.notified().await;
             Err(TargetConnectError::Connection("target refused".to_owned()))
         }
     }
@@ -2876,13 +2886,12 @@ mod tests {
             .expect("authorization store"),
         );
         enroll(&store, &ingress_key);
+        let mut config = node_config(Arc::clone(&egress_key), Arc::clone(&store));
+        config.max_inbound_target_connections = 1;
         let node = Arc::new(
-            EgressNode::bind(
-                node_config(Arc::clone(&egress_key), Arc::clone(&store)),
-                RejectConnector,
-            )
-            .await
-            .expect("bind Egress node"),
+            EgressNode::bind(config, RejectConnector::default())
+                .await
+                .expect("bind Egress node"),
         );
         let (shutdown, shutdown_rx) = oneshot::channel();
         let runner = tokio::spawn(run_node(Arc::clone(&node), shutdown_rx));
@@ -2892,19 +2901,38 @@ mod tests {
             panic!("Path should be admitted");
         };
         let ingress = IngressSessionHandle::start(path).expect("Ingress Session");
+        let open = ingress.open_tcp(TargetEndpoint {
+            hostname: b"refused.test".to_vec(),
+            port: 443,
+            resolved_addresses: Vec::new(),
+        });
+        let observe_pending = async {
+            tokio::time::timeout(Duration::from_secs(5), node.connector.started.notified())
+                .await
+                .expect("target dial started");
+            let sample = node.status_provider.sample();
+            assert_eq!(sample.active_target_connections, 0);
+            assert_eq!(sample.connection_utilization_basis_points, 10_000);
+            assert!(!sample.admission_allowed);
+            assert_eq!(sample.admission_reason, AdmissionReason::ConnectionLimit);
+            assert_eq!(
+                sample.service_state,
+                pathchord_core::EgressServiceState::Degraded
+            );
+            node.connector.finish.notify_one();
+        };
+        let (result, ()) = tokio::join!(open, observe_pending);
         assert!(matches!(
-            ingress
-                .open_tcp(TargetEndpoint {
-                    hostname: b"refused.test".to_vec(),
-                    port: 443,
-                    resolved_addresses: Vec::new(),
-                })
-                .await,
+            result,
             Err(OpenStreamError::Rejected {
                 error: ErrorClass::TargetFailure,
                 ..
             })
         ));
+        let sample = node.status_provider.sample();
+        assert!(sample.admission_allowed);
+        assert_eq!(sample.admission_reason, AdmissionReason::None);
+        assert_eq!(sample.connection_utilization_basis_points, 0);
         ingress.shutdown().await.expect("Ingress shutdown");
         shutdown.send(()).expect("node shutdown");
         runner.await.expect("node task").expect("node runtime");
