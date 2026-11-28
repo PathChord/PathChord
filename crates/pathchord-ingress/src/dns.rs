@@ -435,8 +435,9 @@ impl DnsCache {
 }
 
 fn cache_ttl(message: &Message) -> Option<u32> {
-    if !message.answers.is_empty() {
-        return message.answers.iter().map(|record| record.ttl).min();
+    let answer_ttl = message.answers.iter().map(|record| record.ttl).min();
+    if message.metadata.response_code == ResponseCode::NoError && answer_ttl.is_some() {
+        return answer_ttl;
     }
     if !matches!(
         message.metadata.response_code,
@@ -444,14 +445,15 @@ fn cache_ttl(message: &Message) -> Option<u32> {
     ) {
         return None;
     }
-    message
+    let negative_ttl = message
         .authorities
         .iter()
         .filter_map(|record| match &record.data {
             RData::SOA(soa) => Some(record.ttl.min(soa.minimum)),
             _ => None,
         })
-        .min()
+        .min()?;
+    Some(answer_ttl.map_or(negative_ttl, |ttl| ttl.min(negative_ttl)))
 }
 
 fn cap_ttls(message: &mut Message, maximum: u32) {
@@ -675,7 +677,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use hickory_proto::op::Query;
-    use hickory_proto::rr::rdata::{A, AAAA, SOA};
+    use hickory_proto::rr::rdata::{A, AAAA, CNAME, SOA};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use pathchord_policy::{DnsCacheConfig, DnsLocalConfig, DnsPolicyConfig, DnsPolicyId};
     use tokio::net::TcpListener;
@@ -930,6 +932,37 @@ mod tests {
         assert_eq!(cached.metadata.response_code, ResponseCode::NXDomain);
         assert_eq!(cached.metadata.id, 13);
         assert_eq!(negative.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn nxdomain_with_cname_requires_soa_and_expires_with_the_shortest_ttl() {
+        let wire = query(1, RecordType::A);
+        let query = Message::from_vec(&wire).unwrap();
+        let name = query.queries[0].name();
+        let alias = CNAME(Name::from_ascii("missing.example.test.").unwrap());
+        let key = canonical_query_key(&query).unwrap();
+        for (alias_ttl, soa_ttl, minimum, lifetime) in
+            [(120, 60, 30, 30), (120, 20, 30, 20), (10, 60, 30, 10)]
+        {
+            let mut message = Message::from_vec(&negative_answer(&wire, soa_ttl, minimum)).unwrap();
+            message.add_answer(Record::from_rdata(
+                name.clone(),
+                alias_ttl,
+                RData::CNAME(alias.clone()),
+            ));
+            let now = Instant::now();
+            let mut cache = DnsCache::new(true, 1, 300);
+            cache.insert(key.clone(), message.clone(), now);
+            assert!(cache.get(&key, 2, now).is_some());
+            assert!(
+                cache
+                    .get(&key, 3, now + Duration::from_secs(lifetime))
+                    .is_none()
+            );
+            message.authorities.clear();
+            cache.insert(key.clone(), message, now);
+            assert!(cache.get(&key, 4, now).is_none());
+        }
     }
 
     #[test]
