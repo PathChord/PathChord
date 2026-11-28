@@ -2,20 +2,33 @@
 
 [简体中文](observability.zh-CN.md)
 
-PathChord exposes live runtime state through the local control socket. Use
-pathchordctl get diagnostics -o json with an actor that has metrics:read.
-The response includes the process instance, retained Path termination records,
-reason counters, and producer loss counters.
+Use an actor with `metrics:read` to query diagnostics over the local control
+socket. The response includes the process instance, retained Path termination
+records, reason counters, and producer loss counters. On the Ingress host, run
+the following commands to view diagnostics and export a bounded, redacted JSON
+snapshot. These examples use the packaged Linux socket paths. Substitute the
+configured socket if your deployment uses a different path.
 
-Use pathchordctl export-diagnostics --output /path/to/diagnostics.json to
-write a bounded, redacted JSON snapshot for offline comparison. Collect one
-file from Ingress and one from Egress, then correlate admitted records by
-session_id and path_id. Each role reports its own observed trigger.
+```sh
+pathchordctl --socket /run/pathchord/ingress.sock get diagnostics -o json
+pathchordctl --socket /run/pathchord/ingress.sock export-diagnostics --output ingress-diagnostics.json
+```
 
-When a record list is empty, inspect expired, evicted, and producer_drops.
+On the Egress host, export its snapshot using the Egress control socket.
+
+```sh
+pathchordctl --socket /run/pathchord/egress.sock export-diagnostics --output egress-diagnostics.json
+```
+
+In the exported files, the Ingress records are under
+`response.result.diagnostics.records` and the Egress records are under
+`response.result.path_diagnostics.records`. Match admitted Path records by
+`ids.session_id` and `ids.path_id` to see the trigger each role observed.
+
+When a record list is empty, inspect `expired`, `evicted`, and `producer_drops`.
 A nonzero value means the absence of a record does not prove that the stage
-was never reached. Prometheus exposes pathchord_path_terminations_total and
-pathchord_diagnostic_records_dropped_total when the authenticated Web
+was never reached. Prometheus exposes `pathchord_path_terminations_total` and
+`pathchord_diagnostic_records_dropped_total` when the authenticated Web
 Gateway is enabled.
 
 ## Detailed service logs

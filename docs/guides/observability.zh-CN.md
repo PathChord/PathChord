@@ -2,19 +2,30 @@
 
 [English](observability.md)
 
-PathChord 通过本地控制 socket 暴露运行时状态。使用具有
-metrics:read 能力的 actor 运行 pathchordctl get diagnostics -o json。
+使用具有 `metrics:read` 权限的 actor 通过本地控制 socket 查询诊断信息。
 响应包含进程实例、保留的 Path 终止记录、原因计数器和生产者丢失计数器。
+在 Ingress 主机上运行下列命令，查看诊断信息并导出有界、已脱敏的 JSON 快照。
+示例使用 Linux 软件包的 socket 路径，其他部署请替换为实际配置的路径。
 
-使用 pathchordctl export-diagnostics --output /path/to/diagnostics.json
-写出有界且已脱敏的 JSON 快照供离线比较。分别从 Ingress 和 Egress
-收集文件，再用 session_id 和 path_id 关联已接纳的记录。每个角色
-报告自己观察到的触发原因。
+```sh
+pathchordctl --socket /run/pathchord/ingress.sock get diagnostics -o json
+pathchordctl --socket /run/pathchord/ingress.sock export-diagnostics --output ingress-diagnostics.json
+```
 
-记录列表为空时，检查 expired、evicted 和 producer_drops。这些值
+在 Egress 主机上，通过 Egress 控制 socket 导出该端的快照。
+
+```sh
+pathchordctl --socket /run/pathchord/egress.sock export-diagnostics --output egress-diagnostics.json
+```
+
+在导出文件中，Ingress 的记录位于 `response.result.diagnostics.records`，
+Egress 的记录位于 `response.result.path_diagnostics.records`。
+使用 `ids.session_id` 和 `ids.path_id` 关联已接纳的 Path 记录，查看每端观察到的触发原因。
+
+记录列表为空时，检查 `expired`、`evicted` 和 `producer_drops`。这些值
 非零时，缺少记录不能证明对应阶段从未发生。启用并通过认证的 Web
-Gateway 后，Prometheus 暴露 pathchord_path_terminations_total 和
-pathchord_diagnostic_records_dropped_total。
+Gateway 后，Prometheus 暴露 `pathchord_path_terminations_total` 和
+`pathchord_diagnostic_records_dropped_total`。
 
 ## 详细服务日志
 

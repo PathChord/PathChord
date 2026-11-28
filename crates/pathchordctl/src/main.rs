@@ -149,8 +149,19 @@ struct EnrollmentMutationArgs {
 
 #[derive(Debug, Args)]
 struct ExportDiagnosticsArgs {
-    #[arg(long)]
-    output: PathBuf,
+    // Keep the global format argument's ID and type, but reserve --output for the file here.
+    /// Format for reporting a control-plane error.
+    #[arg(
+        id = "output",
+        short = 'o',
+        value_enum,
+        default_value = "human",
+        value_name = "FORMAT"
+    )]
+    format: Output,
+    /// Destination for the JSON diagnostics snapshot.
+    #[arg(long = "output", value_name = "FILE")]
+    file: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -278,15 +289,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             )
             .await?;
             if !response.ok {
-                return print_response(&response, output, false);
+                return print_response(&response, args.format, false);
             }
             let envelope = serde_json::json!({
                 "format_version": 1,
                 "collected_at_unix_ms": now_unix_ms(),
                 "response": response,
             });
-            write_json_file(&args.output, &envelope)?;
-            println!("{}", args.output.display());
+            write_json_file(&args.file, &envelope)?;
+            println!("{}", args.file.display());
             return Ok(());
         }
         Command::Diagnostics => {
@@ -823,4 +834,44 @@ async fn exchange(_socket: &Path, _request: RequestEnvelope) -> Result<ResponseE
     Err(CliError::UnsupportedTransport {
         platform: std::env::consts::OS,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_diagnostic_export_file_independently_of_output_format() {
+        let parse = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["pathchordctl"].into_iter().chain(args.iter().copied()))
+                .unwrap();
+            let Command::ExportDiagnostics(export) = cli.command else {
+                panic!("expected export-diagnostics");
+            };
+            assert_eq!(export.file, Path::new("diagnostics.json"));
+            export.format
+        };
+        assert!(matches!(
+            parse(&["export-diagnostics", "--output", "diagnostics.json"]),
+            Output::Human
+        ));
+        for args in [
+            [
+                "--output",
+                "json",
+                "export-diagnostics",
+                "--output",
+                "diagnostics.json",
+            ],
+            [
+                "export-diagnostics",
+                "-o",
+                "json",
+                "--output",
+                "diagnostics.json",
+            ],
+        ] {
+            assert!(matches!(parse(&args), Output::Json));
+        }
+    }
 }
