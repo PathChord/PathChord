@@ -1640,6 +1640,7 @@ impl SessionControlEntry {
 }
 
 struct PendingSessionControl {
+    retry_round: usize,
     message: SessionControlEntry,
     eligible_paths: Option<BTreeMap<PathId, u32>>,
     last_sent_at: Instant,
@@ -4544,12 +4545,17 @@ where
         for (_, pending) in self.session_control_sender.pending_mut() {
             if now.duration_since(pending.last_sent_at) >= MIN_RETRANSMISSION_TIMEOUT {
                 pending.last_sent_at = now;
-                retry.push((pending.message.clone(), pending.eligible_paths.clone()));
+                pending.retry_round = pending.retry_round.wrapping_add(1);
+                retry.push((
+                    pending.message.clone(),
+                    pending.eligible_paths.clone(),
+                    pending.retry_round,
+                ));
             }
         }
-        for (message, eligible) in retry {
+        for (message, eligible, retry_round) in retry {
             if let Err(error) = self
-                .send_control_copies(message.message(), eligible.as_ref())
+                .send_control_copies(message.message(), eligible.as_ref(), retry_round)
                 .await
                 && !error.is_flow_recoverable()
             {
@@ -5477,13 +5483,14 @@ where
         // Check the outer bound before consuming a sequence number.
         Message::SessionControl(control.clone()).encode(self.limits)?;
         let actual = self.session_control_sender.enqueue(PendingSessionControl {
+            retry_round: 0,
             message: SessionControlEntry::Control(control.clone()),
             eligible_paths: None,
             last_sent_at: Instant::now(),
         })?;
         debug_assert_eq!(actual, sequence);
         if let Err(error) = self
-            .send_control_copies(Message::SessionControl(control), None)
+            .send_control_copies(Message::SessionControl(control), None, 0)
             .await
         {
             if !matches!(
@@ -5502,8 +5509,9 @@ where
         &mut self,
         message: Message,
         eligible: Option<&BTreeMap<PathId, u32>>,
+        retry_round: usize,
     ) -> Result<(), SessionRuntimeError> {
-        let paths: Vec<_> = self
+        let mut paths: Vec<_> = self
             .multipath
             .existing_path_ids()
             .into_iter()
@@ -5512,6 +5520,10 @@ where
         if paths.is_empty() {
             return Err(MultipathError::NoSchedulablePath.into());
         }
+        // A required retry may use another ready Path even when the Session
+        // has no budget for optional copies in this transmission round.
+        let start = retry_round % paths.len();
+        paths.rotate_left(start);
         let copy_size = message.encode(self.limits)?.len().saturating_add(128) as u64;
         let mut sent = false;
         for path in paths {
@@ -7009,11 +7021,22 @@ mod tests {
         IngressAdmittedPath<DuplexStream>,
         EgressAdmittedPath<DuplexStream>,
     ) {
-        let mut ingress_config = ingress_config();
-        ingress_config.path_id = PathId::new(path_id);
+        let mut config = ingress_config();
+        config.path_id = PathId::new(path_id);
+        admit_duplex_pair(ingress_key, egress_key, config, duplex(512 * 1024)).await
+    }
+
+    async fn admit_duplex_pair(
+        ingress_key: &StaticKeypair,
+        egress_key: &StaticKeypair,
+        ingress_config: IngressPathAdmissionConfig,
+        (ingress_io, egress_io): (DuplexStream, DuplexStream),
+    ) -> (
+        IngressAdmittedPath<DuplexStream>,
+        EgressAdmittedPath<DuplexStream>,
+    ) {
         let egress_config = egress_config();
         let authorization = authorization(ingress_key);
-        let (ingress_io, egress_io) = duplex(512 * 1024);
         let (ingress, egress) = tokio::join!(
             dial_path(
                 ingress_io,
@@ -8309,6 +8332,59 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unacknowledged_control_retries_on_another_ready_path_without_replication() {
+        let (ik, ek) = keys();
+        let config = |id| IngressPathAdmissionConfig {
+            path_id: PathId::new(id),
+            replication_budget_bytes_per_second: 0,
+            ..ingress_config()
+        };
+        let (i, mut left) = duplex(512 * 1024);
+        let (mut right, e) = duplex(512 * 1024);
+        let mut relay =
+            Box::pin(async move { tokio::io::copy_bidirectional(&mut left, &mut right).await });
+        let (i1, e1) = tokio::select! {
+            pair = admit_duplex_pair(&ik, &ek, config(1), (i, e)) => pair,
+            result = &mut relay => panic!("first Path closed during admission: {result:?}"),
+        };
+        let (i2, e2) = admit_duplex_pair(&ik, &ek, config(2), duplex(512 * 1024)).await;
+        let factory = EchoFactory::default();
+        let egress = EgressSessionHandle::start(e1, factory.clone()).unwrap();
+        let ingress = IngressSessionHandle::start(i1).unwrap();
+        egress
+            .controller()
+            .add_path(e2, Default::default())
+            .await
+            .unwrap();
+        ingress.add_path(i2, Default::default()).await.unwrap();
+
+        // Keep both Paths attached but delay all records on the first until
+        // the second has delivered the retried open. No record is discarded.
+        let mut open = Box::pin(ingress.open_tcp(target("slow-control.test")));
+        assert!(
+            tokio::time::timeout(MIN_RETRANSMISSION_TIMEOUT / 2, &mut open)
+                .await
+                .is_err()
+        );
+        let mut stream = tokio::time::timeout(MIN_RETRANSMISSION_TIMEOUT * 5, open)
+            .await
+            .expect("the open should complete while both Paths are still ready")
+            .unwrap();
+        assert_eq!(ingress.snapshot().ready_paths, 2);
+        let relay_task = tokio::spawn(relay);
+        stream.write_all(b"once").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        stream.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"once");
+        assert_eq!(factory.tasks.lock().unwrap().len(), 1);
+        ingress.shutdown().await.unwrap();
+        egress.wait().await.unwrap();
+        factory.join().await;
+        relay_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
