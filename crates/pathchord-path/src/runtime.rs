@@ -1008,6 +1008,11 @@ impl EgressSessionController {
     }
 
     #[must_use]
+    pub fn active_stream_count(&self) -> usize {
+        self.snapshots.borrow().active_streams
+    }
+
+    #[must_use]
     pub fn snapshot(&self) -> SessionSnapshot {
         self.snapshots.borrow().clone()
     }
@@ -3384,12 +3389,8 @@ where
                 },
             )?;
         }
-        for path_id in status_paths {
-            let report_seqno = self.next_status_report_seq;
-            self.next_status_report_seq = self
-                .next_status_report_seq
-                .checked_add(1)
-                .ok_or(SessionRuntimeError::FrameSequenceExhausted)?;
+        if !status_paths.is_empty() {
+            // Status describes the whole Egress at this instant, across all Paths.
             let sample = self.status_provider.sample();
             let adjusted_capacity = sample
                 .effective_capacity_bps
@@ -3400,36 +3401,45 @@ where
             } else {
                 adjusted_capacity
             };
-            outgoing.push((
-                path_id,
-                Message::StatusReport(StatusReport {
-                    connected: sample.connected,
-                    service_state: sample.service_state,
-                    admission_allowed: sample.admission_allowed,
-                    admission_reason: sample.admission_reason,
-                    load_basis_points: sample.load_basis_points,
-                    connection_utilization_basis_points: sample.connection_utilization_basis_points,
-                    bandwidth_utilization_basis_points: sample.bandwidth_utilization_basis_points,
-                    active_sessions: sample.active_sessions,
-                    active_streams: sample.active_streams,
-                    active_target_connections: sample.active_target_connections,
-                    configured_capacity_bps: sample.configured_capacity_bps,
-                    effective_capacity_bps: if matches!(
-                        sample.capacity_state,
-                        CapacityState::Unknown | CapacityState::Stale
-                    ) {
-                        0
-                    } else {
-                        quota_adjusted_capacity
-                    },
-                    current_wire_rate_bps: sample.current_wire_rate_bps,
-                    replication_allowance_bps: sample.replication_allowance_bps,
-                    capacity_state: sample.capacity_state,
-                    report_seqno,
-                    sample_age_ms: 0,
-                    expires_after_ms: PATH_FAILED_AFTER.as_millis() as u64,
-                }),
-            ));
+            for path_id in status_paths {
+                let report_seqno = self.next_status_report_seq;
+                self.next_status_report_seq = self
+                    .next_status_report_seq
+                    .checked_add(1)
+                    .ok_or(SessionRuntimeError::FrameSequenceExhausted)?;
+                outgoing.push((
+                    path_id,
+                    Message::StatusReport(StatusReport {
+                        connected: sample.connected,
+                        service_state: sample.service_state,
+                        admission_allowed: sample.admission_allowed,
+                        admission_reason: sample.admission_reason,
+                        load_basis_points: sample.load_basis_points,
+                        connection_utilization_basis_points: sample
+                            .connection_utilization_basis_points,
+                        bandwidth_utilization_basis_points: sample
+                            .bandwidth_utilization_basis_points,
+                        active_sessions: sample.active_sessions,
+                        active_streams: sample.active_streams,
+                        active_target_connections: sample.active_target_connections,
+                        configured_capacity_bps: sample.configured_capacity_bps,
+                        effective_capacity_bps: if matches!(
+                            sample.capacity_state,
+                            CapacityState::Unknown | CapacityState::Stale
+                        ) {
+                            0
+                        } else {
+                            quota_adjusted_capacity
+                        },
+                        current_wire_rate_bps: sample.current_wire_rate_bps,
+                        replication_allowance_bps: sample.replication_allowance_bps,
+                        capacity_state: sample.capacity_state,
+                        report_seqno,
+                        sample_age_ms: 0,
+                        expires_after_ms: PATH_FAILED_AFTER.as_millis() as u64,
+                    }),
+                ));
+            }
         }
         for (path_id, message) in outgoing {
             if let Err(error) = self.send_message_on(path_id, message).await {

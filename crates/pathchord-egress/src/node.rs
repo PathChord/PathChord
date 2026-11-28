@@ -320,7 +320,7 @@ where
                 .sessions
                 .values()
                 .filter_map(|session| session.controller.as_ref())
-                .map(|controller| controller.snapshot().active_streams)
+                .map(|controller| controller.active_stream_count())
                 .sum(),
             active_target_connections: self.observations.active_targets.load(Ordering::Relaxed),
             target_open_attempts: self
@@ -511,7 +511,7 @@ where
                     let target_count = metadata
                         .controller
                         .as_ref()
-                        .map(|controller| controller.snapshot().active_streams as u64)
+                        .map(|controller| controller.active_stream_count() as u64)
                         .unwrap_or_else(|| metadata.active_targets.load(Ordering::Relaxed));
                     cleanup.streams += target_count;
                     cleanup.target_connections += target_count;
@@ -1190,7 +1190,7 @@ impl EgressStatusProvider for NodeStatusProvider {
             let mut streams = 0_u64;
             for session in runtime.sessions.values() {
                 if let Some(controller) = &session.controller {
-                    streams = streams.saturating_add(controller.snapshot().active_streams as u64);
+                    streams = streams.saturating_add(controller.active_stream_count() as u64);
                 }
             }
             (runtime.sessions.len() as u64, streams)
